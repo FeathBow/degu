@@ -1,0 +1,9 @@
+#!/bin/sh
+# degu pre-commit: fast gates (fmt + clippy). Tests run at pre-push.
+set -e
+
+echo "degu pre-commit → cargo fmt --check"
+cargo fmt --all --check
+
+echo "degu pre-commit → cargo clippy --workspace --all-targets --locked --quiet -- -D warnings"
+cargo clippy --workspace --all-targets --locked --quiet -- -D warnings

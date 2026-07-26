@@ -1,0 +1,5 @@
+no_progress = true
+max_retries = 3
+retry_wait_time = 2
+timeout = 20
+include_fragments = "anchor-only"

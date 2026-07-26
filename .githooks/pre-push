@@ -1,0 +1,6 @@
+#!/bin/sh
+# degu pre-push: full test suite (commits stay light; see pre-commit).
+set -e
+
+echo "degu pre-push → cargo test --workspace --locked"
+cargo test --workspace --locked --quiet

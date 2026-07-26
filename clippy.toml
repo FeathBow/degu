@@ -1,0 +1,11 @@
+# Deletion is confined to the private lifecycle trash engine.
+disallowed-methods = [
+    { path = "std::fs::remove_file", reason = "use the verified fd-relative deletion engine" },
+    { path = "std::fs::remove_dir", reason = "use the verified fd-relative deletion engine" },
+    { path = "std::fs::remove_dir_all", reason = "use the verified fd-relative deletion engine" },
+    { path = "rustix::fs::unlinkat", reason = "use the verified fd-relative deletion engine" },
+    { path = "libc::unlink", reason = "use the verified fd-relative deletion engine" },
+    { path = "libc::unlinkat", reason = "use the verified fd-relative deletion engine" },
+    { path = "libc::remove", reason = "use the verified fd-relative deletion engine" },
+    { path = "libc::rmdir", reason = "use the verified fd-relative deletion engine" },
+]

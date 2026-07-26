@@ -1,0 +1,34 @@
+#!/bin/sh
+# degu commit-msg: enforce Conventional Commits (type(scope)!: subject).
+# Keep the type and scope vocabulary in sync with CONTRIBUTING.md.
+
+msg_file="$1"
+first_line=$(head -n1 "$msg_file")
+
+# Exempt: merge / revert (git-generated) / autosquash
+case "$first_line" in
+  Merge\ *|Revert\ *|fixup!*|squash!*) exit 0 ;;
+esac
+
+types='feat|fix|build|ci|perf|refactor|docs|test|chore|revert'
+scopes='core|walk|adapters|cli|deps|ci|tools|init|release|test'
+
+if ! printf '%s' "$first_line" | grep -qE "^($types)(\(($scopes)\))?!?: .+"; then
+  cat >&2 <<EOF
+x commit message does not match the convention:
+    $first_line
+
+  expected: type(scope)!: subject
+    type:  $types
+    scope: $scopes (optional; ! marks a breaking change)
+  example: feat(core): guard rejects relative paths
+  see CONTRIBUTING.md
+EOF
+  exit 1
+fi
+
+chars=$(printf '%s' "$first_line" | wc -m | tr -d ' ')
+if [ "$chars" -gt 72 ]; then
+  echo "x first line is ${chars} chars, limit is 72" >&2
+  exit 1
+fi

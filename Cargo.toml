@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/degu-walk",
     "crates/degu-core",
+    "crates/degu-adapters",
 ]
 
 [workspace.package]
@@ -12,12 +13,14 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+degu-core = { path = "crates/degu-core", version = "0.1.0" }
 degu-walk = { path = "crates/degu-walk", version = "0.1.0" }
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.1"
 thiserror = "2.0"
 tracing = "0.1"
 rustix = { version = "1.1", features = ["fs", "process"] }
+libc = "0.2"
 tempfile = "3.27"
 
 [profile.dev]

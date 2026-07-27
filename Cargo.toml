@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/degu-walk",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+tracing = "0.1"
+rustix = { version = "1.1", features = ["fs", "process"] }
+tempfile = "3.27"
+
+[profile.dev]
+incremental = false
+
+# Favor small static release binaries.
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

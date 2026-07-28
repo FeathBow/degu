@@ -1,0 +1,33 @@
+[package]
+name = "degu"
+description = "Find and safely reclaim user-owned caches and build artifacts when HOME quota is tight"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+default-run = "degu"
+
+[[bin]]
+name = "degu"
+path = "src/main.rs"
+test = false
+
+[[bin]]
+name = "dg"
+path = "src/bin/dg.rs"
+test = false
+
+[dependencies]
+degu-adapters.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+clap_mangen.workspace = true
+crossterm.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+tempfile.workspace = true

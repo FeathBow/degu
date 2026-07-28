@@ -4,11 +4,15 @@
 //! Output discipline: stdout carries command data only; diagnostics and logs go to stderr so machine-readable output remains pipe-safe.
 
 mod cli;
+mod collection;
 mod commands;
 mod configuration;
+mod filters;
 mod output;
 mod presentation;
 mod runtime;
+mod source_selection;
+mod value_parser;
 
 use anyhow::Result;
 use cli::{Cli, ColorPolicy, Command};
@@ -53,12 +57,25 @@ fn render_error(error: &anyhow::Error) -> String {
 }
 
 fn run(verbose: u8, command: Command, policy: ColorPolicy) -> Result<()> {
-    runtime::initialize(verbose, policy)?;
+    let ui = runtime::initialize(verbose, policy)?;
 
     match command {
         Command::Completions { shell } => commands::completions::run(shell),
         Command::Man { command } => commands::man::run(command),
         Command::Adapters => commands::adapters::run(),
+        command => {
+            runtime::enforce_root_policy(ui.colors)?;
+            dispatch(command, ui)
+        }
+    }
+}
+
+fn dispatch(command: Command, ui: runtime::Ui) -> Result<()> {
+    match command {
+        Command::Scan(args) => commands::scan::run(args, ui),
+        Command::Completions { .. } | Command::Man { .. } | Command::Adapters => {
+            unreachable!("handled before guarded run")
+        }
     }
 }
 

@@ -5,6 +5,7 @@ use std::path::Path;
 
 mod output;
 mod render;
+pub(crate) use output::print;
 
 pub(crate) const UNSAFE_SCOPE_REASON: &str =
     "unavailable: this scope cannot be represented safely as a shell command.";
@@ -24,13 +25,20 @@ pub(crate) struct Request<'a> {
 
 pub(crate) enum Workflow<'a> {
     Scan(ScanState<'a>),
+    TrashList(TrashListState),
 }
 
 pub(crate) struct ScanState<'a> {
     pub(crate) scope: &'a ScanScope,
+    pub(crate) trash_entries: usize,
     pub(crate) completeness: ScanCompleteness,
     pub(crate) needs_review: bool,
     pub(crate) has_effective_project_roots: bool,
+}
+
+pub(crate) struct TrashListState {
+    pub(crate) ambiguous: bool,
+    pub(crate) interrupted_purge: bool,
 }
 
 pub(crate) struct NextLine(String);
@@ -44,10 +52,13 @@ impl NextLine {
 enum Action {
     CompleteScan(ScanScope),
     ProjectScan(ScanScope),
+    TrashList,
+    Ops,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum GuidanceKind {
+    Standard,
     CompleteScan,
     ProjectScan,
 }
@@ -103,6 +114,7 @@ impl Action {
         match self {
             Self::CompleteScan(_) => GuidanceKind::CompleteScan,
             Self::ProjectScan(_) => GuidanceKind::ProjectScan,
+            _ => GuidanceKind::Standard,
         }
     }
 }
@@ -114,12 +126,18 @@ fn allows_next(output: OutputMode) -> bool {
 fn action_for(workflow: Workflow<'_>) -> Option<Action> {
     match workflow {
         Workflow::Scan(state) => scan_action(state),
+        Workflow::TrashList(state) => {
+            (state.ambiguous || state.interrupted_purge).then_some(Action::Ops)
+        }
     }
 }
 
 fn scan_action(state: ScanState<'_>) -> Option<Action> {
     if state.completeness.is_truncated() {
         return Some(Action::CompleteScan(state.scope.clone()));
+    }
+    if state.trash_entries > 0 {
+        return Some(Action::TrashList);
     }
     if state.completeness.findings.is_incomplete() {
         return None;
@@ -132,3 +150,6 @@ fn scan_action(state: ScanState<'_>) -> Option<Action> {
     }
     state.scope.project_scan_scope().map(Action::ProjectScan)
 }
+
+#[cfg(test)]
+mod tests;

@@ -87,6 +87,16 @@ pub(crate) enum Command {
     /// Report known cache sources and, when project roots are available, build artifacts (read-only)
     #[command(after_help = SCAN_EXAMPLES)]
     Scan(ScanArgs),
+    /// Inspect or permanently purge degu trash
+    Trash {
+        #[command(subcommand)]
+        command: TrashCommand,
+    },
+    /// Show recorded clean, restore, and purge operations
+    Ops {
+        #[command(flatten)]
+        output: JsonArgs,
+    },
     /// List adapter IDs accepted by --only and configuration, plus the built-in source IDs accepted by --only
     Adapters,
     /// Print shell completion script to stdout
@@ -112,6 +122,9 @@ pub(crate) struct ScanArgs {
     /// Show each finding with its full absolute path, kind, rationale, and cleanup reason; ignored by --json
     #[arg(short, long)]
     pub(crate) details: bool,
+    /// Group findings by source instead of listing individual paths
+    #[arg(long, conflicts_with = "details")]
+    pub(crate) summary: bool,
     /// Keep only findings using at least this much space on disk (bytes, K, M, G, T)
     #[arg(long, value_name = "SIZE", value_parser = parse_size)]
     pub(crate) min_size: Option<u64>,
@@ -128,4 +141,13 @@ pub(crate) struct ScanArgs {
     pub(crate) runtime: bool,
     /// Project roots whose build artifacts are added to the usual cache scan
     pub(crate) roots: Vec<PathBuf>,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum TrashCommand {
+    /// List trash entries
+    List {
+        #[command(flatten)]
+        output: JsonArgs,
+    },
 }

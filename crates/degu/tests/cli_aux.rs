@@ -1,6 +1,14 @@
 use assert_cmd::Command;
 
-const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[&["scan"], &["adapters"], &["completions"], &["man"]];
+const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[
+    &["scan"],
+    &["trash"],
+    &["ops"],
+    &["adapters"],
+    &["completions"],
+    &["man"],
+];
+const NESTED_MAN_COMMANDS: &[&[&str]] = &[&["trash", "list"]];
 
 fn degu() -> Command {
     let mut command = Command::cargo_bin("degu").unwrap();
@@ -79,7 +87,7 @@ fn generated_surfaces_prioritize_the_progressive_workflow() {
 
 #[test]
 fn man_renders_every_shipped_command_page() {
-    for path in TOP_LEVEL_MAN_COMMANDS.iter() {
+    for path in TOP_LEVEL_MAN_COMMANDS.iter().chain(NESTED_MAN_COMMANDS) {
         let output = generated_man(path);
         let title = format!(".TH degu{} 1", page_suffix(path));
         assert!(output.contains(&title), "missing {title:?}");
@@ -88,6 +96,9 @@ fn man_renders_every_shipped_command_page() {
         assert!(output.contains(&format!(".SH SYNOPSIS\n\\fBdegu {}\\fR", path.join(" "))));
         assert!(!output.contains("\\-help(1)"));
     }
+    assert!(generated_man(&["scan"]).contains("\\-\\-summary"));
+    let trash = generated_man(&["trash"]);
+    assert!(trash.contains("degu\\-trash\\-list(1)"));
 }
 
 #[test]
@@ -95,6 +106,21 @@ fn man_references_only_pages_in_the_release_contract() {
     assert_eq!(
         man_references(&generated_man(&[])),
         expected_man_references(TOP_LEVEL_MAN_COMMANDS)
+    );
+    assert_eq!(
+        man_references(&generated_man(&["trash"])),
+        expected_man_references(NESTED_MAN_COMMANDS)
+    );
+}
+
+#[test]
+fn man_rejects_an_unknown_command_path() {
+    let output = degu().args(["man", "trash", "unknown"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("no man page for command path 'trash unknown'")
     );
 }
 
@@ -135,6 +161,8 @@ fn assert_man_order() {
         &output,
         &[
             "degu\\-scan(1)",
+            "degu\\-trash(1)",
+            "degu\\-ops(1)",
             "degu\\-adapters(1)",
             "degu\\-completions(1)",
             "degu\\-man(1)",
@@ -149,19 +177,28 @@ fn assert_completion_order(shell: &str) {
     assert!(!output.is_empty());
     if shell == "bash" {
         assert!(output.contains("complete -F") || output.contains("_degu"));
-        assert!(output.contains("scan adapters completions man help"));
+        assert!(output.contains("scan trash ops adapters completions man help"));
         assert!(!output.contains("degu,usage)"));
         return;
     }
     let markers: &[&str] = match shell {
         "zsh" => {
             assert!(output.contains("#compdef") || output.contains("_degu"));
-            &["(scan)", "(adapters)", "(completions)", "(man)"]
+            &[
+                "(scan)",
+                "(trash)",
+                "(ops)",
+                "(adapters)",
+                "(completions)",
+                "(man)",
+            ]
         }
         "fish" => {
             assert!(output.contains("complete"));
             &[
                 "-a \"scan\"",
+                "-a \"trash\"",
+                "-a \"ops\"",
                 "-a \"adapters\"",
                 "-a \"completions\"",
                 "-a \"man\"",

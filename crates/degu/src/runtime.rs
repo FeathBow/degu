@@ -306,6 +306,8 @@ pub(crate) struct OutputColors {
 /// that is not "dumb"; everything else falls back to pure ASCII.
 #[derive(Clone, Copy)]
 pub(crate) struct Glyphs {
+    pub(crate) bar_filled: char,
+    pub(crate) bar_empty: char,
     pub(crate) separator: char,
     pub(crate) ellipsis: &'static str,
     pub(crate) lower_bound: &'static str,
@@ -313,11 +315,15 @@ pub(crate) struct Glyphs {
 
 impl Glyphs {
     pub(crate) const UNICODE: Self = Self {
+        bar_filled: '\u{2588}',
+        bar_empty: '\u{2591}',
         separator: '\u{b7}',
         ellipsis: "\u{2026}",
         lower_bound: "\u{2265}",
     };
     pub(crate) const ASCII: Self = Self {
+        bar_filled: '#',
+        bar_empty: '-',
         separator: '-',
         ellipsis: "...",
         lower_bound: ">=",
@@ -663,6 +669,8 @@ mod tests {
             width: TEST_WIDTH,
         })
         .glyphs;
+        assert_eq!(selected.bar_filled, '█');
+        assert_eq!(selected.bar_empty, '░');
         assert_eq!(selected.separator, '·');
         assert_eq!(selected.ellipsis, "…");
         assert_eq!(selected.lower_bound, "≥");
@@ -674,6 +682,8 @@ mod tests {
                 width: TEST_WIDTH,
             })
             .glyphs;
+            assert_eq!(selected.bar_filled, '#');
+            assert_eq!(selected.bar_empty, '-');
             assert_eq!(selected.separator, '-');
             assert_eq!(selected.ellipsis, "...");
             assert_eq!(selected.lower_bound, ">=");
@@ -689,6 +699,8 @@ mod tests {
             width: TEST_WIDTH,
         })
         .glyphs;
+        assert_eq!(selected.bar_filled, '#');
+        assert_eq!(selected.bar_empty, '-');
         assert_eq!(selected.separator, '-');
         assert_eq!(selected.ellipsis, "...");
     }

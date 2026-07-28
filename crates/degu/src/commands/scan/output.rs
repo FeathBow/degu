@@ -2,6 +2,7 @@ use super::ScanReport;
 use crate::commands::next_action::{self, OutputMode, Request, ScanState, Workflow};
 use crate::finding_filter::FilteredFinding;
 use crate::findings_table::{self, print as print_findings_table};
+use crate::lifecycle::Lifecycle;
 use crate::output::stdoutln;
 use crate::presentation::semantic::Tone;
 use crate::presentation::{
@@ -23,21 +24,33 @@ const FOLDED_LOCATIONS_HINT: &str = "Rerun with --details to list every location
 
 pub(super) fn print(report: &ScanReport) -> Result<()> {
     if report.json {
-        print_json(report)?;
+        if report.summary {
+            super::summary::print(report)?;
+        } else {
+            print_json(report)?;
+        }
         return Ok(());
     }
-    print_human(report)?;
+    if report.summary {
+        super::summary::print(report)?;
+    } else {
+        print_human(report)?;
+    }
+    let trash_entries = print_trash_summary(&report.ctx, report.ui)?;
     let guidance = next_action::resolve(Request {
         output: OutputMode::Human(report.ui),
         workflow: Workflow::Scan(ScanState {
             scope: &report.scope,
+            trash_entries,
             completeness: report.completeness,
             needs_review: has_needs_review_findings(report),
             has_effective_project_roots: report.has_effective_project_roots,
         }),
         home: Some(&report.ctx.home),
     });
-    print_details_hint(report)?;
+    if !report.summary {
+        print_details_hint(report)?;
+    }
     print_project_scope_note(report, &guidance)?;
     guidance.print()
 }
@@ -179,6 +192,58 @@ fn print_human(report: &ScanReport) -> Result<()> {
     )
 }
 
+fn print_trash_summary(ctx: &degu_core::ecosystem::DetectCtx, ui: Ui) -> Result<usize> {
+    if let Some(summary) = Lifecycle::new(ctx).trash_summary()? {
+        stdoutln!(
+            "{}",
+            ui.section(&render_trash_summary(
+                summary.bytes_allocated,
+                summary.entries,
+                summary.bytes_hardlinked,
+                summary.entries_lower_bound,
+                summary.bytes_lower_bound,
+                ui
+            ))
+        )?;
+        return Ok(summary.entries);
+    }
+    Ok(0)
+}
+
+fn render_trash_summary(
+    bytes_allocated: u64,
+    entries: usize,
+    bytes_hardlinked: u64,
+    entries_lower_bound: bool,
+    bytes_lower_bound: bool,
+    ui: Ui,
+) -> String {
+    // A budget that expires before any entry is enumerated leaves nothing to
+    // lower-bound; reporting zero would read as a near-empty trash rather than
+    // an unmeasured one.
+    if entries_lower_bound && entries == 0 {
+        return ui.prose("Trash size unknown (scan budget reached).");
+    }
+    let mut sentence = format!(
+        "Trash holds {} across {}.",
+        lower_bound_bytes(bytes_lower_bound, bytes_allocated, ui.glyphs),
+        cleanup::lower_bound_count_label(
+            entries_lower_bound,
+            entries,
+            "entry",
+            "entries",
+            ui.glyphs
+        )
+    );
+    if bytes_hardlinked > 0 {
+        sentence.push_str(&format!(
+            " {} is hardlink-shared; reclaimed space may be lower.",
+            lower_bound_bytes(bytes_lower_bound, bytes_hardlinked, ui.glyphs)
+        ));
+    }
+    ui.prose(&sentence)
+}
+
 /// Artifacts are cleanable only under explicit roots: bare clean never
 /// receives config-discovered project roots, so Eligible artifacts from a
 /// bare scan must not be promised as cleanable anywhere in the output.
@@ -278,3 +343,6 @@ fn print_hidden_summary(hidden: &[FilteredFinding], ui: Ui) -> Result<()> {
         )
     )
 }
+
+#[cfg(test)]
+mod tests;

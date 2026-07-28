@@ -1,7 +1,38 @@
 use std::time::Duration;
 
+const KIBIBYTE: u64 = 1024;
 const SECONDS_PER_MINUTE: u64 = 60;
 const MINUTES_PER_HOUR: u64 = 60;
+
+pub(crate) fn parse_size(raw: &str) -> Result<u64, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("size must not be empty".to_string());
+    }
+    let (digits, multiplier) = split_size(raw)?;
+    parse_scaled(digits, multiplier, "size")
+}
+
+fn split_size(raw: &str) -> Result<(&str, u64), String> {
+    let Some(last) = raw.as_bytes().last().copied() else {
+        unreachable!("empty input rejected by parse_size");
+    };
+    if !last.is_ascii_alphabetic() {
+        return Ok((raw, 1));
+    }
+    let multiplier = match (last as char).to_ascii_lowercase() {
+        'k' => KIBIBYTE,
+        'm' => KIBIBYTE.pow(2),
+        'g' => KIBIBYTE.pow(3),
+        't' => KIBIBYTE.pow(4),
+        _ => {
+            return Err(
+                "size suffix must be one of K, M, G, or T; decimals are not supported".to_string(),
+            );
+        }
+    };
+    Ok((&raw[..raw.len() - 1], multiplier))
+}
 
 pub(crate) fn parse_duration(raw: &str) -> Result<Duration, String> {
     let raw = raw.trim();
@@ -51,6 +82,29 @@ fn parse_scaled(digits: &str, multiplier: u64, kind: &str) -> Result<u64, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn size_accepts_binary_suffixes_case_and_zero() {
+        let cases = [
+            ("0", 0),
+            ("42", 42),
+            ("1K", KIBIBYTE),
+            ("2k", 2 * KIBIBYTE),
+            ("3M", 3 * KIBIBYTE.pow(2)),
+            ("4g", 4 * KIBIBYTE.pow(3)),
+            ("5T", 5 * KIBIBYTE.pow(4)),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(parse_size(raw), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn size_rejects_invalid_and_fractional_values() {
+        for raw in ["", "K", "1.5G", "1KiB", "12B", "-1", "abc"] {
+            assert!(parse_size(raw).is_err(), "{raw:?} should be invalid");
+        }
+    }
 
     #[test]
     fn duration_accepts_seconds_and_smh_suffixes() {

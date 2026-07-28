@@ -62,6 +62,12 @@ impl ScanCompleteness {
     pub(crate) fn is_incomplete(self) -> bool {
         self.findings.is_incomplete() || self.runtime.is_incomplete()
     }
+
+    pub(crate) fn unvisited_dirs(&self) -> u64 {
+        self.findings
+            .unvisited_dirs()
+            .saturating_add(self.runtime.unvisited_dirs())
+    }
 }
 
 pub(crate) fn collect_profiled(

@@ -88,6 +88,36 @@ fn debug_scan_names_each_sampled_skipped_path_with_its_reason() {
     );
 }
 
+// The TOML parse error must render as a block indented under the `error:`
+// prefix, never flattened to one line with a literal "\n".
+#[test]
+fn malformed_config_errors_keep_their_multi_line_shape() {
+    let home = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(config.path().join("degu")).unwrap();
+    let config_path = config.path().join("degu/config.toml");
+    std::fs::write(&config_path, "not = valid = toml\n").unwrap();
+
+    let out = degu()
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config.path())
+        .arg("scan")
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    let expected = format!(
+        "error: failed to parse {}: TOML parse error at line 1, column 13\n         \
+         |\n       \
+         1 | not = valid = toml\n         \
+         |             ^\n       \
+         unexpected key or value, expected newline, `#`\n",
+        config_path.display()
+    );
+    assert_eq!(String::from_utf8(out.stderr).unwrap(), expected);
+}
+
 #[test]
 fn invalid_rust_log_fails_loudly() {
     let home = tempfile::tempdir().unwrap();

@@ -1,4 +1,6 @@
 pub(super) use crate::common::isolated_degu as degu;
+pub(super) use crate::next_command::assert_next_command;
+pub(super) use crate::strip_sgr::strip_sgr;
 
 pub(super) const CACHEDIR_TAG_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
 

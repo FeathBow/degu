@@ -118,12 +118,24 @@ impl ScanStatus {
         }
     }
 
+    pub(crate) fn is_requested(self) -> bool {
+        self.requested
+    }
+
     pub(crate) fn is_truncated(self) -> bool {
         self.observation.truncated
     }
 
     pub(crate) fn is_incomplete(self) -> bool {
         self.observation.incomplete
+    }
+
+    pub(crate) fn is_lower_bound(self) -> bool {
+        self.is_truncated() || self.is_incomplete()
+    }
+
+    pub(crate) fn unvisited_dirs(self) -> u64 {
+        self.observation.unvisited_dirs
     }
 }
 

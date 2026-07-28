@@ -59,6 +59,32 @@ fn no_color_wins_over_force_in_automatic_mode() {
 }
 
 #[test]
+fn force_color_styles_help_and_human_output_in_pipes() {
+    let help = degu()
+        .env("CLICOLOR_FORCE", "1")
+        .arg("--help")
+        .output()
+        .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let cache = home.path().join("pip-cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("wheel.whl"), [0u8; 2048]).unwrap();
+    let scan = degu()
+        .env("CLICOLOR_FORCE", "1")
+        .env("HOME", home.path())
+        .env("LOGNAME", home.path())
+        .env("PIP_CACHE_DIR", cache)
+        .arg("scan")
+        .output()
+        .unwrap();
+
+    assert!(help.status.success());
+    assert!(scan.status.success());
+    assert!(has_ansi(&help.stdout), "{:?}", help.stdout);
+    assert!(has_ansi(&scan.stdout), "{:?}", scan.stdout);
+}
+
+#[test]
 fn colored_help_strips_to_the_never_colored_contract() {
     let colored = degu().args(["--color=always", "--help"]).output().unwrap();
     let plain = degu().args(["--color=never", "--help"]).output().unwrap();

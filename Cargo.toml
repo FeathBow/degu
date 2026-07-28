@@ -4,6 +4,7 @@ members = [
     "crates/degu-walk",
     "crates/degu-core",
     "crates/degu-adapters",
+    "crates/degu",
 ]
 
 [workspace.package]
@@ -15,14 +16,23 @@ publish = false
 [workspace.dependencies]
 degu-core = { path = "crates/degu-core", version = "0.1.0" }
 degu-walk = { path = "crates/degu-walk", version = "0.1.0" }
+degu-adapters = { path = "crates/degu-adapters", version = "0.1.0" }
+clap = { version = "4.6", features = ["derive", "wrap_help"] }
+clap_complete = "4.6"
+clap_mangen = "0.2"
+crossterm = { version = "0.29", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1"
 thiserror = "2.0"
+anyhow = "1.0"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 rustix = { version = "1.1", features = ["fs", "process"] }
 libc = "0.2"
 tempfile = "3.27"
+assert_cmd = "2.2"
+unicode-width = "0.2"
 
 [profile.dev]
 incremental = false

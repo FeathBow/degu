@@ -37,7 +37,29 @@ pub struct CappedBytes {
 pub fn open_regular_capped(path: &Path) -> io::Result<Option<File>> {
     // No NOFOLLOW: legitimately symlinked config files must still resolve.
     let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
-    let fd = rustix::fs::open(path, flags, Mode::empty())?;
+    open_capped_with(path, flags)
+}
+
+/// Like [`open_regular_capped`], but refuses to follow a symlink at the final
+/// path component (surfaced as `Ok(None)`, like a FIFO or directory).
+///
+/// Use for markers that grant authority: a symlink must forfeit trust rather
+/// than resolve, and the single no-follow `open` + descriptor `fstat` leaves no
+/// lstat-then-open window to swap the file under the check.
+pub fn open_regular_capped_nofollow(path: &Path) -> io::Result<Option<File>> {
+    let flags =
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    open_capped_with(path, flags)
+}
+
+fn open_capped_with(path: &Path, flags: OFlags) -> io::Result<Option<File>> {
+    let fd = match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        // With O_NOFOLLOW a symlinked final component fails with ELOOP; treat it
+        // as a non-regular file, not an error, so the marker is simply untrusted.
+        Err(rustix::io::Errno::LOOP) if flags.contains(OFlags::NOFOLLOW) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
 
     // fstat the held descriptor, not the path, closing the open-then-check swap window.
     let stat = rustix::fs::fstat(&fd).map_err(io::Error::from)?;
@@ -57,7 +79,17 @@ pub fn open_regular_capped(path: &Path) -> io::Result<Option<File>> {
 /// data followed, so a caller can treat an over-cap file as indeterminate rather
 /// than silently trusting a partial read.
 pub fn read_regular_capped(path: &Path, cap: usize) -> io::Result<Option<CappedBytes>> {
-    let Some(file) = open_regular_capped(path)? else {
+    read_capped(open_regular_capped(path)?, cap)
+}
+
+/// Like [`read_regular_capped`], but refuses to follow a final-component symlink
+/// (see [`open_regular_capped_nofollow`]). Use for authority-granting markers.
+pub fn read_regular_capped_nofollow(path: &Path, cap: usize) -> io::Result<Option<CappedBytes>> {
+    read_capped(open_regular_capped_nofollow(path)?, cap)
+}
+
+fn read_capped(file: Option<File>, cap: usize) -> io::Result<Option<CappedBytes>> {
+    let Some(file) = file else {
         return Ok(None);
     };
 

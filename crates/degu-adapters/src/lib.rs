@@ -4,13 +4,19 @@
 //! Verified deletion remains private to the degu lifecycle.
 
 mod apptainer;
+mod artifacts;
 mod cachedir_tag;
 mod cargo;
 mod ccache;
+mod checkpoints;
 mod computecache;
+mod conda;
+pub mod discovery;
 mod docker;
 mod gobuild;
 mod helm;
+mod huggingface;
+mod inductor;
 mod jax;
 mod npm;
 mod ollama;
@@ -20,8 +26,11 @@ mod pixi;
 mod podman;
 mod roots;
 mod sccache;
+mod shm;
 mod spack;
+mod tmp;
 mod torch;
+mod torchext;
 mod triton;
 mod uv;
 mod vllm;
@@ -91,9 +100,12 @@ pub(crate) fn first_present(
     outcome
 }
 
+pub const ARTIFACT_SOURCE_ID: &str = artifacts::SOURCE_ID;
+pub const CHECKPOINT_SOURCE_ID: &str = checkpoints::SOURCE_ID;
+pub const PROJECT_SOURCE_IDS: [&str; 2] = [ARTIFACT_SOURCE_ID, CHECKPOINT_SOURCE_ID];
 pub use cachedir_tag::{Probe as CachedirTagProbe, has_valid_cachedir_tag, probe_for_scheduling};
 
-pub(crate) use roots::resolve_existing_roots;
+pub(crate) use roots::{resolve_existing_roots, validate_root_path};
 
 pub(crate) struct FindingSpec<'a> {
     pub ecosystem: &'a str,
@@ -198,6 +210,7 @@ pub(crate) fn log_skipped_samples(ecosystem: &str, stats: &degu_walk::WalkStats)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdapterScope {
     Cache,
+    Runtime,
 }
 
 /// An adapter instance and the scope governing its activation and output.
@@ -229,16 +242,18 @@ impl RegisteredAdapter {
 
 /// Full registry; config-driven activation filtering happens in the caller.
 pub fn all() -> Vec<RegisteredAdapter> {
-    use AdapterScope::Cache;
+    use AdapterScope::{Cache, Runtime};
 
     vec![
         RegisteredAdapter::new(cargo::Cargo, Cache),
+        RegisteredAdapter::new(conda::Conda, Cache),
         RegisteredAdapter::new(apptainer::Apptainer, Cache),
         RegisteredAdapter::new(npm::Npm, Cache),
         RegisteredAdapter::new(pip::Pip, Cache),
         RegisteredAdapter::new(uv::Uv, Cache),
         RegisteredAdapter::new(pixi::Pixi, Cache),
         RegisteredAdapter::new(vscode::Vscode, Cache),
+        RegisteredAdapter::new(huggingface::Huggingface, Cache),
         RegisteredAdapter::new(ollama::Ollama, Cache),
         RegisteredAdapter::new(podman::Podman, Cache),
         RegisteredAdapter::new(docker::Docker, Cache),
@@ -246,6 +261,7 @@ pub fn all() -> Vec<RegisteredAdapter> {
         RegisteredAdapter::new(vllm::Vllm, Cache),
         RegisteredAdapter::new(triton::Triton, Cache),
         RegisteredAdapter::new(torch::Torch, Cache),
+        RegisteredAdapter::new(torchext::Torchext, Cache),
         RegisteredAdapter::new(jax::Jax, Cache),
         RegisteredAdapter::new(helm::Helm, Cache),
         RegisteredAdapter::new(spack::Spack, Cache),
@@ -253,6 +269,9 @@ pub fn all() -> Vec<RegisteredAdapter> {
         RegisteredAdapter::new(ccache::Ccache, Cache),
         RegisteredAdapter::new(gobuild::Gobuild, Cache),
         RegisteredAdapter::new(sccache::Sccache, Cache),
+        RegisteredAdapter::new(inductor::Inductor, Cache),
+        RegisteredAdapter::new(shm::Shm, Runtime),
+        RegisteredAdapter::new(tmp::Tmp, Runtime),
     ]
 }
 
@@ -384,16 +403,18 @@ mod tests {
 
     #[test]
     fn registry_identity_and_scope_contract_is_consistent() {
-        use AdapterScope::Cache;
+        use AdapterScope::{Cache, Runtime};
 
         const EXPECTED: &[(&str, AdapterScope)] = &[
             ("cargo", Cache),
+            ("conda", Cache),
             ("apptainer", Cache),
             ("npm", Cache),
             ("pip", Cache),
             ("uv", Cache),
             ("pixi", Cache),
             ("vscode", Cache),
+            ("huggingface", Cache),
             ("ollama", Cache),
             ("podman", Cache),
             ("docker", Cache),
@@ -401,6 +422,7 @@ mod tests {
             ("vllm", Cache),
             ("triton", Cache),
             ("torch", Cache),
+            ("torchext", Cache),
             ("jax", Cache),
             ("helm", Cache),
             ("spack", Cache),
@@ -408,6 +430,9 @@ mod tests {
             ("ccache", Cache),
             ("go-build", Cache),
             ("sccache", Cache),
+            ("inductor", Cache),
+            ("shm", Runtime),
+            ("tmp", Runtime),
         ];
 
         let actual = all()

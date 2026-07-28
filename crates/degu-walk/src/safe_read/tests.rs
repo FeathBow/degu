@@ -68,3 +68,31 @@ fn fifo_returns_none_without_hanging() {
     assert!(open_regular_capped(&path).unwrap().is_none());
     assert!(read_regular_capped(&path, 1024).unwrap().is_none());
 }
+
+#[test]
+fn nofollow_reads_a_real_regular_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data");
+    std::fs::write(&path, b"hello").unwrap();
+
+    let read = read_regular_capped_nofollow(&path, 1024).unwrap().unwrap();
+
+    assert_eq!(read.bytes, b"hello");
+}
+
+#[cfg(unix)]
+#[test]
+fn nofollow_refuses_a_symlinked_regular_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    std::fs::write(&target, b"secret-from-outside").unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    // The link target is a perfectly readable regular file, yet the no-follow
+    // read must not resolve it -- a symlinked marker forfeits trust.
+    assert!(open_regular_capped_nofollow(&link).unwrap().is_none());
+    assert!(read_regular_capped_nofollow(&link, 1024).unwrap().is_none());
+    // The following variant still resolves it, proving the flag is the sole cause.
+    assert!(read_regular_capped(&link, 1024).unwrap().is_some());
+}

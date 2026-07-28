@@ -13,7 +13,10 @@ mod safe_read;
 mod walker;
 
 pub use mutation_guard::{find_named_entry_single_mount, validate_single_mount_tree};
-pub use safe_read::{CappedBytes, open_regular_capped, read_regular_capped};
+pub use safe_read::{
+    CappedBytes, open_regular_capped, open_regular_capped_nofollow, read_regular_capped,
+    read_regular_capped_nofollow,
+};
 pub use walker::measure;
 
 use std::num::NonZeroUsize;

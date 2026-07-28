@@ -126,6 +126,13 @@ fn command_help_lists_only_effective_options() {
 }
 
 #[test]
+fn human_review_options_use_task_oriented_names() {
+    let scan = String::from_utf8(run(&["scan", "--help"]).stdout).unwrap();
+    assert!(declares_option(&scan, "--details"), "{scan}");
+    assert!(!declares_option(&scan, "--long"), "{scan}");
+}
+
+#[test]
 fn supported_options_are_accepted_after_their_commands() {
     for args in SUPPORTED_CASES {
         let output = run(args);

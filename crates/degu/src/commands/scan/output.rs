@@ -1,14 +1,104 @@
 use super::ScanReport;
+use crate::commands::next_action::{self, OutputMode, Request, ScanState, Workflow};
+use crate::finding_filter::FilteredFinding;
+use crate::findings_table::{self, print as print_findings_table};
 use crate::output::stdoutln;
+use crate::presentation::semantic::Tone;
+use crate::presentation::{
+    cleanup, lower_bound_bytes, print_scan_footer, print_scan_incomplete_warning, semantic,
+};
+use crate::runtime::{Headline, HeadlineLead, Ui};
 use anyhow::Result;
-use degu_core::finding::Finding;
+use degu_core::finding::{DispositionMode, Finding};
+use std::path::Path;
+
+mod findings;
+
+const PROJECT_SCOPE_LABEL: &str =
+    "Scan build artifacts under this project, or any parent directory:";
+const PROJECT_SCOPE_COMMAND: &str = "degu scan .";
+const UNMANAGED_ARTIFACTS_HINT: &str =
+    "Rerun with --details for each Not managed location's full reason.";
+const FOLDED_LOCATIONS_HINT: &str = "Rerun with --details to list every location.";
 
 pub(super) fn print(report: &ScanReport) -> Result<()> {
     if report.json {
         print_json(report)?;
         return Ok(());
     }
-    Ok(())
+    print_human(report)?;
+    let guidance = next_action::resolve(Request {
+        output: OutputMode::Human(report.ui),
+        workflow: Workflow::Scan(ScanState {
+            scope: &report.scope,
+            completeness: report.completeness,
+            needs_review: has_needs_review_findings(report),
+            has_effective_project_roots: report.has_effective_project_roots,
+        }),
+        home: Some(&report.ctx.home),
+    });
+    print_details_hint(report)?;
+    print_project_scope_note(report, &guidance)?;
+    guidance.print()
+}
+
+fn print_scan_incomplete(report: &ScanReport) -> Result<()> {
+    let marked_totals = (!report.findings.is_empty() && report.findings_lower_bound())
+        || (!report.runtime_findings.is_empty() && report.runtime_lower_bound());
+    print_scan_incomplete_warning(report.is_lower_bound(), marked_totals, report.ui)
+}
+
+/// The one end-of-report pointer at --details. A report with folded tiers
+/// needs the complete listing, and an explicitly rooted scan whose
+/// artifacts stay out of "Ready to clean" needs the full reasons; the
+/// details view carries both, so when the two cases coincide only the
+/// folded-locations wording prints.
+fn print_details_hint(report: &ScanReport) -> Result<()> {
+    let hint = if findings::any_tier_folds(report) {
+        FOLDED_LOCATIONS_HINT
+    } else if has_unmanaged_artifacts_to_explain(report) {
+        UNMANAGED_ARTIFACTS_HINT
+    } else {
+        return Ok(());
+    };
+    stdoutln!(
+        "\n{}",
+        semantic::paint(
+            report.ui.prose(hint),
+            Tone::Secondary,
+            report.ui.colors.stdout
+        )
+    )
+}
+
+fn has_unmanaged_artifacts_to_explain(report: &ScanReport) -> bool {
+    !report.details
+        && report.scope.has_explicit_roots()
+        && report.findings.iter().any(|finding| {
+            finding.ecosystem() == "artifacts"
+                && finding.disposition().mode == DispositionMode::ReportOnly
+        })
+}
+
+fn print_project_scope_note(report: &ScanReport, guidance: &next_action::Guidance) -> Result<()> {
+    if report.truncated()
+        || report.has_effective_project_roots
+        || !report.scope.includes_project_sources()
+        || guidance.project_scan_is_next()
+    {
+        return Ok(());
+    }
+    stdoutln!(
+        "{}",
+        report.ui.section(&report.ui.command_block(
+            &semantic::paint(
+                report.ui.prose(PROJECT_SCOPE_LABEL),
+                Tone::Accent,
+                report.ui.colors.stdout
+            ),
+            &semantic::paint(PROJECT_SCOPE_COMMAND, Tone::Accent, report.ui.colors.stdout),
+        ))
+    )
 }
 
 fn print_json(report: &ScanReport) -> Result<()> {
@@ -59,4 +149,132 @@ fn section_completeness(status: crate::collection::ScanStatus, dropped: usize) -
     } else {
         status.as_str()
     }
+}
+
+fn print_human(report: &ScanReport) -> Result<()> {
+    let not_managed_explained = if report.completeness.findings.is_requested() {
+        findings::print(report)?
+    } else {
+        print_scan_incomplete(report)?;
+        false
+    };
+    if report.completeness.runtime.is_requested() {
+        if report.completeness.findings.is_requested() {
+            stdoutln!("")?;
+        }
+        print_runtime(RuntimeSection {
+            findings: &report.runtime_findings,
+            hidden: &report.runtime_hidden,
+            details: report.details,
+            lower_bound: report.runtime_lower_bound(),
+            home: &report.ctx.home,
+            ui: report.ui,
+            explain_not_managed: !not_managed_explained,
+        })?;
+    }
+    print_scan_footer(
+        report.truncated(),
+        report.completeness.unvisited_dirs(),
+        report.ui,
+    )
+}
+
+/// Artifacts are cleanable only under explicit roots: bare clean never
+/// receives config-discovered project roots, so Eligible artifacts from a
+/// bare scan must not be promised as cleanable anywhere in the output.
+fn is_cleanable(finding: &Finding, report: &ScanReport) -> bool {
+    finding.disposition().mode == DispositionMode::Eligible
+        && (finding.ecosystem() != "artifacts" || report.scope.has_explicit_roots())
+}
+
+fn has_needs_review_findings(report: &ScanReport) -> bool {
+    report
+        .findings
+        .iter()
+        .any(|finding| finding.disposition().mode == DispositionMode::OptIn)
+}
+
+struct RuntimeSection<'a> {
+    findings: &'a [Finding],
+    hidden: &'a [FilteredFinding],
+    details: bool,
+    lower_bound: bool,
+    home: &'a Path,
+    ui: Ui,
+    explain_not_managed: bool,
+}
+
+fn print_runtime(section: RuntimeSection<'_>) -> Result<()> {
+    if section.findings.is_empty() {
+        stdoutln!(
+            "{}",
+            section.ui.toned_prose(
+                0,
+                crate::commands::scan::NO_RUNTIME_LOCATIONS_DETECTED,
+                Tone::Secondary
+            )
+        )?;
+        return print_hidden_summary(section.hidden, section.ui);
+    }
+    print_runtime_heading(&section)?;
+    print_findings_table(
+        section.findings,
+        findings_table::FindingsTableOptions::new(section.ui, section.details, section.home)
+            .for_disposition(DispositionMode::ReportOnly),
+    )?;
+    print_runtime_total(&section)?;
+    print_hidden_summary(section.hidden, section.ui)
+}
+
+fn print_runtime_heading(section: &RuntimeSection<'_>) -> Result<()> {
+    stdoutln!(
+        "{}",
+        section
+            .ui
+            .toned_prose(0, "node-runtime (Not managed):", Tone::Heading)
+    )?;
+    if section.explain_not_managed
+        && let Some(explanation) = cleanup::explanation(DispositionMode::ReportOnly)
+    {
+        stdoutln!(
+            "{}",
+            section.ui.toned_prose(0, explanation, Tone::Secondary)
+        )?;
+    }
+    Ok(())
+}
+
+fn print_runtime_total(section: &RuntimeSection<'_>) -> Result<()> {
+    let stats = cleanup::FindingStats::from_findings(section.findings);
+    stdoutln!(
+        "{}",
+        section.ui.toned_prose(
+            0,
+            &format!(
+                "Total node-runtime: {}",
+                stats.bytes_label(section.lower_bound, section.ui.glyphs)
+            ),
+            Tone::Heading
+        )
+    )
+}
+
+fn print_hidden_summary(hidden: &[FilteredFinding], ui: Ui) -> Result<()> {
+    if hidden.is_empty() {
+        return Ok(());
+    }
+    let bytes = hidden.iter().fold(0u64, |total, filtered| {
+        total.saturating_add(filtered.finding.bytes_allocated())
+    });
+    let lower_bound = hidden
+        .iter()
+        .any(|filtered| filtered.finding.measurement_incomplete());
+    stdoutln!(
+        "{}",
+        ui.headline(
+            Headline::new("Hidden by filters", HeadlineLead::Colon)
+                .stat(cleanup::count_label(hidden.len(), "location", "locations"))
+                .stat(lower_bound_bytes(lower_bound, bytes, ui.glyphs))
+        )
+    )
 }

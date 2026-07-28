@@ -8,6 +8,8 @@ mod collection;
 mod commands;
 mod configuration;
 mod filters;
+mod finding_filter;
+mod findings_table;
 mod output;
 mod presentation;
 mod runtime;

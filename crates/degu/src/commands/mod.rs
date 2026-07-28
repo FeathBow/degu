@@ -6,6 +6,7 @@ use std::time::Duration;
 pub(crate) mod adapters;
 pub(crate) mod completions;
 pub(crate) mod man;
+pub(crate) mod next_action;
 pub(crate) mod scan;
 mod scope;
 

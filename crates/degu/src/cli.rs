@@ -1,4 +1,4 @@
-use crate::value_parser::parse_duration;
+use crate::value_parser::{parse_duration, parse_size};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -69,7 +69,7 @@ pub(crate) fn parse() -> Cli {
 #[derive(Args)]
 pub(crate) struct JsonArgs {
     /// Emit machine-readable JSON to stdout
-    #[arg(long, required = true)]
+    #[arg(long)]
     pub(crate) json: bool,
 }
 
@@ -109,6 +109,18 @@ pub(crate) struct ScanArgs {
     pub(crate) output: JsonArgs,
     #[command(flatten)]
     pub(crate) limits: ScanLimitArgs,
+    /// Show each finding with its full absolute path, kind, rationale, and cleanup reason; ignored by --json
+    #[arg(short, long)]
+    pub(crate) details: bool,
+    /// Keep only findings using at least this much space on disk (bytes, K, M, G, T)
+    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+    pub(crate) min_size: Option<u64>,
+    /// Keep only the N largest findings; applies per section (cache findings and node-runtime findings are filtered independently)
+    #[arg(long, value_name = "N")]
+    pub(crate) top: Option<usize>,
+    /// Keep only findings untouched for at least this many days
+    #[arg(long, value_name = "DAYS")]
+    pub(crate) older_than: Option<u64>,
     /// Show only findings from this source ID; repeatable
     #[arg(long)]
     pub(crate) only: Vec<String>,

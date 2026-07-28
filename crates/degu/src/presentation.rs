@@ -23,6 +23,7 @@ pub(crate) const CELL_PADDING: usize = 2;
 /// Below this many columns a truncated path stops being recognizable, so
 /// wide tables yield to their compact layouts instead.
 pub(crate) const PATH_BUDGET_FLOOR: usize = 24;
+pub(crate) const RATIO_BAR_CELLS: usize = 10;
 const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
 const BUDGET_RERUN_ACTION: &str = "Rerun without --budget or use a longer duration.";
 
@@ -186,6 +187,17 @@ fn indent_continuation_lines(text: &str, indent: usize) -> String {
     indented
 }
 
+pub(crate) fn ratio_bar(ratio: f64, glyphs: Glyphs) -> String {
+    let filled = ((ratio * RATIO_BAR_CELLS as f64).round() as usize).min(RATIO_BAR_CELLS);
+    let mut bar = String::with_capacity(RATIO_BAR_CELLS * glyphs.bar_filled.len_utf8());
+    bar.extend(std::iter::repeat_n(glyphs.bar_filled, filled));
+    bar.extend(std::iter::repeat_n(
+        glyphs.bar_empty,
+        RATIO_BAR_CELLS - filled,
+    ));
+    bar
+}
+
 /// Deterministic budget for a table's one flexible path column: the full
 /// width minus every fixed column's measured content plus padding, so
 /// comfy_table never has to hard-wrap a path mid-word. `None` demands the
@@ -336,6 +348,13 @@ pub(crate) fn print_scan_footer(
     Ok(())
 }
 
+pub(crate) fn budget_exhausted_note(unvisited_dirs: u64) -> String {
+    format!(
+        "{}; reported totals are lower bounds. {BUDGET_RERUN_ACTION}",
+        budget_exhausted_facts(unvisited_dirs)
+    )
+}
+
 fn budget_exhausted_facts(unvisited_dirs: u64) -> String {
     match unvisited_dirs {
         0 => "budget exhausted: results are incomplete".to_owned(),
@@ -444,6 +463,15 @@ mod tests {
         assert!(term_value_is_dumb(Some(OsStr::new("dumb"))));
         assert!(!term_value_is_dumb(Some(OsStr::new("xterm-256color"))));
         assert!(!term_value_is_dumb(None));
+    }
+
+    #[test]
+    fn ratio_bar_rounds_and_caps_a_ten_cell_scale() {
+        assert_eq!(ratio_bar(0.0, Glyphs::UNICODE), "░░░░░░░░░░");
+        assert_eq!(ratio_bar(0.001, Glyphs::UNICODE), "░░░░░░░░░░");
+        assert_eq!(ratio_bar(0.667, Glyphs::UNICODE), "███████░░░");
+        assert_eq!(ratio_bar(1.25, Glyphs::UNICODE), "██████████");
+        assert_eq!(ratio_bar(0.667, Glyphs::ASCII), "#######---");
     }
 
     #[test]

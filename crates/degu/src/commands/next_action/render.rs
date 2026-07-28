@@ -8,6 +8,8 @@ impl Action {
     pub(super) fn render(self, home: Option<&Path>) -> Option<String> {
         match self {
             Self::CompleteScan(scope) | Self::ProjectScan(scope) => render_scan(&scope, home),
+            Self::TrashList => Some("degu trash list".to_string()),
+            Self::Ops => Some("degu ops".to_string()),
         }
     }
 }

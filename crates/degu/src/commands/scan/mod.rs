@@ -1,4 +1,5 @@
 mod output;
+mod summary;
 
 pub(crate) const NO_STORAGE_DETECTED: &str = "No storage detected by degu.";
 pub(crate) const NO_RUNTIME_LOCATIONS_DETECTED: &str = "No node-runtime locations detected.";
@@ -25,6 +26,7 @@ pub(super) struct ScanReport {
     pub(super) has_effective_project_roots: bool,
     pub(super) json: bool,
     pub(super) details: bool,
+    pub(super) summary: bool,
     pub(super) scope: ScanScope,
     pub(super) ui: Ui,
     /// Collection wall time, measured once at the command boundary;
@@ -56,6 +58,7 @@ impl ScanReport {
 
 struct ScanRequest {
     details: bool,
+    summary: bool,
     run: CollectionRunOptions,
     scope: ScanScope,
     ui: Ui,
@@ -66,6 +69,7 @@ impl ScanRequest {
         let scope = ScanScope::from_args(&args);
         Self {
             details: args.details,
+            summary: args.summary,
             run: CollectionRunOptions::new(args.output, args.limits, ui.colors),
             scope,
             ui,
@@ -121,6 +125,7 @@ fn prepare(request: ScanRequest) -> Result<ScanReport> {
         has_effective_project_roots,
         json: request.run.json,
         details: request.details,
+        summary: request.summary,
         scope: request.scope,
         ui: request.ui,
         elapsed: None,

@@ -465,6 +465,28 @@ impl DetectCtx {
         })
     }
 
+    /// Test-support constructor: a context over an explicit home and env map,
+    /// so a test can point discovery at a temp tree without mutating the shared
+    /// process environment.
+    #[doc(hidden)]
+    pub fn for_test<K, V>(home: PathBuf, env: impl IntoIterator<Item = (K, V)>) -> Self
+    where
+        K: Into<OsString>,
+        V: Into<OsString>,
+    {
+        Self {
+            home,
+            max_concurrency: None,
+            progress: None,
+            deadline: None,
+            env: env
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+            reported_invalid_roots: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
     pub fn with_max_concurrency(mut self, max_concurrency: Option<NonZeroUsize>) -> Self {
         self.max_concurrency = max_concurrency;
         self

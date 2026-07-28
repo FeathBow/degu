@@ -138,6 +138,21 @@ pub(crate) fn count_label(count: usize, singular: &str, plural: &str) -> String 
     format!("{count} {noun}")
 }
 
+pub(crate) fn lower_bound_count_label(
+    lower_bound: bool,
+    count: usize,
+    singular: &str,
+    plural: &str,
+    glyphs: Glyphs,
+) -> String {
+    let label = count_label(count, singular, plural);
+    if lower_bound {
+        format!("{} {label}", glyphs.lower_bound)
+    } else {
+        label
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FindingStats, Group, group_header, short_reason};

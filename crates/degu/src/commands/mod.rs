@@ -7,8 +7,10 @@ pub(crate) mod adapters;
 pub(crate) mod completions;
 pub(crate) mod man;
 pub(crate) mod next_action;
+pub(crate) mod ops;
 pub(crate) mod scan;
 mod scope;
+pub(crate) mod trash;
 
 pub(crate) struct CollectionRunOptions {
     pub(crate) json: bool,

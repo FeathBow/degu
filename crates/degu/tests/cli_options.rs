@@ -28,9 +28,25 @@ const HELP_CASES: &[HelpCase] = &[
     HelpCase::new(&["completions", "--help"], false, false),
     HelpCase::new(&["man", "--help"], false, false),
     HelpCase::new(&["scan", "--help"], true, true),
+    HelpCase::new(&["trash", "--help"], false, false),
+    HelpCase::new(&["trash", "list", "--help"], true, false),
+    HelpCase::new(&["ops", "--help"], true, false),
 ];
 
-const SUPPORTED_CASES: &[&[&str]] = &[&["scan", JSON, BUDGET, "1h", MAX_CONCURRENCY, "1"]];
+const SUPPORTED_CASES: &[&[&str]] = &[
+    &["scan", JSON, BUDGET, "1h", MAX_CONCURRENCY, "1"],
+    &[
+        "scan",
+        "--summary",
+        JSON,
+        BUDGET,
+        "1h",
+        MAX_CONCURRENCY,
+        "1",
+    ],
+    &["trash", "list", JSON, "--help"],
+    &["ops", JSON, "--help"],
+];
 
 const UNSUPPORTED_CASES: &[(&[&str], &str)] = &[
     (&["scan", LONG], LONG),
@@ -46,6 +62,10 @@ const UNSUPPORTED_CASES: &[(&[&str], &str)] = &[
     (&["man", JSON], JSON),
     (&["man", BUDGET, "1s"], BUDGET),
     (&["man", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
+    (&["trash", "list", BUDGET, "1s"], BUDGET),
+    (&["trash", "list", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
+    (&["ops", BUDGET, "1s"], BUDGET),
+    (&["ops", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
 ];
 
 #[derive(Clone, Copy)]
@@ -70,6 +90,12 @@ const COMPLETION_CASES: &[CompletionCase] = &[
     CompletionCase::new("__fish_degu_using_subcommand completions", false, false),
     CompletionCase::new("__fish_degu_using_subcommand man", false, false),
     CompletionCase::new("__fish_degu_using_subcommand scan", true, true),
+    CompletionCase::new(
+        "__fish_degu_using_subcommand trash; and __fish_seen_subcommand_from list",
+        true,
+        false,
+    ),
+    CompletionCase::new("__fish_degu_using_subcommand ops", true, false),
 ];
 
 fn run(args: &[&str]) -> Output {

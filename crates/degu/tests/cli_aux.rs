@@ -1,6 +1,6 @@
 use assert_cmd::Command;
 
-const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[&["adapters"], &["completions"], &["man"]];
+const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[&["scan"], &["adapters"], &["completions"], &["man"]];
 
 fn degu() -> Command {
     let mut command = Command::cargo_bin("degu").unwrap();
@@ -134,6 +134,7 @@ fn assert_man_order() {
     assert_order(
         &output,
         &[
+            "degu\\-scan(1)",
             "degu\\-adapters(1)",
             "degu\\-completions(1)",
             "degu\\-man(1)",
@@ -148,18 +149,23 @@ fn assert_completion_order(shell: &str) {
     assert!(!output.is_empty());
     if shell == "bash" {
         assert!(output.contains("complete -F") || output.contains("_degu"));
-        assert!(output.contains("adapters completions man help"));
+        assert!(output.contains("scan adapters completions man help"));
         assert!(!output.contains("degu,usage)"));
         return;
     }
     let markers: &[&str] = match shell {
         "zsh" => {
             assert!(output.contains("#compdef") || output.contains("_degu"));
-            &["(adapters)", "(completions)", "(man)"]
+            &["(scan)", "(adapters)", "(completions)", "(man)"]
         }
         "fish" => {
             assert!(output.contains("complete"));
-            &["-a \"adapters\"", "-a \"completions\"", "-a \"man\""]
+            &[
+                "-a \"scan\"",
+                "-a \"adapters\"",
+                "-a \"completions\"",
+                "-a \"man\"",
+            ]
         }
         _ => unreachable!(),
     };

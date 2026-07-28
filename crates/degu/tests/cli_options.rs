@@ -4,6 +4,7 @@ use std::process::Output;
 const JSON: &str = "--json";
 const BUDGET: &str = "--budget";
 const MAX_CONCURRENCY: &str = "--max-concurrency";
+const LONG: &str = "--long";
 
 #[derive(Clone, Copy)]
 struct HelpCase {
@@ -26,9 +27,16 @@ const HELP_CASES: &[HelpCase] = &[
     HelpCase::new(&["--help"], false, false),
     HelpCase::new(&["completions", "--help"], false, false),
     HelpCase::new(&["man", "--help"], false, false),
+    HelpCase::new(&["scan", "--help"], true, true),
 ];
 
+const SUPPORTED_CASES: &[&[&str]] = &[&["scan", JSON, BUDGET, "1h", MAX_CONCURRENCY, "1"]];
+
 const UNSUPPORTED_CASES: &[(&[&str], &str)] = &[
+    (&["scan", LONG], LONG),
+    (&[JSON, "scan"], JSON),
+    (&[BUDGET, "1s", "scan"], BUDGET),
+    (&[MAX_CONCURRENCY, "1", "scan"], MAX_CONCURRENCY),
     (&["completions", "bash", JSON], JSON),
     (&["completions", "bash", BUDGET, "1s"], BUDGET),
     (
@@ -61,6 +69,7 @@ const COMPLETION_CASES: &[CompletionCase] = &[
     CompletionCase::new("__fish_degu_needs_command", false, false),
     CompletionCase::new("__fish_degu_using_subcommand completions", false, false),
     CompletionCase::new("__fish_degu_using_subcommand man", false, false),
+    CompletionCase::new("__fish_degu_using_subcommand scan", true, true),
 ];
 
 fn run(args: &[&str]) -> Output {
@@ -113,6 +122,14 @@ fn command_help_lists_only_effective_options() {
                 case.args
             );
         }
+    }
+}
+
+#[test]
+fn supported_options_are_accepted_after_their_commands() {
+    for args in SUPPORTED_CASES {
+        let output = run(args);
+        assert!(output.status.success(), "supported args failed: {args:?}");
     }
 }
 

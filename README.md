@@ -66,7 +66,15 @@ For datasets, checkpoints, and unknown large files, pair degu with a disk-usage 
 
 ## Installation
 
-Build from source with Git and the current stable Rust toolchain:
+Install the latest release (static binaries; Linux x86_64/aarch64 and macOS):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/FeathBow/degu/main/install.sh | sh
+```
+
+Or through cargo — `cargo binstall degu` pulls the same attested release archives without compiling, `cargo install degu --locked` builds from crates.io.
+
+Alternatively, build from source with Git and the current stable Rust toolchain:
 
 ```sh
 git clone https://github.com/FeathBow/degu.git

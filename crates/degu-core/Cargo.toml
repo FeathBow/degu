@@ -1,10 +1,10 @@
 [package]
 name = "degu-core"
-description = "Domain types and safety policy for degu"
+description = "Domain types and safety policy for the degu CLI (internal crate; no API stability guarantees)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
 
 [dependencies]
 degu-walk.workspace = true

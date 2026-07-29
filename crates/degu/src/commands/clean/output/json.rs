@@ -1,9 +1,15 @@
+use super::super::execution::ExpiryExecution;
 use super::super::preparation::PreparedClean;
-use crate::lifecycle::{CleanExecution, Lifecycle};
+use crate::lifecycle::{CleanExecution, ExpiryPlan, Lifecycle, TRASH_RETENTION_DAYS};
 use crate::output::stdoutln;
 use anyhow::Result;
+use std::path::PathBuf;
 
-pub(crate) fn print(prepared: &PreparedClean, executed: &[CleanExecution]) -> Result<()> {
+pub(crate) fn print(
+    prepared: &PreparedClean,
+    executed: &[CleanExecution],
+    expiry: &ExpiryExecution,
+) -> Result<()> {
     let (planned, excluded, omitted) = prepared_findings_json(prepared)?;
     let executed = executed
         .iter()
@@ -16,6 +22,7 @@ pub(crate) fn print(prepared: &PreparedClean, executed: &[CleanExecution]) -> Re
         "excluded": excluded,
         "executed": executed,
         "opt_in": prepared.scope.include_review(),
+        "expiry": expiry_json(expiry)?,
     });
     stdoutln!("{}", serde_json::to_string_pretty(&report)?)
 }
@@ -29,6 +36,13 @@ pub(crate) fn validate_prepared(prepared: &PreparedClean) -> Result<()> {
             .map_err(anyhow::Error::msg)?;
         let _ = serde_json::to_value(trash_dir)?;
     }
+    Ok(())
+}
+
+pub(crate) fn validate_expiry(plan: &ExpiryPlan) -> Result<()> {
+    let _ = expiry_plan_json(plan)?;
+    let roots = plan.trash_roots().collect::<Vec<_>>();
+    let _ = serde_json::to_value(roots)?;
     Ok(())
 }
 
@@ -63,6 +77,41 @@ fn completeness_label(prepared: &PreparedClean, omitted: usize) -> &'static str 
     }
 }
 
+fn expiry_json(expiry: &ExpiryExecution) -> Result<serde_json::Value> {
+    let planned = expiry_plan_json(&expiry.plan)?;
+    let report = expiry.report.as_ref();
+    let purged = report.map_or(&[][..], |report| report.purged.as_slice());
+    let failed = match report {
+        Some(report) => report
+            .failed
+            .iter()
+            .map(expiry_failure_json)
+            .collect::<Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    let purged = serde_json::to_value(purged)?;
+    Ok(serde_json::json!({
+        "retention_days": TRASH_RETENTION_DAYS,
+        "attempted": report.is_some(),
+        "planned": planned,
+        "purged": purged,
+        "failed": failed,
+    }))
+}
+
+fn expiry_plan_json(plan: &ExpiryPlan) -> Result<serde_json::Value> {
+    let entries = plan.entries().collect::<Vec<_>>();
+    Ok(serde_json::to_value(entries)?)
+}
+
+fn expiry_failure_json(failure: &(PathBuf, String)) -> Result<serde_json::Value> {
+    let path = serde_json::to_value(&failure.0)?;
+    Ok(serde_json::json!({
+        "path": path,
+        "reason": &failure.1,
+    }))
+}
+
 fn execution_json(item: &CleanExecution) -> Result<serde_json::Value> {
     let path = serde_json::to_value(item.path())?;
     let trash_entry = serde_json::to_value(item.trash_entry())?;
@@ -71,6 +120,7 @@ fn execution_json(item: &CleanExecution) -> Result<serde_json::Value> {
         "trash_entry": trash_entry,
         "state": item.state_label(),
         "outcome": outcome_json(item),
+        "purged": item.purged(),
     }))
 }
 

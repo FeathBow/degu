@@ -30,13 +30,25 @@ pub(in crate::lifecycle::stage) enum StageOutcome {
 pub(in crate::lifecycle::stage) struct CommittedStage {
     subject: CleanSubject,
     entry: PathBuf,
+    /// The staged object's verified identity, carried forward so a direct
+    /// purge deletes exactly what was staged -- re-capturing from the trash
+    /// path would authorize whatever object sits there by then.
+    identity: EntryIdentity,
+    reclamation_id: String,
 }
 
 impl StageOutcome {
-    fn committed(finding: &Finding, entry: PathBuf) -> Self {
+    fn committed(
+        finding: &Finding,
+        entry: PathBuf,
+        identity: EntryIdentity,
+        reclamation_id: &str,
+    ) -> Self {
         Self::Committed(CommittedStage {
             subject: CleanSubject::from_finding(finding),
             entry,
+            identity,
+            reclamation_id: reclamation_id.to_string(),
         })
     }
 
@@ -53,6 +65,18 @@ impl StageOutcome {
 }
 
 impl CommittedStage {
+    pub(in crate::lifecycle::stage) fn entry(&self) -> &std::path::Path {
+        &self.entry
+    }
+
+    pub(in crate::lifecycle::stage) fn identity(&self) -> &EntryIdentity {
+        &self.identity
+    }
+
+    pub(in crate::lifecycle::stage) fn reclamation_id(&self) -> &str {
+        &self.reclamation_id
+    }
+
     pub(super) fn into_parts(self) -> (CleanSubject, PathBuf) {
         (self.subject, self.entry)
     }
@@ -119,9 +143,16 @@ pub(in crate::lifecycle::stage) fn stage_finding_with_log(
 fn complete_stage(request: StageRequest<'_>, outcome: CommitOutcome) -> StageOutcome {
     match outcome {
         CommitOutcome::Staged {
-            cleanup_failure, ..
+            moved,
+            cleanup_failure,
+            ..
         } => match cleanup_failure {
-            None => StageOutcome::committed(request.finding, request.entry),
+            None => StageOutcome::committed(
+                request.finding,
+                request.entry,
+                moved,
+                request.reclamation_id,
+            ),
             Some(reason) => StageOutcome::terminal(CleanExecution::staged_with_failure(
                 request.finding,
                 request.entry,
@@ -250,6 +281,13 @@ impl CommitOutcome {
 fn commit_failure(error: RenameFailure) -> CommitOutcome {
     match error {
         RenameFailure::Source(error) => CommitOutcome::Failed(error.to_string()),
+        // Staging renames into a degu-controlled trash entry via
+        // `rename_verified_located`, which never authenticates a parent, so this
+        // arm is unreachable here; keep it total and treat it as a plain failure.
+        RenameFailure::UnauthenticatedParent { parent, error } => CommitOutcome::Failed(format!(
+            "destination parent {} could not be authenticated: {error}",
+            parent.display()
+        )),
         RenameFailure::UnverifiedDestination { destination, error } => {
             CommitOutcome::UnverifiedDestination {
                 entry: destination,

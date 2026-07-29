@@ -1,3 +1,5 @@
+use crate::pty::{PtyRun, run as run_pty};
+use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -20,6 +22,72 @@ pub(super) fn run(
         .args(args)
         .output()
         .unwrap()
+}
+
+pub(super) fn run_interactive_purge(
+    home: &Path,
+    state: &Path,
+    response: &str,
+) -> std::process::Output {
+    let body = r#"
+spawn $env(DEGU_BIN) --color always trash purge
+expect -exact {Type 'purge' to permanently delete this plan: }
+send "$env(RESPONSE)\r"
+"#;
+    let extra_env = [("RESPONSE", OsStr::new(response))];
+    run_pty(PtyRun {
+        body,
+        home,
+        config_home: test_config_home(),
+        state_home: state,
+        extra_env: &extra_env,
+    })
+}
+
+pub(super) fn run_purge_with_late_entry(
+    home: &Path,
+    state: &Path,
+    late_entry: &Path,
+) -> std::process::Output {
+    let body = r#"
+spawn $env(DEGU_BIN) trash purge
+expect -exact {Type 'purge' to permanently delete this plan: }
+file mkdir $env(LATE_ENTRY)
+send "purge\r"
+"#;
+    let extra_env = [("LATE_ENTRY", late_entry.as_os_str())];
+    run_pty(PtyRun {
+        body,
+        home,
+        config_home: test_config_home(),
+        state_home: state,
+        extra_env: &extra_env,
+    })
+}
+
+pub(super) fn run_purge_with_replaced_entry(
+    home: &Path,
+    state: &Path,
+    planned_entry: &Path,
+) -> std::process::Output {
+    let body = r#"
+spawn $env(DEGU_BIN) trash purge
+expect -exact {Type 'purge' to permanently delete this plan: }
+file delete -force -- $env(PLANNED_ENTRY)
+file mkdir $env(PLANNED_ENTRY)
+set replacement [open [file join $env(PLANNED_ENTRY) replacement.txt] w]
+puts -nonewline $replacement {replacement data}
+close $replacement
+send "purge\r"
+"#;
+    let extra_env = [("PLANNED_ENTRY", planned_entry.as_os_str())];
+    run_pty(PtyRun {
+        body,
+        home,
+        config_home: test_config_home(),
+        state_home: state,
+        extra_env: &extra_env,
+    })
 }
 
 pub(super) fn seed_interrupted_purge_claim(state: &tempfile::TempDir) -> PathBuf {

@@ -15,7 +15,9 @@ use entry::{NamedEntry, open_directory_at};
 use error::{contextual_error, require_same_mount};
 use identity::{IdentityExpectation, kind_from_mode, object_identity_from_stat};
 
-pub(in crate::lifecycle) use identity::object_identity_from_stat as parent_identity;
+pub(in crate::lifecycle) use identity::{
+    IdentityExpectation as ParentIdentityExpectation, object_identity_from_stat as parent_identity,
+};
 
 pub(super) fn remove(root: &Path, expected: ObjectIdentity) -> io::Result<()> {
     degu_walk::validate_single_mount_tree(root)?;

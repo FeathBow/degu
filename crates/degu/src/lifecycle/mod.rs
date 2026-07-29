@@ -3,6 +3,7 @@ mod entries;
 mod expiry;
 mod identity;
 mod operation_log;
+mod purge;
 mod reconcile;
 mod stage;
 mod state_read;
@@ -17,7 +18,9 @@ use degu_core::safety::Guard;
 use std::path::{Path, PathBuf};
 
 pub(crate) use entries::TrashEntry;
+pub(crate) use expiry::TRASH_RETENTION_DAYS;
 pub(crate) use identity::EntryIdentity;
+pub(crate) use purge::{ExpiryPlan, PurgeReport, TrashPurgePlan};
 pub(crate) use stage::{
     CapturedCleanPlan, CleanExecution, CleanExecutionFailure, cleaned_resources,
 };
@@ -45,6 +48,10 @@ impl Lifecycle {
 
     pub(crate) fn trash_entries(&self) -> Result<Vec<TrashEntry>> {
         entries::trash_entries(&self.ctx)
+    }
+
+    pub(crate) fn plan_expired(&self) -> Result<ExpiryPlan> {
+        purge::plan_expired_trash(&self.ctx)
     }
 
     pub(crate) fn operations(&self) -> Result<Vec<degu_core::oplog::OpRecord>> {
@@ -77,8 +84,25 @@ impl MutationSession {
     pub(crate) fn execute_clean(
         &self,
         plan: &CapturedCleanPlan,
+        purge: bool,
         recheck: &dyn Fn(&Finding) -> Result<(), String>,
     ) -> Vec<CleanExecution> {
-        stage::execute_clean(&self.lifecycle.ctx, plan, recheck)
+        stage::execute_clean(&self.lifecycle.ctx, plan, purge, recheck)
+    }
+
+    pub(crate) fn plan_purge_all(&self) -> Result<TrashPurgePlan> {
+        purge::plan_all_trash(&self.lifecycle.ctx)
+    }
+
+    pub(crate) fn execute_purge_all(&self, plan: TrashPurgePlan) -> PurgeReport {
+        purge::execute_purge_plan(&self.lifecycle.ctx, "trash purge", plan)
+    }
+
+    pub(crate) fn plan_expired(&self) -> Result<ExpiryPlan> {
+        purge::plan_expired_trash(&self.lifecycle.ctx)
+    }
+
+    pub(crate) fn execute_expiry(&self, plan: &ExpiryPlan) -> PurgeReport {
+        purge::execute_expiry_plan(&self.lifecycle.ctx, plan)
     }
 }

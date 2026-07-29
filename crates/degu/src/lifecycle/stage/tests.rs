@@ -12,6 +12,9 @@ use super::{CleanExecution, StageRequest, cleaned_resources, stage_finding_with_
 use crate::lifecycle::EntryIdentity;
 use crate::lifecycle::operation_log::OperationLog;
 
+#[path = "tests/purge.rs"]
+mod purge;
+
 pub(super) fn noop_recheck(_: &Finding) -> Result<(), String> {
     Ok(())
 }
@@ -108,8 +111,11 @@ fn pending_final_append_failure_counts_successful_rename_as_staged() {
             .is_some_and(|reason| reason.contains("operation log append failed"))
     );
     assert!(item.final_log_append_failed());
-    assert!(item.reported_as_cleaned());
-    assert_eq!(cleaned_resources(std::slice::from_ref(item)), (4096, 2));
+    assert!(item.reported_as_cleaned(false));
+    assert_eq!(
+        cleaned_resources(std::slice::from_ref(item), false),
+        (4096, 2)
+    );
     assert_eq!(item.trash_entry(), Some(entry.as_path()));
     assert_eq!(appended.len(), 2);
     assert_eq!(appended[0].outcome, OpOutcome::Pending);

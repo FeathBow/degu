@@ -9,7 +9,9 @@ mod huggingface;
 mod language_toolchains;
 #[cfg(target_os = "linux")]
 mod linux_runtime;
+mod models_packages;
 mod observability;
+mod python_caches;
 mod safe_reads;
 mod scope_output;
 mod selection;

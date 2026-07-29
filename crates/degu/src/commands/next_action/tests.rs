@@ -43,6 +43,32 @@ fn scan_review_preview_preserves_scope_and_selects_one_path() {
 }
 
 #[test]
+fn next_action_clean_preserves_safe_selection_without_purge_or_yes() {
+    let scope = CleanScope {
+        filters: Filters {
+            roots: vec![PathBuf::from("work tree")],
+            only: vec!["pip".to_string()],
+            older_than: Some(30),
+            min_size: Some(4096),
+            top: Some(2),
+        },
+        paths: vec![PathBuf::from("cache path")],
+        include_review: true,
+    };
+    let line = line(terminal(Workflow::CleanPreview(CleanPreviewState {
+        scope: &scope,
+        planned: 1,
+        direct_purge_requested: false,
+    })))
+    .unwrap();
+
+    assert_eq!(
+        line.as_str(),
+        "degu clean --include-review --only pip --older-than 30 --min-size 4096 --top 2 --path 'cache path' -- 'work tree'"
+    );
+}
+
+#[test]
 fn clean_review_preview_replaces_paths_and_quotes_the_target() {
     let scope = CleanScope {
         filters: Filters {
@@ -121,4 +147,25 @@ fn next_action_keeps_destructive_trash_decisions_manual() {
     })))
     .unwrap();
     assert_eq!(interrupted.as_str(), "degu ops");
+}
+
+#[test]
+fn next_action_marks_control_characters_as_an_unsafe_scope() {
+    let scope = CleanScope {
+        filters: Filters {
+            roots: vec![PathBuf::from("bad\nroot")],
+            ..Filters::default()
+        },
+        paths: Vec::new(),
+        include_review: false,
+    };
+    assert!(matches!(
+        resolve(terminal(Workflow::CleanPreview(CleanPreviewState {
+            scope: &scope,
+            planned: 1,
+            direct_purge_requested: false,
+        })))
+        .resolution,
+        Resolution::UnsafeScope
+    ));
 }

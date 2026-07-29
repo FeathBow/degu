@@ -35,6 +35,101 @@ fn closed_stdout_stops_clean_before_mutation() {
 }
 
 #[test]
+fn clean_purge_yes_human_prints_not_restorable_mechanism_line() {
+    let home = tempfile::tempdir().unwrap();
+    let (cache, state) = fake_pip_cache(&home, ".cache/pip");
+    let out = run_clean(&home, &state, &["clean", "--purge", "--yes"]);
+    assert!(out.status.success());
+    assert!(!cache.exists());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_mechanism_line(&stdout, &state, true);
+    assert!(stdout.contains("Purged "));
+}
+
+#[test]
+fn clean_purge_dry_run_discloses_permanent_mode_without_mutating() {
+    let home = tempfile::tempdir().unwrap();
+    let (cache, state) = fake_pip_cache(&home, ".cache/pip");
+    let out = run_clean(&home, &state, &["clean", "--purge", "--dry-run"]);
+
+    assert!(out.status.success());
+    assert!(cache.exists());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("Would permanently delete"));
+    assert!(stdout.contains("Not restorable."));
+    assert!(!stdout.contains("Would move"));
+    assert!(!state.path().join("degu/trash").exists());
+}
+
+#[test]
+fn clean_purge_preview_labels_the_restorable_continuation() {
+    use crate::pty::{PtyRun, run as run_pty};
+
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let (cache, _) = fake_pip_cache(&home, ".cache/pip");
+    let out = run_pty(PtyRun {
+        body: r#"
+spawn -noecho $env(DEGU_BIN) --color never clean --purge --dry-run
+"#,
+        home: home.path(),
+        config_home: test_config_home(),
+        state_home: state.path(),
+        extra_env: &[],
+    });
+
+    assert!(out.status.success());
+    assert!(cache.exists());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_next_command(
+        &stdout,
+        "Safer next (current locations stage to trash):",
+        "degu clean",
+    );
+    assert!(
+        !stdout.lines().any(|line| line.trim_end() == "Next:"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn clean_purge_color_marks_dry_run_and_irreversible_language() {
+    let home = tempfile::tempdir().unwrap();
+    let (_cache, state) = fake_pip_cache(&home, ".cache/pip");
+    let plain = run_clean(
+        &home,
+        &state,
+        &["--color", "never", "clean", "--purge", "--dry-run"],
+    );
+    let colored = run_clean(
+        &home,
+        &state,
+        &["--color", "always", "clean", "--purge", "--dry-run"],
+    );
+
+    assert!(plain.status.success() && colored.status.success());
+    let colored_text = String::from_utf8_lossy(&colored.stdout);
+    assert_sgr_color(&colored_text, "Dry run", "38;5;14");
+    assert_sgr_color(&colored_text, "Would permanently delete", "38;5;9");
+    assert_sgr_color(&colored_text, "Not restorable", "38;5;9");
+    assert_eq!(strip_sgr(&colored.stdout), plain.stdout);
+}
+
+#[test]
+fn clean_purge_rejects_generic_permanent_confirmation_as_non_success() {
+    let home = tempfile::tempdir().unwrap();
+    let (cache, state) = fake_pip_cache(&home, ".cache/pip");
+    let out = run_interactive_clean_purge(home.path(), state.path(), "y");
+
+    assert!(!out.status.success());
+    assert!(cache.exists());
+    assert!(!state.path().join("degu/trash").exists());
+    let transcript = String::from_utf8(out.stdout).unwrap();
+    assert!(transcript.contains("Staged then purged immediately; not restorable."));
+    assert!(transcript.contains("Canceled; no clean or purge changes made."));
+}
+
+#[test]
 fn clean_details_human_table_shows_kind_and_rationale() {
     let home = tempfile::tempdir().unwrap();
     let (cache, state) = fake_pip_cache(&home, ".cache/pip");

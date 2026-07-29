@@ -4,6 +4,28 @@ const CACHEDIR_TAG_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc5
 
 #[cfg(unix)]
 #[test]
+fn clean_purge_unlinks_descendant_symlink_without_touching_its_target() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let (cache, _) = fake_pip_cache(&home, ".cache/pip");
+    let victim = external.path().join("keep.txt");
+    std::fs::write(&victim, "must survive").unwrap();
+    std::os::unix::fs::symlink(external.path(), cache.join("external-link")).unwrap();
+
+    let out = run_clean(&home, &state, &["clean", "--purge", "--yes", "--json"]);
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!cache.exists());
+    assert_eq!(std::fs::read_to_string(victim).unwrap(), "must survive");
+}
+
+#[cfg(unix)]
+#[test]
 fn clean_rejects_canonical_alias_overlap_before_mutation() {
     let home = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -42,6 +64,53 @@ fn clean_rejects_canonical_alias_overlap_before_mutation() {
     assert!(alias.exists());
     let alias_metadata = std::fs::symlink_metadata(&alias_parent).unwrap();
     assert!(alias_metadata.file_type().is_symlink());
+    assert!(!state.path().join("degu/trash").exists());
+    assert!(!state.path().join("degu/ops.jsonl").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn final_symlink_adapter_root_is_incomplete_and_never_cleaned() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let alias = home.path().join("pip-cache");
+    std::fs::write(
+        target.path().join("CACHEDIR.TAG"),
+        format!("{CACHEDIR_TAG_SIGNATURE}\n"),
+    )
+    .unwrap();
+    let payload = target.path().join("payload");
+    std::fs::write(&payload, [0_u8; 4096]).unwrap();
+    std::os::unix::fs::symlink(target.path(), &alias).unwrap();
+
+    let scan = degu()
+        .env("HOME", home.path())
+        .env("PIP_CACHE_DIR", &alias)
+        .args(["scan", "--only", "pip", "--json"])
+        .output()
+        .unwrap();
+    assert!(scan.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&scan.stdout).unwrap();
+    assert!(report["findings"].as_array().unwrap().is_empty());
+    assert_eq!(report["completeness"]["findings"], "incomplete");
+
+    let clean = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .env("PIP_CACHE_DIR", &alias)
+        .args(["clean", "--only", "pip", "--purge", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert!(clean.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    assert_eq!(report["completeness"], "incomplete");
+    assert!(report["planned"].as_array().unwrap().is_empty());
+    assert!(report["executed"].as_array().unwrap().is_empty());
+    assert!(String::from_utf8_lossy(&clean.stderr).contains("symlink adapter root refused"));
+    let alias_metadata = std::fs::symlink_metadata(&alias).unwrap();
+    assert!(alias_metadata.file_type().is_symlink());
+    assert!(payload.exists());
     assert!(!state.path().join("degu/trash").exists());
     assert!(!state.path().join("degu/ops.jsonl").exists());
 }

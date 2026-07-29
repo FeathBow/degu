@@ -24,7 +24,7 @@ impl Action {
                     details: true,
                 },
             ),
-            Self::Clean(scope) => render_clean(
+            Self::Clean(scope) | Self::RestorableClean(scope) => render_clean(
                 &scope,
                 home,
                 CleanRenderOptions {

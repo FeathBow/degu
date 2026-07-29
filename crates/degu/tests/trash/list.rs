@@ -17,7 +17,6 @@ spawn -noecho $env(DEGU_BIN) trash list
     })
 }
 
-#[cfg(unix)]
 #[test]
 fn trash_list_color_always_strips_to_plain_bytes_and_never_colors_json() {
     let (home, state, _) = fake_pip_cache();
@@ -44,6 +43,7 @@ fn trash_list_color_always_strips_to_plain_bytes_and_never_colors_json() {
     serde_json::from_slice::<serde_json::Value>(&json.stdout).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn trash_list_rejects_fifo_registry_without_hanging() {
     let home = tempfile::tempdir().unwrap();
@@ -70,6 +70,39 @@ fn trash_list_rejects_fifo_registry_without_hanging() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("trashroots"), "stderr: {stderr}");
     assert!(stderr.contains("not a regular file"), "stderr: {stderr}");
+}
+
+#[test]
+fn interrupted_purge_claim_is_visible_without_undo_guidance() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let claim = seed_interrupted_purge_claim(&state);
+
+    let out = run(&home, &state, &["trash", "list", "--json"]);
+    assert!(out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["omitted"], 0);
+    let row = &report["entries"].as_array().unwrap()[0];
+    assert_eq!(row["entry"], claim.to_string_lossy().as_ref());
+    assert!(row["original"].is_null());
+    assert_eq!(row["ambiguous"], false);
+    assert_eq!(row["interrupted_purge"], true);
+
+    let out = run(&home, &state, &["trash", "list"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("interrupted purge; not undoable"));
+    assert!(stdout.contains("never removed by automatic expiry"));
+
+    let out = run_interactive_list(home.path(), state.path());
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("Available outcome:"));
+    assert!(stdout.contains("including interrupted"));
+    assert!(stdout.contains("confirm again"));
+    assert!(stdout.contains("degu trash purge"));
+    assert!(!stdout.contains("degu undo"));
+    assert_next_command(&stdout, "Next:", "degu ops");
 }
 
 #[test]
@@ -149,6 +182,59 @@ fn trash_list_reconciles_pending_rows_and_marks_ambiguous_entries() {
     assert!(!stdout.contains("Choose one outcome:"), "stdout: {stdout}");
     assert!(!stdout.contains("degu trash purge"), "stdout: {stdout}");
     assert_next_command(&stdout, "Next:", "degu ops");
+}
+
+#[test]
+fn trash_list_reports_staged_entry_and_empty_after_purge() {
+    let (home, state, cache) = fake_pip_cache();
+    let fixture_size = std::fs::metadata(cache.join("wheel.whl")).unwrap().len();
+    let cache_json = cache.canonicalize().unwrap().to_string_lossy().into_owned();
+    clean_pip_cache(&home, &state);
+    let trash_dir = state.path().join("degu/trash");
+
+    let out = run(&home, &state, &["trash", "list", "--json"]);
+    assert!(out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["omitted"], 0);
+    let rows = report["entries"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    let entry = row["entry"].as_str().unwrap();
+    assert!(Path::new(entry).starts_with(&trash_dir));
+    assert_eq!(row["original"], cache_json);
+    assert!(row["bytes_allocated"].as_u64().unwrap() >= fixture_size);
+    assert!(row["age_days"].as_u64().is_some());
+
+    let out = run(&home, &state, &["trash", "list"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let entry_name = Path::new(entry).file_name().unwrap().to_string_lossy();
+    assert!(stdout.contains(entry_name.as_ref()));
+    assert!(stdout.contains("in trash"));
+    assert!(!stdout.contains(" idle "));
+    assert!(stdout.contains("Total trash:"));
+    assert!(!stdout.contains("Choose one outcome:"));
+    assert!(!stdout.contains("degu undo"));
+    assert!(!stdout.contains("degu trash purge"));
+
+    assert!(
+        run(&home, &state, &["trash", "purge", "--yes"])
+            .status
+            .success()
+    );
+    let out = run(&home, &state, &["trash", "list"]);
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        "Trash is empty."
+    );
+
+    let out = run_interactive_list(home.path(), state.path());
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        "Trash is empty."
+    );
 }
 
 #[cfg(target_os = "linux")]

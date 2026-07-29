@@ -10,6 +10,10 @@ pub(crate) fn write_stdout_line(arguments: fmt::Arguments<'_>) -> Result<()> {
     map_stdout_result(writeln!(io::stdout().lock(), "{arguments}"))
 }
 
+pub(crate) fn flush_stdout() -> Result<()> {
+    map_stdout_result(io::stdout().lock().flush())
+}
+
 pub(crate) fn is_stdout_closed(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<StdoutClosed>())
 }

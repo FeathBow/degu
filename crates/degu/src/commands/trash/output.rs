@@ -7,9 +7,10 @@ use unicode_width::UnicodeWidthStr;
 use crate::lifecycle::TrashEntry;
 use crate::output::stdoutln;
 use crate::presentation::cleanup::count_label;
+use crate::presentation::semantic::Tone;
 use crate::presentation::{
     CELL_PADDING, PATH_BUDGET_FLOOR, WIDE_TABLE_MIN_WIDTH, display_path, dynamic_table,
-    escape_terminal_text, header_cells, lower_bound_bytes, right_align_columns,
+    escape_terminal_text, header_cells, lower_bound_bytes, right_align_columns, semantic,
     truncate_path_middle,
 };
 use crate::runtime::Ui;
@@ -17,6 +18,7 @@ use crate::runtime::Ui;
 pub(crate) const TRASH_IS_EMPTY: &str = "Trash is empty.";
 const WIDE_HEADERS: [&str; 4] = ["entry", "original", "on disk", "in trash"];
 const RIGHT_ALIGNED_COLUMNS: [usize; 2] = [2, 3];
+const INTERRUPTED_PURGE_NOTE: &str = "Interrupted purge claims remain in trash, cannot be undone automatically, and are never removed by automatic expiry. They are permanently deleted only after a new degu trash purge confirmation.";
 
 #[derive(Clone, Copy)]
 struct RenderOptions<'a> {
@@ -89,6 +91,36 @@ pub(super) fn print_human(rows: &[TrashEntry], home: &Path, ui: Ui) -> Result<()
     stdoutln!("{}", render_human(rows, RenderOptions { home, ui }))
 }
 
+pub(super) fn print_outcomes(rows: &[TrashEntry], ui: Ui) -> Result<()> {
+    stdoutln!("\n{}", render_outcomes(rows, ui))
+}
+
+fn render_outcomes(rows: &[TrashEntry], ui: Ui) -> String {
+    let color_enabled = ui.colors.stdout;
+    let can_restore = rows
+        .iter()
+        .any(|row| !row.interrupted_purge && row.original.is_some());
+    let has_interrupted = rows.iter().any(|row| row.interrupted_purge);
+    let mut outcomes = Vec::new();
+    let delete_label = if has_interrupted {
+        "Permanently delete all listed entries, including interrupted purge claims (confirm again):"
+    } else {
+        "Permanently delete all listed entries:"
+    };
+    let delete_label = ui.prose(delete_label);
+    outcomes.push(format!(
+        "{}\n  {}",
+        semantic::paint(&delete_label, Tone::Destructive, color_enabled),
+        semantic::paint("degu trash purge", Tone::Destructive, color_enabled)
+    ));
+    let heading = if can_restore {
+        "Choose one outcome:"
+    } else {
+        "Available outcome:"
+    };
+    format!("{heading}\n\n{}", outcomes.join("\n\n"))
+}
+
 fn render_human(rows: &[TrashEntry], options: RenderOptions<'_>) -> String {
     if rows.is_empty() {
         return TRASH_IS_EMPTY.to_owned();
@@ -99,6 +131,9 @@ fn render_human(rows: &[TrashEntry], options: RenderOptions<'_>) -> String {
         sections.push(options.ui.prose(
             "ambiguous entries have an unverified operation state or recorded identity and are never auto-expired; inspect the operation history before acting",
         ));
+    }
+    if rows.iter().any(|row| row.interrupted_purge) {
+        sections.push(options.ui.prose(INTERRUPTED_PURGE_NOTE));
     }
     let lower_bound = rows.iter().any(|row| row.lower_bound);
     let bytes_hardlinked = rows.iter().fold(0u64, |total, row| {
@@ -245,6 +280,9 @@ fn original_label(row: &TrashEntry, home: &Path) -> String {
         .unwrap_or_else(|| "-".to_string());
     if row.ambiguous {
         original.push_str(" (ambiguous)");
+    }
+    if row.interrupted_purge {
+        original.push_str(" (interrupted purge; not undoable)");
     }
     original
 }

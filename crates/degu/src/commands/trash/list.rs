@@ -12,6 +12,9 @@ pub(super) fn run(json: bool, ui: crate::runtime::Ui) -> Result<()> {
         output::print_json(&rows)
     } else {
         output::print_human(&rows, &ctx.home, ui)?;
+        if should_print_outcomes(&rows, ui.stdout_is_terminal) {
+            output::print_outcomes(&rows, ui)?;
+        }
         next_action::print(Request {
             output: OutputMode::Human(ui),
             workflow: Workflow::TrashList(TrashListState {
@@ -21,4 +24,8 @@ pub(super) fn run(json: bool, ui: crate::runtime::Ui) -> Result<()> {
             home: None,
         })
     }
+}
+
+fn should_print_outcomes(rows: &[crate::lifecycle::TrashEntry], stdout_is_terminal: bool) -> bool {
+    stdout_is_terminal && !rows.is_empty() && rows.iter().all(|row| !row.ambiguous)
 }

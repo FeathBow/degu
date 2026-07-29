@@ -102,7 +102,11 @@ fn print_selection_summary(prepared: &PreparedClean, stats: cleanup::FindingStat
     if !prepared.settings.dry_run {
         return print_selected_summary(prepared, stats);
     }
-    print_staging_preview(prepared, stats)
+    if prepared.settings.purge {
+        print_permanent_preview(prepared, stats)
+    } else {
+        print_staging_preview(prepared, stats)
+    }
 }
 
 fn print_selected_summary(prepared: &PreparedClean, stats: cleanup::FindingStats) -> Result<()> {
@@ -115,6 +119,29 @@ fn print_selected_summary(prepared: &PreparedClean, stats: cleanup::FindingStats
             )
             .stat(stats.locations_label())
             .stat(stats.inodes_label(prepared.plan_lower_bound(), prepared.settings.ui.glyphs))
+        )
+    )
+}
+
+fn print_permanent_preview(prepared: &PreparedClean, stats: cleanup::FindingStats) -> Result<()> {
+    stdoutln!(
+        "{}",
+        semantic::paint(
+            prepared.settings.ui.prose(&format!(
+                "Would permanently delete {}",
+                planned_bytes(prepared)
+            )),
+            Tone::Destructive,
+            prepared.settings.ui.colors.stdout
+        )
+    )?;
+    print_scope_summary(prepared, stats)?;
+    stdoutln!(
+        "{}",
+        semantic::paint(
+            "Not restorable.",
+            Tone::Destructive,
+            prepared.settings.ui.colors.stdout
         )
     )
 }

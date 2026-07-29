@@ -81,6 +81,28 @@ pub(super) fn trash_record(request: TrashRecord<'_>) -> OpRecord {
     })
 }
 
+pub(super) struct PurgeRecord<'a> {
+    pub(super) command: &'a str,
+    pub(super) entry: &'a Path,
+    pub(super) reclamation_id: Option<&'a str>,
+    pub(super) outcome: OpOutcome,
+}
+
+pub(super) fn purge_record(request: PurgeRecord<'_>) -> OpRecord {
+    stamped_record(RecordFields {
+        command: request.command.to_string(),
+        action: OpAction::Purge,
+        path: request.entry.to_path_buf(),
+        bytes_allocated: 0,
+        inodes: 0,
+        trash_entry: None,
+        reclamation_id: request.reclamation_id.map(str::to_string),
+        expected_identity: None,
+        destination_parent: None,
+        outcome: request.outcome,
+    })
+}
+
 struct RecordFields {
     command: String,
     action: OpAction,
@@ -141,3 +163,6 @@ fn read_records(log_path: &Path) -> Result<Vec<OpRecord>> {
     })?;
     Ok(records)
 }
+
+#[cfg(test)]
+mod tests;

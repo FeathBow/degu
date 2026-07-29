@@ -44,6 +44,7 @@ pub(crate) struct ScanState<'a> {
 pub(crate) struct CleanPreviewState<'a> {
     pub(crate) scope: &'a CleanScope,
     pub(crate) planned: usize,
+    pub(crate) direct_purge_requested: bool,
 }
 
 pub(crate) struct CleanResultState {
@@ -69,6 +70,7 @@ enum Action {
     CleanPreview(CleanScope),
     CleanReview(CleanScope),
     Clean(CleanScope),
+    RestorableClean(CleanScope),
     TrashList,
     Ops,
 }
@@ -78,6 +80,7 @@ enum GuidanceKind {
     Standard,
     CompleteScan,
     ProjectScan,
+    RestorableClean,
 }
 
 enum Resolution {
@@ -167,6 +170,7 @@ impl Action {
         match self {
             Self::CompleteScan(_) => GuidanceKind::CompleteScan,
             Self::ProjectScan(_) => GuidanceKind::ProjectScan,
+            Self::RestorableClean(_) => GuidanceKind::RestorableClean,
             _ => GuidanceKind::Standard,
         }
     }
@@ -214,7 +218,11 @@ fn clean_preview_action(state: CleanPreviewState<'_>) -> Option<Action> {
         return None;
     }
     let scope = state.scope.clone();
-    Some(Action::Clean(scope))
+    if state.direct_purge_requested {
+        Some(Action::RestorableClean(scope))
+    } else {
+        Some(Action::Clean(scope))
+    }
 }
 
 #[cfg(test)]

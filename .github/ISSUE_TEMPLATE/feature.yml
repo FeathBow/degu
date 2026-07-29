@@ -1,0 +1,59 @@
+name: Feature request
+description: Propose a new capability or improvement for degu
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem first. A proposed implementation is welcome but not required.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What user problem should degu solve, and in which environment does it occur?
+    validations:
+      required: true
+
+  - type: textarea
+    id: desired-behavior
+    attributes:
+      label: Desired behavior
+      description: Describe the observable outcome rather than a specific internal implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: example
+    attributes:
+      label: Example workflow or CLI
+      description: Show how a user would experience the change, if useful.
+      render: shell
+
+  - type: input
+    id: affected-area
+    attributes:
+      label: Affected area or ecosystem
+      description: For example, scanning, cleanup, trash/undo, relocation, uv, Conda, or Hugging Face.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Current workaround or alternatives
+      description: How is the problem handled today, if at all?
+
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and filesystem semantics
+      description: If this affects scanning, moving, or deleting data, describe ownership, regenerability, rebuild cost, path confidence, active-use concerns, and failure behavior.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing open and closed issues.
+          required: true

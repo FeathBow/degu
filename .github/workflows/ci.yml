@@ -4,10 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+    inputs:
+      toolchain:
+        description: Rust toolchain selected by the calling workflow
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTUP_TOOLCHAIN: stable
+  RUSTUP_TOOLCHAIN: ${{ inputs.toolchain || 'stable' }}
 
 concurrency:
   cancel-in-progress: true
@@ -114,6 +120,30 @@ jobs:
             sudo umount "${DEGU_QUOTA_TEST_PATH}"
           fi
 
+  # Static musl binaries are the core deliverable: no-root HPC login nodes on aging glibc.
+  musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --workspace --release --locked --target x86_64-unknown-linux-musl
+      - name: verify the artifact is statically linked
+        run: |
+          file target/x86_64-unknown-linux-musl/release/degu | grep -qE "statically linked|static-pie linked"
+      - name: test the release contracts
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '[.packages[] | select(.name == "degu") | .version] | if length == 1 then .[0] else error("expected one degu package") end')
+          ./tools/verify-release-contract.sh
+          ./tools/test-release-assets.sh "v${version}" x86_64-unknown-linux-musl
+          ./tools/test-release-records.sh
+
   installer:
     strategy:
       matrix:
@@ -125,3 +155,48 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
       - run: ./tools/test-installer.sh
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+
+  workflow-security:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    env:
+      ACTIONLINT_VERSION: 1.7.12
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install actionlint
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          path="${RUNNER_TEMP}/${archive}"
+          gh release download "v${ACTIONLINT_VERSION}" --repo rhysd/actionlint --pattern "${archive}" --dir "${RUNNER_TEMP}"
+          printf '%s  %s\n' "${ACTIONLINT_SHA256}" "${path}" | sha256sum --check --strict -
+          gh attestation verify "${path}" --repo rhysd/actionlint
+          tar --extract --gzip --file "${path}" --directory "${RUNNER_TEMP}" actionlint
+      - name: Lint workflows
+        run: |
+          "${RUNNER_TEMP}/actionlint"
+      - name: Audit workflows
+        uses: zizmorcore/zizmor-action@6599ee8b7a49aef6a770f63d261d214911a7ce02 # v0.6.0
+        with:
+          advanced-security: false
+          annotations: true
+          min-confidence: high
+          online-audits: true
+          persona: regular
+          version: 1.27.0

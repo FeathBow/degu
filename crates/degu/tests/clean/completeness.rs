@@ -1,5 +1,30 @@
 use super::support::*;
 
+const DEGU_FAILURE_EXIT_CODE: i32 = 1;
+
+#[test]
+fn clean_rejects_a_truncated_scan_before_preview_or_mutation() {
+    let home = tempfile::tempdir().unwrap();
+    let (cache, state) = fake_pip_cache(&home, ".cache/pip");
+
+    for args in [
+        &["clean", "--budget", "0s", "--dry-run"][..],
+        &["clean", "--budget", "0s", "--yes", "--json"][..],
+    ] {
+        let out = run_clean(&home, &state, args);
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("refusing to clean on partial results")
+        );
+        assert!(cache.join("wheel.whl").exists());
+        assert!(!state.path().join("degu/trash").exists());
+        assert!(!state.path().join("degu/ops.jsonl").exists());
+    }
+}
+
+/// Same source, two roots: incompleteness gates per root, so it must not
+/// poison a --path clean of the fully measured sibling root.
+#[cfg(unix)]
 #[test]
 fn path_clean_of_a_fully_measured_root_survives_an_incomplete_sibling_root() {
     if root_ignores_dir_modes() {
@@ -331,4 +356,49 @@ fn fake_cargo_home_with_unreadable_git(
     std::fs::create_dir_all(&git_db).unwrap();
     set_mode(&git_db, 0o000);
     (registry, git_db)
+}
+
+#[cfg(unix)]
+#[test]
+fn interactive_clean_rejects_an_incomplete_nonempty_plan_before_confirmation() {
+    use crate::pty::{PtyRun, run as run_pty};
+
+    let home = tempfile::tempdir().unwrap();
+    let unresolved = tempfile::tempdir().unwrap();
+    let (cache, state) = fake_pip_cache(&home, ".cache/pip");
+    let alias = home.path().join("uv-cache-link");
+    std::os::unix::fs::symlink(unresolved.path(), &alias).unwrap();
+    let body = r#"
+spawn -noecho $env(DEGU_BIN) clean
+expect {
+    -exact {refusing to clean on incomplete results} {}
+    -exact {Proceed? [y/N] } {
+        send "n\r"
+        puts stderr "unexpected confirmation prompt"
+    }
+}
+"#;
+    let extra_env = [("UV_CACHE_DIR", alias.as_os_str())];
+    let out = run_pty(PtyRun {
+        body,
+        home: home.path(),
+        config_home: test_config_home(),
+        state_home: state.path(),
+        extra_env: &extra_env,
+    });
+
+    assert_eq!(out.status.code(), Some(DEGU_FAILURE_EXIT_CODE));
+    let transcript = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        transcript.contains("refusing to clean on incomplete results"),
+        "transcript: {transcript}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("unexpected confirmation prompt"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(cache.join("wheel.whl").exists());
+    assert!(!state.path().join("degu/trash").exists());
+    assert!(!state.path().join("degu/ops.jsonl").exists());
 }

@@ -19,6 +19,32 @@ spawn -noecho $env(DEGU_BIN) trash list
 
 #[cfg(unix)]
 #[test]
+fn trash_list_color_always_strips_to_plain_bytes_and_never_colors_json() {
+    let (home, state, _) = fake_pip_cache();
+    clean_pip_cache(&home, &state);
+    let plain = run(&home, &state, &["trash", "list"]);
+    let colored = run(&home, &state, &["--color", "always", "trash", "list"]);
+    let json = run(
+        &home,
+        &state,
+        &["--color", "always", "trash", "list", "--json"],
+    );
+
+    assert!(plain.status.success());
+    assert!(colored.status.success());
+    assert!(json.status.success());
+    assert!(
+        colored
+            .stdout
+            .windows(b"\x1b[".len())
+            .any(|window| window == b"\x1b[")
+    );
+    assert_eq!(strip_sgr(&colored.stdout), plain.stdout);
+    assert!(!json.stdout.contains(&b'\x1b'));
+    serde_json::from_slice::<serde_json::Value>(&json.stdout).unwrap();
+}
+
+#[test]
 fn trash_list_rejects_fifo_registry_without_hanging() {
     let home = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -58,6 +84,24 @@ fn scan_summary_counts_an_interrupted_purge_claim() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("Trash holds"));
     assert!(stdout.contains("across 1 entry"));
+}
+
+#[test]
+fn scan_human_reports_trash_while_scan_json_stays_data_only() {
+    let (home, state, _) = fake_pip_cache();
+    clean_pip_cache(&home, &state);
+
+    let out = run(&home, &state, &["scan"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("Trash"));
+    assert!(!stdout.contains("degu trash purge"));
+
+    let out = run(&home, &state, &["scan", "--json"]);
+    assert!(out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(report["findings"].as_array().is_some());
+    assert!(report["runtime"].as_array().is_some());
 }
 
 #[test]

@@ -9,6 +9,7 @@ pub(crate) mod completions;
 pub(crate) mod man;
 pub(crate) mod next_action;
 pub(crate) mod ops;
+pub(crate) mod prompt;
 mod regions;
 pub(crate) mod scan;
 mod scope;

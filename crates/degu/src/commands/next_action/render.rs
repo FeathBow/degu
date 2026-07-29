@@ -24,6 +24,14 @@ impl Action {
                     details: true,
                 },
             ),
+            Self::Clean(scope) => render_clean(
+                &scope,
+                home,
+                CleanRenderOptions {
+                    dry_run: false,
+                    details: false,
+                },
+            ),
             Self::TrashList => Some("degu trash list".to_string()),
             Self::Ops => Some("degu ops".to_string()),
         }

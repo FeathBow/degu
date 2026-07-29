@@ -1,10 +1,13 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+pub(super) use crate::clean_run::run as clean_pip_cache;
 pub(super) use crate::common::isolated_config_home as test_config_home;
 pub(super) use crate::common::isolated_degu as degu;
 pub(super) use crate::next_command::assert_next_command;
+pub(super) use crate::pip_fixture::create as fake_pip_cache;
 pub(super) use crate::private_degu_state::create as private_degu_state;
+pub(super) use crate::strip_sgr::strip_sgr;
 
 pub(super) fn run(
     home: &tempfile::TempDir,

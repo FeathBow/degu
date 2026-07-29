@@ -11,6 +11,8 @@ use help::TOP_LEVEL_HELP_TEMPLATE;
 
 const TOP_LEVEL_EXAMPLES: &str = "Workflow:
   degu scan
+  degu clean --dry-run
+  degu clean
 
 Run 'degu <command> --help' for command details.";
 
@@ -168,8 +170,11 @@ pub(crate) struct CleanArgs {
     /// Include Needs review findings in the clean plan after inspecting them
     #[arg(long)]
     pub(crate) include_review: bool,
+    /// Proceed without prompting
+    #[arg(long)]
+    pub(crate) yes: bool,
     /// Show the plan without staging findings or purging expired trash
-    #[arg(long, required = true)]
+    #[arg(long)]
     pub(crate) dry_run: bool,
     /// Keep only findings untouched for at least this many days
     #[arg(long, value_name = "DAYS")]

@@ -1,6 +1,17 @@
+#[path = "support/clean_run.rs"]
+mod clean_run;
 #[path = "support/mod.rs"]
 mod common;
+#[path = "support/pip_cache.rs"]
+mod pip_cache;
+#[path = "support/pip_fixture.rs"]
+mod pip_fixture;
+#[path = "support/strip_sgr.rs"]
+mod strip_sgr;
+use clean_run::run as run_clean;
 use common::isolated_degu as degu;
+use pip_fixture::create as fake_pip_cache;
+use strip_sgr::strip_sgr;
 
 const STATE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -26,6 +37,46 @@ fn write_records(path: &std::path::Path, records: &[serde_json::Value]) {
         .join("\n");
     contents.push('\n');
     std::fs::write(path, contents).unwrap();
+}
+
+#[test]
+fn ops_renders_operation_log_in_json_and_human_formats() {
+    let (home, state, _cache) = fake_pip_cache();
+    run_clean(home.path(), state.path());
+
+    let out = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args(["ops", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let records: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let records = records.as_array().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["action"], "trash");
+    assert_eq!(records[0]["outcome"], "pending");
+    assert_eq!(records[1]["action"], "trash");
+    assert_eq!(records[1]["outcome"], "ok");
+    assert_eq!(records[0]["trash_entry"], records[1]["trash_entry"]);
+
+    let out = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .arg("ops")
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("trash"));
+    // The ~-compressed default pip path is platform-specific.
+    #[cfg(target_os = "macos")]
+    let expected = "~/Library/Caches/pip";
+    #[cfg(not(target_os = "macos"))]
+    let expected = "~/.cache/pip";
+    assert!(stdout.contains(expected));
 }
 
 #[test]
@@ -73,6 +124,44 @@ fn ops_rejects_fifo_state_without_hanging() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("ops.jsonl"), "stderr: {stderr}");
     assert!(stderr.contains("not a regular file"), "stderr: {stderr}");
+}
+
+#[test]
+fn ops_color_always_strips_to_plain_bytes_and_never_colors_json() {
+    let (home, state, _cache) = fake_pip_cache();
+    run_clean(home.path(), state.path());
+
+    let plain = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .arg("ops")
+        .output()
+        .unwrap();
+    let colored = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args(["--color", "always", "ops"])
+        .output()
+        .unwrap();
+    let json = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args(["--color", "always", "ops", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(plain.status.success());
+    assert!(colored.status.success());
+    assert!(json.status.success());
+    assert!(
+        colored
+            .stdout
+            .windows(b"\x1b[".len())
+            .any(|window| window == b"\x1b[")
+    );
+    assert_eq!(strip_sgr(&colored.stdout), plain.stdout);
+    assert!(!json.stdout.contains(&b'\x1b'));
+    serde_json::from_slice::<serde_json::Value>(&json.stdout).unwrap();
 }
 
 #[test]

@@ -1,0 +1,20 @@
+use super::super::tests::finding_for_test;
+use super::CleanExecution;
+use std::path::PathBuf;
+
+#[test]
+fn unverified_destination_reports_its_location_and_manual_recovery() {
+    let entry = PathBuf::from("/trash/0001-cache");
+    let finding = finding_for_test(PathBuf::from("/cache"), 0, 0);
+    let item = CleanExecution::unverified_destination(
+        &finding,
+        entry.clone(),
+        "restoration failed".into(),
+    );
+
+    assert!(item.failed());
+    assert_eq!(item.state_label(), "unverified_destination");
+    assert!(item.has_trash_location());
+    assert!(!item.reported_as_cleaned());
+    assert_eq!(item.trash_entry(), Some(entry.as_path()));
+}

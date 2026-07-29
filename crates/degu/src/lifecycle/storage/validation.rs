@@ -1,11 +1,32 @@
 use std::ffi::OsStr;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use super::STATE_TRASH_NAME;
+
+const PRIVATE_DIR_MODE: u32 = 0o700;
 const SHARED_WRITE_MASK: u32 = 0o022;
 const STICKY_BIT: u32 = 0o1000;
+
+pub(crate) fn ensure_managed_trash_root(root: &Path, expected_name: &str) -> Result<PathBuf> {
+    prepare_trash_parent(root, expected_name)?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(PRIVATE_DIR_MODE);
+    match builder.create(root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to create {}", root.display()));
+        }
+    }
+    Ok(validate_existing_trash_root(root, expected_name)?
+        .ok_or_else(|| {
+            anyhow::anyhow!("trash root disappeared after creation: {}", root.display())
+        })?
+        .lexical)
+}
 
 /// A validated trash root: the lexical path as configured, kept for display, and
 /// the canonicalized path, used to fold lexical aliases of one directory onto a
@@ -39,6 +60,32 @@ pub(super) fn validate_existing_trash_root(
         lexical: root.to_path_buf(),
         canonical,
     }))
+}
+
+fn prepare_trash_parent(root: &Path, expected_name: &str) -> Result<()> {
+    let parent = root
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("trash root has no parent: {}", root.display()))?;
+    if expected_name == STATE_TRASH_NAME {
+        return ensure_state_parent(parent);
+    }
+    validate_trash_parent(parent)
+}
+
+pub(super) fn ensure_state_parent(parent: &Path) -> Result<()> {
+    let ancestor = parent.parent().ok_or_else(|| {
+        anyhow::anyhow!("state trash parent has no ancestor: {}", parent.display())
+    })?;
+    std::fs::create_dir_all(ancestor)
+        .with_context(|| format!("failed to create {}", ancestor.display()))?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(PRIVATE_DIR_MODE);
+    match builder.create(parent) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to create {}", parent.display())),
+    }?;
+    validate_trash_parent(parent)
 }
 
 fn validate_root_name(root: &Path, expected_name: &str) -> Result<()> {

@@ -65,13 +65,6 @@ impl EntryIdentity {
         destination: &Path,
         destination_parent: ObjectIdentity,
     ) -> Result<Self, RenameFailure> {
-        let matches = self.matches(source).map_err(RenameFailure::Source)?;
-        if !matches {
-            return Err(RenameFailure::Source(identity_changed(
-                source,
-                "before the move",
-            )));
-        }
         let (parent, basename) = split_destination(destination).map_err(RenameFailure::Source)?;
         // Do NOT tighten this to `Exact`. A directory's ctime bumps on every
         // entry add/remove, so `Exact` would spuriously refuse (a) the parent
@@ -83,6 +76,16 @@ impl EntryIdentity {
                 parent: parent.to_path_buf(),
                 error,
             })?;
+        // The source recheck sits after parent authentication, which resolves
+        // and opens paths and is not constant time: a source swapped during it
+        // would otherwise be renamed into the authenticated destination.
+        let matches = self.matches(source).map_err(RenameFailure::Source)?;
+        if !matches {
+            return Err(RenameFailure::Source(identity_changed(
+                source,
+                "before the move",
+            )));
+        }
         rename_into_noreplace(source, &parent_fd, &basename).map_err(RenameFailure::Source)?;
         let moved = Self::capture(destination)
             .map_err(|error| unverified_destination(source, destination, Some(error)))?;

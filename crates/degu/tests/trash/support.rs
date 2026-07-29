@@ -10,6 +10,7 @@ pub(super) use crate::next_command::assert_next_command;
 pub(super) use crate::pip_fixture::create as fake_pip_cache;
 pub(super) use crate::private_degu_state::create as private_degu_state;
 pub(super) use crate::strip_sgr::strip_sgr;
+pub(super) use crate::trash_entries::visible as visible_trash_entries;
 
 pub(super) fn run(
     home: &tempfile::TempDir,
@@ -35,6 +36,31 @@ expect -exact {Type 'purge' to permanently delete this plan: }
 send "$env(RESPONSE)\r"
 "#;
     let extra_env = [("RESPONSE", OsStr::new(response))];
+    run_pty(PtyRun {
+        body,
+        home,
+        config_home: test_config_home(),
+        state_home: state,
+        extra_env: &extra_env,
+    })
+}
+
+pub(super) fn run_purge_during_concurrent_clean(home: &Path, state: &Path) -> std::process::Output {
+    let body = r#"
+spawn $env(DEGU_BIN) trash purge
+expect -exact {Type 'purge' to permanently delete this plan: }
+set concurrent_status [catch {
+    exec env HOME=$env(HOME) XDG_CONFIG_HOME=$env(XDG_CONFIG_HOME) XDG_STATE_HOME=$env(XDG_STATE_HOME) $env(DEGU_BIN) clean --yes >& $env(CONCURRENT_LOG)
+} concurrent_error]
+set concurrent_log [open $env(CONCURRENT_LOG) r]
+set concurrent [read $concurrent_log]
+close $concurrent_log
+puts "concurrent clean status: $concurrent_status"
+puts "concurrent clean: $concurrent"
+send "purge\r"
+"#;
+    let concurrent_log = state.join("concurrent-clean.log");
+    let extra_env = [("CONCURRENT_LOG", concurrent_log.as_os_str())];
     run_pty(PtyRun {
         body,
         home,

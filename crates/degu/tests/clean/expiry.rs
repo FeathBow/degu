@@ -60,9 +60,13 @@ fn assert_human_expiry_after_report() {
     assert!(!cache.exists());
     assert!(!expired.exists());
     let stdout = String::from_utf8(out.stdout).unwrap();
+    let quota = stdout
+        .find("Still counts against quota while staged")
+        .unwrap();
     let preview = stdout.find("Expired trash: 1 entry").unwrap();
     let purged = stdout.find("Purged 1 expired trash entry").unwrap();
     assert!(preview < purged);
+    assert!(purged > quota);
 }
 
 #[test]

@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 impl Action {
     pub(super) fn render(self, home: Option<&Path>) -> Option<String> {
         match self {
-            Self::CompleteScan(scope) | Self::ProjectScan(scope) => render_scan(&scope, home),
+            Self::Scan(scope) | Self::CompleteScan(scope) | Self::ProjectScan(scope) => {
+                render_scan(&scope, home)
+            }
             Self::CleanPreview(scope) => render_clean(
                 &scope,
                 home,

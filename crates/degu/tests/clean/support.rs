@@ -97,6 +97,29 @@ pub(super) fn write_oplog(state: &tempfile::TempDir, records: &[serde_json::Valu
     std::fs::write(state.path().join("degu/ops.jsonl"), format!("{jsonl}\n")).unwrap();
 }
 
+/// Terminal form of the clean plan: a Plan headline, the trash destination
+/// on its own line under "To:", then the restorability note.
+pub(super) fn assert_plan_block(stdout: &str, state: &tempfile::TempDir) {
+    assert!(stdout.contains("move 1 location"), "stdout: {stdout}");
+    let trash_dir = state.path().join("degu/trash");
+    let lines: Vec<&str> = stdout.lines().map(str::trim_end).collect();
+    let to = lines
+        .iter()
+        .position(|line| *line == "To:")
+        .unwrap_or_else(|| panic!("missing To: line in stdout: {stdout}"));
+    assert_eq!(
+        lines[to + 1],
+        format!("  {}", trash_dir.display()),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "Restorable with degu undo; a later clean may purge it after {TRASH_TTL_DAYS} days."
+        )),
+        "stdout: {stdout}"
+    );
+}
+
 pub(super) fn assert_mechanism_line(stdout: &str, state: &tempfile::TempDir, purge: bool) {
     let trash_dir = state.path().join("degu/trash");
     assert!(stdout.contains("Plan: move 1 location ("));
@@ -111,6 +134,24 @@ pub(super) fn assert_mechanism_line(stdout: &str, state: &tempfile::TempDir, pur
             TRASH_TTL_DAYS
         )));
     }
+}
+
+pub(super) fn run_interactive_clean(
+    home: &std::path::Path,
+    state: &std::path::Path,
+) -> std::process::Output {
+    let body = r#"
+spawn $env(DEGU_BIN) clean
+expect -exact {Proceed? [y/N] }
+send "y\r"
+"#;
+    run_pty(PtyRun {
+        body,
+        home,
+        config_home: test_config_home(),
+        state_home: state,
+        extra_env: &[],
+    })
 }
 
 pub(super) fn run_interactive_clean_purge(

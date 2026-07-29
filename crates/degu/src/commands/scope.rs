@@ -10,7 +10,6 @@ pub(crate) struct ScanScope {
 }
 
 impl ScanScope {
-    #[cfg(test)]
     pub(super) fn empty() -> Self {
         Self {
             filters: Filters::default(),

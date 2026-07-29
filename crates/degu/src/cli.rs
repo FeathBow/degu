@@ -15,6 +15,7 @@ const TOP_LEVEL_EXAMPLES: &str = "Workflow:
   degu clean
 
 After staging, choose one outcome:
+  degu undo
   degu trash purge
 
 Run 'degu <command> --help' for command details.";
@@ -109,6 +110,11 @@ pub(crate) enum Command {
     /// Preview or execute a cleanup plan
     #[command(after_help = CLEAN_HELP)]
     Clean(CleanArgs),
+    /// Restore the latest staged clean operation
+    Undo {
+        #[command(flatten)]
+        output: JsonArgs,
+    },
     /// Inspect or permanently purge degu trash
     Trash {
         #[command(subcommand)]

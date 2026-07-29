@@ -35,6 +35,28 @@ fn closed_stdout_stops_clean_before_mutation() {
 }
 
 #[test]
+fn clean_yes_human_reports_staged_trash_and_quota_note() {
+    let home = tempfile::tempdir().unwrap();
+    let (cache, state) = fake_pip_cache(&home, ".cache/pip");
+    let out = run_clean(&home, &state, &["clean", "--yes"]);
+    assert!(out.status.success());
+    assert!(!cache.exists());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_mechanism_line(&stdout, &state, false);
+    let staged = staged_summary_line(&stdout);
+    assert!(staged.contains("1 location - "), "{staged}");
+    crate::elapsed::assert_no_elapsed_suffix(staged);
+    assert!(stdout.contains("Still counts against quota while staged; restore with 'degu undo'."));
+}
+
+fn staged_summary_line(stdout: &str) -> &str {
+    stdout
+        .lines()
+        .find(|line| line.starts_with("Staged ") && line.contains(" into the trash"))
+        .unwrap_or_else(|| panic!("missing staged summary: {stdout}"))
+}
+
+#[test]
 fn clean_purge_yes_human_prints_not_restorable_mechanism_line() {
     let home = tempfile::tempdir().unwrap();
     let (cache, state) = fake_pip_cache(&home, ".cache/pip");
@@ -127,6 +149,21 @@ fn clean_purge_rejects_generic_permanent_confirmation_as_non_success() {
     let transcript = String::from_utf8(out.stdout).unwrap();
     assert!(transcript.contains("Staged then purged immediately; not restorable."));
     assert!(transcript.contains("Canceled; no clean or purge changes made."));
+}
+
+#[test]
+fn clean_interactive_prompt_prints_plan_block_first() {
+    let home = tempfile::tempdir().unwrap();
+    let (cache, state) = fake_pip_cache(&home, ".cache/pip");
+    let out = run_interactive_clean(home.path(), state.path());
+    assert!(out.status.success());
+    assert!(!cache.exists());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_plan_block(&stdout, &state);
+    assert!(stdout.find("Plan:").unwrap() < stdout.find("Proceed? [y/N]").unwrap());
+    assert_eq!(stdout.matches("Next:").count(), 1);
+    assert_next_command(&stdout, "Next:", "degu trash list");
+    crate::elapsed::assert_elapsed_suffix(staged_summary_line(&stdout));
 }
 
 #[test]

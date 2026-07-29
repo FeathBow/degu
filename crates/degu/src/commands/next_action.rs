@@ -14,6 +14,7 @@ pub(crate) const UNSAFE_SCOPE_REASON: &str =
 
 #[derive(Clone, Copy)]
 pub(crate) enum OutputMode {
+    Json,
     Human(Ui),
 }
 
@@ -30,6 +31,7 @@ pub(crate) enum Workflow<'a> {
     CleanPreview(CleanPreviewState<'a>),
     CleanResult(CleanResultState),
     TrashList(TrashListState),
+    Undo(UndoState),
 }
 
 pub(crate) struct ScanState<'a> {
@@ -56,6 +58,12 @@ pub(crate) struct TrashListState {
     pub(crate) interrupted_purge: bool,
 }
 
+pub(crate) struct UndoState {
+    pub(crate) restored: usize,
+    pub(crate) failed: usize,
+    pub(crate) ambiguous: usize,
+}
+
 pub(crate) struct NextLine(String);
 
 impl NextLine {
@@ -65,6 +73,7 @@ impl NextLine {
 }
 
 enum Action {
+    Scan(ScanScope),
     CompleteScan(ScanScope),
     ProjectScan(ScanScope),
     CleanPreview(CleanScope),
@@ -188,6 +197,7 @@ fn action_for(workflow: Workflow<'_>) -> Option<Action> {
         Workflow::TrashList(state) => {
             (state.ambiguous || state.interrupted_purge).then_some(Action::Ops)
         }
+        Workflow::Undo(state) => undo_action(state),
     }
 }
 
@@ -222,6 +232,16 @@ fn clean_preview_action(state: CleanPreviewState<'_>) -> Option<Action> {
         Some(Action::RestorableClean(scope))
     } else {
         Some(Action::Clean(scope))
+    }
+}
+
+fn undo_action(state: UndoState) -> Option<Action> {
+    if state.failed > 0 || state.ambiguous > 0 {
+        Some(Action::TrashList)
+    } else if state.restored > 0 {
+        Some(Action::Scan(ScanScope::empty()))
+    } else {
+        None
     }
 }
 

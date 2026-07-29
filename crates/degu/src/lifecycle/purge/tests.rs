@@ -103,9 +103,9 @@ fn purge_rollback_refuses_a_swapped_trash_root_ancestor() {
 
     assert!(report.purged.is_empty());
     assert_eq!(report.failed.len(), 1);
-    // The rollback is refused (the swapped ancestor diverts the logical claim and
-    // destination paths); the entry is not moved into the diverted directory.
-    assert!(report.failed[0].1.contains("restore did not complete"));
+    // The rollback is refused: parent authentication catches the swapped
+    // ancestor, so the entry is not moved into the diverted directory.
+    assert!(report.failed[0].1.contains("destination parent"));
     assert!(!evil_root.join("0001-cache").exists());
     assert!(evil_root.join(".claims").read_dir().is_err());
     // The claim is still recoverable in the physical claims directory.

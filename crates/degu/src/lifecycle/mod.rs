@@ -10,6 +10,7 @@ mod state_read;
 mod storage;
 mod summary;
 mod trash;
+mod undo;
 
 use anyhow::Result;
 use degu_core::ecosystem::DetectCtx;
@@ -24,6 +25,7 @@ pub(crate) use purge::{ExpiryPlan, PurgeReport, TrashPurgePlan};
 pub(crate) use stage::{
     CapturedCleanPlan, CleanExecution, CleanExecutionFailure, cleaned_resources,
 };
+pub(crate) use undo::{UndoAmbiguousEntry, UndoEntry, UndoFailedEntry, UndoLogFailure, UndoReport};
 
 pub(crate) struct Lifecycle {
     ctx: DetectCtx,
@@ -104,5 +106,9 @@ impl MutationSession {
 
     pub(crate) fn execute_expiry(&self, plan: &ExpiryPlan) -> PurgeReport {
         purge::execute_expiry_plan(&self.lifecycle.ctx, plan)
+    }
+
+    pub(crate) fn undo_latest(&self) -> Result<Option<UndoReport>> {
+        undo::undo_latest(&self.lifecycle.ctx)
     }
 }

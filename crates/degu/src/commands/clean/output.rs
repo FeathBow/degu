@@ -51,33 +51,34 @@ fn print_mechanism(prepared: &PreparedClean) -> Result<()> {
     for trash_dir in &trash_dirs {
         stdoutln!("  {trash_dir}")?;
     }
-    if prepared.settings.purge {
-        let mechanism = ui.toned_prose(
+    let mechanism = if prepared.settings.purge {
+        ui.toned_prose(
             0,
             "Staged then purged immediately; not restorable.",
             Tone::Destructive,
-        );
-        stdoutln!("{mechanism}")?;
-    }
-    Ok(())
+        )
+    } else {
+        ui.prose(&format!(
+            "Restorable with degu undo; a later clean may purge it after {TRASH_RETENTION_DAYS} days."
+        ))
+    };
+    stdoutln!("{mechanism}")
 }
 
 fn print_mechanism_sentence(prepared: &PreparedClean, trash_dirs: &[String]) -> Result<()> {
-    if prepared.settings.purge {
-        let mechanism = semantic::paint(
+    let mechanism = if prepared.settings.purge {
+        semantic::paint(
             "staged then purged immediately; not restorable.",
             Tone::Destructive,
             prepared.settings.ui.colors.stdout,
-        );
-        return stdoutln!(
-            "Plan: move {} ({}) to {} — {mechanism}",
-            cleanup::count_label(prepared.plan.items().len(), "location", "locations"),
-            plan::planned_bytes(prepared),
-            trash_dirs.join(", ")
-        );
-    }
+        )
+    } else {
+        format!(
+            "restorable with degu undo; a later clean may purge it after {TRASH_RETENTION_DAYS} days."
+        )
+    };
     stdoutln!(
-        "Plan: move {} ({}) to {}",
+        "Plan: move {} ({}) to {} — {mechanism}",
         cleanup::count_label(prepared.plan.items().len(), "location", "locations"),
         plan::planned_bytes(prepared),
         trash_dirs.join(", ")
@@ -173,7 +174,14 @@ pub(super) fn print_execution(
             cleanup::inode_total_label(false, cleaned_inodes, ui.glyphs)
         );
         append_elapsed(&mut summary, elapsed, ui);
-        stdoutln!("{}", ui.prose(&summary))
+        stdoutln!("{}", ui.prose(&summary))?;
+        if executed.iter().all(|item| !item.requires_manual_recovery()) {
+            stdoutln!(
+                "{}",
+                ui.prose("Still counts against quota while staged; restore with 'degu undo'.")
+            )?;
+        }
+        Ok(())
     }
 }
 

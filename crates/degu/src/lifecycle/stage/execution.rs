@@ -203,6 +203,10 @@ impl CleanExecution {
         }
     }
 
+    pub(crate) fn requires_manual_recovery(&self) -> bool {
+        matches!(self.state, CleanState::UnverifiedDestination { .. })
+    }
+
     fn staged(staged: CommittedStage) -> Self {
         let (subject, entry) = staged.into_parts();
         Self {

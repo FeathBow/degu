@@ -14,9 +14,13 @@ mod private_degu_state;
 mod pty;
 #[path = "support/strip_sgr.rs"]
 mod strip_sgr;
+#[path = "support/trash_entries.rs"]
+mod trash_entries;
 
 #[path = "trash/list.rs"]
 mod list;
+#[path = "trash/purge.rs"]
+mod purge;
 #[path = "trash/recovery.rs"]
 mod recovery;
 #[path = "trash/support.rs"]

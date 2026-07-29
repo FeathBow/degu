@@ -10,6 +10,7 @@ pub(crate) mod man;
 pub(crate) mod next_action;
 pub(crate) mod ops;
 pub(crate) mod prompt;
+pub(crate) mod quota;
 mod regions;
 pub(crate) mod scan;
 mod scope;

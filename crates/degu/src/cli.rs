@@ -28,6 +28,14 @@ const SCAN_EXAMPLES: &str = "Examples:
   degu scan --json | jq .
       Emit machine-readable data";
 
+const QUOTA_EXAMPLES: &str = "Examples:
+  degu quota
+      Inspect the current user's quota for HOME
+  degu quota /scratch/$USER
+      Inspect the filesystem containing one path
+  degu quota --json | jq .
+      Emit authoritative quota data as JSON";
+
 const MAN_EXAMPLES: &str = "Examples:
   degu man
       Print the top-level page
@@ -107,6 +115,9 @@ pub(crate) enum Command {
     /// Report known cache sources and, when project roots are available, build artifacts (read-only)
     #[command(after_help = SCAN_EXAMPLES)]
     Scan(ScanArgs),
+    /// Report the current user's authoritative filesystem quota for one path
+    #[command(after_help = QUOTA_EXAMPLES)]
+    Quota(QuotaArgs),
     /// Preview or execute a cleanup plan
     #[command(after_help = CLEAN_HELP)]
     Clean(CleanArgs),
@@ -169,6 +180,14 @@ pub(crate) struct ScanArgs {
     pub(crate) runtime: bool,
     /// Project roots whose build artifacts are added to the usual cache scan
     pub(crate) roots: Vec<PathBuf>,
+}
+
+#[derive(Args)]
+pub(crate) struct QuotaArgs {
+    #[command(flatten)]
+    pub(crate) output: JsonArgs,
+    /// Path whose containing filesystem should be queried; defaults to HOME
+    pub(crate) path: Option<PathBuf>,
 }
 
 #[derive(Args)]

@@ -2,6 +2,7 @@ use assert_cmd::Command;
 
 const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[
     &["scan"],
+    &["quota"],
     &["clean"],
     &["undo"],
     &["trash"],
@@ -99,6 +100,7 @@ fn man_renders_every_shipped_command_page() {
         assert!(!output.contains("\\-help(1)"));
     }
     assert!(generated_man(&["scan"]).contains("\\-\\-summary"));
+    assert!(generated_man(&["quota"]).contains("quota data as JSON"));
     let trash = generated_man(&["trash"]);
     assert!(trash.contains("degu\\-trash\\-list(1)"));
     assert!(trash.contains("degu\\-trash\\-purge(1)"));
@@ -165,6 +167,7 @@ fn assert_man_order() {
         &output,
         &[
             "degu\\-scan(1)",
+            "degu\\-quota(1)",
             "degu\\-clean(1)",
             "degu\\-undo(1)",
             "degu\\-trash(1)",
@@ -183,7 +186,7 @@ fn assert_completion_order(shell: &str) {
     assert!(!output.is_empty());
     if shell == "bash" {
         assert!(output.contains("complete -F") || output.contains("_degu"));
-        assert!(output.contains("scan clean undo trash ops adapters completions man help"));
+        assert!(output.contains("scan quota clean undo trash ops adapters completions man help"));
         assert!(!output.contains("degu,usage)"));
         return;
     }
@@ -192,6 +195,7 @@ fn assert_completion_order(shell: &str) {
             assert!(output.contains("#compdef") || output.contains("_degu"));
             &[
                 "(scan)",
+                "(quota)",
                 "(clean)",
                 "(undo)",
                 "(trash)",
@@ -205,6 +209,7 @@ fn assert_completion_order(shell: &str) {
             assert!(output.contains("complete"));
             &[
                 "-a \"scan\"",
+                "-a \"quota\"",
                 "-a \"clean\"",
                 "-a \"undo\"",
                 "-a \"trash\"",

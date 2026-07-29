@@ -52,14 +52,17 @@ impl Ecosystem for Huggingface {
             Relocation {
                 var: "HF_HUB_CACHE",
                 subdir: "huggingface/hub",
+                role: Some(ROLE_HUB),
             },
             Relocation {
                 var: "HF_DATASETS_CACHE",
                 subdir: "huggingface/datasets",
+                role: Some(ROLE_DATASETS),
             },
             Relocation {
                 var: "HF_XET_CACHE",
                 subdir: "huggingface/xet",
+                role: Some(ROLE_XET),
             },
         ]
     }

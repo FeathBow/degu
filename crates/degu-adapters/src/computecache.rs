@@ -24,6 +24,7 @@ impl Ecosystem for Computecache {
         vec![Relocation {
             var: "CUDA_CACHE_PATH",
             subdir: "nv-computecache",
+            role: None,
         }]
     }
 

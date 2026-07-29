@@ -26,6 +26,7 @@ impl Ecosystem for Apptainer {
         vec![Relocation {
             var: "APPTAINER_CACHEDIR",
             subdir: "apptainer",
+            role: None,
         }]
     }
 

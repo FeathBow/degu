@@ -25,6 +25,7 @@ impl Ecosystem for Vllm {
         vec![Relocation {
             var: "VLLM_CACHE_ROOT",
             subdir: "vllm",
+            role: None,
         }]
     }
 

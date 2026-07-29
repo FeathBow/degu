@@ -23,6 +23,7 @@ impl Ecosystem for Pip {
         vec![Relocation {
             var: "PIP_CACHE_DIR",
             subdir: "pip",
+            role: None,
         }]
     }
 

@@ -34,8 +34,9 @@ const HELP_CASES: &[HelpCase] = &[
     HelpCase::new(&["trash", "--help"], false, false),
     HelpCase::new(&["trash", "list", "--help"], true, false),
     HelpCase::new(&["trash", "purge", "--help"], true, false),
-    HelpCase::new(&["undo", "--help"], true, false),
     HelpCase::new(&["ops", "--help"], true, false),
+    HelpCase::new(&["relocate", "--help"], true, false),
+    HelpCase::new(&["undo", "--help"], true, false),
 ];
 
 const SUPPORTED_CASES: &[&[&str]] = &[
@@ -49,6 +50,7 @@ const SUPPORTED_CASES: &[&[&str]] = &[
         MAX_CONCURRENCY,
         "1",
     ],
+    &["quota", JSON, "--help"],
     &[
         "clean",
         JSON,
@@ -60,8 +62,9 @@ const SUPPORTED_CASES: &[&[&str]] = &[
     ],
     &["trash", "list", JSON, "--help"],
     &["trash", "purge", JSON, "--help"],
-    &["undo", JSON, "--help"],
     &["ops", JSON, "--help"],
+    &["relocate", "/tmp/degu-cache", JSON, "--help"],
+    &["undo", JSON, "--help"],
 ];
 
 const UNSUPPORTED_CASES: &[(&[&str], &str)] = &[
@@ -71,6 +74,8 @@ const UNSUPPORTED_CASES: &[(&[&str], &str)] = &[
     (&[JSON, "scan"], JSON),
     (&[BUDGET, "1s", "scan"], BUDGET),
     (&[MAX_CONCURRENCY, "1", "scan"], MAX_CONCURRENCY),
+    (&["quota", BUDGET, "1s"], BUDGET),
+    (&["quota", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
     (&["completions", "bash", JSON], JSON),
     (&["completions", "bash", BUDGET, "1s"], BUDGET),
     (
@@ -84,10 +89,15 @@ const UNSUPPORTED_CASES: &[(&[&str], &str)] = &[
     (&["trash", "list", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
     (&["trash", "purge", BUDGET, "1s"], BUDGET),
     (&["trash", "purge", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
-    (&["undo", BUDGET, "1s"], BUDGET),
-    (&["undo", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
     (&["ops", BUDGET, "1s"], BUDGET),
     (&["ops", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
+    (&["relocate", "/tmp/degu-cache", BUDGET, "1s"], BUDGET),
+    (
+        &["relocate", "/tmp/degu-cache", MAX_CONCURRENCY, "1"],
+        MAX_CONCURRENCY,
+    ),
+    (&["undo", BUDGET, "1s"], BUDGET),
+    (&["undo", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
 ];
 
 #[derive(Clone, Copy)]
@@ -130,6 +140,7 @@ const COMPLETION_CASES: &[CompletionCase] = &[
         false,
     ),
     CompletionCase::new("__fish_degu_using_subcommand ops", true, false),
+    CompletionCase::new("__fish_degu_using_subcommand relocate", true, false),
     CompletionCase::new("__fish_degu_using_subcommand undo", true, false),
 ];
 
@@ -200,24 +211,6 @@ fn human_review_options_use_task_oriented_names() {
 }
 
 #[test]
-fn max_concurrency_zero_is_rejected_for_scan_and_clean() {
-    for args in [
-        &["scan", MAX_CONCURRENCY, "0"][..],
-        &["clean", MAX_CONCURRENCY, "0", "--dry-run"],
-    ] {
-        let output = run(args);
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        assert_eq!(output.status.code(), Some(2), "zero was accepted: {args:?}");
-        assert!(stderr.contains(MAX_CONCURRENCY), "{stderr}");
-        assert!(stderr.contains('0'), "{stderr}");
-        assert!(
-            stderr.contains("nonzero") || stderr.contains("non-zero"),
-            "{stderr}"
-        );
-    }
-}
-
-#[test]
 fn supported_options_are_accepted_after_their_commands() {
     for args in SUPPORTED_CASES {
         let output = run(args);
@@ -237,6 +230,24 @@ fn unsupported_options_and_root_prefix_forms_are_rejected() {
         );
         assert!(stderr.contains("unexpected argument"), "{stderr}");
         assert!(stderr.contains(option), "{stderr}");
+    }
+}
+
+#[test]
+fn max_concurrency_zero_is_rejected_for_scan_and_clean() {
+    for args in [
+        &["scan", MAX_CONCURRENCY, "0"][..],
+        &["clean", MAX_CONCURRENCY, "0", "--dry-run"],
+    ] {
+        let output = run(args);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(2), "zero was accepted: {args:?}");
+        assert!(stderr.contains(MAX_CONCURRENCY), "{stderr}");
+        assert!(stderr.contains('0'), "{stderr}");
+        assert!(
+            stderr.contains("nonzero") || stderr.contains("non-zero"),
+            "{stderr}"
+        );
     }
 }
 

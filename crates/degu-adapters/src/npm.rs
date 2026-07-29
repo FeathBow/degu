@@ -34,6 +34,7 @@ impl Ecosystem for Npm {
         vec![Relocation {
             var: "npm_config_cache",
             subdir: "npm",
+            role: None,
         }]
     }
 

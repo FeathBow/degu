@@ -35,6 +35,7 @@ impl Ecosystem for Sccache {
         vec![Relocation {
             var: "SCCACHE_DIR",
             subdir: "sccache",
+            role: None,
         }]
     }
 

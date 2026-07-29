@@ -36,6 +36,10 @@ const QUOTA_EXAMPLES: &str = "Examples:
   degu quota --json | jq .
       Emit authoritative quota data as JSON";
 
+const RELOCATE_EXAMPLES: &str = "Examples:
+  degu relocate /scratch/$USER
+      Print shell exports for future cache writes";
+
 const MAN_EXAMPLES: &str = "Examples:
   degu man
       Print the top-level page
@@ -131,6 +135,9 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: TrashCommand,
     },
+    /// Print shell config directing future cache writes at TARGET; existing data stays in place, no shell profile is modified
+    #[command(after_help = RELOCATE_EXAMPLES)]
+    Relocate(RelocateArgs),
     /// Show recorded clean, restore, and purge operations
     Ops {
         #[command(flatten)]
@@ -228,6 +235,14 @@ pub(crate) struct CleanArgs {
     /// Keep only findings at or under this path; repeatable
     #[arg(long)]
     pub(crate) path: Vec<PathBuf>,
+}
+
+#[derive(Args)]
+pub(crate) struct RelocateArgs {
+    #[command(flatten)]
+    pub(crate) output: JsonArgs,
+    /// Absolute scratch/cache target
+    pub(crate) target: PathBuf,
 }
 
 #[derive(Subcommand)]

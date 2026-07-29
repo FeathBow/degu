@@ -34,6 +34,7 @@ impl Ecosystem for Torchext {
         vec![Relocation {
             var: "TORCH_EXTENSIONS_DIR",
             subdir: "torch_extensions",
+            role: None,
         }]
     }
 

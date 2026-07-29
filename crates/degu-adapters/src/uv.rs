@@ -34,6 +34,7 @@ impl Ecosystem for Uv {
         vec![Relocation {
             var: "UV_CACHE_DIR",
             subdir: "uv",
+            role: None,
         }]
     }
 

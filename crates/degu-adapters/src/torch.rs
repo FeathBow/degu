@@ -24,6 +24,7 @@ impl Ecosystem for Torch {
         vec![Relocation {
             var: "TORCH_HOME",
             subdir: "torch",
+            role: None,
         }]
     }
 

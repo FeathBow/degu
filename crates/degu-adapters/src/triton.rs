@@ -24,6 +24,7 @@ impl Ecosystem for Triton {
         vec![Relocation {
             var: "TRITON_CACHE_DIR",
             subdir: "triton",
+            role: None,
         }]
     }
 

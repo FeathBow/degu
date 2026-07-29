@@ -6,6 +6,7 @@ const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[
     &["clean"],
     &["undo"],
     &["trash"],
+    &["relocate"],
     &["ops"],
     &["adapters"],
     &["completions"],
@@ -171,6 +172,7 @@ fn assert_man_order() {
             "degu\\-clean(1)",
             "degu\\-undo(1)",
             "degu\\-trash(1)",
+            "degu\\-relocate(1)",
             "degu\\-ops(1)",
             "degu\\-adapters(1)",
             "degu\\-completions(1)",
@@ -186,7 +188,10 @@ fn assert_completion_order(shell: &str) {
     assert!(!output.is_empty());
     if shell == "bash" {
         assert!(output.contains("complete -F") || output.contains("_degu"));
-        assert!(output.contains("scan quota clean undo trash ops adapters completions man help"));
+        assert!(
+            output
+                .contains("scan quota clean undo trash relocate ops adapters completions man help")
+        );
         assert!(!output.contains("degu,usage)"));
         return;
     }
@@ -199,6 +204,7 @@ fn assert_completion_order(shell: &str) {
                 "(clean)",
                 "(undo)",
                 "(trash)",
+                "(relocate)",
                 "(ops)",
                 "(adapters)",
                 "(completions)",
@@ -213,6 +219,7 @@ fn assert_completion_order(shell: &str) {
                 "-a \"clean\"",
                 "-a \"undo\"",
                 "-a \"trash\"",
+                "-a \"relocate\"",
                 "-a \"ops\"",
                 "-a \"adapters\"",
                 "-a \"completions\"",

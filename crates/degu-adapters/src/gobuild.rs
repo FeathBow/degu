@@ -26,6 +26,7 @@ impl Ecosystem for Gobuild {
         vec![Relocation {
             var: "GOCACHE",
             subdir: "go-build",
+            role: None,
         }]
     }
 

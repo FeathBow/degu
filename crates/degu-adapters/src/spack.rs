@@ -31,6 +31,7 @@ impl Ecosystem for Spack {
         vec![Relocation {
             var: "SPACK_USER_CACHE_PATH",
             subdir: "spack-cache",
+            role: None,
         }]
     }
 

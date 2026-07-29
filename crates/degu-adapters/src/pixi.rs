@@ -46,6 +46,7 @@ impl Ecosystem for Pixi {
         vec![Relocation {
             var: "PIXI_CACHE_DIR",
             subdir: "pixi",
+            role: None,
         }]
     }
 

@@ -20,6 +20,7 @@ impl Ecosystem for Ccache {
         vec![Relocation {
             var: "CCACHE_DIR",
             subdir: "ccache",
+            role: None,
         }]
     }
 

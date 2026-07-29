@@ -23,6 +23,7 @@ impl Ecosystem for Helm {
         vec![Relocation {
             var: "HELM_CACHE_HOME",
             subdir: "helm",
+            role: None,
         }]
     }
 

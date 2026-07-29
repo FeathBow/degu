@@ -26,6 +26,7 @@ impl Ecosystem for Ollama {
         vec![Relocation {
             var: "OLLAMA_MODELS",
             subdir: "ollama",
+            role: None,
         }]
     }
 

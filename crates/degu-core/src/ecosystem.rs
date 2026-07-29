@@ -415,6 +415,9 @@ impl Root {
 pub struct Relocation {
     pub var: &'static str,
     pub subdir: &'static str,
+    /// Binds this relocation to the same-named root role, so an adapter with
+    /// several roots reports each current location only under its own export.
+    pub role: Option<&'static str>,
 }
 
 pub struct RelocationRefusal {

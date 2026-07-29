@@ -80,3 +80,27 @@ pub(super) fn assert_redirected_adapter(env_key: &str, ecosystem: &str) {
     assert!(arr[0]["bytes_apparent"].as_u64().unwrap() >= 4096);
     assert!(arr[0]["bytes_allocated"].as_u64().unwrap() >= 4096);
 }
+
+/// A TMPDIR fixture holding one stale (11 days old) file the tmp adapter
+/// reports when node-runtime diagnostics are enabled. Returns the canonical
+/// stale path because the tmp adapter canonicalizes its roots.
+pub(super) fn fake_stale_tmpdir() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let stale_file = tmp.path().join("old.tmp");
+    std::fs::write(&stale_file, [0u8; 4096]).unwrap();
+    let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(11 * 24 * 60 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(&stale_file)
+        .unwrap()
+        .set_modified(stale)
+        .unwrap();
+    (tmp, stale_file.canonicalize().unwrap())
+}
+
+pub(super) fn runtime_config_home(config: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("degu")).unwrap();
+    std::fs::write(dir.path().join("degu/config.toml"), config).unwrap();
+    dir
+}

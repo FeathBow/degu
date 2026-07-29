@@ -59,6 +59,7 @@ impl Ecosystem for Inductor {
         vec![Relocation {
             var: "TORCHINDUCTOR_CACHE_DIR",
             subdir: "torchinductor",
+            role: None,
         }]
     }
 

@@ -12,6 +12,7 @@ pub(crate) mod ops;
 pub(crate) mod prompt;
 pub(crate) mod quota;
 mod regions;
+pub(crate) mod relocate;
 pub(crate) mod scan;
 mod scope;
 pub(crate) mod trash;

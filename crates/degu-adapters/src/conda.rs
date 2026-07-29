@@ -200,6 +200,7 @@ impl Ecosystem for Conda {
         vec![Relocation {
             var: "CONDA_PKGS_DIRS",
             subdir: "conda-pkgs",
+            role: None,
         }]
     }
 

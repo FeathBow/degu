@@ -27,6 +27,7 @@ pub(crate) struct Request<'a> {
 }
 
 pub(crate) enum Workflow<'a> {
+    Quota,
     Scan(ScanState<'a>),
     CleanPreview(CleanPreviewState<'a>),
     CleanResult(CleanResultState),
@@ -191,6 +192,7 @@ fn allows_next(output: OutputMode) -> bool {
 
 fn action_for(workflow: Workflow<'_>) -> Option<Action> {
     match workflow {
+        Workflow::Quota => Some(Action::Scan(ScanScope::empty())),
         Workflow::Scan(state) => scan_action(state),
         Workflow::CleanPreview(state) => clean_preview_action(state),
         Workflow::CleanResult(state) => (state.trash_locations > 0).then_some(Action::TrashList),

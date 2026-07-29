@@ -21,6 +21,20 @@ fn line(request: Request<'_>) -> Option<NextLine> {
 }
 
 #[test]
+fn next_action_is_suppressed_for_json_and_pipes() {
+    for output in [OutputMode::Json, OutputMode::Human(Ui::test_pipe(80))] {
+        assert!(
+            line(Request {
+                output,
+                workflow: Workflow::Quota,
+                home: None,
+            })
+            .is_none()
+        );
+    }
+}
+
+#[test]
 fn scan_review_preview_preserves_scope_and_selects_one_path() {
     let scope = ScanScope {
         filters: Filters {

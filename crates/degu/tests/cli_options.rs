@@ -29,6 +29,7 @@ const HELP_CASES: &[HelpCase] = &[
     HelpCase::new(&["completions", "--help"], false, false),
     HelpCase::new(&["man", "--help"], false, false),
     HelpCase::new(&["scan", "--help"], true, true),
+    HelpCase::new(&["quota", "--help"], true, false),
     HelpCase::new(&["clean", "--help"], true, true),
     HelpCase::new(&["trash", "--help"], false, false),
     HelpCase::new(&["trash", "list", "--help"], true, false),
@@ -111,6 +112,7 @@ const COMPLETION_CASES: &[CompletionCase] = &[
     CompletionCase::new("__fish_degu_using_subcommand completions", false, false),
     CompletionCase::new("__fish_degu_using_subcommand man", false, false),
     CompletionCase::new("__fish_degu_using_subcommand scan", true, true),
+    CompletionCase::new("__fish_degu_using_subcommand quota", true, false),
     CompletionCase::new("__fish_degu_using_subcommand clean", true, true),
     CompletionCase::new(
         "__fish_degu_using_subcommand trash; and not __fish_seen_subcommand_from list purge help",

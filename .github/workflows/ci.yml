@@ -50,3 +50,40 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y expect
       - run: cargo test --workspace --locked
+
+  quota-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+      - name: Install quota support
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y quota "linux-modules-extra-$(uname -r)"
+          sudo modprobe quota_v2
+      - name: Create quota-enabled ext4 fixture
+        run: |
+          image="${RUNNER_TEMP}/degu-quota.img"
+          mount_point="${RUNNER_TEMP}/degu-quota"
+          echo "DEGU_QUOTA_TEST_PATH=${mount_point}" >> "${GITHUB_ENV}"
+          truncate --size 128M "${image}"
+          mkfs.ext4 -q -O quota -E quotatype=usrquota "${image}"
+          mkdir "${mount_point}"
+          sudo mount -o loop,usrquota "${image}" "${mount_point}"
+          sudo chown "$(id -u):$(id -g)" "${mount_point}"
+          sudo setquota -u "$(id -u)" 2048 4096 20 40 "${mount_point}"
+          dd if=/dev/zero of="${mount_point}/allocated.bin" bs=1024 count=128 status=none
+          mkdir "${mount_point}/one" "${mount_point}/two"
+      - name: Test authoritative ext4 quota
+        run: timeout 60s cargo test --locked -p degu --test quota quota_linux_ext4_fixture_reports_configured_limits -- --ignored --exact
+      - name: Unmount quota fixture
+        if: always()
+        run: |
+          if mountpoint -q "${DEGU_QUOTA_TEST_PATH}"; then
+            sudo umount "${DEGU_QUOTA_TEST_PATH}"
+          fi

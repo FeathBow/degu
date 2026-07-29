@@ -46,6 +46,25 @@ fn explicit_color_controls_parse_errors() {
 }
 
 #[test]
+fn explicit_color_controls_runtime_error_prefixes() {
+    let colored = degu()
+        .args(["--color", "always", "quota", "/degu-missing-color-target"])
+        .output()
+        .unwrap();
+    let plain = degu()
+        .env("CLICOLOR_FORCE", "1")
+        .args(["--color", "never", "quota", "/degu-missing-color-target"])
+        .output()
+        .unwrap();
+
+    assert!(!colored.status.success());
+    assert!(!plain.status.success());
+    assert!(has_ansi(&colored.stderr), "{:?}", colored.stderr);
+    assert!(!has_ansi(&plain.stderr), "{:?}", plain.stderr);
+    assert_eq!(strip_sgr(&colored.stderr), plain.stderr);
+}
+
+#[test]
 fn no_color_wins_over_force_in_automatic_mode() {
     let output = degu()
         .env("NO_COLOR", "1")

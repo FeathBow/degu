@@ -1,5 +1,7 @@
 use super::*;
+use crate::filters::Filters;
 use crate::runtime::Ui;
+use std::path::PathBuf;
 
 const TEST_HOME: &str = "/home/user";
 
@@ -16,6 +18,86 @@ fn line(request: Request<'_>) -> Option<NextLine> {
         Resolution::Ready { line, .. } => Some(line),
         Resolution::Absent | Resolution::UnsafeScope => None,
     }
+}
+
+#[test]
+fn scan_review_preview_preserves_scope_and_selects_one_path() {
+    let scope = ScanScope {
+        filters: Filters {
+            roots: vec![PathBuf::from("first root"), PathBuf::from("second/root")],
+            only: vec!["huggingface".to_string(), "pip".to_string()],
+            older_than: Some(30),
+            min_size: Some(4096),
+            top: Some(2),
+        },
+        runtime: true,
+    };
+
+    let line =
+        review_preview_from_scan(&scope, Path::new("review path"), Path::new(TEST_HOME)).unwrap();
+
+    assert_eq!(
+        line.as_str(),
+        "degu clean --details --dry-run --include-review --only huggingface --only pip --older-than 30 --min-size 4096 --top 2 --path 'review path' -- 'first root' second/root"
+    );
+}
+
+#[test]
+fn clean_review_preview_replaces_paths_and_quotes_the_target() {
+    let scope = CleanScope {
+        filters: Filters {
+            roots: vec![PathBuf::from("work tree")],
+            only: vec!["huggingface".to_string()],
+            older_than: Some(7),
+            min_size: Some(1024),
+            top: Some(3),
+        },
+        paths: vec![PathBuf::from("old one"), PathBuf::from("old two")],
+        include_review: false,
+    };
+
+    let line = review_preview_from_clean(
+        &scope,
+        Path::new("chosen cache/it's here"),
+        Path::new(TEST_HOME),
+    )
+    .unwrap();
+
+    assert_eq!(
+        line.as_str(),
+        "degu clean --details --dry-run --include-review --only huggingface --older-than 7 --min-size 1024 --top 3 --path 'chosen cache/it'\\''s here' -- 'work tree'"
+    );
+}
+
+#[test]
+fn clean_details_preview_preserves_the_current_scope() {
+    let scope = CleanScope {
+        filters: Filters {
+            roots: vec![PathBuf::from("work tree")],
+            only: vec!["huggingface".to_string()],
+            older_than: Some(7),
+            min_size: Some(1024),
+            top: Some(3),
+        },
+        paths: vec![PathBuf::from("chosen cache")],
+        include_review: true,
+    };
+
+    let line = details_preview_from_clean(&scope, Path::new(TEST_HOME)).unwrap();
+
+    assert_eq!(
+        line.as_str(),
+        "degu clean --details --dry-run --include-review --only huggingface --older-than 7 --min-size 1024 --top 3 --path 'chosen cache' -- 'work tree'"
+    );
+}
+
+#[test]
+fn review_preview_rejects_control_characters_in_the_target_path() {
+    let scope = ScanScope::empty();
+
+    assert!(
+        review_preview_from_scan(&scope, Path::new("bad\npath"), Path::new(TEST_HOME)).is_none()
+    );
 }
 
 #[test]

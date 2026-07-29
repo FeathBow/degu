@@ -1,5 +1,5 @@
 use crate::collection::ScanCompleteness;
-use crate::commands::scope::ScanScope;
+use crate::commands::scope::{CleanScope, ScanScope};
 use crate::runtime::Ui;
 use std::path::Path;
 
@@ -7,6 +7,8 @@ mod output;
 mod render;
 pub(crate) use output::print;
 
+pub(crate) const UNSAFE_PATH_REASON: &str =
+    "Preview unavailable: this path cannot be represented safely as a shell command.";
 pub(crate) const UNSAFE_SCOPE_REASON: &str =
     "unavailable: this scope cannot be represented safely as a shell command.";
 
@@ -32,6 +34,7 @@ pub(crate) struct ScanState<'a> {
     pub(crate) scope: &'a ScanScope,
     pub(crate) trash_entries: usize,
     pub(crate) completeness: ScanCompleteness,
+    pub(crate) cleanable: bool,
     pub(crate) needs_review: bool,
     pub(crate) has_effective_project_roots: bool,
 }
@@ -52,6 +55,8 @@ impl NextLine {
 enum Action {
     CompleteScan(ScanScope),
     ProjectScan(ScanScope),
+    CleanPreview(CleanScope),
+    CleanReview(CleanScope),
     TrashList,
     Ops,
 }
@@ -83,6 +88,42 @@ impl Guidance {
                 ..
             }
         )
+    }
+}
+
+pub(crate) fn review_preview_from_scan(
+    scope: &ScanScope,
+    path: &Path,
+    home: &Path,
+) -> Option<NextLine> {
+    let clean_scope = scope.clean_scope().for_review_path(path);
+    Action::CleanReview(clean_scope)
+        .render(Some(home))
+        .map(NextLine)
+}
+
+pub(crate) fn review_preview_from_clean(
+    scope: &CleanScope,
+    path: &Path,
+    home: &Path,
+) -> Option<NextLine> {
+    let clean_scope = scope.for_review_path(path);
+    Action::CleanReview(clean_scope)
+        .render(Some(home))
+        .map(NextLine)
+}
+
+pub(crate) fn details_preview_from_clean(scope: &CleanScope, home: &Path) -> Option<NextLine> {
+    Action::CleanReview(scope.clone())
+        .render(Some(home))
+        .map(NextLine)
+}
+
+pub(crate) fn review_followup(stdout_is_terminal: bool) -> &'static str {
+    if stdout_is_terminal {
+        "If the preview looks right, run its Next command; it keeps the same path and filters."
+    } else {
+        "Run this preview in a terminal to receive a Next command with the same path and filters."
     }
 }
 
@@ -141,6 +182,9 @@ fn scan_action(state: ScanState<'_>) -> Option<Action> {
     }
     if state.completeness.findings.is_incomplete() {
         return None;
+    }
+    if state.cleanable {
+        return Some(Action::CleanPreview(state.scope.clean_scope()));
     }
     if state.needs_review || state.has_effective_project_roots {
         return None;

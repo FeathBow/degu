@@ -102,6 +102,14 @@ impl FindingStats {
         Self::collect(findings.iter())
     }
 
+    pub(crate) fn for_mode(findings: &[Finding], mode: DispositionMode) -> Self {
+        Self::collect(
+            findings
+                .iter()
+                .filter(|finding| finding.disposition().mode == mode),
+        )
+    }
+
     pub(crate) fn collect<'a>(findings: impl Iterator<Item = &'a Finding>) -> Self {
         findings.fold(Self::default(), |mut stats, finding| {
             stats.add(finding);
@@ -123,6 +131,10 @@ impl FindingStats {
 
     pub(crate) fn inodes_label(self, scan_lower_bound: bool, glyphs: Glyphs) -> String {
         inode_total_label(scan_lower_bound || self.lower_bound, self.inodes, glyphs)
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.locations == 0
     }
 
     fn add(&mut self, finding: &Finding) {

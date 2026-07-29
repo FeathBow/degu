@@ -155,6 +155,24 @@ fn grouped_compact_view_keeps_metrics_and_reason_without_repeating_status() {
 }
 
 #[test]
+fn plan_views_do_not_repeat_cleanup_policy() {
+    let findings = huggingface_findings();
+    let compact_options =
+        FindingsTableOptions::new(terminal_ui(STANDARD_WIDTH), false, Path::new(HOME)).for_plan();
+    let details_options =
+        FindingsTableOptions::new(terminal_ui(NARROW_WIDTH), true, Path::new(HOME)).for_plan();
+
+    let compact = render(&findings[..1], compact_options);
+    let details = render(&findings[..1], details_options);
+
+    for output in [&compact, &details] {
+        assert!(!output.contains("cleanup"), "{output}");
+        assert!(!output.contains("Needs review"), "{output}");
+    }
+    assert_wrapped_content(&details, "rationalerealisticnarrow-terminalfixture");
+}
+
+#[test]
 fn details_view_fits_narrow_width_and_contains_absolute_paths() {
     let findings = huggingface_findings();
     let options = FindingsTableOptions::new(terminal_ui(NARROW_WIDTH), true, Path::new(HOME));

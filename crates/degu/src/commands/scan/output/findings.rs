@@ -1,4 +1,5 @@
 use super::{ScanReport, print_hidden_summary};
+use crate::commands::{next_action, regions};
 use crate::findings_table::{FindingsTableOptions, print as print_findings_table};
 use crate::output::stdoutln;
 use crate::presentation::semantic::Tone;
@@ -8,6 +9,7 @@ use crate::presentation::{
 use crate::runtime::{Headline, HeadlineLead, Ui};
 use anyhow::Result;
 use degu_core::finding::{DispositionMode, Finding};
+use std::path::Path;
 
 const SECTION_ORDER: [DispositionMode; 3] = [
     DispositionMode::Eligible,
@@ -247,6 +249,88 @@ fn fold_line(ui: Ui, folded: &FoldedTail<'_>, scan_lower_bound: bool) -> String 
     )
 }
 
+/// The end-of-output action for the largest "Needs review" finding; it
+/// prints with the other suggested actions so the findings groups stay
+/// uninterrupted.
+pub(super) fn print_review_command(report: &ScanReport) -> Result<()> {
+    if !report.completeness.findings.is_requested() {
+        return Ok(());
+    }
+    let Some(finding) = report
+        .findings
+        .iter()
+        .find(|finding| finding.disposition().mode == DispositionMode::OptIn)
+    else {
+        return Ok(());
+    };
+    if !preview_clean_would_be_accepted(report, finding.path()) {
+        tracing::debug!(
+            target: "degu",
+            path = %finding.path().display(),
+            "review preview withheld: a clean of this path would refuse on incompleteness provenance"
+        );
+        return Ok(());
+    }
+    let heading = semantic::paint(
+        report
+            .ui
+            .prose("Preview the largest Needs review location (no changes):"),
+        Tone::AccentHeading,
+        report.ui.colors.stdout,
+    );
+    match next_action::review_preview_from_scan(&report.scope, finding.path(), &report.ctx.home) {
+        Some(line) => {
+            stdoutln!(
+                "\n{}",
+                report.ui.command_block(
+                    &heading,
+                    &semantic::paint(line.as_str(), Tone::Accent, report.ui.colors.stdout),
+                )
+            )?;
+            stdoutln!(
+                "{}",
+                semantic::paint(
+                    report
+                        .ui
+                        .prose(next_action::review_followup(report.ui.stdout_is_terminal)),
+                    Tone::Secondary,
+                    report.ui.colors.stdout
+                )
+            )?;
+        }
+        None => {
+            stdoutln!("\n{heading}")?;
+            stdoutln!(
+                "{}",
+                semantic::paint(
+                    report.ui.indented_prose(2, next_action::UNSAFE_PATH_REASON),
+                    Tone::Review,
+                    report.ui.colors.stdout
+                )
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Emission mirror of the clean provenance gate: the preview runs
+/// `clean --path` on the finding, so it is suggested only when that command
+/// would pass the gate. A truncated findings scan is withheld unconditionally,
+/// as the gate refuses it and, more fundamentally, a budget-cut findings scan
+/// under-samples incompleteness — its regions cannot predict what a full
+/// re-scan reaches. Otherwise the findings scan must be complete, or every
+/// recorded measurement-cause region proven disjoint from the finding's
+/// path; the shared proof skips deliberate protected prunes exactly as the
+/// gate does, so a scan incomplete only behind protected boundaries still
+/// emits the preview.
+fn preview_clean_would_be_accepted(report: &ScanReport, path: &Path) -> bool {
+    if report.completeness.findings.is_truncated() {
+        return false;
+    }
+    !report.completeness.findings.is_incomplete()
+        || regions::prove_disjoint(&[path], &report.incomplete_regions).is_ok()
+}
+
 fn has_mode(findings: &[Finding], mode: DispositionMode) -> bool {
     findings
         .iter()
@@ -255,15 +339,47 @@ fn has_mode(findings: &[Finding], mode: DispositionMode) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ROW_BUDGET, fold_line, fold_tail, headline_label};
+    use super::{
+        FOLD_MIN_SAVINGS, ROW_BUDGET, any_tier_folds, fold_line, fold_tail, headline_label,
+        preview_clean_would_be_accepted,
+    };
+    use crate::collection::{ScanCompleteness, ScanStatus};
+    use crate::commands::scan::ScanReport;
+    use crate::commands::scope::ScanScope;
     use crate::runtime::Ui;
+    use degu_core::ecosystem::{DetectCtx, IncompleteRegions, RegionCause};
     use degu_core::finding::{
         Finding, FindingCandidate, FindingKind, FindingSource, Ownership, Recovery, RegenCost,
         finalize_findings,
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     const ROW_BYTES: u64 = 4096;
+
+    fn region(path: &str, cause: RegionCause) -> IncompleteRegions {
+        let mut regions = IncompleteRegions::default();
+        regions.record(&PathBuf::from(path), cause);
+        regions
+    }
+
+    fn report(findings: ScanStatus, runtime: ScanStatus) -> ScanReport {
+        ScanReport {
+            ctx: DetectCtx::from_process().unwrap(),
+            findings: Vec::new(),
+            runtime_findings: Vec::new(),
+            hidden: Vec::new(),
+            runtime_hidden: Vec::new(),
+            completeness: ScanCompleteness { findings, runtime },
+            incomplete_regions: IncompleteRegions::default(),
+            has_effective_project_roots: false,
+            json: false,
+            details: false,
+            summary: false,
+            scope: ScanScope::empty(),
+            ui: Ui::test_pipe(80),
+            elapsed: None,
+        }
+    }
 
     #[test]
     fn headline_drops_the_duration_before_it_would_wrap() {
@@ -280,6 +396,72 @@ mod tests {
         );
         assert_eq!(headline_label(base(), None, Ui::test_terminal(80)), base());
         assert_eq!(headline_label(base(), elapsed, Ui::test_pipe(80)), base());
+    }
+
+    #[test]
+    fn preview_gate_uses_findings_truncation_not_global_truncation() {
+        let complete = ScanStatus::requested_for_test(false, false);
+        let truncated = ScanStatus::requested_for_test(true, false);
+        let path = Path::new("/selected/location");
+        let mut findings_truncated = report(truncated, complete);
+        findings_truncated.incomplete_regions = region("/other/place", RegionCause::Measurement);
+
+        assert!(!preview_clean_would_be_accepted(&findings_truncated, path));
+        assert!(preview_clean_would_be_accepted(
+            &report(complete, truncated),
+            path,
+        ));
+    }
+
+    #[test]
+    fn complete_findings_emit_without_consulting_regions() {
+        let complete = ScanStatus::requested_for_test(false, false);
+        assert!(preview_clean_would_be_accepted(
+            &report(complete, complete),
+            Path::new("/selected/location")
+        ));
+    }
+
+    #[test]
+    fn incomplete_findings_without_recorded_regions_are_withheld() {
+        let complete = ScanStatus::requested_for_test(false, false);
+        let incomplete = ScanStatus::requested_for_test(false, true);
+        assert!(!preview_clean_would_be_accepted(
+            &report(incomplete, complete),
+            Path::new("/selected/location")
+        ));
+    }
+
+    /// Mirror of the relaxed gate: a scan incomplete only behind a deliberate
+    /// protected prune emits the preview even when the pruned region is
+    /// unresolvable and lexically overlaps the previewed path, because the
+    /// shared proof never consults protected regions.
+    #[test]
+    fn preview_emits_when_the_only_incompleteness_is_a_protected_prune() {
+        let complete = ScanStatus::requested_for_test(false, false);
+        let incomplete = ScanStatus::requested_for_test(false, true);
+        let mut protected_only = report(incomplete, complete);
+        protected_only.incomplete_regions =
+            region("/selected/location/pruned", RegionCause::Protected);
+
+        assert!(preview_clean_would_be_accepted(
+            &protected_only,
+            Path::new("/selected/location")
+        ));
+    }
+
+    #[test]
+    fn preview_withheld_when_a_measurement_region_cannot_be_proven_disjoint() {
+        let complete = ScanStatus::requested_for_test(false, false);
+        let incomplete = ScanStatus::requested_for_test(false, true);
+        let mut unresolvable = report(incomplete, complete);
+        unresolvable.incomplete_regions =
+            region("/selected/location/unreadable", RegionCause::Measurement);
+
+        assert!(!preview_clean_would_be_accepted(
+            &unresolvable,
+            Path::new("/selected/location")
+        ));
     }
 
     fn tier_finding(index: usize, bytes: u64, inodes: u64, skipped: u64) -> Finding {
@@ -417,5 +599,19 @@ mod tests {
             fold_line(Ui::test_pipe(40), &folded, false),
             "... and 2 more locations - 12.0 KiB - 2 inodes"
         );
+    }
+
+    #[test]
+    fn the_details_hint_gate_sees_folds_only_outside_details_mode() {
+        let complete = ScanStatus::requested_for_test(false, false);
+        let mut folding = report(complete, complete);
+        folding.findings = ranked_tier(ROW_BUDGET + FOLD_MIN_SAVINGS);
+
+        assert!(any_tier_folds(&folding));
+        folding.details = true;
+        assert!(!any_tier_folds(&folding));
+        folding.details = false;
+        folding.findings.truncate(ROW_BUDGET + FOLD_MIN_SAVINGS - 1);
+        assert!(!any_tier_folds(&folding));
     }
 }

@@ -106,6 +106,18 @@ impl CollectionSection {
 }
 
 impl ScanStatus {
+    #[cfg(test)]
+    pub(crate) fn requested_for_test(truncated: bool, incomplete: bool) -> Self {
+        Self {
+            requested: true,
+            observation: SectionObservation {
+                truncated,
+                incomplete,
+                unvisited_dirs: 0,
+            },
+        }
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         if !self.requested {
             "not_requested"

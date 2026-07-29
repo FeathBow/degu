@@ -5,6 +5,7 @@ const JSON: &str = "--json";
 const BUDGET: &str = "--budget";
 const MAX_CONCURRENCY: &str = "--max-concurrency";
 const LONG: &str = "--long";
+const OPT_IN: &str = "--opt-in";
 
 #[derive(Clone, Copy)]
 struct HelpCase {
@@ -28,6 +29,7 @@ const HELP_CASES: &[HelpCase] = &[
     HelpCase::new(&["completions", "--help"], false, false),
     HelpCase::new(&["man", "--help"], false, false),
     HelpCase::new(&["scan", "--help"], true, true),
+    HelpCase::new(&["clean", "--help"], true, true),
     HelpCase::new(&["trash", "--help"], false, false),
     HelpCase::new(&["trash", "list", "--help"], true, false),
     HelpCase::new(&["ops", "--help"], true, false),
@@ -44,12 +46,23 @@ const SUPPORTED_CASES: &[&[&str]] = &[
         MAX_CONCURRENCY,
         "1",
     ],
+    &[
+        "clean",
+        JSON,
+        BUDGET,
+        "1h",
+        MAX_CONCURRENCY,
+        "1",
+        "--dry-run",
+    ],
     &["trash", "list", JSON, "--help"],
     &["ops", JSON, "--help"],
 ];
 
 const UNSUPPORTED_CASES: &[(&[&str], &str)] = &[
     (&["scan", LONG], LONG),
+    (&["clean", LONG, "--dry-run"], LONG),
+    (&["clean", OPT_IN, "--dry-run"], OPT_IN),
     (&[JSON, "scan"], JSON),
     (&[BUDGET, "1s", "scan"], BUDGET),
     (&[MAX_CONCURRENCY, "1", "scan"], MAX_CONCURRENCY),
@@ -90,6 +103,7 @@ const COMPLETION_CASES: &[CompletionCase] = &[
     CompletionCase::new("__fish_degu_using_subcommand completions", false, false),
     CompletionCase::new("__fish_degu_using_subcommand man", false, false),
     CompletionCase::new("__fish_degu_using_subcommand scan", true, true),
+    CompletionCase::new("__fish_degu_using_subcommand clean", true, true),
     CompletionCase::new(
         "__fish_degu_using_subcommand trash; and __fish_seen_subcommand_from list",
         true,
@@ -156,6 +170,30 @@ fn human_review_options_use_task_oriented_names() {
     let scan = String::from_utf8(run(&["scan", "--help"]).stdout).unwrap();
     assert!(declares_option(&scan, "--details"), "{scan}");
     assert!(!declares_option(&scan, "--long"), "{scan}");
+
+    let clean = String::from_utf8(run(&["clean", "--help"]).stdout).unwrap();
+    assert!(declares_option(&clean, "--details"), "{clean}");
+    assert!(declares_option(&clean, "--include-review"), "{clean}");
+    assert!(!declares_option(&clean, "--long"), "{clean}");
+    assert!(!declares_option(&clean, "--opt-in"), "{clean}");
+}
+
+#[test]
+fn max_concurrency_zero_is_rejected_for_scan_and_clean() {
+    for args in [
+        &["scan", MAX_CONCURRENCY, "0"][..],
+        &["clean", MAX_CONCURRENCY, "0", "--dry-run"],
+    ] {
+        let output = run(args);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(2), "zero was accepted: {args:?}");
+        assert!(stderr.contains(MAX_CONCURRENCY), "{stderr}");
+        assert!(stderr.contains('0'), "{stderr}");
+        assert!(
+            stderr.contains("nonzero") || stderr.contains("non-zero"),
+            "{stderr}"
+        );
+    }
 }
 
 #[test]

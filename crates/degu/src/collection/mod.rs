@@ -36,10 +36,23 @@ impl CollectionRequest {
             indicator_color_enabled,
         }
     }
+
+    pub(crate) fn clean(
+        roots: Vec<PathBuf>,
+        sources: SourceSelection,
+        indicator_color_enabled: bool,
+    ) -> Self {
+        Self {
+            project_roots: ProjectRoots::CleanupAuthorized(roots),
+            sources,
+            indicator_color_enabled,
+        }
+    }
 }
 
 pub(crate) enum ProjectRoots {
     ReadOnlyDiscovery(Vec<PathBuf>),
+    CleanupAuthorized(Vec<PathBuf>),
 }
 
 pub(crate) struct Collection {

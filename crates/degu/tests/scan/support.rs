@@ -1,5 +1,7 @@
 pub(super) use crate::common::isolated_degu as degu;
+pub(super) use crate::human_bytes::{assert_human_bytes, parse_human_bytes};
 pub(super) use crate::next_command::assert_next_command;
+pub(super) use crate::sgr_assertion::assert_sgr_color;
 pub(super) use crate::strip_sgr::strip_sgr;
 
 pub(super) const CACHEDIR_TAG_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
@@ -21,6 +23,33 @@ pub(super) fn fake_cache(
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join(filename), vec![0u8; bytes]).unwrap();
     (home, cache)
+}
+
+pub(super) fn parse_summary_sizes(output: &str) -> (f64, f64, f64, f64) {
+    (
+        headline_size(output),
+        group_header_size(output, "Ready to clean - "),
+        group_header_size(output, "Needs review - "),
+        group_header_size(output, "Not managed - "),
+    )
+}
+
+fn headline_size(output: &str) -> f64 {
+    let value = output
+        .lines()
+        .find_map(|line| line.split_once(" detected across").map(|(value, _)| value))
+        .unwrap_or_else(|| panic!("missing detected-space headline in {output}"));
+    parse_human_bytes(value)
+}
+
+/// Group headers read "<label> - <count> locations - <size>" under a pipe; a
+/// group with no findings prints no header and counts as zero bytes.
+fn group_header_size(output: &str, label: &str) -> f64 {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(label))
+        .and_then(|rest| rest.rsplit(" - ").next())
+        .map_or(0.0, parse_human_bytes)
 }
 
 pub(super) fn assert_redirected_adapter(env_key: &str, ecosystem: &str) {

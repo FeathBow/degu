@@ -76,6 +76,7 @@ fn run(verbose: u8, command: Command, policy: ColorPolicy) -> Result<()> {
 fn dispatch(command: Command, ui: runtime::Ui) -> Result<()> {
     match command {
         Command::Scan(args) => commands::scan::run(args, ui),
+        Command::Clean(args) => commands::clean::run(args, ui),
         Command::Trash { command } => commands::trash::run(command, ui),
         Command::Ops { output } => commands::ops::run(output.json, ui),
         Command::Completions { .. } | Command::Man { .. } | Command::Adapters => {

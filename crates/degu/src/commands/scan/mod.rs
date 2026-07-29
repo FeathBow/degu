@@ -13,7 +13,7 @@ use crate::finding_filter::{FilteredFinding, PreparedFindingFilter};
 use crate::runtime::Ui;
 use crate::source_selection::SourceSelection;
 use anyhow::Result;
-use degu_core::ecosystem::DetectCtx;
+use degu_core::ecosystem::{DetectCtx, IncompleteRegions};
 use degu_core::finding::Finding;
 
 pub(super) struct ScanReport {
@@ -23,6 +23,10 @@ pub(super) struct ScanReport {
     pub(super) hidden: Vec<FilteredFinding>,
     pub(super) runtime_hidden: Vec<FilteredFinding>,
     pub(super) completeness: ScanCompleteness,
+    /// Findings-section incompleteness provenance: suggested commands that a
+    /// fresh clean would refuse are withheld with it. Never serialized (the
+    /// JSON schema is frozen).
+    pub(super) incomplete_regions: IncompleteRegions,
     pub(super) has_effective_project_roots: bool,
     pub(super) json: bool,
     pub(super) details: bool,
@@ -103,7 +107,7 @@ fn prepare(request: ScanRequest) -> Result<ScanReport> {
     ));
     let ctx = ctx.with_deadline(deadline_from_budget(request.run.budget)?);
     let collection = collect_profiled(&ctx, &config, collection_request)?;
-    let (findings, findings_status, _) = collection.findings.into_parts();
+    let (findings, findings_status, incomplete_regions) = collection.findings.into_parts();
     // Runtime findings are never cleanable, so no suggested command gates on
     // the runtime section's provenance; it is dropped here (and never
     // serialized).
@@ -122,6 +126,7 @@ fn prepare(request: ScanRequest) -> Result<ScanReport> {
         hidden: findings.excluded,
         runtime_hidden: runtime_findings.excluded,
         completeness,
+        incomplete_regions,
         has_effective_project_roots,
         json: request.run.json,
         details: request.details,

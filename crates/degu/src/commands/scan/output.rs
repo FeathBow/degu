@@ -43,12 +43,14 @@ pub(super) fn print(report: &ScanReport) -> Result<()> {
             scope: &report.scope,
             trash_entries,
             completeness: report.completeness,
+            cleanable: has_cleanable_findings(report),
             needs_review: has_needs_review_findings(report),
             has_effective_project_roots: report.has_effective_project_roots,
         }),
         home: Some(&report.ctx.home),
     });
     if !report.summary {
+        findings::print_review_command(report)?;
         print_details_hint(report)?;
     }
     print_project_scope_note(report, &guidance)?;
@@ -250,6 +252,13 @@ fn render_trash_summary(
 fn is_cleanable(finding: &Finding, report: &ScanReport) -> bool {
     finding.disposition().mode == DispositionMode::Eligible
         && (finding.ecosystem() != "artifacts" || report.scope.has_explicit_roots())
+}
+
+fn has_cleanable_findings(report: &ScanReport) -> bool {
+    report
+        .findings
+        .iter()
+        .any(|finding| is_cleanable(finding, report))
 }
 
 fn has_needs_review_findings(report: &ScanReport) -> bool {

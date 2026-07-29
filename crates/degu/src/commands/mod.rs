@@ -4,10 +4,12 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 pub(crate) mod adapters;
+pub(crate) mod clean;
 pub(crate) mod completions;
 pub(crate) mod man;
 pub(crate) mod next_action;
 pub(crate) mod ops;
+mod regions;
 pub(crate) mod scan;
 mod scope;
 pub(crate) mod trash;

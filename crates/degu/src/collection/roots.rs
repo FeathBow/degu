@@ -68,6 +68,7 @@ fn requested_roots(ctx: &DetectCtx, requested: ProjectRoots, config: &Config) ->
             roots.extend(cli_roots);
             roots
         }
+        ProjectRoots::CleanupAuthorized(cli_roots) => cli_roots,
     }
 }
 

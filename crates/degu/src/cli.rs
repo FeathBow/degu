@@ -30,6 +30,14 @@ const MAN_EXAMPLES: &str = "Examples:
   degu man trash purge
       Print a nested command page";
 
+const CLEAN_HELP: &str = "Examples:
+  degu clean --dry-run
+      Preview cleanup without changing files
+  degu clean --details --dry-run --include-review --path ~/.cache/huggingface/datasets
+      Preview one reviewed location
+  degu clean ~/code --dry-run
+      Include project build artifacts";
+
 const MAX_CONCURRENCY_HELP: &str = "Override the per-filesystem directory-read limit";
 
 #[cfg(target_os = "linux")]
@@ -87,6 +95,9 @@ pub(crate) enum Command {
     /// Report known cache sources and, when project roots are available, build artifacts (read-only)
     #[command(after_help = SCAN_EXAMPLES)]
     Scan(ScanArgs),
+    /// Preview or execute a cleanup plan
+    #[command(after_help = CLEAN_HELP)]
+    Clean(CleanArgs),
     /// Inspect or permanently purge degu trash
     Trash {
         #[command(subcommand)]
@@ -141,6 +152,40 @@ pub(crate) struct ScanArgs {
     pub(crate) runtime: bool,
     /// Project roots whose build artifacts are added to the usual cache scan
     pub(crate) roots: Vec<PathBuf>,
+}
+
+#[derive(Args)]
+pub(crate) struct CleanArgs {
+    #[command(flatten)]
+    pub(crate) output: JsonArgs,
+    #[command(flatten)]
+    pub(crate) limits: ScanLimitArgs,
+    /// Show each finding with its full absolute path, kind, rationale, and cleanup reason; ignored by --json
+    #[arg(short, long)]
+    pub(crate) details: bool,
+    /// Project roots explicitly authorized for this clean; configured scan roots are excluded
+    pub(crate) roots: Vec<PathBuf>,
+    /// Include Needs review findings in the clean plan after inspecting them
+    #[arg(long)]
+    pub(crate) include_review: bool,
+    /// Show the plan without staging findings or purging expired trash
+    #[arg(long, required = true)]
+    pub(crate) dry_run: bool,
+    /// Keep only findings untouched for at least this many days
+    #[arg(long, value_name = "DAYS")]
+    pub(crate) older_than: Option<u64>,
+    /// Restrict the clean plan to this source ID; repeatable
+    #[arg(long)]
+    pub(crate) only: Vec<String>,
+    /// Keep only findings using at least this much space on disk (bytes, K, M, G, T)
+    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+    pub(crate) min_size: Option<u64>,
+    /// Keep only the N largest findings
+    #[arg(long, value_name = "N")]
+    pub(crate) top: Option<usize>,
+    /// Keep only findings at or under this path; repeatable
+    #[arg(long)]
+    pub(crate) path: Vec<PathBuf>,
 }
 
 #[derive(Subcommand)]

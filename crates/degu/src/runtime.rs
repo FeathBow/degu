@@ -36,6 +36,21 @@ impl Ui {
         }
     }
 
+    /// [`Ui::prose`] under a fixed left margin: every wrapped line keeps the
+    /// indent and the text wraps to the remaining width. Piped output stays
+    /// a single indented line.
+    pub(crate) fn indented_prose(self, indent: u16, text: &str) -> String {
+        let margin = " ".repeat(usize::from(indent));
+        if !self.stdout_is_terminal {
+            return format!("{margin}{text}");
+        }
+        crate::presentation::wrap_words(text, self.width.saturating_sub(indent))
+            .lines()
+            .map(|line| format!("{margin}{line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Opens a new output block on a terminal: one blank line, then the
     /// rendered text. Piped output keeps the block flush against the
     /// previous line so the piped byte contract stays frozen.
@@ -81,6 +96,7 @@ impl Ui {
         let lead = match headline.lead {
             HeadlineLead::Separator => separator.clone(),
             HeadlineLead::Colon => ": ".to_owned(),
+            HeadlineLead::Phrase(phrase) => format!(" {phrase} "),
         };
         let joined = headline
             .stats
@@ -203,6 +219,7 @@ pub(crate) struct Headline {
 pub(crate) enum HeadlineLead {
     Separator,
     Colon,
+    Phrase(&'static str),
 }
 
 impl Headline {
@@ -231,6 +248,11 @@ impl Headline {
     /// datum at full intensity while the supporting stats stay dimmed.
     pub(crate) fn stat_toned(mut self, stat: impl Into<String>, tone: Tone) -> Self {
         self.stats.push((stat.into(), Some(tone)));
+        self
+    }
+
+    pub(crate) fn stat_tone(mut self, tone: Tone) -> Self {
+        self.stat_tone = tone;
         self
     }
 
@@ -483,6 +505,22 @@ mod tests {
     }
 
     #[test]
+    fn indented_prose_wraps_under_the_margin() {
+        for width in [24u16, 32, 80] {
+            let wrapped = Ui::test_terminal(width).indented_prose(4, NOTE);
+            assert!(
+                wrapped.lines().all(|line| line.starts_with("    ")
+                    && UnicodeWidthStr::width(line) <= usize::from(width)),
+                "width {width}: {wrapped}"
+            );
+        }
+        assert_eq!(
+            Ui::test_pipe(24).indented_prose(4, "one line"),
+            "    one line"
+        );
+    }
+
+    #[test]
     fn headline_layout_follows_the_terminal_width() {
         for (width, expected) in [
             (80u16, "Ready to clean · 36 locations · 111.6 MiB"),
@@ -643,6 +681,19 @@ mod tests {
         assert_eq!(
             Ui::test_terminal(32).headline(colon()),
             "Hidden by filters\n  1 location · 1.8 MiB"
+        );
+        let phrase = || {
+            Headline::new("Selected 3.2 MiB", HeadlineLead::Phrase("from"))
+                .stat("2 locations")
+                .stat("4 inodes")
+        };
+        assert_eq!(
+            Ui::test_terminal(80).headline(phrase()),
+            "Selected 3.2 MiB from 2 locations · 4 inodes"
+        );
+        assert_eq!(
+            Ui::test_terminal(24).headline(phrase()),
+            "Selected 3.2 MiB\n  2 locations · 4 inodes"
         );
     }
 

@@ -1,5 +1,5 @@
 use super::Action;
-use crate::commands::scope::ScanScope;
+use crate::commands::scope::{CleanScope, ScanScope};
 use crate::filters::Filters;
 use crate::presentation::shell::{command_path, quote_path, quote_word};
 use std::path::{Path, PathBuf};
@@ -8,10 +8,32 @@ impl Action {
     pub(super) fn render(self, home: Option<&Path>) -> Option<String> {
         match self {
             Self::CompleteScan(scope) | Self::ProjectScan(scope) => render_scan(&scope, home),
+            Self::CleanPreview(scope) => render_clean(
+                &scope,
+                home,
+                CleanRenderOptions {
+                    dry_run: true,
+                    details: false,
+                },
+            ),
+            Self::CleanReview(scope) => render_clean(
+                &scope,
+                home,
+                CleanRenderOptions {
+                    dry_run: true,
+                    details: true,
+                },
+            ),
             Self::TrashList => Some("degu trash list".to_string()),
             Self::Ops => Some("degu ops".to_string()),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct CleanRenderOptions {
+    dry_run: bool,
+    details: bool,
 }
 
 fn render_scan(scope: &ScanScope, home: Option<&Path>) -> Option<String> {
@@ -19,6 +41,30 @@ fn render_scan(scope: &ScanScope, home: Option<&Path>) -> Option<String> {
     push_filters(&mut words, &scope.filters)?;
     if scope.runtime {
         words.push("--runtime".to_string());
+    }
+    push_roots(&mut words, &scope.filters.roots, home)?;
+    Some(words.join(" "))
+}
+
+fn render_clean(
+    scope: &CleanScope,
+    home: Option<&Path>,
+    options: CleanRenderOptions,
+) -> Option<String> {
+    let mut words = vec!["degu".to_string(), "clean".to_string()];
+    if options.details {
+        words.push("--details".to_string());
+    }
+    if options.dry_run {
+        words.push("--dry-run".to_string());
+    }
+    if scope.include_review {
+        words.push("--include-review".to_string());
+    }
+    push_filters(&mut words, &scope.filters)?;
+    for path in &scope.paths {
+        words.push("--path".to_string());
+        words.push(render_path(path, home)?);
     }
     push_roots(&mut words, &scope.filters.roots, home)?;
     Some(words.join(" "))

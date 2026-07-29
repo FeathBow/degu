@@ -1,0 +1,116 @@
+name: Bug report
+description: Report incorrect or unexpected degu behavior
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Search existing issues first and remove credentials, usernames, hostnames, and private paths from all output.
+
+        Do not use this public form if degu moved or purged data outside the confirmed target set, bypassed a protected path, crossed a symlink or filesystem boundary unexpectedly, or exposed sensitive path information. Follow the [security policy](https://github.com/FeathBow/degu/security/policy) instead. If you are unsure whether the report is security-sensitive, report it privately.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the problem and its effect in a few sentences.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: command
+    attributes:
+      label: Affected command
+      options:
+        - scan
+        - quota
+        - clean
+        - trash or purge
+        - undo
+        - relocate
+        - ops
+        - installation or release
+        - other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: data-impact
+    attributes:
+      label: Data impact
+      description: Select the most severe effect you observed.
+      options:
+        - No filesystem mutation
+        - Incorrect finding, classification, or plan
+        - Files moved to staging trash
+        - Files purged or apparently lost
+        - Unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include the exact command, arguments, and the smallest relevant directory layout.
+      placeholder: |
+        1. Create or identify ...
+        2. Run `degu ...`
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect degu to report or do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What did degu report or do instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the degu version, installation method, OS/kernel, architecture, and filesystem type such as local, NFS, Lustre, or GPFS.
+      placeholder: |
+        degu version: output of `degu --version`
+        installation method:
+        OS/kernel/architecture: output of `uname -orsm`
+        filesystem type:
+        byte or inode quota involved: yes / no / unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: recovery
+    attributes:
+      label: Recovery details
+      description: If files were staged or purged, include the operation ID, current trash state, and relevant undo output.
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output or logs
+      description: Paste relevant output in a code block after removing credentials, usernames, hostnames, and private paths.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing open and closed issues.
+          required: true
+        - label: I removed credentials and personally identifiable or private infrastructure details.
+          required: true

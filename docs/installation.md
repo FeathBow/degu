@@ -47,8 +47,6 @@ Choose one of these release targets:
 
 The archive contains both binaries, shell completions, man pages, and project licenses. The steps below require an authenticated [GitHub CLI](https://cli.github.com/) and verify both the published SHA-256 checksum and the archive's build provenance before extracting or installing it.
 
-> No release has been published yet; the commands below describe the verification flow the first release will use, including the release workflow the attestation identity refers to.
-
 ```sh
 sh -eu <<'DEGU_INSTALL' &&
 version=vX.Y.Z

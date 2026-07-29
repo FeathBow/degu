@@ -1,0 +1,296 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: "1.97.1"
+
+concurrency:
+  cancel-in-progress: false
+  group: release-${{ github.ref }}
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      aggregate_artifact: ${{ steps.release.outputs.aggregate_artifact }}
+      tag: ${{ steps.release.outputs.tag }}
+      toolchain: ${{ steps.release.outputs.toolchain }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+      - id: release
+        name: prepare release metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '[.packages[] | select(.name == "degu") | .version] | if length == 1 then .[0] else error("expected one degu package") end')
+          tag="v${version}"
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            [ "${GITHUB_REF_TYPE}" = "tag" ] || { echo "Release pushes must reference a tag." >&2; exit 1; }
+            [ "${GITHUB_REF_NAME}" = "$tag" ] || { echo "Release tag ${GITHUB_REF_NAME} does not match workspace version $tag." >&2; exit 1; }
+            aggregate_artifact="release-assets-${tag}"
+            ./tools/verify-release-ref.sh "$tag" "$GITHUB_SHA"
+          else
+            aggregate_artifact="release-assets-${tag}-unverified"
+          fi
+          {
+            printf 'aggregate_artifact=%s\n' "$aggregate_artifact"
+            printf 'tag=%s\n' "$tag"
+            printf 'toolchain=%s\n' "$RUSTUP_TOOLCHAIN"
+          } >> "$GITHUB_OUTPUT"
+
+  checks:
+    needs: metadata
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      toolchain: ${{ needs.metadata.outputs.toolchain }}
+
+  build:
+    needs: [metadata, checks]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            install_musl: true
+            verify_static: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            install_musl: true
+            verify_static: true
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            install_musl: false
+            verify_static: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            install_musl: false
+            verify_static: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - if: matrix.install_musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --workspace --locked --target ${{ matrix.target }}
+      - if: matrix.verify_static
+        name: verify the artifact is statically linked
+        run: |
+          file target/${{ matrix.target }}/release/degu | grep -qE "statically linked|static-pie linked"
+      - name: package and verify the artifact
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          ./tools/package-release.sh "$RELEASE_TAG" "${{ matrix.target }}" dist
+          ./tools/verify-release-assets.sh "$RELEASE_TAG" dist "${{ matrix.target }}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          if-no-files-found: error
+          name: degu-${{ matrix.target }}
+          path: |
+            dist/degu-${{ needs.metadata.outputs.tag }}-${{ matrix.target }}.tar.gz
+            dist/degu-${{ needs.metadata.outputs.tag }}-${{ matrix.target }}.sha256
+
+  aggregate:
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          merge-multiple: true
+          path: dist
+      - name: verify the complete asset set
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+        run: ./tools/verify-release-assets.sh "$RELEASE_TAG" dist all
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          if-no-files-found: error
+          name: ${{ needs.metadata.outputs.aggregate_artifact }}
+          path: |
+            dist/degu-${{ needs.metadata.outputs.tag }}-x86_64-unknown-linux-musl.tar.gz
+            dist/degu-${{ needs.metadata.outputs.tag }}-x86_64-unknown-linux-musl.sha256
+            dist/degu-${{ needs.metadata.outputs.tag }}-aarch64-unknown-linux-musl.tar.gz
+            dist/degu-${{ needs.metadata.outputs.tag }}-aarch64-unknown-linux-musl.sha256
+            dist/degu-${{ needs.metadata.outputs.tag }}-x86_64-apple-darwin.tar.gz
+            dist/degu-${{ needs.metadata.outputs.tag }}-x86_64-apple-darwin.sha256
+            dist/degu-${{ needs.metadata.outputs.tag }}-aarch64-apple-darwin.tar.gz
+            dist/degu-${{ needs.metadata.outputs.tag }}-aarch64-apple-darwin.sha256
+
+  attest:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [metadata, aggregate]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets-${{ needs.metadata.outputs.tag }}
+          path: dist
+      - name: attest release archives
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: dist/*.tar.gz
+
+  publish:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [metadata, attest]
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+    permissions:
+      actions: read
+      attestations: read
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets-${{ needs.metadata.outputs.tag }}
+          path: dist
+      - name: verify release inputs
+        run: ./tools/verify-release-assets.sh "$RELEASE_TAG" dist all
+      - id: release_state
+        name: inspect the existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./tools/verify-release-ref.sh "$RELEASE_TAG" "$GITHUB_SHA"
+          pages="${RUNNER_TEMP}/release-pages.json"
+          state="${RUNNER_TEMP}/release-state.json"
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$pages"
+          ./tools/inspect-release-list.sh "$RELEASE_TAG" "$pages" > "$state"
+          jq -r '"state=\(.state)", "publish_needed=\(.publish_needed)", (.release_id // "" | "release_id=\(.)")' "$state" >> "$GITHUB_OUTPUT"
+      - if: steps.release_state.outputs.publish_needed == 'true'
+        name: verify provenance before mutation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./tools/verify-release-provenance.sh "$RELEASE_TAG" dist
+      - id: release
+        name: resolve the release id
+        env:
+          EXISTING_RELEASE_ID: ${{ steps.release_state.outputs.release_id }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_STATE: ${{ steps.release_state.outputs.state }}
+        run: |
+          release_id="$EXISTING_RELEASE_ID"
+          if [ -z "$release_id" ]; then
+            [ "$RELEASE_STATE" = "missing" ] || { echo "Only a missing release may be created." >&2; exit 1; }
+            payload="${RUNNER_TEMP}/create-release.json"
+            response="${RUNNER_TEMP}/created-release.json"
+            jq -n --arg tag "$RELEASE_TAG" '{tag_name: $tag, name: $tag, draft: true, prerelease: false, generate_release_notes: true}' > "$payload"
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" --input "$payload" > "$response"
+            jq -e --arg tag "$RELEASE_TAG" '(.id | type) == "number" and .id > 0 and (.id | floor) == .id and .tag_name == $tag and .draft == true and .prerelease == false and ((.body | type) == "string") and (.body | test("[^[:space:]]"))' "$response" > /dev/null
+            release_id=$(jq -er '.id' "$response")
+          fi
+          printf 'release_id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
+      - if: steps.release_state.outputs.publish_needed == 'true'
+        name: reconcile draft assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+        run: |
+          response="${RUNNER_TEMP}/release-before-upload.json"
+          inspection="${RUNNER_TEMP}/release-before-upload-state.json"
+          replacements="${RUNNER_TEMP}/replacement-assets"
+          uploads="${RUNNER_TEMP}/upload-assets"
+          guard="${RUNNER_TEMP}/release-mutation-guard.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID" > "$response"
+          ./tools/inspect-release-record.sh "$RELEASE_TAG" "$response" dist > "$inspection"
+          jq -e --argjson id "$RELEASE_ID" '.id == $id and .draft == true' "$inspection" > /dev/null
+          upload_url=$(jq -er '.upload_url | if type == "string" then sub("\\{[^}]*\\}$"; "") else error("release upload URL must be a string") end' "$response")
+          expected_upload_url="https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID/assets"
+          [ "$upload_url" = "$expected_upload_url" ] || { echo "Release upload URL does not match release $RELEASE_ID." >&2; exit 1; }
+          jq -r '.replace[] | [.id, .name] | @tsv' "$inspection" > "$replacements"
+          : > "$uploads"
+          while IFS="$(printf '\t')" read -r asset_id name; do
+            gh api "repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID" > "$guard"
+            jq -e --arg tag "$RELEASE_TAG" --arg name "$name" --argjson id "$RELEASE_ID" --argjson asset_id "$asset_id" '.id == $id and .tag_name == $tag and .draft == true and .prerelease == false and any(.assets[]; .id == $asset_id and .name == $name)' "$guard" > /dev/null
+            printf 'Replacing draft asset %s.\n' "$name"
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/$asset_id" --silent
+            printf '%s\n' "$name" >> "$uploads"
+          done < "$replacements"
+          jq -r '.missing[]' "$inspection" >> "$uploads"
+          while IFS= read -r name; do
+            gh api "repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID" > "$guard"
+            jq -e --arg tag "$RELEASE_TAG" --arg name "$name" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == true and .prerelease == false and all(.assets[]; .name != $name)' "$guard" > /dev/null
+            printf 'Uploading draft asset %s.\n' "$name"
+            gh api --method POST --header "Content-Type: application/octet-stream" --input "dist/$name" --field "name=$name" "$upload_url" --silent
+          done < "$uploads"
+      - if: steps.release_state.outputs.publish_needed == 'false'
+        name: verify the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+        run: |
+          response="${RUNNER_TEMP}/verified-release.json"
+          inspection="${RUNNER_TEMP}/verified-release-state.json"
+          remote="${RUNNER_TEMP}/published-assets"
+          downloads="${RUNNER_TEMP}/published-asset-list"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID" > "$response"
+          ./tools/inspect-release-record.sh "$RELEASE_TAG" "$response" dist > "$inspection"
+          jq -e --argjson id "$RELEASE_ID" '.id == $id and .draft == false and (.missing | length) == 0' "$inspection" > /dev/null
+          mkdir "$remote"
+          jq -r '.assets[] | [.id, .name] | @tsv' "$inspection" > "$downloads"
+          while IFS="$(printf '\t')" read -r asset_id name; do
+            gh api --header "Accept: application/octet-stream" "repos/${GITHUB_REPOSITORY}/releases/assets/$asset_id" > "$remote/$name"
+          done < "$downloads"
+          ./tools/verify-release-assets.sh "$RELEASE_TAG" "$remote" all
+          ./tools/verify-release-provenance.sh "$RELEASE_TAG" "$remote"
+          ./tools/inspect-release-record.sh "$RELEASE_TAG" "$response" "$remote" > "$inspection"
+          jq -e --argjson id "$RELEASE_ID" '.id == $id and .draft == false and (.missing | length) == 0 and (.replace | length) == 0' "$inspection" > /dev/null
+      - if: steps.release_state.outputs.publish_needed == 'true'
+        name: publish the verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+        run: |
+          ./tools/verify-release-ref.sh "$RELEASE_TAG" "$GITHUB_SHA"
+          release="${RUNNER_TEMP}/release-before-publish.json"
+          inspection="${RUNNER_TEMP}/release-before-publish-state.json"
+          publish_payload="${RUNNER_TEMP}/publish-release.json"
+          published="${RUNNER_TEMP}/published-release.json"
+          published_state="${RUNNER_TEMP}/published-release-state.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID" > "$release"
+          ./tools/inspect-release-record.sh "$RELEASE_TAG" "$release" dist > "$inspection"
+          jq -e --argjson id "$RELEASE_ID" '.id == $id and .draft == true and (.missing | length) == 0 and (.replace | length) == 0' "$inspection" > /dev/null
+          jq '.publish_payload' "$inspection" > "$publish_payload"
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID" --input "$publish_payload" > "$published"
+          ./tools/inspect-release-record.sh "$RELEASE_TAG" "$published" dist > "$published_state"
+          jq -e --argjson id "$RELEASE_ID" '.id == $id and .draft == false and (.missing | length) == 0 and (.replace | length) == 0' "$published_state" > /dev/null
+          jq -e --slurpfile before "$release" '.body == $before[0].body' "$published" > /dev/null

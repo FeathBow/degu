@@ -22,4 +22,4 @@ Include the affected commit, installation method, exact command, observed impact
 
 Do not send credentials, unredacted logs, real private file contents, or more identifying path information than the report requires. The maintainer may request more information and will coordinate validation, remediation, credit, and disclosure privately when a vulnerability is confirmed. No fixed response or remediation timeline is offered.
 
-Ordinary non-security bugs that remained within the confirmed target set may be reported in a public issue using redacted diagnostics.
+Ordinary bugs that remained within the confirmed target set and can be described with redacted diagnostics belong in the public bug form.

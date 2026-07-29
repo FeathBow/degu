@@ -6,7 +6,7 @@ Browse the [open issues](https://github.com/FeathBow/degu/issues) to find work. 
 
 ## Prerequisites
 
-You need Git, [rustup](https://rustup.rs/), and the current stable Rust toolchain. `rust-toolchain.toml` selects stable Rust with rustfmt and clippy, and ordinary CI follows that rolling channel. Release builds will pin an exact stable compiler version in the release workflow when it lands; maintainers will update that pin deliberately. Older stable releases are unsupported and untested; edition 2024 support alone is not a minimum-version guarantee.
+You need Git, [rustup](https://rustup.rs/), and the current stable Rust toolchain. `rust-toolchain.toml` selects stable Rust with rustfmt and clippy, and ordinary CI follows that rolling channel. Release builds use the exact stable version recorded in `.github/workflows/release.yml` so every release job selects the same compiler; maintainers update that pin deliberately. Older stable releases are unsupported and untested; edition 2024 support alone is not a minimum-version guarantee.
 
 The full test suite also requires `expect` because the interactive safety tests invoke it directly. Install it with your system package manager if it is not already available.
 
@@ -52,7 +52,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-CI repeats these checks and also validates documentation links; static musl build verification, dependency policy, and workflow security checks arrive with the release tooling. Pull requests must be green before merge.
+CI repeats these checks and also validates the static musl build, dependency policy, documentation links, and workflow security. Pull requests must be green before merge.
 
 ## Optional Git hooks
 

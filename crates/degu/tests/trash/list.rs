@@ -73,6 +73,27 @@ fn trash_list_rejects_fifo_registry_without_hanging() {
 }
 
 #[test]
+fn interactive_trash_list_presents_restore_and_purge_as_outcomes() {
+    let (home, state, _) = fake_pip_cache();
+    clean_pip_cache(&home, &state);
+    let out = run_interactive_list(home.path(), state.path());
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("Choose one outcome:"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Restore the latest clean:"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("degu undo"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Permanently delete all listed entries:"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("degu trash purge"), "stdout: {stdout}");
+}
+
+#[test]
 fn interrupted_purge_claim_is_visible_without_undo_guidance() {
     let home = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();

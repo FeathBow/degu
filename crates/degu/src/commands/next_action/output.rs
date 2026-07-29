@@ -9,7 +9,9 @@ pub(crate) fn print(request: Request<'_>) -> Result<()> {
 
 impl Guidance {
     pub(crate) fn print(self) -> Result<()> {
-        let OutputMode::Human(ui) = self.output;
+        let OutputMode::Human(ui) = self.output else {
+            return Ok(());
+        };
         let color_enabled = ui.colors.stdout;
         match self.resolution {
             Resolution::Ready { line, kind } => stdoutln!(

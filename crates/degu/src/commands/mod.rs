@@ -14,6 +14,7 @@ mod regions;
 pub(crate) mod scan;
 mod scope;
 pub(crate) mod trash;
+pub(crate) mod undo;
 
 pub(crate) struct CollectionRunOptions {
     pub(crate) json: bool,

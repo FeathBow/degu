@@ -102,6 +102,9 @@ fn render_outcomes(rows: &[TrashEntry], ui: Ui) -> String {
         .any(|row| !row.interrupted_purge && row.original.is_some());
     let has_interrupted = rows.iter().any(|row| row.interrupted_purge);
     let mut outcomes = Vec::new();
+    if can_restore {
+        outcomes.push("Restore the latest clean:\n  degu undo".to_owned());
+    }
     let delete_label = if has_interrupted {
         "Permanently delete all listed entries, including interrupted purge claims (confirm again):"
     } else {
@@ -285,4 +288,122 @@ fn original_label(row: &TrashEntry, home: &Path) -> String {
         original.push_str(" (interrupted purge; not undoable)");
     }
     original
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RenderOptions, render_human, render_outcomes};
+    use crate::lifecycle::TrashEntry;
+    use crate::presentation::WIDE_TABLE_MIN_WIDTH;
+    use crate::runtime::Ui;
+    use std::path::{Path, PathBuf};
+    use unicode_width::UnicodeWidthStr;
+
+    fn row() -> TrashEntry {
+        TrashEntry {
+            entry: PathBuf::from(
+                "/state/degu/trash/0001-a-very-long-entry-name-for-responsive-layout",
+            ),
+            original: Some(PathBuf::from(
+                "/home/user/a-very-long-original-cache-path-for-responsive-layout",
+            )),
+            bytes_allocated: 4096,
+            bytes_hardlinked: 0,
+            age_days: 3,
+            ambiguous: false,
+            interrupted_purge: false,
+            lower_bound: false,
+        }
+    }
+
+    fn options(width: u16) -> RenderOptions<'static> {
+        RenderOptions {
+            home: Path::new("/home/user"),
+            ui: Ui::test_terminal(width),
+        }
+    }
+
+    #[test]
+    fn trash_list_respects_narrow_and_wide_terminal_widths() {
+        for width in [32, 40, 80, 100, 120] {
+            let rendered = render_human(&[row()], options(width));
+            assert!(
+                rendered
+                    .lines()
+                    .all(|line| UnicodeWidthStr::width(line) <= usize::from(width)),
+                "width {width}:\n{rendered}"
+            );
+        }
+    }
+
+    fn incomplete_row() -> TrashEntry {
+        let mut row = row();
+        row.lower_bound = true;
+        row.bytes_hardlinked = 2048;
+        row
+    }
+
+    #[test]
+    fn trash_list_marks_a_lower_bound_size_and_hardlink_caveat() {
+        for width in [40, 120] {
+            let rendered = render_human(&[incomplete_row()], options(width));
+            assert!(rendered.contains('\u{2265}'), "width {width}:\n{rendered}");
+            assert!(
+                rendered.contains("hardlink-shared"),
+                "width {width}:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("Total trash: \u{2265}"),
+                "width {width}:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn trash_list_switches_to_a_wide_table_at_the_wide_threshold() {
+        let compact = render_human(&[row()], options(WIDE_TABLE_MIN_WIDTH - 1));
+        let wide = render_human(&[row()], options(WIDE_TABLE_MIN_WIDTH));
+
+        assert_eq!(compact.lines().next().map(str::trim), Some("entry"));
+        assert!(wide.lines().next().unwrap().contains("original"));
+    }
+
+    #[test]
+    fn trash_list_truncates_paths_instead_of_wrapping_them() {
+        for width in [40, WIDE_TABLE_MIN_WIDTH] {
+            let rendered = render_human(&[row()], options(width));
+            assert!(rendered.contains('…'), "width {width}:\n{rendered}");
+            assert!(
+                rendered.contains("responsive-layout"),
+                "width {width}:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn outcome_guidance_fits_a_32_column_terminal() {
+        let normal = row();
+        let mut interrupted = row();
+        interrupted.original = None;
+        interrupted.interrupted_purge = true;
+        let mixed = render_outcomes(&[row(), interrupted], Ui::test_terminal(32));
+        assert!(mixed.contains("degu undo"));
+        assert!(mixed.contains("including interrupted"));
+        let mut interrupted_only = row();
+        interrupted_only.original = None;
+        interrupted_only.interrupted_purge = true;
+        let interrupted_only = render_outcomes(&[interrupted_only], Ui::test_terminal(32));
+        assert!(!interrupted_only.contains("degu undo"));
+        for guidance in [
+            render_outcomes(&[normal], Ui::test_terminal(32)),
+            mixed,
+            interrupted_only,
+        ] {
+            assert!(
+                guidance
+                    .lines()
+                    .all(|line| UnicodeWidthStr::width(line) <= 32)
+            );
+        }
+    }
 }

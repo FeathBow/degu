@@ -103,6 +103,29 @@ pub(super) fn purge_record(request: PurgeRecord<'_>) -> OpRecord {
     })
 }
 
+pub(super) struct RestoreRecord<'a> {
+    pub(super) target: &'a OpRecord,
+    pub(super) trash_entry: &'a Path,
+    pub(super) reclamation_id: Option<String>,
+    pub(super) expected_identity: Option<ObjectIdentity>,
+    pub(super) outcome: OpOutcome,
+}
+
+pub(super) fn restore_record(request: RestoreRecord<'_>) -> OpRecord {
+    stamped_record(RecordFields {
+        command: "undo".to_string(),
+        action: OpAction::Restore,
+        path: request.target.path.clone(),
+        bytes_allocated: request.target.bytes_allocated,
+        inodes: request.target.inodes,
+        trash_entry: Some(request.trash_entry.to_path_buf()),
+        reclamation_id: request.reclamation_id,
+        expected_identity: request.expected_identity,
+        destination_parent: None,
+        outcome: request.outcome,
+    })
+}
+
 struct RecordFields {
     command: String,
     action: OpAction,

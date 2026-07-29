@@ -1,6 +1,8 @@
 mod non_utf8_paths;
 mod support;
 
+mod ai_tool;
+mod ai_tool_authority;
 mod checkpoints;
 mod cli_output;
 mod compile_caches;

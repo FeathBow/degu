@@ -3,6 +3,7 @@ use assert_cmd::Command;
 const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[
     &["scan"],
     &["clean"],
+    &["undo"],
     &["trash"],
     &["ops"],
     &["adapters"],
@@ -165,6 +166,7 @@ fn assert_man_order() {
         &[
             "degu\\-scan(1)",
             "degu\\-clean(1)",
+            "degu\\-undo(1)",
             "degu\\-trash(1)",
             "degu\\-ops(1)",
             "degu\\-adapters(1)",
@@ -181,7 +183,7 @@ fn assert_completion_order(shell: &str) {
     assert!(!output.is_empty());
     if shell == "bash" {
         assert!(output.contains("complete -F") || output.contains("_degu"));
-        assert!(output.contains("scan clean trash ops adapters completions man help"));
+        assert!(output.contains("scan clean undo trash ops adapters completions man help"));
         assert!(!output.contains("degu,usage)"));
         return;
     }
@@ -191,6 +193,7 @@ fn assert_completion_order(shell: &str) {
             &[
                 "(scan)",
                 "(clean)",
+                "(undo)",
                 "(trash)",
                 "(ops)",
                 "(adapters)",
@@ -203,6 +206,7 @@ fn assert_completion_order(shell: &str) {
             &[
                 "-a \"scan\"",
                 "-a \"clean\"",
+                "-a \"undo\"",
                 "-a \"trash\"",
                 "-a \"ops\"",
                 "-a \"adapters\"",

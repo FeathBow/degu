@@ -18,4 +18,5 @@ fn unverified_destination_reports_its_location_and_manual_recovery() {
     assert!(!item.reported_as_cleaned(false));
     assert!(!item.reported_as_cleaned(true));
     assert_eq!(item.trash_entry(), Some(entry.as_path()));
+    assert!(item.requires_manual_recovery());
 }

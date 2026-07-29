@@ -150,6 +150,24 @@ fn next_action_keeps_destructive_trash_decisions_manual() {
 }
 
 #[test]
+fn next_action_undo_routes_failure_to_trash_and_success_to_scan() {
+    let failed = line(terminal(Workflow::Undo(UndoState {
+        restored: 1,
+        failed: 1,
+        ambiguous: 0,
+    })))
+    .unwrap();
+    assert_eq!(failed.as_str(), "degu trash list");
+    let restored = line(terminal(Workflow::Undo(UndoState {
+        restored: 1,
+        failed: 0,
+        ambiguous: 0,
+    })))
+    .unwrap();
+    assert_eq!(restored.as_str(), "degu scan");
+}
+
+#[test]
 fn next_action_marks_control_characters_as_an_unsafe_scope() {
     let scope = CleanScope {
         filters: Filters {

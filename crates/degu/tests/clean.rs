@@ -1,5 +1,7 @@
 #[path = "support/mod.rs"]
 mod common;
+#[path = "support/elapsed.rs"]
+mod elapsed;
 #[path = "support/human_bytes.rs"]
 mod human_bytes;
 #[path = "support/next_command.rs"]
@@ -22,6 +24,9 @@ mod trash_entries;
 mod ai_tool_revalidation;
 #[path = "clean/completeness.rs"]
 mod completeness;
+#[cfg(target_os = "linux")]
+#[path = "clean/exdev.rs"]
+mod exdev;
 #[path = "clean/execution.rs"]
 mod execution;
 #[path = "clean/expiry.rs"]
@@ -30,6 +35,8 @@ mod expiry;
 mod expiry_reconciliation;
 #[path = "clean/filtering.rs"]
 mod filtering;
+#[path = "clean/lifecycle.rs"]
+mod lifecycle;
 #[path = "clean/native_paths.rs"]
 mod native_paths;
 #[path = "clean/output.rs"]

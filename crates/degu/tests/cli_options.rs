@@ -33,6 +33,7 @@ const HELP_CASES: &[HelpCase] = &[
     HelpCase::new(&["trash", "--help"], false, false),
     HelpCase::new(&["trash", "list", "--help"], true, false),
     HelpCase::new(&["trash", "purge", "--help"], true, false),
+    HelpCase::new(&["undo", "--help"], true, false),
     HelpCase::new(&["ops", "--help"], true, false),
 ];
 
@@ -58,6 +59,7 @@ const SUPPORTED_CASES: &[&[&str]] = &[
     ],
     &["trash", "list", JSON, "--help"],
     &["trash", "purge", JSON, "--help"],
+    &["undo", JSON, "--help"],
     &["ops", JSON, "--help"],
 ];
 
@@ -81,6 +83,8 @@ const UNSUPPORTED_CASES: &[(&[&str], &str)] = &[
     (&["trash", "list", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
     (&["trash", "purge", BUDGET, "1s"], BUDGET),
     (&["trash", "purge", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
+    (&["undo", BUDGET, "1s"], BUDGET),
+    (&["undo", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
     (&["ops", BUDGET, "1s"], BUDGET),
     (&["ops", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
 ];
@@ -124,6 +128,7 @@ const COMPLETION_CASES: &[CompletionCase] = &[
         false,
     ),
     CompletionCase::new("__fish_degu_using_subcommand ops", true, false),
+    CompletionCase::new("__fish_degu_using_subcommand undo", true, false),
 ];
 
 fn run(args: &[&str]) -> Output {

@@ -25,6 +25,7 @@ pub(super) struct CleanSettings {
     pub(super) details: bool,
     pub(super) yes: bool,
     pub(super) dry_run: bool,
+    pub(super) purge: bool,
     pub(super) ui: Ui,
 }
 
@@ -116,6 +117,7 @@ impl CleanRequest {
                 details: args.details,
                 yes: args.yes,
                 dry_run: args.dry_run,
+                purge: args.purge,
                 ui,
             },
             run,

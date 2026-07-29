@@ -61,6 +61,48 @@ fn clean_yes_json_keeps_redirected_pip_cache_report_only() {
 }
 
 #[test]
+fn clean_purge_yes_json_releases_pip_cache_now_and_writes_purge_oplog() {
+    let home = tempfile::tempdir().unwrap();
+    let (cache, state) = fake_pip_cache(&home, ".cache/pip");
+    let out = run_clean(&home, &state, &["clean", "--purge", "--yes", "--json"]);
+    assert!(out.status.success());
+    assert!(!cache.exists());
+    assert!(visible_trash_entries(&state.path().join("degu/trash")).is_empty());
+    let records = oplog_records(&state);
+    assert_purge_sequence(&records);
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["executed"].as_array().unwrap().len(), 1);
+    assert_eq!(report["executed"][0]["purged"], true);
+    assert_eq!(report["executed"][0]["state"], "purged");
+}
+
+fn assert_purge_sequence(records: &[serde_json::Value]) {
+    let sequence = records
+        .iter()
+        .map(|record| {
+            (
+                record["action"].as_str().unwrap(),
+                record["outcome"].as_str().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sequence,
+        [
+            ("trash", "pending"),
+            ("trash", "ok"),
+            ("purge", "pending"),
+            ("purge", "ok")
+        ]
+    );
+    assert_eq!(records[0]["trash_entry"], records[1]["trash_entry"]);
+    assert_eq!(records[2]["path"], records[1]["trash_entry"]);
+    assert_eq!(records[3]["path"], records[1]["trash_entry"]);
+    let id = records[0]["reclamation_id"].as_str().unwrap();
+    assert!(records.iter().all(|record| record["reclamation_id"] == id));
+}
+
+#[test]
 fn clean_dry_run_json_reports_plan_without_mutating_or_logging() {
     let home = tempfile::tempdir().unwrap();
     let (cache, state) = fake_pip_cache(&home, ".cache/pip");

@@ -14,6 +14,9 @@ const TOP_LEVEL_EXAMPLES: &str = "Workflow:
   degu clean --dry-run
   degu clean
 
+After staging, choose one outcome:
+  degu trash purge
+
 Run 'degu <command> --help' for command details.";
 
 const SCAN_EXAMPLES: &str = "Examples:
@@ -32,7 +35,13 @@ const MAN_EXAMPLES: &str = "Examples:
   degu man trash purge
       Print a nested command page";
 
-const CLEAN_HELP: &str = "Examples:
+const CLEAN_HELP: &str = "Safety:
+  Clean also selects trash entries at least seven days old for permanent
+  deletion. Dry runs preview both the clean plan and expired trash without
+  changing either. A mutating run displays and authorizes the fixed expiry
+  plan before deleting it.
+
+Examples:
   degu clean --dry-run
       Preview cleanup without changing files
   degu clean --details --dry-run --include-review --path ~/.cache/huggingface/datasets
@@ -176,6 +185,9 @@ pub(crate) struct CleanArgs {
     /// Show the plan without staging findings or purging expired trash
     #[arg(long)]
     pub(crate) dry_run: bool,
+    /// Stage then immediately purge clean items; use with --yes in non-interactive runs
+    #[arg(long)]
+    pub(crate) purge: bool,
     /// Keep only findings untouched for at least this many days
     #[arg(long, value_name = "DAYS")]
     pub(crate) older_than: Option<u64>,
@@ -199,5 +211,13 @@ pub(crate) enum TrashCommand {
     List {
         #[command(flatten)]
         output: JsonArgs,
+    },
+    /// Permanently remove all trash entries
+    Purge {
+        #[command(flatten)]
+        output: JsonArgs,
+        /// Proceed without prompting
+        #[arg(long)]
+        yes: bool,
     },
 }

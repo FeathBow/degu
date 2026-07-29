@@ -17,5 +17,7 @@ mod strip_sgr;
 
 #[path = "trash/list.rs"]
 mod list;
+#[path = "trash/recovery.rs"]
+mod recovery;
 #[path = "trash/support.rs"]
 mod support;

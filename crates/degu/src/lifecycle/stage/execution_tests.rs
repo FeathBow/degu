@@ -15,6 +15,7 @@ fn unverified_destination_reports_its_location_and_manual_recovery() {
     assert!(item.failed());
     assert_eq!(item.state_label(), "unverified_destination");
     assert!(item.has_trash_location());
-    assert!(!item.reported_as_cleaned());
+    assert!(!item.reported_as_cleaned(false));
+    assert!(!item.reported_as_cleaned(true));
     assert_eq!(item.trash_entry(), Some(entry.as_path()));
 }

@@ -43,6 +43,17 @@ fn render(path: &Path, failure: CleanExecutionFailure<'_>) -> (Severity, String)
                 escape_terminal_text(reason)
             ),
         ),
+        CleanExecutionFailure::PurgeFailed { reason } => (
+            Severity::Error,
+            format!("failed to purge {path}: {}", escape_terminal_text(reason)),
+        ),
+        CleanExecutionFailure::PurgedLog { reason } => (
+            Severity::Warning,
+            format!(
+                "purged {path}, but the operation log write failed after deletion; deletion is complete and cannot be undone: {}",
+                escape_terminal_text(reason)
+            ),
+        ),
     }
 }
 
@@ -77,5 +88,11 @@ mod tests {
         assert!(matches!(severity, Severity::Error));
         assert!(unverified.contains("automatic rollback was not attempted"));
         assert!(unverified.contains("recover it manually only after confirming its identity"));
+        let (severity, purged) = render(
+            Path::new("/cache"),
+            CleanExecutionFailure::PurgedLog { reason: "log full" },
+        );
+        assert!(matches!(severity, Severity::Warning));
+        assert!(purged.contains("deletion is complete and cannot be undone"));
     }
 }

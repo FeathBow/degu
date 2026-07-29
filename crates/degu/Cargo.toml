@@ -33,6 +33,7 @@ serde_json.workspace = true
 jiff.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+getrandom.workspace = true
 rustix.workspace = true
 libc.workspace = true
 unicode-width.workspace = true

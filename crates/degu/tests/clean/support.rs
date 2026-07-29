@@ -1,9 +1,20 @@
 use crate::pty::{PtyRun, run as run_pty};
+use std::ffi::OsStr;
+use std::os::unix::fs::PermissionsExt;
+
+const EXPIRED_AGE_DAYS: u64 = 8;
+const SECONDS_PER_DAY: u64 = 86_400;
+const TRASH_TTL_DAYS: u64 = 7;
+const EXPIRED_AGE: std::time::Duration =
+    std::time::Duration::from_secs(EXPIRED_AGE_DAYS * SECONDS_PER_DAY);
 
 pub(super) use crate::common::isolated_config_home as test_config_home;
 pub(super) use crate::common::isolated_degu as degu;
 pub(super) use crate::human_bytes::assert_human_bytes;
+pub(super) use crate::next_command::assert_next_command;
 pub(super) use crate::oplog_records::oplog_records;
+pub(super) use crate::sgr_assertion::assert_sgr_color;
+pub(super) use crate::strip_sgr::strip_sgr;
 pub(super) use crate::trash_entries::visible as visible_trash_entries;
 
 pub(super) fn fake_pip_cache(
@@ -23,6 +34,47 @@ pub(super) fn fake_pip_cache(
     (cache, state)
 }
 
+pub(super) fn seed_expired_trash_entry(state: &tempfile::TempDir) -> std::path::PathBuf {
+    seed_expired_trash_entry_named(state, "0001-old-cache")
+}
+
+pub(super) fn seed_expired_trash_entry_named(
+    state: &tempfile::TempDir,
+    name: &str,
+) -> std::path::PathBuf {
+    let trash_dir = private_trash_root(state);
+    let entry = trash_dir.join(name);
+    std::fs::create_dir_all(&entry).unwrap();
+    std::fs::write(entry.join("payload.bin"), [0u8; 1024]).unwrap();
+    let staged_at = jiff::Timestamp::try_from(expired_time()).unwrap();
+    let identity = degu_core::oplog::ObjectIdentity::capture(&entry).unwrap();
+    let record = serde_json::json!({
+        "ts": staged_at.to_string(),
+        "tool_version": "0.0.0",
+        "command": "clean",
+        "action": "trash",
+        "path": "/nonexistent/original/old-cache",
+        "bytes_allocated": 1024,
+        "inodes": 2,
+        "trash_entry": entry.to_string_lossy(),
+        "expected_identity": identity,
+        "outcome": "ok",
+    });
+    std::fs::write(state.path().join("degu/ops.jsonl"), format!("{record}\n")).unwrap();
+    entry
+}
+
+pub(super) fn private_trash_root(state: &tempfile::TempDir) -> std::path::PathBuf {
+    let trash = crate::private_degu_state::create(state).join("trash");
+    std::fs::create_dir_all(&trash).unwrap();
+    std::fs::set_permissions(&trash, std::fs::Permissions::from_mode(0o700)).unwrap();
+    trash
+}
+
+pub(super) fn expired_time() -> std::time::SystemTime {
+    std::time::SystemTime::now() - EXPIRED_AGE
+}
+
 pub(super) fn fake_conda_env(home: &tempfile::TempDir) -> std::path::PathBuf {
     let env = home.path().join("miniconda3/envs/myenv");
     std::fs::create_dir_all(env.join("conda-meta")).unwrap();
@@ -32,6 +84,55 @@ pub(super) fn fake_conda_env(home: &tempfile::TempDir) -> std::path::PathBuf {
 
 pub(super) fn canonical_path_string(path: &std::path::Path) -> String {
     path.canonicalize().unwrap().to_string_lossy().into_owned()
+}
+
+pub(super) fn write_oplog(state: &tempfile::TempDir, records: &[serde_json::Value]) {
+    std::fs::create_dir_all(state.path().join("degu")).unwrap();
+    let jsonl = records
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n");
+    std::fs::write(state.path().join("degu/ops.jsonl"), format!("{jsonl}\n")).unwrap();
+}
+
+pub(super) fn assert_mechanism_line(stdout: &str, state: &tempfile::TempDir, purge: bool) {
+    let trash_dir = state.path().join("degu/trash");
+    assert!(stdout.contains("Plan: move 1 location ("));
+    assert!(stdout.contains(&format!(" to {} ", trash_dir.display())));
+    if purge {
+        assert!(stdout.contains("staged then purged immediately; not restorable."));
+        assert!(!stdout.contains("restorable with degu undo"));
+    } else {
+        assert!(stdout.contains("restorable with degu undo"));
+        assert!(stdout.contains(&format!(
+            "a later clean may purge it after {} days.",
+            TRASH_TTL_DAYS
+        )));
+    }
+}
+
+pub(super) fn run_interactive_clean_purge(
+    home: &std::path::Path,
+    state: &std::path::Path,
+    permanent_response: &str,
+) -> std::process::Output {
+    let body = r#"
+spawn $env(DEGU_BIN) clean --purge
+expect -exact {Proceed? [y/N] }
+send "y\r"
+expect -exact {Type 'purge' to permanently delete this plan: }
+send "$env(PERMANENT_RESPONSE)\r"
+"#;
+    let extra_env = [("PERMANENT_RESPONSE", OsStr::new(permanent_response))];
+    run_pty(PtyRun {
+        body,
+        home,
+        config_home: test_config_home(),
+        state_home: state,
+        extra_env: &extra_env,
+    })
 }
 
 pub(super) fn run_clean(

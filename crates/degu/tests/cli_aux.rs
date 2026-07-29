@@ -9,7 +9,7 @@ const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[
     &["completions"],
     &["man"],
 ];
-const NESTED_MAN_COMMANDS: &[&[&str]] = &[&["trash", "list"]];
+const NESTED_MAN_COMMANDS: &[&[&str]] = &[&["trash", "list"], &["trash", "purge"]];
 
 fn degu() -> Command {
     let mut command = Command::cargo_bin("degu").unwrap();
@@ -100,6 +100,8 @@ fn man_renders_every_shipped_command_page() {
     assert!(generated_man(&["scan"]).contains("\\-\\-summary"));
     let trash = generated_man(&["trash"]);
     assert!(trash.contains("degu\\-trash\\-list(1)"));
+    assert!(trash.contains("degu\\-trash\\-purge(1)"));
+    assert!(generated_man(&["trash", "purge"]).contains("\\-\\-yes"));
 }
 
 #[test]

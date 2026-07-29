@@ -4,10 +4,9 @@ use std::path::{Path, PathBuf};
 mod failure;
 mod transaction;
 pub(crate) use failure::CleanExecutionFailure;
-#[cfg(test)]
-pub(super) use transaction::StageOutcome;
 pub(super) use transaction::{
-    CleanFailure, CommittedStage, StageRequest, record_clean_failure, stage_finding_with_log,
+    CleanFailure, CommittedStage, StageOutcome, StageRequest, record_clean_failure,
+    stage_finding_with_log,
 };
 
 pub(crate) struct CleanExecution {
@@ -41,6 +40,14 @@ enum CleanState {
     StagedWithFailure {
         entry: PathBuf,
         failure: StagedFailure,
+    },
+    PurgeFailed {
+        entry: PathBuf,
+        reason: String,
+    },
+    Purged {
+        entry: PathBuf,
+        final_log_failure: Option<String>,
     },
 }
 
@@ -104,7 +111,9 @@ impl CleanExecution {
             CleanState::StageFailed { .. } => None,
             CleanState::UnverifiedDestination { entry, .. }
             | CleanState::Staged { entry, .. }
-            | CleanState::StagedWithFailure { entry, .. } => Some(entry),
+            | CleanState::StagedWithFailure { entry, .. }
+            | CleanState::PurgeFailed { entry, .. }
+            | CleanState::Purged { entry, .. } => Some(entry),
         }
     }
 
@@ -124,7 +133,18 @@ impl CleanExecution {
                 reason: &failure.reason,
                 final_log_append_failed: failure.final_log_append_failed,
             }),
-            CleanState::Staged { .. } => None,
+            CleanState::PurgeFailed { reason, .. } => {
+                Some(CleanExecutionFailure::PurgeFailed { reason })
+            }
+            CleanState::Purged {
+                final_log_failure: Some(reason),
+                ..
+            } => Some(CleanExecutionFailure::PurgedLog { reason }),
+            CleanState::Staged { .. }
+            | CleanState::Purged {
+                final_log_failure: None,
+                ..
+            } => None,
         }
     }
 
@@ -132,11 +152,17 @@ impl CleanExecution {
         self.failure_reason().is_some()
     }
 
+    pub(crate) fn purged(&self) -> bool {
+        matches!(self.state, CleanState::Purged { .. })
+    }
+
     pub(crate) fn state_label(&self) -> &'static str {
         match &self.state {
             CleanState::StageFailed { .. } => "stage_failed",
             CleanState::UnverifiedDestination { .. } => "unverified_destination",
             CleanState::Staged { .. } | CleanState::StagedWithFailure { .. } => "staged",
+            CleanState::PurgeFailed { .. } => "purge_failed",
+            CleanState::Purged { .. } => "purged",
         }
     }
 
@@ -146,6 +172,7 @@ impl CleanExecution {
             CleanState::UnverifiedDestination { .. }
                 | CleanState::Staged { .. }
                 | CleanState::StagedWithFailure { .. }
+                | CleanState::PurgeFailed { .. }
         )
     }
 
@@ -155,6 +182,9 @@ impl CleanExecution {
             CleanState::UnverifiedDestination {
                 final_log_append_failed: true,
                 ..
+            } | CleanState::Purged {
+                final_log_failure: Some(_),
+                ..
             }
         ) || matches!(
             &self.state,
@@ -162,11 +192,15 @@ impl CleanExecution {
         )
     }
 
-    pub(crate) fn reported_as_cleaned(&self) -> bool {
-        matches!(
-            self.state,
-            CleanState::Staged { .. } | CleanState::StagedWithFailure { .. }
-        )
+    pub(crate) fn reported_as_cleaned(&self, purge: bool) -> bool {
+        if purge {
+            self.purged()
+        } else {
+            matches!(
+                self.state,
+                CleanState::Staged { .. } | CleanState::StagedWithFailure { .. }
+            )
+        }
     }
 
     fn staged(staged: CommittedStage) -> Self {
@@ -174,6 +208,25 @@ impl CleanExecution {
         Self {
             subject,
             state: CleanState::Staged { entry },
+        }
+    }
+
+    pub(super) fn purge_failed(staged: CommittedStage, entry: PathBuf, reason: String) -> Self {
+        let (subject, _) = staged.into_parts();
+        Self {
+            subject,
+            state: CleanState::PurgeFailed { entry, reason },
+        }
+    }
+
+    pub(super) fn from_purged(staged: CommittedStage, final_log_failure: Option<String>) -> Self {
+        let (subject, entry) = staged.into_parts();
+        Self {
+            subject,
+            state: CleanState::Purged {
+                entry,
+                final_log_failure,
+            },
         }
     }
 }
@@ -190,10 +243,10 @@ impl CleanSubject {
     }
 }
 
-pub(crate) fn cleaned_resources(executed: &[CleanExecution]) -> (u64, u64) {
+pub(crate) fn cleaned_resources(executed: &[CleanExecution], purge: bool) -> (u64, u64) {
     executed
         .iter()
-        .filter(|item| item.reported_as_cleaned())
+        .filter(|item| item.reported_as_cleaned(purge))
         .fold((0, 0), |(bytes, inodes), item| {
             let resources = item.subject.resources;
             (

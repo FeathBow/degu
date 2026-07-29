@@ -1,5 +1,6 @@
 mod execution;
 mod plan;
+mod purge;
 #[cfg(test)]
 mod tests;
 
@@ -22,12 +23,14 @@ pub(crate) use plan::CapturedCleanPlan;
 pub(crate) fn execute_clean(
     ctx: &DetectCtx,
     plan: &CapturedCleanPlan,
+    purge: bool,
     recheck: &dyn Fn(&Finding) -> Result<(), String>,
 ) -> Vec<CleanExecution> {
     let run = CleanRun {
         ctx,
         log: OperationLog::new(ctx),
         reclamation_id: reclamation_id(),
+        purge,
         recheck,
     };
     plan.items_with_identities()
@@ -39,6 +42,7 @@ struct CleanRun<'a> {
     ctx: &'a DetectCtx,
     log: OperationLog,
     reclamation_id: String,
+    purge: bool,
     recheck: &'a dyn Fn(&Finding) -> Result<(), String>,
 }
 
@@ -67,7 +71,11 @@ fn execute_finding(
         reclamation_id: &run.reclamation_id,
     };
     let staged = stage_finding_with_log(request, &mut append, run.recheck);
-    let item = staged.finish();
+    let item = if run.purge {
+        purge::execute(run.ctx, staged)
+    } else {
+        staged.finish()
+    };
     trace_execution(&item);
     item
 }

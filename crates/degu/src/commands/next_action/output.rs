@@ -37,6 +37,7 @@ impl GuidanceKind {
         match self {
             Self::Standard | Self::ProjectScan => "Next:",
             Self::CompleteScan => "Rerun to complete the scan:",
+            Self::RestorableClean => "Safer next (current locations stage to trash):",
         }
     }
 }

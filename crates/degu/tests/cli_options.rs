@@ -32,6 +32,7 @@ const HELP_CASES: &[HelpCase] = &[
     HelpCase::new(&["clean", "--help"], true, true),
     HelpCase::new(&["trash", "--help"], false, false),
     HelpCase::new(&["trash", "list", "--help"], true, false),
+    HelpCase::new(&["trash", "purge", "--help"], true, false),
     HelpCase::new(&["ops", "--help"], true, false),
 ];
 
@@ -56,6 +57,7 @@ const SUPPORTED_CASES: &[&[&str]] = &[
         "--dry-run",
     ],
     &["trash", "list", JSON, "--help"],
+    &["trash", "purge", JSON, "--help"],
     &["ops", JSON, "--help"],
 ];
 
@@ -77,6 +79,8 @@ const UNSUPPORTED_CASES: &[(&[&str], &str)] = &[
     (&["man", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
     (&["trash", "list", BUDGET, "1s"], BUDGET),
     (&["trash", "list", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
+    (&["trash", "purge", BUDGET, "1s"], BUDGET),
+    (&["trash", "purge", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
     (&["ops", BUDGET, "1s"], BUDGET),
     (&["ops", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
 ];
@@ -105,7 +109,17 @@ const COMPLETION_CASES: &[CompletionCase] = &[
     CompletionCase::new("__fish_degu_using_subcommand scan", true, true),
     CompletionCase::new("__fish_degu_using_subcommand clean", true, true),
     CompletionCase::new(
+        "__fish_degu_using_subcommand trash; and not __fish_seen_subcommand_from list purge help",
+        false,
+        false,
+    ),
+    CompletionCase::new(
         "__fish_degu_using_subcommand trash; and __fish_seen_subcommand_from list",
+        true,
+        false,
+    ),
+    CompletionCase::new(
+        "__fish_degu_using_subcommand trash; and __fish_seen_subcommand_from purge",
         true,
         false,
     ),

@@ -8,7 +8,7 @@ use super::claims::{CLAIMS_DIR_NAME, MAX_CLAIM_ATTEMPTS, prepare_claims_dir};
 
 mod removal;
 
-pub(in crate::lifecycle) use removal::parent_identity;
+pub(in crate::lifecycle) use removal::{ParentIdentityExpectation, parent_identity};
 
 const SEQUENCE_WIDTH: usize = 4;
 
@@ -108,6 +108,24 @@ impl Trash {
         }
         matching.sort();
         Ok(matching)
+    }
+
+    pub(super) fn purge_entry_verified(
+        &self,
+        entry: &Path,
+        expected: ObjectIdentity,
+    ) -> io::Result<()> {
+        if entry.parent() != Some(self.dir.as_path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "purge entry is not a direct child of {}: {}",
+                    self.dir.display(),
+                    entry.display()
+                ),
+            ));
+        }
+        removal::remove(entry, expected)
     }
 
     fn claims_dir(&self) -> PathBuf {

@@ -37,3 +37,7 @@ pub(crate) fn disposition_tone(mode: DispositionMode) -> Tone {
         DispositionMode::ReportOnly => Tone::Heading,
     }
 }
+
+pub(crate) fn disposition(value: &str, mode: DispositionMode, enabled: bool) -> String {
+    paint(value, disposition_tone(mode), enabled)
+}

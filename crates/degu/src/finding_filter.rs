@@ -24,9 +24,29 @@ struct ValidatedPathScope {
     canonical_findings: HashMap<PathBuf, PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FilterReason {
+    Path,
+    OlderThan,
+    MinSize,
+    Top,
+}
+
+impl FilterReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::OlderThan => "older_than",
+            Self::MinSize => "min_size",
+            Self::Top => "top",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct FilteredFinding {
     pub(crate) finding: Finding,
+    pub(crate) reason: FilterReason,
 }
 
 impl<'a> PreparedFindingFilter<'a> {
@@ -44,24 +64,28 @@ impl<'a> PreparedFindingFilter<'a> {
     pub(crate) fn select(&self, findings: Vec<Finding>) -> Result<FilterResult> {
         let mut result = self.path_scope.select(findings)?;
         if let Some(days) = self.filters.older_than {
-            result = result.retain(|finding| finding.age_days().is_some_and(|age| age >= days));
+            result = result.retain(FilterReason::OlderThan, |finding| {
+                finding.age_days().is_some_and(|age| age >= days)
+            });
         }
         if let Some(min_size) = self.filters.min_size {
-            result = result.retain(|finding| finding.bytes_allocated() >= min_size);
+            result = result.retain(FilterReason::MinSize, |finding| {
+                finding.bytes_allocated() >= min_size
+            });
         }
         Ok(result.rank_and_limit(self.filters.top))
     }
 }
 
 impl FilterResult {
-    fn retain(self, mut keep: impl FnMut(&Finding) -> bool) -> Self {
+    fn retain(self, reason: FilterReason, mut keep: impl FnMut(&Finding) -> bool) -> Self {
         let (included, removed): (Vec<_>, Vec<_>) =
             self.included.into_iter().partition(|finding| keep(finding));
         let mut excluded = self.excluded;
         excluded.extend(
             removed
                 .into_iter()
-                .map(|finding| FilteredFinding { finding }),
+                .map(|finding| FilteredFinding { finding, reason }),
         );
         Self { included, excluded }
     }
@@ -74,7 +98,10 @@ impl FilterResult {
                 included
                     .split_off(top)
                     .into_iter()
-                    .map(|finding| FilteredFinding { finding }),
+                    .map(|finding| FilteredFinding {
+                        finding,
+                        reason: FilterReason::Top,
+                    }),
             );
         }
         Self { included, excluded }
@@ -109,7 +136,10 @@ fn select_paths(findings: Vec<Finding>, path_scope: &ValidatedPathScope) -> Resu
         if path_scope.includes(&finding)? {
             included.push(finding);
         } else {
-            excluded.push(FilteredFinding { finding });
+            excluded.push(FilteredFinding {
+                finding,
+                reason: FilterReason::Path,
+            });
         }
     }
     Ok(FilterResult { included, excluded })

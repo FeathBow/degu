@@ -1,5 +1,7 @@
 use super::support::*;
 
+mod dispositions;
+
 #[test]
 fn scan_color_always_styles_human_hierarchy_and_never_json() {
     let (home, cache) = fake_cache("scratch/pip-cache", "wheel.whl", 2048);

@@ -23,6 +23,7 @@ pub(crate) struct FindingsTableOptions<'a> {
 enum FindingsTablePresentation {
     Mixed,
     Grouped(DispositionMode),
+    Plan,
 }
 
 impl<'a> FindingsTableOptions<'a> {
@@ -40,12 +41,21 @@ impl<'a> FindingsTableOptions<'a> {
         self
     }
 
+    pub(crate) fn for_plan(mut self) -> Self {
+        self.presentation = FindingsTablePresentation::Plan;
+        self
+    }
+
     fn color_enabled(self) -> bool {
         self.ui.colors.stdout
     }
 
     fn is_grouped(self) -> bool {
         !matches!(self.presentation, FindingsTablePresentation::Mixed)
+    }
+
+    fn is_plan(self) -> bool {
+        matches!(self.presentation, FindingsTablePresentation::Plan)
     }
 
     fn shows_reason(self) -> bool {
@@ -127,10 +137,12 @@ fn detail_rows(
         detail_row("kind", kind_label(finding.kind())),
         detail_row("rationale", finding.rationale()),
     ]);
-    rows.push(detail_row(
-        "cleanup reason",
-        finding.disposition().reason.as_deref().unwrap_or("-"),
-    ));
+    if !options.is_plan() {
+        rows.push(detail_row(
+            "cleanup reason",
+            finding.disposition().reason.as_deref().unwrap_or("-"),
+        ));
+    }
     rows
 }
 

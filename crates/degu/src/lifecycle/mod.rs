@@ -3,6 +3,7 @@ mod entries;
 mod expiry;
 mod operation_log;
 mod reconcile;
+mod stage;
 mod state_read;
 mod storage;
 mod summary;
@@ -12,6 +13,7 @@ use anyhow::Result;
 use degu_core::ecosystem::DetectCtx;
 
 pub(crate) use entries::TrashEntry;
+pub(crate) use stage::CapturedCleanPlan;
 
 pub(crate) struct Lifecycle {
     ctx: DetectCtx,

@@ -78,6 +78,14 @@ pub(crate) fn project_sources_selected(only: &[String]) -> bool {
             .any(|id| only.iter().any(|selected| selected == id))
 }
 
+pub(crate) fn clean_only_ids(only: &[String]) -> Vec<String> {
+    let registrations = degu_adapters::all();
+    only.iter()
+        .filter(|id| !is_runtime_adapter(&registrations, id))
+        .cloned()
+        .collect()
+}
+
 fn selects_findings(registrations: &[RegisteredAdapter], only: &[String]) -> bool {
     project_sources_selected(only)
         || only.iter().any(|id| {

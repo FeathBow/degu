@@ -27,6 +27,8 @@ pub(crate) struct Request<'a> {
 
 pub(crate) enum Workflow<'a> {
     Scan(ScanState<'a>),
+    CleanPreview(CleanPreviewState<'a>),
+    CleanResult(CleanResultState),
     TrashList(TrashListState),
 }
 
@@ -37,6 +39,15 @@ pub(crate) struct ScanState<'a> {
     pub(crate) cleanable: bool,
     pub(crate) needs_review: bool,
     pub(crate) has_effective_project_roots: bool,
+}
+
+pub(crate) struct CleanPreviewState<'a> {
+    pub(crate) scope: &'a CleanScope,
+    pub(crate) planned: usize,
+}
+
+pub(crate) struct CleanResultState {
+    pub(crate) trash_locations: usize,
 }
 
 pub(crate) struct TrashListState {
@@ -57,6 +68,7 @@ enum Action {
     ProjectScan(ScanScope),
     CleanPreview(CleanScope),
     CleanReview(CleanScope),
+    Clean(CleanScope),
     TrashList,
     Ops,
 }
@@ -167,6 +179,8 @@ fn allows_next(output: OutputMode) -> bool {
 fn action_for(workflow: Workflow<'_>) -> Option<Action> {
     match workflow {
         Workflow::Scan(state) => scan_action(state),
+        Workflow::CleanPreview(state) => clean_preview_action(state),
+        Workflow::CleanResult(state) => (state.trash_locations > 0).then_some(Action::TrashList),
         Workflow::TrashList(state) => {
             (state.ambiguous || state.interrupted_purge).then_some(Action::Ops)
         }
@@ -193,6 +207,14 @@ fn scan_action(state: ScanState<'_>) -> Option<Action> {
         return None;
     }
     state.scope.project_scan_scope().map(Action::ProjectScan)
+}
+
+fn clean_preview_action(state: CleanPreviewState<'_>) -> Option<Action> {
+    if state.planned == 0 {
+        return None;
+    }
+    let scope = state.scope.clone();
+    Some(Action::Clean(scope))
 }
 
 #[cfg(test)]

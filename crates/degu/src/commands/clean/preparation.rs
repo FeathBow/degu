@@ -1,12 +1,14 @@
 use super::super::CollectionRunOptions;
 use crate::cli::CleanArgs;
-use crate::collection::{CollectionRequest, ScanStatus, collect_profiled};
+use crate::collection::{
+    CollectionRequest, ScanStatus, collect_profiled, validate_clean_plan_disablement,
+};
 use crate::commands::regions::{self, DisjointnessFailure};
 use crate::commands::scope::CleanScope;
 use crate::configuration::{deadline_from_budget, load_config, resolve_max_concurrency};
 use crate::filters::Filters;
 use crate::finding_filter::{FilterReason, FilteredFinding, PreparedFindingFilter};
-use crate::lifecycle::CapturedCleanPlan;
+use crate::lifecycle::{CapturedCleanPlan, Lifecycle, MutationSession};
 use crate::runtime::Ui;
 use crate::source_selection::SourceSelection;
 use anyhow::Result;
@@ -21,12 +23,14 @@ use std::path::{Path, PathBuf};
 pub(super) struct CleanSettings {
     pub(super) json: bool,
     pub(super) details: bool,
+    pub(super) yes: bool,
     pub(super) dry_run: bool,
     pub(super) ui: Ui,
 }
 
 pub(super) struct PreparedClean {
     pub(super) ctx: DetectCtx,
+    pub(super) config: Config,
     pub(super) plan: CapturedCleanPlan,
     pub(super) exclusions: CleanExclusions,
     pub(super) scan_status: ScanStatus,
@@ -56,6 +60,44 @@ impl PreparedClean {
             .iter()
             .any(Finding::measurement_incomplete)
     }
+
+    pub(super) fn lock(&self) -> Result<MutationSession> {
+        Lifecycle::new(&self.ctx).lock()
+    }
+
+    pub(super) fn revalidate(&self, session: &MutationSession) -> Result<()> {
+        validate_clean_plan_disablement(&self.ctx, &self.config, self.plan.items())?;
+        self.plan.validate_path_separation()?;
+        let mut guard = build_guard(&self.ctx, &self.config)?;
+        session.add_trash_roots_to_guard(self.plan.items(), &mut guard)?;
+        for (finding, identity) in self.plan.items_with_identities() {
+            if !identity.matches(finding.path())? {
+                anyhow::bail!(
+                    "clean item identity changed after planning: {}",
+                    finding.path().display()
+                );
+            }
+            guard.check(finding.path())?;
+        }
+        Ok(())
+    }
+
+    /// Re-runs the dynamic protection checks for one finding at its rename
+    /// boundary. A guard canonicalizes protected paths when it is built, so a
+    /// protected path that became an alias of this source after revalidate()
+    /// is only visible to a freshly built guard, not to the plan-wide check.
+    pub(super) fn recheck_finding(
+        &self,
+        session: &MutationSession,
+        finding: &Finding,
+    ) -> Result<()> {
+        let single = std::slice::from_ref(finding);
+        validate_clean_plan_disablement(&self.ctx, &self.config, single)?;
+        let mut guard = build_guard(&self.ctx, &self.config)?;
+        session.add_trash_roots_to_guard(single, &mut guard)?;
+        guard.check(finding.path())?;
+        Ok(())
+    }
 }
 
 struct CleanRequest {
@@ -72,6 +114,7 @@ impl CleanRequest {
             settings: CleanSettings {
                 json: run.json,
                 details: args.details,
+                yes: args.yes,
                 dry_run: args.dry_run,
                 ui,
             },
@@ -83,6 +126,15 @@ impl CleanRequest {
 
 pub(super) fn prepare(args: CleanArgs, ui: Ui) -> Result<PreparedClean> {
     let request = CleanRequest::new(args, ui);
+    // Accepted, not a conflict: unattended recipes toggle --dry-run while
+    // keeping --yes, so the combination only earns a notice.
+    if request.settings.dry_run && request.settings.yes {
+        crate::presentation::print_stderr_note(
+            crate::presentation::Severity::Warning,
+            "--yes has no effect in a dry run.",
+            ui.colors,
+        );
+    }
     let ctx = DetectCtx::from_process()?;
     let config = load_config(&ctx)?;
     let sources = SourceSelection::from_only(request.scope.only_ids(), false, &config.disable)?;
@@ -123,8 +175,10 @@ pub(super) fn prepare(args: CleanArgs, ui: Ui) -> Result<PreparedClean> {
         0
     };
     validate_guard(&ctx, &config, plan.items())?;
+    validate_invocation(request.settings)?;
     Ok(PreparedClean {
         ctx,
+        config,
         plan,
         exclusions,
         scan_status,
@@ -465,11 +519,7 @@ fn disjointness_refusal(
     }
 }
 
-fn validate_guard(
-    ctx: &DetectCtx,
-    config: &degu_core::config::Config,
-    findings: &[Finding],
-) -> Result<()> {
+fn validate_guard(ctx: &DetectCtx, config: &Config, findings: &[Finding]) -> Result<()> {
     let guard = build_guard(ctx, config)?;
     for finding in findings {
         guard.check_identity(finding.path())?;
@@ -483,6 +533,13 @@ fn build_guard(ctx: &DetectCtx, config: &Config) -> Result<Guard> {
         guard.add(ctx.home.join(protected))?;
     }
     Ok(guard)
+}
+
+fn validate_invocation(settings: CleanSettings) -> Result<()> {
+    if settings.json && !settings.yes && !settings.dry_run {
+        anyhow::bail!("--json requires --yes or --dry-run");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

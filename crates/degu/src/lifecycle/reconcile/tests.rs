@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use degu_core::oplog::{OpAction, OpOutcome, OpRecord};
 
-use super::{active_trash_indices, active_trash_state, reconciled_trash_info};
+use super::{
+    active_trash_indices, active_trash_state, reconcile_pending_record, reconciled_trash_info,
+};
+use crate::lifecycle::EntryIdentity;
 
 struct RecordSpec<'a> {
     action: OpAction,
@@ -49,6 +52,21 @@ fn pending_record_for_test(path: &str, entry: &str, reclamation_id: Option<&str>
     })
 }
 
+fn with_expected_identity(mut record: OpRecord, path: &Path) -> OpRecord {
+    record.expected_identity = Some(EntryIdentity::capture(path).unwrap().oplog_identity());
+    record
+}
+
+fn restore_record_for_test(entry: &str, outcome: OpOutcome) -> OpRecord {
+    op_record_for_test(RecordSpec {
+        action: OpAction::Restore,
+        outcome,
+        path: "/original",
+        trash_entry: Some(entry),
+        reclamation_id: Some("run"),
+    })
+}
+
 fn restore_record_with_paths(path: &Path, entry: &Path, outcome: OpOutcome) -> OpRecord {
     op_record_for_test(RecordSpec {
         action: OpAction::Restore,
@@ -70,6 +88,156 @@ fn active_trash_indices_keeps_only_the_last_record_naming_an_entry() {
     ];
 
     assert_eq!(active_trash_indices(&records), vec![4, 3, 1]);
+}
+
+#[test]
+fn reconciled_trash_info_reads_pendings_and_prefers_ok_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let staged_entry = dir.path().join("trash/0001-staged");
+    let ambiguous_entry = dir.path().join("trash/0002-ambiguous");
+    let ambiguous_original = dir.path().join("recreated");
+    std::fs::create_dir_all(&staged_entry).unwrap();
+    std::fs::create_dir_all(&ambiguous_entry).unwrap();
+    std::fs::write(&ambiguous_original, b"new occupant").unwrap();
+    let records = reconciliation_records(ReconciliationPaths {
+        dir: &dir,
+        staged_entry: &staged_entry,
+        ambiguous_entry: &ambiguous_entry,
+        ambiguous_original: &ambiguous_original,
+    });
+
+    let info = reconciled_trash_info(&records);
+    let staged = info.get(&staged_entry).unwrap();
+    assert_eq!(staged.original, dir.path().join("gone"));
+    assert!(!staged.ambiguous);
+    assert!(staged.staged_at.is_some());
+    let ambiguous = info.get(&ambiguous_entry).unwrap();
+    assert_eq!(ambiguous.original, ambiguous_original);
+    assert!(ambiguous.ambiguous);
+    assert!(!info.contains_key(Path::new("/trash/0003-both")));
+}
+
+struct ReconciliationPaths<'a> {
+    dir: &'a tempfile::TempDir,
+    staged_entry: &'a Path,
+    ambiguous_entry: &'a Path,
+    ambiguous_original: &'a Path,
+}
+
+fn reconciliation_records(paths: ReconciliationPaths<'_>) -> Vec<OpRecord> {
+    vec![
+        with_expected_identity(
+            pending_record_for_test(
+                paths.dir.path().join("gone").to_str().unwrap(),
+                paths.staged_entry.to_str().unwrap(),
+                Some("run"),
+            ),
+            paths.staged_entry,
+        ),
+        pending_record_for_test(
+            paths.ambiguous_original.to_str().unwrap(),
+            paths.ambiguous_entry.to_str().unwrap(),
+            Some("run"),
+        ),
+        pending_record_for_test("/pending-original", "/trash/0003-both", Some("run")),
+        trash_record_for_test("/ok-original", "/trash/0003-both", Some("run")),
+    ]
+}
+
+#[test]
+fn reconciled_trash_info_prefers_new_pending_after_settled_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("trash/0001-cache");
+    let new_original = dir.path().join("new-original");
+    std::fs::create_dir_all(&entry).unwrap();
+    let entry_text = entry.to_str().unwrap();
+    let records = vec![
+        trash_record_for_test("/old-original", entry_text, Some("old")),
+        restore_record_for_test(entry_text, OpOutcome::Ok),
+        with_expected_identity(
+            pending_record_for_test(new_original.to_str().unwrap(), entry_text, Some("new")),
+            &entry,
+        ),
+    ];
+
+    let info = reconciled_trash_info(&records);
+
+    assert_eq!(info[&entry].original, new_original);
+    assert!(!info[&entry].ambiguous);
+}
+
+#[test]
+fn completed_pending_trash_requires_the_recorded_destination_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("gone");
+    let entry = dir.path().join("trash/0001-cache");
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    std::fs::write(&entry, "staged").unwrap();
+    std::fs::write(&other, "different object").unwrap();
+    let record = pending_record_for_test(
+        original.to_str().unwrap(),
+        entry.to_str().unwrap(),
+        Some("run"),
+    );
+
+    assert_eq!(
+        reconcile_pending_record(&record, &entry),
+        degu_core::oplog::PendingState::AmbiguousIdentity
+    );
+    let mismatched = with_expected_identity(record.clone(), &other);
+    assert_eq!(
+        reconcile_pending_record(&mismatched, &entry),
+        degu_core::oplog::PendingState::AmbiguousIdentity
+    );
+    let matched = with_expected_identity(record, &entry);
+    assert_eq!(
+        reconcile_pending_record(&matched, &entry),
+        degu_core::oplog::PendingState::Moved
+    );
+}
+
+#[test]
+fn completed_pending_restore_is_not_left_active_after_a_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("original");
+    let entry = dir.path().join("trash/0001-cache");
+    std::fs::write(&original, "restored").unwrap();
+    let records = vec![
+        trash_record_for_test(
+            original.to_str().unwrap(),
+            entry.to_str().unwrap(),
+            Some("run"),
+        ),
+        with_expected_identity(
+            restore_record_with_paths(&original, &entry, OpOutcome::Pending),
+            &original,
+        ),
+    ];
+
+    assert!(active_trash_indices(&records).is_empty());
+}
+
+#[test]
+fn pending_restore_before_the_move_keeps_the_trash_entry_active() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("original");
+    let entry = dir.path().join("trash/0001-cache");
+    std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    std::fs::write(&entry, "staged").unwrap();
+    let records = vec![
+        trash_record_for_test(
+            original.to_str().unwrap(),
+            entry.to_str().unwrap(),
+            Some("run"),
+        ),
+        with_expected_identity(
+            restore_record_with_paths(&original, &entry, OpOutcome::Pending),
+            &entry,
+        ),
+    ];
+
+    assert_eq!(active_trash_indices(&records), vec![0]);
 }
 
 #[test]

@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
+use degu_adapters::AdapterScope;
+use degu_core::config::Config;
 use degu_core::ecosystem::{DetectCtx, Root};
-use degu_core::finding::FindingCandidate;
+use degu_core::finding::{Finding, FindingCandidate};
 use degu_core::safety::paths_overlap;
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Default)]
@@ -177,4 +180,55 @@ fn path_overlaps_claim(path: &Path, claims: &ExclusionClaims) -> Result<bool> {
         .iter()
         .any(|dependency| views.iter().any(|view| dependency.starts_with(view)));
     Ok(overlaps_root || breaks_dependency)
+}
+
+pub(crate) fn validate_clean_plan_disablement(
+    ctx: &DetectCtx,
+    config: &Config,
+    findings: &[Finding],
+) -> Result<()> {
+    if config.disable.is_empty() || findings.is_empty() {
+        return Ok(());
+    }
+    let disabled = config
+        .disable
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let validation_ctx = ctx.clone().with_deadline(None);
+    let claims = configured_exclusions(&validation_ctx, &disabled)?;
+    for finding in findings {
+        if path_overlaps_claim(finding.path(), &claims)? {
+            anyhow::bail!(
+                "clean plan is no longer safe because {} overlaps a disabled adapter root or its resolution path",
+                finding.path().display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn configured_exclusions(ctx: &DetectCtx, disabled: &HashSet<&str>) -> Result<ExclusionClaims> {
+    let mut claims = ExclusionClaims::default();
+    for registration in degu_adapters::all() {
+        if registration.scope() != AdapterScope::Cache || !disabled.contains(registration.id()) {
+            continue;
+        }
+        let outcome = registration.ecosystem().roots(ctx);
+        if outcome.incomplete || outcome.truncated {
+            anyhow::bail!(
+                "failed to resolve disabled adapter {:?} roots",
+                registration.id()
+            );
+        }
+        let Some(discovered) = root_claims(ctx, registration.id(), &outcome.roots)? else {
+            anyhow::bail!(
+                "failed to resolve disabled adapter {:?} roots",
+                registration.id()
+            );
+        };
+        claims.extend(discovered);
+    }
+    claims.sort_and_dedup();
+    Ok(claims)
 }

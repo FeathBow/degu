@@ -7,7 +7,9 @@ use degu_core::ecosystem::{DetectCtx, Root, RootOutcome};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-pub(crate) use claims::{ExclusionClaims, exclude_claimed_candidates};
+pub(crate) use claims::{
+    ExclusionClaims, exclude_claimed_candidates, validate_clean_plan_disablement,
+};
 
 pub(crate) struct PreparedAdapters {
     pub(crate) enabled: Vec<PreparedAdapter>,

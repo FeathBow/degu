@@ -1,11 +1,36 @@
 use std::ffi::OsStr;
 use std::io;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 pub(super) const CLAIMS_DIR_NAME: &str = ".claims";
+pub(super) const MAX_CLAIM_ATTEMPTS: u64 = 10_000;
+const PRIVATE_DIR_MODE: u32 = 0o700;
 const SHARED_WRITE_MASK: u32 = 0o022;
+
+#[cfg(test)]
+mod tests;
+
+pub(crate) fn prepare_claims_dir(trash_root: &Path) -> io::Result<PathBuf> {
+    let claims = trash_root.join(CLAIMS_DIR_NAME);
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(PRIVATE_DIR_MODE);
+    match builder.create(&claims) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    validate_existing_claims_dir(trash_root)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "claims directory disappeared after creation: {}",
+                claims.display()
+            ),
+        )
+    })
+}
 
 pub(crate) fn validate_existing_claims_dir(trash_root: &Path) -> io::Result<Option<PathBuf>> {
     let claims = trash_root.join(CLAIMS_DIR_NAME);

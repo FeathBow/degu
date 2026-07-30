@@ -45,8 +45,8 @@ unicode-width.workspace = true
 assert_cmd.workspace = true
 tempfile.workspace = true
 
-# cargo binstall pulls the attested static release archives instead of compiling.
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/degu-v{ version }-{ target }.tar.gz"
 bin-dir = "degu-v{ version }-{ target }/{ bin }"
 pkg-fmt = "tgz"
+disabled-strategies = ["quick-install", "compile"]

@@ -143,6 +143,8 @@ jobs:
           ./tools/verify-release-contract.sh
           ./tools/test-release-assets.sh "v${version}" x86_64-unknown-linux-musl
           ./tools/test-release-records.sh
+      - name: verify the crates package for publication
+        run: cargo publish --workspace --dry-run --locked
 
   installer:
     strategy:

@@ -79,7 +79,7 @@ apply_member_mutation() {
     symlink) rm "$member_path" && ln -s "LICENSE-MIT" "$member_path" ;;
     empty | appledouble) : > "$member_path" ;;
     nonexec) chmod 0644 "$extracted_root/degu" "$extracted_root/dg" ;;
-    independent) cp "$member_path" "$member_path.copy" && rm "$member_path" && mv "$member_path.copy" "$member_path" ;;
+    hardlink) rm "$member_path" && ln "$extracted_root/degu" "$member_path" ;;
     corrupt) printf 'corrupt\n' > "$member_path" ;;
     wrong-completion) printf '#compdef degu\n' > "$member_path" ;;
     extra) printf 'unexpected\n' > "$member_path" ;;
@@ -89,7 +89,7 @@ apply_member_mutation() {
 
 expected_failure_message() {
   case "$1" in
-    symlink | independent | extra) printf '%s\n' "Archive entries do not match" ;;
+    symlink | hardlink | extra) printf '%s\n' "Archive entries do not match" ;;
     empty) printf '%s\n' "Required archive member is not a nonempty regular file" ;;
     nonexec) printf '%s\n' "Archived degu binary is not executable" ;;
     corrupt) printf '%s\n' "Archived MIT license differs" ;;
@@ -159,7 +159,7 @@ test_member_mutation "symlink-license" "LICENSE-APACHE" symlink
 test_member_mutation "empty-completion" "completions/degu.zsh" empty
 test_member_mutation "empty-man" "man/degu-scan.1" empty
 test_member_mutation "non-executable-binaries" degu nonexec
-test_member_mutation "independent-dg" dg independent
+test_member_mutation "hardlinked-dg" dg hardlink
 test_member_mutation "corrupt-license" "LICENSE-MIT" corrupt
 test_member_mutation "wrong-dg-completion" "completions/dg.zsh" wrong-completion
 test_member_mutation "extra-member" unexpected.txt extra

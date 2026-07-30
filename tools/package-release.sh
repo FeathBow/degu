@@ -55,7 +55,9 @@ write_man_page() {
 
 mkdir -p "$root/completions" "$root/man"
 cp "$binary" "$root/degu"
-ln "$root/degu" "$root/dg"
+# A hardlink would be smaller, but cargo-binstall's extractor silently skips
+# link entries, so dg must be an independent regular file in the tar.
+cp "$root/degu" "$root/dg"
 cp "LICENSE-APACHE" "LICENSE-MIT" "$root/"
 for command_name in degu dg; do
   for shell in bash zsh fish; do

@@ -1,8 +1,18 @@
 # Installation
 
+## Install with Cargo
+
+For versions published on crates.io:
+
+```sh
+cargo install degu --locked
+```
+
+`cargo binstall degu` installs the same published version from the official release archives without compiling and fails rather than falling back to a third-party or source build.
+
 ## Build from source
 
-degu is not published on crates.io. Building from source is the primary Cargo installation route; it works before the project has a published release and requires Git plus the current stable Rust toolchain.
+Building from source works for any repository checkout, published or not, and requires Git plus the current stable Rust toolchain.
 
 ```sh
 git clone https://github.com/FeathBow/degu.git &&

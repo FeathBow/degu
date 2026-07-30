@@ -30,15 +30,7 @@ write_expected_assets() {
 
 write_expected_entries() {
   entry_root=$1
-  hardlink_name=$2
-  degu_type=-
-  dg_type=-
 
-  case "$hardlink_name" in
-    degu) degu_type=h ;;
-    dg) dg_type=h ;;
-    *) fail "Unknown hardlink entry: $hardlink_name" ;;
-  esac
   printf '%s\t%s\n' \
     "$entry_root/" d \
     "$entry_root/LICENSE-APACHE" - \
@@ -48,8 +40,8 @@ write_expected_entries() {
     printf '%s\t%s\n' "$entry_root/completions/$completion" -
   done
   printf '%s\t%s\n' \
-    "$entry_root/degu" "$degu_type" \
-    "$entry_root/dg" "$dg_type" \
+    "$entry_root/degu" - \
+    "$entry_root/dg" - \
     "$entry_root/man/" d
   for page in $man_pages; do
     printf '%s\t%s\n' "$entry_root/man/$page" -
@@ -127,17 +119,13 @@ verify_archive() {
   names="$temp/names-$archive_target"
   types="$temp/types-$archive_target"
   expected_entries="$temp/expected-entries-$archive_target"
-  alternate_entries="$temp/alternate-entries-$archive_target"
   actual_entries="$temp/actual-entries-$archive_target"
-  write_expected_entries "$archive_root" dg | LC_ALL=C sort > "$expected_entries"
-  write_expected_entries "$archive_root" degu | LC_ALL=C sort > "$alternate_entries"
+  write_expected_entries "$archive_root" | LC_ALL=C sort > "$expected_entries"
   tar -tzf "$archive_path" > "$names"
   reject_macos_metadata "$names" "$archive_path"
   tar -tvzf "$archive_path" | awk '{print substr($1, 1, 1)}' > "$types"
   paste "$names" "$types" | LC_ALL=C sort > "$actual_entries"
-  if ! cmp -s "$expected_entries" "$actual_entries" && ! cmp -s "$alternate_entries" "$actual_entries"; then
-    fail "Archive entries do not match the release contract: $archive_path"
-  fi
+  cmp -s "$expected_entries" "$actual_entries" || fail "Archive entries do not match the release contract: $archive_path"
 
   extracted="$temp/extracted-$archive_target"
   mkdir -p "$extracted"

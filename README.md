@@ -69,7 +69,7 @@ For datasets, checkpoints, and unknown large files, pair degu with a disk-usage 
 Install a published release (static binaries; Linux x86_64/aarch64 and macOS):
 
 ```sh
-version=v0.1.1
+version=v0.1.2
 installer=$(mktemp "${TMPDIR:-/tmp}/degu-install.XXXXXX") &&
 curl -fsSLo "$installer" "https://raw.githubusercontent.com/FeathBow/degu/$version/install.sh" &&
 DEGU_VERSION="$version" sh "$installer" &&

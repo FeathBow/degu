@@ -5,10 +5,12 @@ set -eu
 
 workflow=".github/workflows/release.yml"
 installer="install.sh"
+manifest="crates/degu/Cargo.toml"
 
 [ "$#" -eq 0 ] || fail "Usage: $0"
 [ -f "$workflow" ] || fail "Release workflow does not exist: $workflow"
 [ -f "$installer" ] || fail "Install script does not exist: $installer"
+[ -f "$manifest" ] || fail "Crate manifest does not exist: $manifest"
 
 temp=$(mktemp -d "${TMPDIR:-/tmp}/degu-release-contract.XXXXXX") || fail "Could not create a temporary directory."
 
@@ -50,3 +52,8 @@ grep -Fqx "archive=\"$(release_archive_name '${version}' '${target}')\"" "$insta
 grep -Fqx "checksum=\"$(release_checksum_name '${version}' '${target}')\"" "$installer" || fail "Install script checksum name does not match the release contract: $installer"
 grep -Fq "\"\$tmp/$installer_stem/degu\"" "$installer" || fail "Install script degu path does not match the release contract: $installer"
 grep -Fq "\"\$tmp/$installer_stem/dg\"" "$installer" || fail "Install script dg path does not match the release contract: $installer"
+
+grep -Fqx "pkg-url = \"{ repo }/releases/download/v{ version }/$(release_archive_name 'v{ version }' '{ target }')\"" "$manifest" || fail "cargo-binstall pkg-url does not match the release contract: $manifest"
+grep -Fqx "bin-dir = \"$(release_asset_stem 'v{ version }' '{ target }')/{ bin }\"" "$manifest" || fail "cargo-binstall bin-dir does not match the release contract: $manifest"
+grep -Fqx 'pkg-fmt = "tgz"' "$manifest" || fail "cargo-binstall pkg-fmt does not match the release contract: $manifest"
+grep -Fqx 'disabled-strategies = ["quick-install", "compile"]' "$manifest" || fail "cargo-binstall fallback strategies must stay disabled: $manifest"

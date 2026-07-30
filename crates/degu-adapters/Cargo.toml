@@ -1,10 +1,10 @@
 [package]
 name = "degu-adapters"
-description = "Ecosystem discovery adapters for degu"
+description = "Cache adapters for the degu CLI (internal crate; no API stability guarantees)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
 
 [dependencies]
 degu-core.workspace = true

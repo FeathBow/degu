@@ -6,7 +6,7 @@
 
 <p align="center"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue?style=flat-square" alt="License: MIT OR Apache-2.0"> <img src="https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-lightgrey?style=flat-square" alt="Platforms: Linux and macOS"></p>
 
-<p align="center"><img src="docs/assets/demo.svg" alt="degu scan output: Ready to clean, Needs review, and Not managed tiers with sizes, reasons, and a copyable preview command" width="92%"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/demo.svg" alt="degu scan output: Ready to clean, Needs review, and Not managed tiers with sizes, reasons, and a copyable preview command" width="92%"></p>
 <p align="center"><sub>Real output from a small demo tree; on a working ML node, model and package caches routinely reach tens of gigabytes.</sub></p>
 
 <details>
@@ -66,7 +66,19 @@ For datasets, checkpoints, and unknown large files, pair degu with a disk-usage 
 
 ## Installation
 
-Build from source with Git and the current stable Rust toolchain:
+Install a published release (static binaries; Linux x86_64/aarch64 and macOS):
+
+```sh
+version=v0.1.1
+installer=$(mktemp "${TMPDIR:-/tmp}/degu-install.XXXXXX") &&
+curl -fsSLo "$installer" "https://raw.githubusercontent.com/FeathBow/degu/$version/install.sh" &&
+DEGU_VERSION="$version" sh "$installer" &&
+rm -f "$installer"
+```
+
+Or through cargo — `cargo binstall degu` fetches the same release archives without compiling and fails rather than falling back to a third-party or source build, `cargo install degu --locked` builds from crates.io.
+
+Alternatively, build from source with Git and the current stable Rust toolchain:
 
 ```sh
 git clone https://github.com/FeathBow/degu.git
@@ -75,7 +87,7 @@ cargo install --path crates/degu --locked --root "$HOME/.local"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Both `degu` and its short alias, `dg`, install into `~/.local/bin`. The [installation guide](docs/installation.md) covers published releases, checksum verification, and build provenance.
+Both `degu` and its short alias, `dg`, install into `~/.local/bin`. The [installation guide](https://github.com/FeathBow/degu/blob/main/docs/installation.md) covers published releases, checksum verification, and build provenance.
 
 ## Quick start
 
@@ -97,7 +109,7 @@ Staged data stays reversible and still counts against quota until purged; choose
 degu scan --budget 300s
 ```
 
-A time budget returns honest lower bounds: truncated sections are flagged, totals are marked as lower bounds, and the report says how many directories went unvisited. The [user guide](docs/usage.md) and [safety model](docs/safety.md) cover recovery and permanent deletion in detail.
+A time budget returns honest lower bounds: truncated sections are flagged, totals are marked as lower bounds, and the report says how many directories went unvisited. The [user guide](https://github.com/FeathBow/degu/blob/main/docs/usage.md) and [safety model](https://github.com/FeathBow/degu/blob/main/docs/safety.md) cover recovery and permanent deletion in detail.
 
 ### Include project builds
 
@@ -108,7 +120,7 @@ degu scan .
 degu clean . --dry-run
 ```
 
-To include a project tree in every scan, add it to `roots` in the [configuration](docs/configuration.md); `clean` still requires the root as an explicit argument.
+To include a project tree in every scan, add it to `roots` in the [configuration](https://github.com/FeathBow/degu/blob/main/docs/configuration.md); `clean` still requires the root as an explicit argument.
 
 ### Check filesystem quota
 
@@ -116,17 +128,17 @@ To include a project tree in every scan, add it to `roots` in the [configuration
 degu quota
 ```
 
-Validated on Linux ext4 and field-validated on a Lustre 2.15 client; other filesystems and macOS report unsupported instead of guessing. See the [user guide](docs/usage.md#scan-and-quota) for supported providers and failure behavior.
+Validated on Linux ext4 and field-validated on a Lustre 2.15 client; other filesystems and macOS report unsupported instead of guessing. See the [user guide](https://github.com/FeathBow/degu/blob/main/docs/usage.md) for supported providers and failure behavior.
 
 Run `degu <command> --help` or `degu man <command>` for complete command details.
 
 ## Documentation
 
-- [Installation](docs/installation.md) covers tagged installers, release archives, and release verification.
-- [User guide](docs/usage.md) covers project scans, exact-path review, JSON automation, recovery, and cache relocation.
-- [Configuration](docs/configuration.md) documents every supported setting and adapter selection.
-- [Operational safety](docs/safety.md) defines cleanup authority, staging, permanent deletion, and filesystem boundaries.
+- [Installation](https://github.com/FeathBow/degu/blob/main/docs/installation.md) covers tagged installers, release archives, and release verification.
+- [User guide](https://github.com/FeathBow/degu/blob/main/docs/usage.md) covers project scans, exact-path review, JSON automation, recovery, and cache relocation.
+- [Configuration](https://github.com/FeathBow/degu/blob/main/docs/configuration.md) documents every supported setting and adapter selection.
+- [Operational safety](https://github.com/FeathBow/degu/blob/main/docs/safety.md) defines cleanup authority, staging, permanent deletion, and filesystem boundaries.
 
 ## License
 
-degu is available under your choice of the [Apache License 2.0](LICENSE-APACHE) or the [MIT License](LICENSE-MIT). Contributions are dual licensed under the same terms.
+degu is available under your choice of the [Apache License 2.0](https://github.com/FeathBow/degu/blob/main/LICENSE-APACHE) or the [MIT License](https://github.com/FeathBow/degu/blob/main/LICENSE-MIT). Contributions are dual licensed under the same terms.

@@ -143,6 +143,10 @@ jobs:
           ./tools/verify-release-contract.sh
           ./tools/test-release-assets.sh "v${version}" x86_64-unknown-linux-musl
           ./tools/test-release-records.sh
+          grep -Fq "version=v${version}" README.md || { echo "README installer pin does not match the workspace version: v${version}" >&2; exit 1; }
+          grep -Fq "DEGU_VERSION=\"\$version\" sh \"\$installer\"" README.md || { echo "README installer must pin DEGU_VERSION to the downloaded tag" >&2; exit 1; }
+      - name: verify the crates package for publication
+        run: cargo publish --workspace --dry-run --locked
 
   installer:
     strategy:

@@ -60,6 +60,16 @@ release_checksum_name() {
   printf '%s.sha256' "$(release_asset_stem "$1" "$2")"
 }
 
+release_installer_name() {
+  printf 'degu-install.sh'
+}
+
+# With an empty tag this yields the stock install.sh line; with a release tag
+# it yields the line the published installer asset must carry instead.
+release_installer_version_line() {
+  printf 'version=${DEGU_VERSION:-%s}' "$1"
+}
+
 calculate_sha256() {
   digest_path=$1
   if command -v sha256sum >/dev/null 2>&1; then

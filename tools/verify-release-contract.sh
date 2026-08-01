@@ -39,6 +39,8 @@ workflow_tag='${{ needs.metadata.outputs.tag }}'
     printf 'dist/%s\n' "$(release_archive_name "$workflow_tag" "$target")"
     printf 'dist/%s\n' "$(release_checksum_name "$workflow_tag" "$target")"
   done
+  printf 'dist/%s\n' "$(release_installer_name)"
+  printf 'dist/%s\n' "$(release_installer_name)"
 } > "$temp/contract-workflow-assets"
 
 grep -F 'dist/degu-' "$workflow" | sed 's/^ *//' > "$temp/workflow-assets"

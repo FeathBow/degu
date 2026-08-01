@@ -27,3 +27,11 @@ for target in $targets; do
     --source-ref "$GITHUB_REF" \
     --source-digest "$GITHUB_SHA"
 done
+
+installer="$directory/$(release_installer_name)"
+[ -f "$installer" ] && [ ! -L "$installer" ] || fail "Release installer is missing or has the wrong type: $installer"
+gh attestation verify "$installer" \
+  --repo "$GITHUB_REPOSITORY" \
+  --cert-identity "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/release.yml@$GITHUB_REF" \
+  --source-ref "$GITHUB_REF" \
+  --source-digest "$GITHUB_SHA"

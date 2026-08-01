@@ -69,11 +69,13 @@ For datasets, checkpoints, and unknown large files, pair degu with a disk-usage 
 Install the latest release (static binaries; Linux x86_64/aarch64 and macOS):
 
 ```sh
-curl -fsSLO https://github.com/FeathBow/degu/releases/latest/download/degu-install.sh
-sh degu-install.sh
+installer=$(mktemp "${TMPDIR:-/tmp}/degu-install.XXXXXX") &&
+curl -fsSLo "$installer" "https://github.com/FeathBow/degu/releases/latest/download/degu-install.sh" &&
+DEGU_VERSION= sh "$installer" &&
+rm -f "$installer"
 ```
 
-The downloaded installer is an attested release asset that carries its release version and verifies the archive's SHA-256 checksum before installing.
+The downloaded installer is an attested release asset that carries its release version and verifies the archive's SHA-256 checksum before installing; the empty `DEGU_VERSION` keeps a value exported in your environment from overriding that pinned release.
 
 Or through cargo — `cargo binstall degu` fetches the same release archives without compiling and fails rather than falling back to a third-party or source build, `cargo install degu --locked` builds from crates.io.
 

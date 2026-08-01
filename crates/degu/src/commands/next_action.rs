@@ -39,6 +39,9 @@ pub(crate) struct ScanState<'a> {
     pub(crate) scope: &'a ScanScope,
     pub(crate) trash_entries: usize,
     pub(crate) completeness: ScanCompleteness,
+    /// The findings incompleteness ledger holds only deliberate protected
+    /// prunes -- the same classification that leaves a clean plan unaffected.
+    pub(crate) protected_prunes_only: bool,
     pub(crate) cleanable: bool,
     pub(crate) needs_review: bool,
     pub(crate) has_effective_project_roots: bool,
@@ -210,7 +213,7 @@ fn scan_action(state: ScanState<'_>) -> Option<Action> {
     if state.trash_entries > 0 {
         return Some(Action::TrashList);
     }
-    if state.completeness.findings.is_incomplete() {
+    if state.completeness.findings.is_incomplete() && !state.protected_prunes_only {
         return None;
     }
     if state.cleanable {

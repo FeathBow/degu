@@ -148,3 +148,44 @@ spawn -noecho $env(DEGU_BIN) --color never scan
         "stdout: {stdout}"
     );
 }
+
+#[test]
+fn protected_only_incompleteness_keeps_the_clean_hint() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(config.path().join("degu")).unwrap();
+    std::fs::write(config.path().join("degu/config.toml"), "").unwrap();
+    let cache = home.path().join("cache/pip");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(
+        cache.join("CACHEDIR.TAG"),
+        format!("{CACHEDIR_TAG_SIGNATURE}\n"),
+    )
+    .unwrap();
+    std::fs::write(cache.join("payload.bin"), [0_u8; 2048]).unwrap();
+    let uv = home.path().join(".cache/uv");
+    std::fs::create_dir_all(uv.join("nested/.aws")).unwrap();
+    std::fs::write(uv.join("cache.bin"), [0_u8; 2048]).unwrap();
+    std::fs::write(uv.join("nested/.aws/credentials"), [0_u8; 64]).unwrap();
+    let extra_env = [("PIP_CACHE_DIR", cache.as_os_str())];
+
+    let out = run_pty(PtyRun {
+        body: r#"
+spawn -noecho $env(DEGU_BIN) --color never scan
+"#,
+        home: home.path(),
+        config_home: config.path(),
+        state_home: state.path(),
+        extra_env: &extra_env,
+    });
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("Scan incomplete"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("contains protected credentials"),
+        "stdout: {stdout}"
+    );
+    assert_next_command(&stdout, "Next:", "degu clean --dry-run");
+}

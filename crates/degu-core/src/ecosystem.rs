@@ -235,6 +235,14 @@ impl IncompleteRegions {
                 .any(|region| region.cause == RegionCause::Measurement)
     }
 
+    /// Whether every recorded event is a deliberate protected prune. An
+    /// incomplete scan whose ledger is empty broke the event<->record
+    /// conservation invariant, so an empty ledger does not count as
+    /// protected-only and callers fall through to their fail-closed paths.
+    pub fn protected_prunes_only(&self) -> bool {
+        !self.is_empty() && !self.has_measurement_events()
+    }
+
     /// Sampled regions recorded as deliberate protected prunes.
     pub fn protected_regions(&self) -> usize {
         self.sample

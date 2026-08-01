@@ -291,7 +291,7 @@ fn capture_clean_plan(
     }
     refuse_incomplete_selection(&planned, exclusions, scope)?;
     if status.is_incomplete() && !planned.is_empty() {
-        if protected_prunes_only(incomplete_regions) {
+        if incomplete_regions.protected_prunes_only() {
             // Pre-descent, name-based, one-directional protection: hidden content can
             // never grant eligibility or change plan membership, so the whole plan
             // proceeds (prune-containing findings were already refused above).
@@ -321,15 +321,6 @@ fn capture_clean_plan(
         }
     }
     CapturedCleanPlan::capture(Plan::new(planned, scope.include_review())?)
-}
-
-/// Whether every recorded incompleteness event is a deliberate protected
-/// prune. An incomplete scan whose ledger is empty broke the event<->record
-/// conservation invariant (see `CollectionSection::into_parts`), so an empty
-/// ledger does not count as protected-only: the gate then falls through to
-/// its fail-closed refusals.
-fn protected_prunes_only(regions: &IncompleteRegions) -> bool {
-    !regions.is_empty() && !regions.has_measurement_events()
 }
 
 /// Observability mirror of the --path relaxation info: names how many
@@ -546,9 +537,7 @@ fn validate_invocation(settings: CleanSettings) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        protected_prunes_only, refuse_incomplete_scope, refuse_incompleteness_overlapping_selection,
-    };
+    use super::{refuse_incomplete_scope, refuse_incompleteness_overlapping_selection};
     use degu_core::ecosystem::{IncompleteRegions, RegionCause};
     use std::path::{Path, PathBuf};
 
@@ -736,16 +725,16 @@ mod tests {
     fn protected_prunes_only_fails_closed_on_an_empty_ledger() {
         let mut protected = IncompleteRegions::default();
         protected.record(Path::new("/degu-test-prune"), RegionCause::Protected);
-        assert!(protected_prunes_only(&protected));
+        assert!(protected.protected_prunes_only());
 
         let empty = IncompleteRegions::default();
         assert!(
-            !protected_prunes_only(&empty),
+            !empty.protected_prunes_only(),
             "an incomplete scan without records broke conservation and must keep refusing"
         );
 
         let mut mixed = protected;
         mixed.record(Path::new("/degu-test-unreadable"), RegionCause::Measurement);
-        assert!(!protected_prunes_only(&mixed));
+        assert!(!mixed.protected_prunes_only());
     }
 }

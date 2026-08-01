@@ -43,6 +43,7 @@ pub(super) fn print(report: &ScanReport) -> Result<()> {
             scope: &report.scope,
             trash_entries,
             completeness: report.completeness,
+            protected_prunes_only: report.incomplete_regions.protected_prunes_only(),
             cleanable: has_cleanable_findings(report),
             needs_review: has_needs_review_findings(report),
             has_effective_project_roots: report.has_effective_project_roots,

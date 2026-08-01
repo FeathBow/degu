@@ -171,6 +171,25 @@ else
   test_member_mutation "appledouble-metadata" appledouble-entry appledouble
 fi
 
+installer_valid="$work/installer-valid"
+./tools/package-installer.sh "$tag" "$installer_valid"
+./tools/verify-release-installer.sh "$tag" "$installer_valid"
+
+installer_wrong_version="$work/installer-wrong-version"
+./tools/package-installer.sh "v0.0.0" "$installer_wrong_version"
+if ./tools/verify-release-installer.sh "$tag" "$installer_wrong_version" > /dev/null 2> "$work/installer-error"; then
+  fail "Installer verification unexpectedly succeeded: $installer_wrong_version"
+fi
+grep -F "does not pin the release version" "$work/installer-error" > /dev/null || fail "Installer verification failed at the wrong guard: $installer_wrong_version"
+
+installer_tampered="$work/installer-tampered"
+./tools/package-installer.sh "$tag" "$installer_tampered"
+printf 'echo tampered\n' >> "$installer_tampered/$(release_installer_name)"
+if ./tools/verify-release-installer.sh "$tag" "$installer_tampered" > /dev/null 2> "$work/installer-error"; then
+  fail "Installer verification unexpectedly succeeded: $installer_tampered"
+fi
+grep -F "does not match the repository install script" "$work/installer-error" > /dev/null || fail "Installer verification failed at the wrong guard: $installer_tampered"
+
 bad_checksum="$work/bad-checksum"
 mkdir -p "$bad_checksum"
 cp -R "$valid/." "$bad_checksum/"

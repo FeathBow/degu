@@ -21,6 +21,7 @@ write_expected_assets() {
       printf '%s\n' "$(release_archive_name "$asset_tag" "$asset_target")"
       printf '%s\n' "$(release_checksum_name "$asset_tag" "$asset_target")"
     done
+    printf '%s\n' "$(release_installer_name)"
     return
   fi
 
@@ -167,6 +168,7 @@ if [ "$scope" = "all" ]; then
   for target in $targets; do
     verify_archive "$tag" "$target" "$directory"
   done
+  "$(dirname "$0")/verify-release-installer.sh" "$tag" "$directory"
 else
   verify_archive "$tag" "$scope" "$directory"
 fi

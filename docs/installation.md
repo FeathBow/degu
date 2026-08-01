@@ -39,12 +39,14 @@ Set `DEGU_INSTALL_DIR` for that invocation to install elsewhere, and add the cho
 ```sh
 version=vX.Y.Z
 installer=$(mktemp "${TMPDIR:-/tmp}/degu-install.XXXXXX") &&
-curl -fsSLo "$installer" "https://raw.githubusercontent.com/FeathBow/degu/$version/install.sh" &&
+curl -fsSLo "$installer" "https://github.com/FeathBow/degu/releases/download/$version/degu-install.sh" &&
 DEGU_VERSION="$version" sh "$installer" &&
 rm -f "$installer" &&
 export PATH="$HOME/.local/bin:$PATH" &&
 degu --version
 ```
+
+The published `degu-install.sh` asset carries its release version as the `DEGU_VERSION` default and is covered by the same build provenance attestation as the archives; the command above still sets `DEGU_VERSION` explicitly so a value inherited from the environment cannot change which release is installed. For tags that predate the installer asset, download `install.sh` from the tag's source tree instead.
 
 ### Manual archive
 

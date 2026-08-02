@@ -179,6 +179,43 @@ fn clean_guard_abort_rejects_protected_paths_before_mutation_or_logging() {
 }
 
 #[test]
+fn relative_xdg_config_home_cannot_bypass_home_protection() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    #[cfg(target_os = "macos")]
+    let cache_subdir = "Library/Caches/pip";
+    #[cfg(not(target_os = "macos"))]
+    let cache_subdir = ".cache/pip";
+    let (cache, _) = fake_pip_cache(&home, cache_subdir);
+    std::fs::create_dir_all(home.path().join(".config/degu")).unwrap();
+    std::fs::write(
+        home.path().join(".config/degu/config.toml"),
+        format!("protect = [\"{cache_subdir}\"]\n"),
+    )
+    .unwrap();
+
+    let out = degu()
+        .current_dir(work.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", "relative-missing")
+        .env("XDG_STATE_HOME", state.path())
+        .args(["clean", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    assert!(cache.exists());
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("protected"),
+        "expected protected-path refusal, got: {stderr}"
+    );
+    assert!(!state.path().join("degu/ops.jsonl").exists());
+}
+
+#[test]
 fn clean_config_protect_rejects_cache_before_mutation_or_logging() {
     let home = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();

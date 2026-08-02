@@ -542,15 +542,23 @@ impl DetectCtx {
     }
 
     pub fn xdg_config(&self) -> PathBuf {
-        self.env("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
+        self.absolute_env_path("XDG_CONFIG_HOME")
             .unwrap_or_else(|| self.home.join(".config"))
     }
 
     pub fn xdg_state(&self) -> PathBuf {
-        self.env("XDG_STATE_HOME")
-            .map(PathBuf::from)
+        self.absolute_env_path("XDG_STATE_HOME")
             .unwrap_or_else(|| self.home.join(".local/state"))
+    }
+
+    /// XDG Base Directory variables must be absolute; relative values are
+    /// invalid and ignored. Cache/data roots deliberately keep the invalid
+    /// spelling so discovery reports them as incomplete rather than silently
+    /// changing scan scope.
+    fn absolute_env_path(&self, variable: &str) -> Option<PathBuf> {
+        self.env(variable)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
     }
 
     fn xdg_root(&self, variable: &'static str, fallback: &str) -> Root {
@@ -752,5 +760,24 @@ mod tests {
                 RegionCause::Measurement
             );
         }
+    }
+
+    #[test]
+    fn relative_xdg_config_and_state_paths_use_home_fallbacks() {
+        let home = PathBuf::from("/home/degu-test");
+        let ctx = DetectCtx::for_test(
+            home.clone(),
+            [
+                ("XDG_CACHE_HOME", "relative-cache"),
+                ("XDG_DATA_HOME", "relative-data"),
+                ("XDG_CONFIG_HOME", "relative-config"),
+                ("XDG_STATE_HOME", "relative-state"),
+            ],
+        );
+
+        assert_eq!(ctx.xdg_cache().path, PathBuf::from("relative-cache"));
+        assert_eq!(ctx.xdg_data().path, PathBuf::from("relative-data"));
+        assert_eq!(ctx.xdg_config(), home.join(".config"));
+        assert_eq!(ctx.xdg_state(), home.join(".local/state"));
     }
 }

@@ -234,18 +234,24 @@ fn unsupported_options_and_root_prefix_forms_are_rejected() {
 }
 
 #[test]
-fn max_concurrency_zero_is_rejected_for_scan_and_clean() {
-    for args in [
-        &["scan", MAX_CONCURRENCY, "0"][..],
-        &["clean", MAX_CONCURRENCY, "0", "--dry-run"],
+fn max_concurrency_out_of_range_is_rejected_for_scan_and_clean() {
+    for (args, invalid) in [
+        (&["scan", MAX_CONCURRENCY, "0"][..], "0"),
+        (&["clean", MAX_CONCURRENCY, "0", "--dry-run"][..], "0"),
+        (&["scan", MAX_CONCURRENCY, "257"][..], "257"),
+        (&["clean", MAX_CONCURRENCY, "257", "--dry-run"][..], "257"),
     ] {
         let output = run(args);
         let stderr = String::from_utf8(output.stderr).unwrap();
-        assert_eq!(output.status.code(), Some(2), "zero was accepted: {args:?}");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "out-of-range value was accepted: {args:?}"
+        );
         assert!(stderr.contains(MAX_CONCURRENCY), "{stderr}");
-        assert!(stderr.contains('0'), "{stderr}");
+        assert!(stderr.contains(invalid), "{stderr}");
         assert!(
-            stderr.contains("nonzero") || stderr.contains("non-zero"),
+            stderr.contains("non-zero") || stderr.contains("must not exceed 256"),
             "{stderr}"
         );
     }

@@ -67,6 +67,15 @@ pub(crate) fn deadline_from_budget(budget: Option<Duration>) -> Result<Option<In
 }
 
 fn validate_config(config: &Config) -> Result<()> {
+    if config
+        .max_concurrency
+        .is_some_and(|value| value.get() > degu_core::config::MAX_SCAN_CONCURRENCY)
+    {
+        anyhow::bail!(
+            "max_concurrency must not exceed {}",
+            degu_core::config::MAX_SCAN_CONCURRENCY
+        );
+    }
     validate_disabled_adapters(&config.disable)?;
     for entry in &config.protect {
         validate_protect_entry(entry)?;
@@ -111,6 +120,11 @@ fn validate_root_entry(entry: &str) -> Result<()> {
     }
     if entry.starts_with('~') && !entry.starts_with("~/") {
         anyhow::bail!("invalid root entry {entry:?}: leading ~ must be followed by /");
+    }
+    if let Some(rest) = entry.strip_prefix("~/")
+        && Path::new(rest).is_absolute()
+    {
+        anyhow::bail!("invalid root entry {entry:?}: ~/ must be followed by a HOME-relative path");
     }
     if !(Path::new(entry).is_absolute() || entry.starts_with("~/")) {
         anyhow::bail!(

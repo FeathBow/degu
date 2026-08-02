@@ -82,6 +82,9 @@ impl ScanRequest {
 }
 
 pub(crate) fn run(args: ScanArgs, ui: Ui) -> Result<()> {
+    if args.details && args.summary && !args.output.json {
+        anyhow::bail!("--details cannot be used with --summary unless --json is also set");
+    }
     let started = std::time::Instant::now();
     let mut report = prepare(ScanRequest::new(args, ui))?;
     report.elapsed = Some(started.elapsed());

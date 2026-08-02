@@ -169,7 +169,7 @@ pub(crate) struct ScanArgs {
     #[arg(short, long)]
     pub(crate) details: bool,
     /// Group findings by source instead of listing individual paths
-    #[arg(long, conflicts_with = "details")]
+    #[arg(long)]
     pub(crate) summary: bool,
     /// Keep only findings using at least this much space on disk (bytes, K, M, G, T)
     #[arg(long, value_name = "SIZE", value_parser = parse_size)]

@@ -174,6 +174,44 @@ fn scan_json_ignores_details_flag_byte_for_byte() {
 }
 
 #[test]
+fn scan_summary_json_ignores_details_flag_byte_for_byte() {
+    let (home, cache) = fake_cache("scratch/pip-cache", "wheel.whl", 2048);
+    let summary = degu()
+        .env("HOME", home.path())
+        .env("PIP_CACHE_DIR", &cache)
+        .args(["scan", "--json", "--summary"])
+        .output()
+        .unwrap();
+    let summary_details = degu()
+        .env("HOME", home.path())
+        .env("PIP_CACHE_DIR", &cache)
+        .args(["scan", "--json", "--summary", "--details"])
+        .output()
+        .unwrap();
+
+    assert!(summary.status.success());
+    assert!(summary_details.status.success());
+    assert_eq!(summary_details.stdout, summary.stdout);
+}
+
+#[test]
+fn scan_human_details_and_summary_remain_mutually_exclusive() {
+    let home = tempfile::tempdir().unwrap();
+    let out = degu()
+        .env("HOME", home.path())
+        .args(["scan", "--summary", "--details"])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("--details cannot be used with --summary unless --json is also set")
+    );
+}
+
+#[test]
 fn scan_table_shows_units_and_total() {
     let (home, cache) = fake_cache("scratch/pip-cache", "wheel.whl", 2048);
     std::fs::hard_link(cache.join("wheel.whl"), cache.join("wheel-link.whl")).unwrap();

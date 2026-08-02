@@ -1,4 +1,4 @@
-use crate::value_parser::{parse_duration, parse_size};
+use crate::value_parser::{parse_duration, parse_max_concurrency, parse_size};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -62,7 +62,7 @@ Examples:
   degu clean ~/code --dry-run
       Include project build artifacts";
 
-const MAX_CONCURRENCY_HELP: &str = "Override the per-filesystem directory-read limit";
+const MAX_CONCURRENCY_HELP: &str = "Override the per-filesystem directory-read limit (1-256)";
 
 #[cfg(target_os = "linux")]
 const RUNTIME_HELP: &str = "Include /dev/shm and temporary-directory diagnostics. Findings are Not managed and never join cache totals.";
@@ -107,7 +107,12 @@ pub(crate) struct JsonArgs {
 
 #[derive(Args)]
 pub(crate) struct ScanLimitArgs {
-    #[arg(long, value_name = "N", help = MAX_CONCURRENCY_HELP)]
+    #[arg(
+        long,
+        value_name = "N",
+        help = MAX_CONCURRENCY_HELP,
+        value_parser = parse_max_concurrency
+    )]
     pub(crate) max_concurrency: Option<NonZeroUsize>,
     /// Stop starting new scan work after this wall-clock budget; in-flight filesystem operations may finish (bare integer seconds, or Ns/Nm/Nh)
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]

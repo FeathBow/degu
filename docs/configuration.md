@@ -17,7 +17,7 @@ runtime = false
 | `roots` | Array of paths | Adds project trees to read-only build-artifact discovery. `clean` requires those roots as explicit positional arguments. |
 | `protect` | Array of paths | Adds paths to the safety guard. Relative paths resolve against `$HOME`. |
 | `disable` | Array of adapter IDs | Disables registered ecosystem adapters. |
-| `max_concurrency` | Positive integer | Overrides the per-filesystem concurrent directory-read limit. |
+| `max_concurrency` | Integer from 1 through 256 | Overrides the per-filesystem concurrent directory-read limit. |
 | `runtime` | Boolean | Opts `scan` into available runtime diagnostics. Defaults to `false`. |
 
 Runtime diagnostics are equivalent to passing `--runtime` to `scan`. Temporary-directory diagnostics are available on Linux and macOS; shared-memory diagnostics for `/dev/shm` are Linux-only. Their findings remain **Not managed** (`report_only` in JSON) and outside cache totals. `clean` never enables runtime adapters.

@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 const KIBIBYTE: u64 = 1024;
@@ -61,6 +62,21 @@ fn split_duration(raw: &str) -> Result<(&str, u64), String> {
         }
     };
     Ok((&raw[..raw.len() - 1], multiplier))
+}
+
+pub(crate) fn parse_max_concurrency(raw: &str) -> Result<NonZeroUsize, String> {
+    let value = raw
+        .parse::<usize>()
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .ok_or_else(|| "concurrency must be a non-zero integer".to_string())?;
+    if value.get() > degu_core::config::MAX_SCAN_CONCURRENCY {
+        return Err(format!(
+            "concurrency must not exceed {}",
+            degu_core::config::MAX_SCAN_CONCURRENCY
+        ));
+    }
+    Ok(value)
 }
 
 fn parse_scaled(digits: &str, multiplier: u64, kind: &str) -> Result<u64, String> {
@@ -130,6 +146,22 @@ mod tests {
     fn duration_rejects_invalid_and_fractional_values() {
         for raw in ["", "s", "1.5s", "1d", "12ms", "-1", "abc"] {
             assert!(parse_duration(raw).is_err(), "{raw:?} should be invalid");
+        }
+    }
+
+    #[test]
+    fn concurrency_accepts_the_documented_range() {
+        assert_eq!(parse_max_concurrency("1").unwrap().get(), 1);
+        assert_eq!(parse_max_concurrency("256").unwrap().get(), 256);
+    }
+
+    #[test]
+    fn concurrency_rejects_zero_invalid_and_excessive_values() {
+        for raw in ["0", "257", "-1", "1.5", "abc"] {
+            assert!(
+                parse_max_concurrency(raw).is_err(),
+                "{raw:?} should be invalid"
+            );
         }
     }
 }

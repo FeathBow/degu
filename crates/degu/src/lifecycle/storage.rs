@@ -19,6 +19,8 @@ mod validation;
 pub(crate) use validation::ensure_managed_trash_root;
 use validation::{ensure_state_parent, validate_existing_trash_root};
 
+use super::operation_log::isolate_partial_tail;
+
 pub(crate) fn trash_dir_state(ctx: &DetectCtx) -> PathBuf {
     ctx.xdg_state().join("degu/trash")
 }
@@ -154,6 +156,8 @@ pub(crate) fn register_trash_root(state_dir: &Path, root: &Path) -> Result<()> {
         .append(true)
         .open(&registry)
         .with_context(|| format!("failed to open {}", registry.display()))?;
+    isolate_partial_tail(&mut file)
+        .with_context(|| format!("failed to inspect {}", registry.display()))?;
     writeln!(file, "{root_line}")
         .with_context(|| format!("failed to write {}", registry.display()))?;
     Ok(())

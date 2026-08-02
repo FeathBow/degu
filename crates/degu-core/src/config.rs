@@ -1,6 +1,10 @@
 use serde::Deserialize;
 use std::num::NonZeroUsize;
 
+/// Hard ceiling for user-configured walker threads. A larger value can spend
+/// substantial CPU and address space creating threads before any scan work.
+pub const MAX_SCAN_CONCURRENCY: usize = 256;
+
 /// User config (~/.config/degu/config.toml). May add read-only coverage or
 /// protection, or disable ecosystems; no field may loosen deletion authority.
 #[derive(Debug, Clone, Default, Deserialize)]

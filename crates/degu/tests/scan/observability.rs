@@ -88,6 +88,48 @@ fn debug_scan_names_each_sampled_skipped_path_with_its_reason() {
     );
 }
 
+#[test]
+fn tilde_root_cannot_escape_home_with_a_second_slash() {
+    let home = tempfile::tempdir().unwrap();
+    let config = runtime_config_home("roots = [\"~//tmp/unintended\"]\n");
+
+    let out = degu()
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config.path())
+        .args(["scan", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("~/ must be followed by a HOME-relative path"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn excessive_configured_concurrency_fails_before_scanning() {
+    let home = tempfile::tempdir().unwrap();
+    let config = runtime_config_home("max_concurrency = 257\n");
+
+    let out = degu()
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config.path())
+        .args(["scan", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("max_concurrency must not exceed 256"),
+        "{stderr}"
+    );
+}
+
 // The TOML parse error must render as a block indented under the `error:`
 // prefix, never flattened to one line with a literal "\n".
 #[test]
@@ -133,4 +175,32 @@ fn invalid_rust_log_fails_loudly() {
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(stderr.contains("invalid RUST_LOG directive"), "{stderr}");
     assert!(stderr.contains("notalevel"), "{stderr}");
+}
+
+#[test]
+fn scan_fails_closed_on_a_corrupt_trash_registry() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let state_dir = state.path().join("degu");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(
+        state_dir.join("trashroots"),
+        b"\"/external/.degu-trash\"TRUNCATED\n",
+    )
+    .unwrap();
+
+    let out = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .arg("scan")
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("trashroots"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("corrupt trash registry line 1"),
+        "stderr: {stderr}"
+    );
 }

@@ -209,39 +209,28 @@ fn read_registered_trash_roots(registry: &Path) -> Result<Vec<PathBuf>> {
     let limits =
         super::state_read::StateReadLimits::new(TRASHROOTS_MAX_BYTES, TRASHROOT_RECORD_MAX_BYTES);
     super::state_read::visit_bounded_state_lines(registry, limits, |line_no, line| {
-        let line = match std::str::from_utf8(line) {
-            Ok(line) => line,
-            Err(_) => {
-                tracing::warn!(
-                    target: "degu",
-                    path = %registry.display(),
-                    line = line_no,
-                    "skipping non-UTF-8 trash registry line"
-                );
-                return Ok(());
-            }
-        };
-        if let Some(root) = parse_registered_trash_root(line, registry, line_no) {
-            roots.push(root);
-        }
+        let line = std::str::from_utf8(line).with_context(|| {
+            format!(
+                "failed to read {}: trash registry line {line_no} is not valid UTF-8",
+                registry.display()
+            )
+        })?;
+        roots.push(parse_registered_trash_root(line, registry, line_no)?);
         Ok(())
     })?;
     Ok(roots)
 }
 
-fn parse_registered_trash_root(line: &str, registry: &Path, line_no: usize) -> Option<PathBuf> {
+fn parse_registered_trash_root(line: &str, registry: &Path, line_no: usize) -> Result<PathBuf> {
     let (root, legacy) = match serde_json::from_str::<PathBuf>(line) {
         Ok(root) => (root, false),
         Err(_) => (PathBuf::from(line), true),
     };
     if !is_registered_trash_root(&root) {
-        tracing::warn!(
-            target: "degu",
-            path = %registry.display(),
-            line = line_no,
-            "skipping corrupt trash registry line"
+        anyhow::bail!(
+            "failed to read {}: corrupt trash registry line {line_no}",
+            registry.display()
         );
-        return None;
     }
     if legacy {
         tracing::warn!(
@@ -251,7 +240,7 @@ fn parse_registered_trash_root(line: &str, registry: &Path, line_no: usize) -> O
             "using legacy unquoted trash registry line"
         );
     }
-    Some(root)
+    Ok(root)
 }
 
 fn is_registered_trash_root(root: &Path) -> bool {

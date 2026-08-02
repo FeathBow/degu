@@ -134,3 +134,31 @@ fn invalid_rust_log_fails_loudly() {
     assert!(stderr.contains("invalid RUST_LOG directive"), "{stderr}");
     assert!(stderr.contains("notalevel"), "{stderr}");
 }
+
+#[test]
+fn scan_fails_closed_on_a_corrupt_trash_registry() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let state_dir = state.path().join("degu");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(
+        state_dir.join("trashroots"),
+        b"\"/external/.degu-trash\"TRUNCATED\n",
+    )
+    .unwrap();
+
+    let out = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .arg("scan")
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("trashroots"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("corrupt trash registry line 1"),
+        "stderr: {stderr}"
+    );
+}

@@ -43,7 +43,7 @@ fn group_writable_trash_root_is_rejected() {
 }
 
 #[test]
-fn registration_isolates_a_partial_registry_tail() {
+fn registration_refuses_a_partial_or_corrupt_registry_tail() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     let registry = state.join(TRASHROOTS_FILE);
@@ -53,12 +53,17 @@ fn registration_isolates_a_partial_registry_tail() {
         std::fs::Permissions::from_mode(0o700),
     )
     .unwrap();
-    std::fs::write(&registry, "\"/not-trash\"\n/partial").unwrap();
+    let original = b"\"/not-trash\"\n/partial";
+    std::fs::write(&registry, original).unwrap();
     let root = dir.path().join(".degu-trash");
 
-    register_trash_root(&state, &root).unwrap();
+    let error = register_trash_root(&state, &root).unwrap_err();
 
-    assert_eq!(read_registered_trash_roots(&registry).unwrap(), vec![root]);
+    assert!(
+        error.to_string().contains("corrupt trash registry line 1"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(&registry).unwrap(), original);
 }
 
 #[test]

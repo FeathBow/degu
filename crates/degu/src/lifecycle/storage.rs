@@ -19,8 +19,6 @@ mod validation;
 pub(crate) use validation::ensure_managed_trash_root;
 use validation::{ensure_state_parent, validate_existing_trash_root};
 
-use super::operation_log::isolate_partial_tail;
-
 pub(crate) fn trash_dir_state(ctx: &DetectCtx) -> PathBuf {
     ctx.xdg_state().join("degu/trash")
 }
@@ -156,8 +154,6 @@ pub(crate) fn register_trash_root(state_dir: &Path, root: &Path) -> Result<()> {
         .append(true)
         .open(&registry)
         .with_context(|| format!("failed to open {}", registry.display()))?;
-    isolate_partial_tail(&mut file)
-        .with_context(|| format!("failed to inspect {}", registry.display()))?;
     writeln!(file, "{root_line}")
         .with_context(|| format!("failed to write {}", registry.display()))?;
     Ok(())
@@ -209,39 +205,28 @@ fn read_registered_trash_roots(registry: &Path) -> Result<Vec<PathBuf>> {
     let limits =
         super::state_read::StateReadLimits::new(TRASHROOTS_MAX_BYTES, TRASHROOT_RECORD_MAX_BYTES);
     super::state_read::visit_bounded_state_lines(registry, limits, |line_no, line| {
-        let line = match std::str::from_utf8(line) {
-            Ok(line) => line,
-            Err(_) => {
-                tracing::warn!(
-                    target: "degu",
-                    path = %registry.display(),
-                    line = line_no,
-                    "skipping non-UTF-8 trash registry line"
-                );
-                return Ok(());
-            }
-        };
-        if let Some(root) = parse_registered_trash_root(line, registry, line_no) {
-            roots.push(root);
-        }
+        let line = std::str::from_utf8(line).with_context(|| {
+            format!(
+                "failed to read {}: trash registry line {line_no} is not valid UTF-8",
+                registry.display()
+            )
+        })?;
+        roots.push(parse_registered_trash_root(line, registry, line_no)?);
         Ok(())
     })?;
     Ok(roots)
 }
 
-fn parse_registered_trash_root(line: &str, registry: &Path, line_no: usize) -> Option<PathBuf> {
+fn parse_registered_trash_root(line: &str, registry: &Path, line_no: usize) -> Result<PathBuf> {
     let (root, legacy) = match serde_json::from_str::<PathBuf>(line) {
         Ok(root) => (root, false),
         Err(_) => (PathBuf::from(line), true),
     };
     if !is_registered_trash_root(&root) {
-        tracing::warn!(
-            target: "degu",
-            path = %registry.display(),
-            line = line_no,
-            "skipping corrupt trash registry line"
+        anyhow::bail!(
+            "failed to read {}: corrupt trash registry line {line_no}",
+            registry.display()
         );
-        return None;
     }
     if legacy {
         tracing::warn!(
@@ -251,7 +236,7 @@ fn parse_registered_trash_root(line: &str, registry: &Path, line_no: usize) -> O
             "using legacy unquoted trash registry line"
         );
     }
-    Some(root)
+    Ok(root)
 }
 
 fn is_registered_trash_root(root: &Path) -> bool {

@@ -73,6 +73,40 @@ fn trash_list_rejects_fifo_registry_without_hanging() {
 }
 
 #[test]
+fn trash_commands_fail_closed_on_a_corrupt_registry() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let state_dir = state.path().join("degu");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(
+        state_dir.join("trashroots"),
+        b"\"/external/.degu-trash\"TRUNCATED\n",
+    )
+    .unwrap();
+
+    for args in [
+        &["trash", "list", "--json"][..],
+        &["trash", "purge", "--yes", "--json"][..],
+    ] {
+        let out = degu()
+            .env("HOME", home.path())
+            .env("XDG_STATE_HOME", state.path())
+            .args(args)
+            .output()
+            .unwrap();
+
+        assert!(!out.status.success(), "corrupt registry accepted: {args:?}");
+        assert!(out.stdout.is_empty(), "false JSON success for {args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("trashroots"), "stderr: {stderr}");
+        assert!(
+            stderr.contains("corrupt trash registry line 1"),
+            "stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn interactive_trash_list_presents_restore_and_purge_as_outcomes() {
     let (home, state, _) = fake_pip_cache();
     clean_pip_cache(&home, &state);

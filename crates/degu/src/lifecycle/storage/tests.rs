@@ -43,7 +43,7 @@ fn group_writable_trash_root_is_rejected() {
 }
 
 #[test]
-fn registration_isolates_a_partial_registry_tail() {
+fn registration_refuses_a_corrupt_registry_line() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     let registry = state.join(TRASHROOTS_FILE);
@@ -53,12 +53,42 @@ fn registration_isolates_a_partial_registry_tail() {
         std::fs::Permissions::from_mode(0o700),
     )
     .unwrap();
-    std::fs::write(&registry, "\"/not-trash\"\n/partial").unwrap();
+    let original = b"\"/not-trash\"\n";
+    std::fs::write(&registry, original).unwrap();
+    let root = dir.path().join(".degu-trash");
+
+    let error = register_trash_root(&state, &root).unwrap_err();
+
+    assert!(
+        error.to_string().contains("corrupt trash registry line 1"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(&registry).unwrap(), original);
+}
+
+#[test]
+fn registration_seals_a_valid_unterminated_tail_before_appending() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let registry = state.join(TRASHROOTS_FILE);
+    std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+    std::fs::set_permissions(
+        registry.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    std::fs::write(&registry, b"\"/old/.degu-trash\"").unwrap();
     let root = dir.path().join(".degu-trash");
 
     register_trash_root(&state, &root).unwrap();
 
-    assert_eq!(read_registered_trash_roots(&registry).unwrap(), vec![root]);
+    let encoded = serde_json::to_string(root.to_str().unwrap()).unwrap();
+    let expected = format!("\"/old/.degu-trash\"\n{encoded}\n");
+    assert_eq!(std::fs::read(&registry).unwrap(), expected.as_bytes());
+    assert_eq!(
+        read_registered_trash_roots(&registry).unwrap(),
+        vec![std::path::PathBuf::from("/old/.degu-trash"), root]
+    );
 }
 
 #[test]

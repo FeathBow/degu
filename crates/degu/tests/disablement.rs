@@ -11,7 +11,7 @@ mod pty;
 mod revalidation;
 
 const CACHEDIR_TAG_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
-const VALID_ADAPTER_IDS: &str = "apptainer, cargo, ccache, computecache, conda, docker, go-build, helm, huggingface, inductor, jax, modelscope, npm, ollama, orbstack, pip, pixi, podman, sccache, shm, spack, tmp, torch, torchext, triton, uv, vllm, vscode";
+const VALID_ADAPTER_IDS: &str = "apptainer, cargo, ccache, computecache, conda, docker, go-build, helm, huggingface, inductor, jax, modelscope, npm, ollama, orbstack, pip, pixi, podman, sccache, shm, spack, tmp, torch, torchext, triton, uv, vllm, vscode, wandb";
 
 fn degu(home: &std::path::Path, config: &std::path::Path) -> Command {
     let mut cmd = Command::cargo_bin("degu").unwrap();

@@ -25,3 +25,4 @@ mod safe_reads;
 mod scope_output;
 mod scoped_builds;
 mod selection;
+mod wandb;

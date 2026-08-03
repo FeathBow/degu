@@ -36,6 +36,7 @@ mod triton;
 mod uv;
 mod vllm;
 mod vscode;
+mod wandb;
 
 use degu_core::ecosystem::{DetectCtx, Ecosystem, Root, RootOutcome, ScanOutcome};
 use degu_core::finding::{FindingCandidate, FindingFacts, FindingKind};
@@ -275,6 +276,7 @@ pub fn all() -> Vec<RegisteredAdapter> {
         RegisteredAdapter::new(gobuild::Gobuild, Cache),
         RegisteredAdapter::new(sccache::Sccache, Cache),
         RegisteredAdapter::new(inductor::Inductor, Cache),
+        RegisteredAdapter::new(wandb::Wandb, Cache),
         RegisteredAdapter::new(shm::Shm, Runtime),
         RegisteredAdapter::new(tmp::Tmp, Runtime),
     ]
@@ -437,6 +439,7 @@ mod tests {
             ("go-build", Cache),
             ("sccache", Cache),
             ("inductor", Cache),
+            ("wandb", Cache),
             ("shm", Runtime),
             ("tmp", Runtime),
         ];

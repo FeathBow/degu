@@ -18,6 +18,7 @@ mod helm;
 mod huggingface;
 mod inductor;
 mod jax;
+mod modelscope;
 mod npm;
 mod ollama;
 mod orbstack;
@@ -257,6 +258,7 @@ pub fn all() -> Vec<RegisteredAdapter> {
         RegisteredAdapter::new(pixi::Pixi, Cache),
         RegisteredAdapter::new(vscode::Vscode, Cache),
         RegisteredAdapter::new(huggingface::Huggingface, Cache),
+        RegisteredAdapter::new(modelscope::Modelscope, Cache),
         RegisteredAdapter::new(ollama::Ollama, Cache),
         RegisteredAdapter::new(podman::Podman, Cache),
         RegisteredAdapter::new(docker::Docker, Cache),
@@ -418,6 +420,7 @@ mod tests {
             ("pixi", Cache),
             ("vscode", Cache),
             ("huggingface", Cache),
+            ("modelscope", Cache),
             ("ollama", Cache),
             ("podman", Cache),
             ("docker", Cache),

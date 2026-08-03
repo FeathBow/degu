@@ -5,7 +5,9 @@ use degu_core::disposition::{
     UNKNOWN_OWNERSHIP, UNKNOWN_RECOVERY, UNVERIFIED_REDIRECT, USER_ASSET,
 };
 use degu_core::finding::{DispositionMode, Finding};
-use degu_core::safety::{MIXED_STATE_AI_TOOL_REASON, PROTECTED_CREDENTIAL_REASON};
+use degu_core::safety::{
+    MIXED_STATE_AI_TOOL_REASON, PROTECTED_CREDENTIAL_REASON, SHARED_WRITABLE_REASON,
+};
 
 const REVIEW_EXPLANATION: &str = "Excluded by default; preview a path before including it.";
 const UNMANAGED_EXPLANATION: &str = "Reported only; degu never cleans these locations.";
@@ -43,6 +45,7 @@ pub(crate) fn short_reason(reason: &str, ecosystem: &str) -> Option<String> {
         ACTIVE_USE => "active use",
         COSTLY_REGEN => "costly to regenerate",
         MIXED_STATE_AI_TOOL_REASON => "contains protected AI tool state",
+        SHARED_WRITABLE_REASON => "shared-writable directory",
         PROTECTED_CREDENTIAL_REASON => "contains protected credentials",
         _ => return None,
     };
@@ -220,6 +223,7 @@ mod tests {
     fn every_exported_reason_has_a_short_phrase() {
         let reasons = degu_core::disposition::STATIC_REASONS.into_iter().chain([
             degu_core::safety::MIXED_STATE_AI_TOOL_REASON,
+            degu_core::safety::SHARED_WRITABLE_REASON,
             degu_core::safety::PROTECTED_CREDENTIAL_REASON,
         ]);
         for reason in reasons {

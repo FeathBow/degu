@@ -22,6 +22,7 @@ impl WalkStats {
             skipped_total,
             truncated,
             unvisited_dirs,
+            shared_writable_dirs,
             excluded_entries,
             excluded_credential_boundaries,
             skipped,
@@ -38,6 +39,9 @@ impl WalkStats {
         self.skipped_total = self.skipped_total.saturating_add(skipped_total);
         self.truncated |= truncated;
         self.unvisited_dirs = self.unvisited_dirs.saturating_add(unvisited_dirs);
+        self.shared_writable_dirs = self
+            .shared_writable_dirs
+            .saturating_add(shared_writable_dirs);
         self.excluded_entries = self.excluded_entries.saturating_add(excluded_entries);
         self.excluded_credential_boundaries = self
             .excluded_credential_boundaries
@@ -107,9 +111,16 @@ pub(super) fn record_file(meta: &FileMeta, stats: &mut WalkStats, progress: Opti
     }
 }
 
-pub(super) fn record_directory(stats: &mut WalkStats, progress: Option<&Progress>) {
+pub(super) fn record_directory(
+    meta: &FileMeta,
+    stats: &mut WalkStats,
+    progress: Option<&Progress>,
+) {
     stats.dirs = stats.dirs.saturating_add(1);
     stats.inodes = stats.inodes.saturating_add(1);
+    if meta.mode & 0o022 != 0 {
+        stats.shared_writable_dirs = stats.shared_writable_dirs.saturating_add(1);
+    }
     record_progress(progress, 1, 0);
 }
 

@@ -6,6 +6,26 @@ use std::io::Write;
 use std::num::NonZeroUsize;
 
 #[test]
+fn records_shared_writable_directories_without_dropping_their_measurement() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let shared = root.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::write(shared.join("data.bin"), [1_u8; 32]).unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let stats = measure(root.path(), &WalkOptions::default()).unwrap();
+
+    assert_eq!(stats.shared_writable_dirs, 2);
+    assert_eq!(stats.dirs, 2);
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.inodes, 3);
+    assert_eq!(stats.skipped_total, 0);
+}
+
+#[test]
 fn counts_files_dirs_and_inodes() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("sub")).unwrap();

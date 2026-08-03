@@ -44,6 +44,55 @@ fn unreadable_claimed_dir_records_a_region_and_drops_the_finding() {
     }));
 }
 
+#[cfg(target_vendor = "apple")]
+#[test]
+fn foreign_owned_project_entry_records_a_region_without_hiding_owned_siblings() {
+    use std::os::unix::fs::MetadataExt;
+
+    let foreign_source = std::path::Path::new("/etc/hosts");
+    let foreign_uid = std::fs::symlink_metadata(foreign_source).unwrap().uid();
+    if foreign_uid == rustix::process::geteuid().as_raw() {
+        return;
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let foreign = root.path().join("foreign-hosts");
+    if let Err(error) = std::fs::hard_link(foreign_source, &foreign) {
+        eprintln!("platform refused the unprivileged foreign hardlink fixture: {error}");
+        return;
+    }
+    let foreign = foreign.canonicalize().unwrap();
+    let artifact = root.path().join("__pycache__");
+    std::fs::create_dir(&artifact).unwrap();
+    std::fs::write(artifact.join("module.pyc"), [0_u8]).unwrap();
+    let artifact = artifact.canonicalize().unwrap();
+    let ctx = degu_core::ecosystem::DetectCtx::from_process().unwrap();
+    let roots = vec![
+        ResolvedProjectRoot::resolve(root.path())
+            .unwrap()
+            .validate()
+            .unwrap(),
+    ];
+    let scope = DiscoveryScope {
+        claimed_roots: &[],
+        dependency_claims: &[],
+        sources: ProjectSources::new(true, false),
+    };
+
+    let outcome = discover(&roots, scope, &ctx).unwrap();
+
+    assert!(outcome.incomplete);
+    assert!(
+        outcome
+            .candidates
+            .iter()
+            .any(|candidate| candidate.path == artifact)
+    );
+    assert!(outcome.incomplete_regions.sample().iter().any(|region| {
+        region.path() == foreign && region.cause() == degu_core::ecosystem::RegionCause::Measurement
+    }));
+}
+
 #[cfg(unix)]
 #[test]
 fn artifact_probe_failure_marks_incomplete_and_keeps_descending() {

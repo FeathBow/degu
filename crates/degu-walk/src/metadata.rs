@@ -24,6 +24,8 @@ pub(super) struct FileMeta {
     pub(super) nlink: u64,
     pub(super) mtime: Option<SystemTime>,
     pub(super) dev: u64,
+    pub(super) uid: u32,
+    pub(super) mode: u32,
 }
 
 /// Re-checked after opening a directory to reject a rename-then-symlink swap.
@@ -82,12 +84,14 @@ fn inspect_at_statx<Fd: AsFd, P: rustix::path::Arg>(
     use rustix::fs::{AtFlags, StatxFlags};
 
     let requested = StatxFlags::TYPE
+        | StatxFlags::MODE
         | StatxFlags::SIZE
         | StatxFlags::BLOCKS
         | StatxFlags::NLINK
         | StatxFlags::MTIME
         | StatxFlags::CTIME
-        | StatxFlags::INO;
+        | StatxFlags::INO
+        | StatxFlags::UID;
     let statx = match rustix::fs::statx(
         parent,
         name,
@@ -199,6 +203,8 @@ fn file_meta_from_statx(statx: &rustix::fs::Statx) -> FileMeta {
         nlink: u64::from(statx.stx_nlink),
         mtime: statx_timestamp_to_system_time(statx.stx_mtime.tv_sec, statx.stx_mtime.tv_nsec),
         dev: rustix::fs::makedev(statx.stx_dev_major, statx.stx_dev_minor),
+        uid: statx.stx_uid,
+        mode: u32::from(statx.stx_mode),
     }
 }
 
@@ -215,6 +221,8 @@ fn lstat_std(path: &Path) -> io::Result<FileMeta> {
         nlink: meta.nlink(),
         mtime: meta.modified().ok(),
         dev: meta.dev(),
+        uid: meta.uid(),
+        mode: meta.mode(),
     })
 }
 
@@ -226,6 +234,8 @@ fn file_meta_from_stat(stat: &Stat) -> FileMeta {
         nlink: stat.st_nlink as _,
         mtime: stat_timestamp_to_system_time(stat.st_mtime as _, stat.st_mtime_nsec as _),
         dev: stat.st_dev as _,
+        uid: stat.st_uid,
+        mode: stat.st_mode as _,
     }
 }
 

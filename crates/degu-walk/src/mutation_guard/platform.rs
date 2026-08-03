@@ -38,6 +38,8 @@ struct EntryIdentity {
 struct Inspection {
     identity: EntryIdentity,
     mount: Option<MountIdentity>,
+    uid: Option<u32>,
+    mode: Option<u32>,
 }
 
 impl TreeAccess for FileSystem {
@@ -56,7 +58,7 @@ impl TreeAccess for FileSystem {
         let fd = open_verified_directory(rustix::fs::CWD, &lookup, path, inspection.identity)?;
         let parent_mount = opened_parent_mount(&fd, path)?;
         Ok(Root {
-            node: directory_node(fd, path.to_path_buf())?,
+            node: directory_node(fd, path.to_path_buf(), inspection.uid, inspection.mode)?,
             parent_mount,
         })
     }
@@ -93,16 +95,20 @@ fn child_node(directory: &Directory, name: &CStr) -> io::Result<TreeNode<Directo
         return Ok(TreeNode {
             path,
             mount,
+            uid: inspection.uid,
+            mode: inspection.mode,
             directory: None,
         });
     }
     if inspection.identity.file_type == FileType::Directory {
         let fd = open_verified_directory(parent, name, &path, inspection.identity)?;
-        return directory_node(fd, path);
+        return directory_node(fd, path, inspection.uid, inspection.mode);
     }
     Ok(TreeNode {
         path,
         mount,
+        uid: inspection.uid,
+        mode: inspection.mode,
         directory: None,
     })
 }
@@ -120,6 +126,8 @@ fn unopened_root(
         node: TreeNode {
             path: path.to_path_buf(),
             mount,
+            uid: inspection.uid,
+            mode: inspection.mode,
             directory: None,
         },
         parent_mount,
@@ -155,13 +163,20 @@ fn crosses_mount(inspection: &Inspection, parent: Option<&MountIdentity>) -> boo
         .is_some_and(|(entry, parent)| entry != parent)
 }
 
-fn directory_node(fd: OwnedFd, path: PathBuf) -> io::Result<TreeNode<Directory>> {
+fn directory_node(
+    fd: OwnedFd,
+    path: PathBuf,
+    uid: Option<u32>,
+    mode: Option<u32>,
+) -> io::Result<TreeNode<Directory>> {
     let mount = mount::identity_for_fd(&fd, &path)?;
     let entries = Dir::new(fd)
         .map_err(|error| contextual_error("read directory", &path, io::Error::from(error)))?;
     Ok(TreeNode {
         path: path.clone(),
         mount: mount.clone(),
+        uid,
+        mode,
         directory: Some(Directory {
             entries,
             path,
@@ -194,6 +209,8 @@ fn inspect_at<Fd: AsFd, P: rustix::path::Arg>(
     Ok(Inspection {
         identity: linux_identity(&stat, path)?,
         mount: Some(mount::linux_mount(path, stat.stx_mask, stat.stx_mnt_id)?),
+        uid: linux_uid(&stat),
+        mode: linux_mode(&stat),
     })
 }
 
@@ -207,6 +224,8 @@ fn inspect_at<Fd: AsFd, P: rustix::path::Arg>(
         .map(|stat| Inspection {
             identity: EntryIdentity::from(&stat),
             mount: None,
+            uid: Some(stat.st_uid),
+            mode: Some(stat.st_mode as _),
         })
         .map_err(|error| contextual_error("inspect", path, io::Error::from(error)))
 }
@@ -259,6 +278,24 @@ fn linux_identity(stat: &rustix::fs::Statx, path: &Path) -> io::Result<EntryIden
         ctime_seconds: stat.stx_ctime.tv_sec,
         ctime_nanoseconds: stat.stx_ctime.tv_nsec.into(),
     })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_uid(stat: &rustix::fs::Statx) -> Option<u32> {
+    use rustix::fs::StatxFlags;
+
+    StatxFlags::from_bits_retain(stat.stx_mask)
+        .contains(StatxFlags::UID)
+        .then_some(stat.stx_uid)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mode(stat: &rustix::fs::Statx) -> Option<u32> {
+    use rustix::fs::StatxFlags;
+
+    StatxFlags::from_bits_retain(stat.stx_mask)
+        .contains(StatxFlags::MODE)
+        .then_some(u32::from(stat.stx_mode))
 }
 
 impl From<&Stat> for EntryIdentity {

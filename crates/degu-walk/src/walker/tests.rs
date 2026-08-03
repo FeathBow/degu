@@ -200,6 +200,80 @@ fn unreadable_directory_is_a_skip_not_a_dir_on_consume() {
 }
 
 #[test]
+fn required_uid_excludes_foreign_entries_and_never_descends_into_foreign_directories() {
+    let root = tempfile::tempdir().unwrap();
+    let owned_file = root.path().join("owned.bin");
+    let foreign_file = root.path().join("foreign.bin");
+    let foreign_dir = root.path().join("foreign-dir");
+    std::fs::write(&owned_file, [1_u8; 16]).unwrap();
+    std::fs::write(&foreign_file, [2_u8; 32]).unwrap();
+    std::fs::create_dir(&foreign_dir).unwrap();
+    std::fs::write(foreign_dir.join("must-not-be-visited.bin"), [3_u8; 64]).unwrap();
+
+    let required_uid = rustix::process::geteuid().as_raw();
+    let foreign_uid = different_uid(required_uid);
+    let overrides = std::collections::HashMap::from([
+        (foreign_file.clone(), foreign_uid),
+        (foreign_dir.clone(), foreign_uid),
+    ]);
+    let options = WalkOptions {
+        required_uid: Some(required_uid),
+        max_concurrency: Some(std::num::NonZeroUsize::MIN),
+        uid_overrides: Some(std::sync::Arc::new(overrides)),
+        ..WalkOptions::default()
+    };
+
+    let stats = measure(root.path(), &options).unwrap();
+
+    assert_eq!(stats.dirs, 1, "only the owned root is counted");
+    assert_eq!(stats.files, 1, "only the owned file is counted");
+    assert_eq!(stats.inodes, 2);
+    assert_eq!(stats.bytes_apparent, 16);
+    assert_eq!(stats.skipped_total, 2);
+    assert_eq!(stats.readdir_ops, 1, "foreign directory was not opened");
+    assert_eq!(stats.stat_ops, 4, "foreign descendant was not inspected");
+    let skipped = stats
+        .skipped
+        .iter()
+        .map(|skip| skip.path.as_path())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        skipped,
+        std::collections::HashSet::from([foreign_file.as_path(), foreign_dir.as_path()])
+    );
+    assert!(
+        stats
+            .skipped
+            .iter()
+            .all(|skip| skip.reason.contains("differs from required UID"))
+    );
+}
+
+#[test]
+fn required_uid_rejects_a_foreign_root_without_accounting_or_descent() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("hidden.bin"), [1_u8; 16]).unwrap();
+    let actual_uid = rustix::process::geteuid().as_raw();
+    let options = WalkOptions {
+        required_uid: Some(different_uid(actual_uid)),
+        ..WalkOptions::default()
+    };
+
+    let stats = measure(root.path(), &options).unwrap();
+
+    assert_eq!(stats.inodes, 0);
+    assert_eq!(stats.bytes_apparent, 0);
+    assert_eq!(stats.readdir_ops, 0);
+    assert_eq!(stats.stat_ops, 1);
+    assert_eq!(stats.skipped_total, 1);
+    assert_eq!(stats.skipped[0].path, root.path());
+}
+
+fn different_uid(uid: u32) -> u32 {
+    if uid == u32::MAX { uid - 1 } else { uid + 1 }
+}
+
+#[test]
 fn vanished_root_is_reported_not_silently_complete() {
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("root");

@@ -8,7 +8,7 @@ degu never deletes a finding in place. Human output starts with the action avail
 
 - **Ready to clean** findings are cleaned by default. These are cheap-to-regenerate caches such as pip.
 - **Needs review** findings are regenerable but costly or carry a declared deletion hazard. Compile caches cost rebuild time, model caches cost download transfer, and removing Conda package caches can break environments installed with softlinks. Review the reported reason, rationale, and exact path with the displayed `degu clean --details --dry-run --include-review --path ...` command.
-- **Not managed** findings are informational and are never staged or purged. They include user assets such as conda environments and training checkpoints, shared-memory segments, tool-coordinated caches, protected mixed-state directories, and caches known only from `CACHEDIR.TAG` when recovery and ownership are unknown.
+- **Not managed** findings are informational and are never staged or purged. They include user assets such as conda environments and training checkpoints, shared-memory segments, tool-coordinated caches, protected mixed-state directories, trees containing entries owned by another UID or group/world-writable directories, and caches known only from `CACHEDIR.TAG` when recovery and ownership are unknown.
 
 Every finding also carries independent machine facts: recovery and ownership may be known or unknown, regeneration may be cheap or costly, locations may be verified or unverified, and deletion may carry hazards. JSON derives the stable `eligible`, `opt_in`, or `report_only` disposition from those facts while human output uses the action-oriented names above.
 
@@ -55,6 +55,10 @@ When degu's normal state directory is on another filesystem, it creates a same-f
 
 Managed trash roots and their claim directories must be real directories owned by the effective user and must not be group- or world-writable. degu creates its own directories with mode `0700` and rejects unsafe existing roots instead of traversing them.
 
+Adapter and project scans account only entries owned by the invoking effective UID. A foreign-owned file or directory is recorded as a measurement gap, a foreign-owned directory is not entered, and the enclosing finding becomes **Not managed**. Group- or world-writable directory mode bits do not make the size a lower bound, but they independently remove cleanup authority because another UID may be able to insert an entry.
+
+Immediately before staging, degu validates the complete no-follow tree before writing the operation log's `Pending` record, then runs the protection re-check and repeats the full tree traversal after `Pending` as the final callback-free operation before the verified rename. Every entry must still belong to the effective UID, every directory must still lack group/world write mode bits, and the tree must remain on the source mount. This owned-tree gate applies to new clean staging only. Undo and purge retain their separate recorded-identity and mount checks so old trash is not made unrestorable merely because its historical ownership differs.
+
 Mutating operations reject a finding or trash entry that is itself a mount point or whose tree contains a mount boundary. Permanent deletion traverses through opened directory descriptors, revalidates each discovered directory before entering it, and rechecks names before unlinking them. A measurement with skipped or unvisited entries is an incomplete lower bound and never receives cleanup authority.
 
 If permanent deletion is interrupted after an entry has been claimed, the claim remains visible in `degu trash list`. Interrupted purge claims never expire automatically and can be deleted only by including them in a new fixed `degu trash purge` plan and confirming that plan again.
@@ -63,4 +67,4 @@ degu refuses to run as root unless it detects a container through `/.dockerenv` 
 
 If degu moves or permanently removes data outside the confirmed clean or purge set, or if a protected-path, symlink, or filesystem-boundary check can be bypassed, stop using the affected operation and follow the private process in the [security policy](../SECURITY.md).
 
-degu detects ordinary concurrent path replacement with object-identity snapshots and verified no-replace claims before permanent deletion. Unix does not provide a security boundary against a malicious process running with the same effective user ID; such a process can manipulate the user's files and processes directly. Run mutating commands only in a trusted user session.
+degu detects ordinary concurrent path replacement with object-identity snapshots and verified no-replace claims before permanent deletion. The shared-write check currently covers Unix group/world mode bits; it does not interpret POSIX or NFSv4 ACL grants. Configure ACL-shared locations as protected and do not authorize them for cleanup. Unix also does not provide a security boundary against a malicious process running with the same effective user ID; such a process can manipulate the user's files and processes directly. Run mutating commands only in a trusted user session.

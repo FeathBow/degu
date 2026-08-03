@@ -477,6 +477,7 @@ mod tests {
             skipped,
             truncated: false,
             unvisited_dirs: 0,
+            shared_writable_dirs: 0,
             protected_boundaries: 0,
             protected_credential_boundaries: 0,
             recovery: Recovery::Regenerable {

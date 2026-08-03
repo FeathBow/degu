@@ -28,6 +28,7 @@ enum PendingDir {
         parent: Arc<OwnedFd>,
         name: CString,
         identity: EntryIdentity,
+        meta: crate::metadata::FileMeta,
         path: PathBuf,
     },
 }
@@ -42,11 +43,15 @@ pub fn measure(root: &Path, options: &WalkOptions) -> io::Result<WalkStats> {
     let progress = options.progress.as_deref();
     let lookup = normalize_root(root);
     let (mut stats, inspection) = inspect_root(&lookup, progress)?;
+    if let Some(reason) = ownership_mismatch(root, &inspection.meta, options) {
+        record_skip_reason(&mut stats, root.to_path_buf(), &reason);
+        return Ok(stats);
+    }
     if !inspection.meta.is_dir {
         record_file(&inspection.meta, &mut stats, progress);
         return Ok(stats);
     }
-    record_directory(&mut stats, progress);
+    record_directory(&inspection.meta, &mut stats, progress);
     if deadline_elapsed(options.deadline) {
         stats.truncated = true;
         stats.unvisited_dirs = stats.unvisited_dirs.saturating_add(1);
@@ -177,11 +182,12 @@ fn consume_dir(
             parent,
             name,
             identity,
+            meta,
             path,
         } => match open_verified_directory(parent.as_fd(), &name, identity) {
             Ok(fd) => {
                 // A directory is counted only once its verified open succeeds.
-                record_directory(&mut result.stats, progress);
+                record_directory(&meta, &mut result.stats, progress);
                 OpenDir {
                     fd: Arc::new(fd),
                     path,
@@ -379,6 +385,11 @@ impl<'a, 'context> EntryScanner<'a, 'context> {
 
     fn record(&mut self, dir: &OpenDir, name: &CStr, path: PathBuf, inspection: Inspection) {
         let progress = self.context.options.progress.as_deref();
+        if let Some(reason) = ownership_mismatch(&path, &inspection.meta, self.context.options) {
+            tracing::debug!(path = %path.display(), %reason, "skipping entry owned by another UID");
+            record_skip_reason(&mut self.result.stats, path, &reason);
+            return;
+        }
         if !inspection.meta.is_dir {
             record_file(&inspection.meta, &mut self.result.stats, progress);
             return;
@@ -392,9 +403,32 @@ impl<'a, 'context> EntryScanner<'a, 'context> {
             parent: Arc::clone(&dir.fd),
             name: name.to_owned(),
             identity: inspection.identity,
+            meta: inspection.meta,
             path,
         });
     }
+}
+
+fn ownership_mismatch(
+    path: &Path,
+    meta: &crate::metadata::FileMeta,
+    options: &WalkOptions,
+) -> Option<String> {
+    let required = options.required_uid?;
+    let actual = effective_uid(path, meta, options);
+    (actual != required).then(|| format!("entry UID {actual} differs from required UID {required}"))
+}
+
+fn effective_uid(_path: &Path, meta: &crate::metadata::FileMeta, _options: &WalkOptions) -> u32 {
+    #[cfg(test)]
+    if let Some(uid) = _options
+        .uid_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(_path))
+    {
+        return *uid;
+    }
+    meta.uid
 }
 
 fn excluded_entry(name: &OsStr, excluded_names: &[&str]) -> bool {

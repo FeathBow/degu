@@ -16,6 +16,7 @@ mod language_toolchains;
 mod linux_runtime;
 mod models_packages;
 mod observability;
+mod ownership_boundary;
 mod python_caches;
 mod runtime_controls;
 mod runtime_discovery;

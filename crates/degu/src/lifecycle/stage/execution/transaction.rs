@@ -87,6 +87,15 @@ pub(in crate::lifecycle::stage) fn stage_finding_with_log(
     append: &mut dyn FnMut(&OpRecord) -> std::io::Result<()>,
     recheck: &dyn Fn(&Finding) -> Result<(), String>,
 ) -> StageOutcome {
+    // Validate the live source before writing even a Pending record. This is the
+    // cleanup authority boundary: every no-follow descendant must remain on the
+    // source mount and belong to the invoking effective UID. Failure releases
+    // the reservation and leaves both the source and operation log untouched.
+    if let Err(error) = validate_source_tree(&request) {
+        let reason = release_failed_reservation(&request, error);
+        return StageOutcome::terminal(CleanExecution::stage_failed(request.finding, reason));
+    }
+
     // Snapshot the restore-destination parent BEFORE the destructive rename and
     // before the pending record, while the source (and therefore its parent) is
     // present. The live restore check uses `Stable` (device+inode+kind), which
@@ -202,45 +211,59 @@ fn move_verified(
     recheck: &dyn Fn(&Finding) -> Result<(), String>,
 ) -> CommitOutcome {
     let source = request.finding.path();
+    // Re-check protected aliases after Pending, then make the full source-tree
+    // traversal the final callback-free operation before the verified rename.
+    // The first traversal keeps a known-unsafe tree out of the log; this final
+    // traversal closes changes during destination capture, Pending, or the
+    // protection re-check itself.
+    if let Err(reason) = recheck(request.finding) {
+        return CommitOutcome::Failed(format!(
+            "protection re-check failed at the staging boundary: {reason}"
+        ));
+    }
+    if let Err(reason) = validate_source_tree(request) {
+        return CommitOutcome::Failed(format!(
+            "source safety re-check failed at the staging boundary: {reason}"
+        ));
+    }
+    match request
+        .identity
+        .rename_verified_located(source, &request.entry)
+    {
+        // The destination parent was captured before this rename, while the
+        // source was present; the rename removes the entry, not the parent,
+        // and the live restore check uses `Stable` (device+inode+kind) which
+        // the rename does not change, so the pre-captured value authenticates
+        // exactly the directory a later restore will find.
+        Ok(moved) => CommitOutcome::Staged {
+            moved,
+            destination_parent,
+            cleanup_failure: None,
+        },
+        Err(error) => commit_failure(error),
+    }
+}
+
+fn validate_source_tree(request: &StageRequest<'_>) -> Result<(), String> {
+    let source = request.finding.path();
     match request.identity.matches(source) {
         Ok(true) => {}
         Ok(false) => {
-            return CommitOutcome::Failed(format!(
-                "entry identity changed before mount safety validation: {}",
+            return Err(format!(
+                "entry identity changed before ownership and mount safety validation: {}",
                 source.display()
             ));
         }
-        Err(error) => return CommitOutcome::Failed(error.to_string()),
+        Err(error) => {
+            return Err(format!(
+                "source identity validation failed before ownership and mount safety validation: {error}"
+            ));
+        }
     }
-    match degu_walk::validate_single_mount_tree(source) {
-        // The recheck runs after the mount traversal, which is not constant
-        // time: a protected alias created while a large tree is walked would
-        // otherwise slip between the check and the rename.
-        Ok(()) => match recheck(request.finding) {
-            Err(reason) => CommitOutcome::Failed(format!(
-                "protection re-check failed at the staging boundary: {reason}"
-            )),
-            Ok(()) => match request
-                .identity
-                .rename_verified_located(source, &request.entry)
-            {
-                // The destination parent was captured before this rename, while the
-                // source was present; the rename removes the entry, not the parent,
-                // and the live restore check uses `Stable` (device+inode+kind) which
-                // the rename does not change, so the pre-captured value authenticates
-                // exactly the directory a later restore will find.
-                Ok(moved) => CommitOutcome::Staged {
-                    moved,
-                    destination_parent,
-                    cleanup_failure: None,
-                },
-                Err(error) => commit_failure(error),
-            },
-        },
-        Err(error) => CommitOutcome::Failed(format!(
-            "mount safety validation failed before staging: {error}"
-        )),
-    }
+    let required_uid = rustix::process::geteuid().as_raw();
+    degu_walk::validate_owned_single_mount_tree(source, required_uid).map_err(|error| {
+        format!("ownership and mount safety validation failed before staging: {error}")
+    })
 }
 
 fn capture_destination_parent(source: &std::path::Path) -> std::io::Result<ObjectIdentity> {

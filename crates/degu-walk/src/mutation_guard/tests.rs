@@ -2,6 +2,8 @@ use super::*;
 
 const ROOT_MOUNT: u8 = 1;
 const OTHER_MOUNT: u8 = 2;
+const TEST_UID: u32 = 1000;
+const FOREIGN_UID: u32 = 2000;
 
 #[derive(Clone, Copy)]
 enum FixtureKind {
@@ -26,6 +28,10 @@ struct FakeTree<'a> {
     parent_mount: u8,
     inspect_error: Option<&'static str>,
     read_error: Option<&'static str>,
+    foreign_uid_path: Option<&'static str>,
+    shared_writable_path: Option<&'static str>,
+    missing_uid_path: Option<&'static str>,
+    missing_mode_path: Option<&'static str>,
 }
 
 impl<'a> FakeTree<'a> {
@@ -35,6 +41,10 @@ impl<'a> FakeTree<'a> {
             parent_mount: ROOT_MOUNT,
             inspect_error: None,
             read_error: None,
+            foreign_uid_path: None,
+            shared_writable_path: None,
+            missing_uid_path: None,
+            missing_mode_path: None,
         }
     }
 
@@ -58,9 +68,35 @@ impl<'a> FakeTree<'a> {
             path: path.to_path_buf(),
             next_child: 0,
         });
+        let uid = if self
+            .foreign_uid_path
+            .is_some_and(|foreign| path == Path::new(foreign))
+        {
+            FOREIGN_UID
+        } else {
+            TEST_UID
+        };
+        let mode = if self
+            .shared_writable_path
+            .is_some_and(|shared| path == Path::new(shared))
+        {
+            0o770
+        } else {
+            0o700
+        };
+        let uid = self
+            .missing_uid_path
+            .is_none_or(|missing| path != Path::new(missing))
+            .then_some(uid);
+        let mode = self
+            .missing_mode_path
+            .is_none_or(|missing| path != Path::new(missing))
+            .then_some(mode);
         Ok(TreeNode {
             path: path.to_path_buf(),
             mount: MountIdentity::fake(node.mount),
+            uid,
+            mode,
             directory,
         })
     }
@@ -214,6 +250,168 @@ fn fails_closed_when_a_directory_cannot_be_read() {
 
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     assert!(error.to_string().contains("failed to read /root"));
+}
+
+#[test]
+fn owned_validation_rejects_a_foreign_root() {
+    let nodes = [FixtureNode {
+        path: "/root",
+        kind: FixtureKind::Directory,
+        mount: ROOT_MOUNT,
+        children: &[],
+    }];
+    let tree = FakeTree {
+        foreign_uid_path: Some("/root"),
+        ..FakeTree::clean(&nodes)
+    };
+
+    let error = validate_owned_with(&tree, Path::new("/root"), TEST_UID).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(error.to_string().contains("UID 2000 at /root"));
+    assert!(error.to_string().contains("required UID 1000"));
+}
+
+#[test]
+fn owned_validation_rejects_a_foreign_descendant() {
+    let nodes = [
+        FixtureNode {
+            path: "/root",
+            kind: FixtureKind::Directory,
+            mount: ROOT_MOUNT,
+            children: &["/root/owned", "/root/foreign"],
+        },
+        FixtureNode {
+            path: "/root/owned",
+            kind: FixtureKind::Other,
+            mount: ROOT_MOUNT,
+            children: &[],
+        },
+        FixtureNode {
+            path: "/root/foreign",
+            kind: FixtureKind::Other,
+            mount: ROOT_MOUNT,
+            children: &[],
+        },
+    ];
+    let tree = FakeTree {
+        foreign_uid_path: Some("/root/foreign"),
+        ..FakeTree::clean(&nodes)
+    };
+
+    let error = validate_owned_with(&tree, Path::new("/root"), TEST_UID).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(error.to_string().contains("/root/foreign"));
+}
+
+#[test]
+fn owned_validation_rejects_a_shared_writable_directory() {
+    let nodes = [
+        FixtureNode {
+            path: "/root",
+            kind: FixtureKind::Directory,
+            mount: ROOT_MOUNT,
+            children: &["/root/shared"],
+        },
+        FixtureNode {
+            path: "/root/shared",
+            kind: FixtureKind::Directory,
+            mount: ROOT_MOUNT,
+            children: &[],
+        },
+    ];
+    let tree = FakeTree {
+        shared_writable_path: Some("/root/shared"),
+        ..FakeTree::clean(&nodes)
+    };
+
+    let error = validate_owned_with(&tree, Path::new("/root"), TEST_UID).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(error.to_string().contains("group- or world-writable"));
+    assert!(error.to_string().contains("/root/shared"));
+}
+
+#[test]
+fn owned_validation_fails_closed_when_uid_or_mode_metadata_is_unavailable() {
+    let nodes = [
+        FixtureNode {
+            path: "/root",
+            kind: FixtureKind::Directory,
+            mount: ROOT_MOUNT,
+            children: &["/root/child"],
+        },
+        FixtureNode {
+            path: "/root/child",
+            kind: FixtureKind::Directory,
+            mount: ROOT_MOUNT,
+            children: &[],
+        },
+    ];
+    for tree in [
+        FakeTree {
+            missing_uid_path: Some("/root/child"),
+            ..FakeTree::clean(&nodes)
+        },
+        FakeTree {
+            missing_mode_path: Some("/root/child"),
+            ..FakeTree::clean(&nodes)
+        },
+    ] {
+        let error = validate_owned_with(&tree, Path::new("/root"), TEST_UID).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("metadata unavailable"));
+    }
+}
+
+#[test]
+fn mount_only_validation_accepts_unavailable_uid_and_mode_metadata() {
+    let nodes = [
+        FixtureNode {
+            path: "/root",
+            kind: FixtureKind::Directory,
+            mount: ROOT_MOUNT,
+            children: &["/root/child"],
+        },
+        FixtureNode {
+            path: "/root/child",
+            kind: FixtureKind::Directory,
+            mount: ROOT_MOUNT,
+            children: &[],
+        },
+    ];
+    let tree = FakeTree {
+        missing_uid_path: Some("/root/child"),
+        missing_mode_path: Some("/root/child"),
+        ..FakeTree::clean(&nodes)
+    };
+
+    validate_with(&tree, Path::new("/root")).unwrap();
+}
+
+#[test]
+fn mount_only_validation_does_not_reinterpret_existing_tree_ownership() {
+    let nodes = [
+        FixtureNode {
+            path: "/root",
+            kind: FixtureKind::Directory,
+            mount: ROOT_MOUNT,
+            children: &["/root/foreign"],
+        },
+        FixtureNode {
+            path: "/root/foreign",
+            kind: FixtureKind::Other,
+            mount: ROOT_MOUNT,
+            children: &[],
+        },
+    ];
+    let tree = FakeTree {
+        foreign_uid_path: Some("/root/foreign"),
+        ..FakeTree::clean(&nodes)
+    };
+
+    validate_with(&tree, Path::new("/root")).unwrap();
 }
 
 #[test]

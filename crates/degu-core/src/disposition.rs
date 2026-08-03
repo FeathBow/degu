@@ -42,11 +42,15 @@ pub(crate) fn authority_rank(disposition: &Disposition) -> (u8, u8) {
     )
 }
 
-/// Constraint reasons outrank every `derive` reason (credential above AI-tool,
-/// matching finalize's precedence); within `derive`, strictest-first order wins.
+/// Constraint reasons outrank every `derive` reason (credential above shared
+/// write above AI-tool, matching finalize's precedence); within `derive`,
+/// strictest-first order wins.
 fn reason_rank(reason: &str) -> u8 {
     let derived = STATIC_REASONS.len() as u8;
     if reason == crate::safety::PROTECTED_CREDENTIAL_REASON {
+        return derived + 3;
+    }
+    if reason == crate::safety::SHARED_WRITABLE_REASON {
         return derived + 2;
     }
     if reason == crate::safety::MIXED_STATE_AI_TOOL_REASON {

@@ -5,6 +5,7 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AuthorityConstraint {
     MixedStateAiToolDirectory,
+    SharedWritableDirectory,
     ProtectedCredentialDirectory,
 }
 
@@ -65,6 +66,9 @@ fn synthesize_constraint(candidate: &FindingCandidate) -> Option<AuthorityConstr
     if candidate.protected_credential_boundaries > 0 {
         return Some(AuthorityConstraint::ProtectedCredentialDirectory);
     }
+    if candidate.shared_writable_dirs > 0 {
+        return Some(AuthorityConstraint::SharedWritableDirectory);
+    }
     (candidate.protected_boundaries > 0).then_some(AuthorityConstraint::MixedStateAiToolDirectory)
 }
 
@@ -87,6 +91,7 @@ fn finalized_disposition(
 fn constraint_reason(constraint: AuthorityConstraint) -> &'static str {
     match constraint {
         AuthorityConstraint::MixedStateAiToolDirectory => crate::safety::MIXED_STATE_AI_TOOL_REASON,
+        AuthorityConstraint::SharedWritableDirectory => crate::safety::SHARED_WRITABLE_REASON,
         AuthorityConstraint::ProtectedCredentialDirectory => {
             crate::safety::PROTECTED_CREDENTIAL_REASON
         }

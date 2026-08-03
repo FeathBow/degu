@@ -13,6 +13,8 @@ struct Root<Directory> {
 struct TreeNode<Directory> {
     path: PathBuf,
     mount: MountIdentity,
+    uid: Option<u32>,
+    mode: Option<u32>,
     directory: Option<Directory>,
 }
 
@@ -31,8 +33,20 @@ pub fn validate_single_mount_tree(root: &Path) -> io::Result<()> {
     validate_with(&platform::FileSystem, root)
 }
 
+/// Verifies the single-mount boundary, invoking-user ownership, and absence of
+/// group/world-writable directories for the complete no-follow tree. Intended
+/// for staging live findings; trash purge and undo validate mount/identity
+/// separately and must not reinterpret old data.
+pub fn validate_owned_single_mount_tree(root: &Path, required_uid: u32) -> io::Result<()> {
+    validate_owned_with(&platform::FileSystem, root, required_uid)
+}
+
 fn validate_with(access: &impl TreeAccess, root: &Path) -> io::Result<()> {
-    find_named_with(access, root, &[]).map(|_| ())
+    find_named_with(access, root, &[], None).map(|_| ())
+}
+
+fn validate_owned_with(access: &impl TreeAccess, root: &Path, required_uid: u32) -> io::Result<()> {
+    find_named_with(access, root, &[], Some(required_uid)).map(|_| ())
 }
 
 /// Finds a named descendant while enforcing [`validate_single_mount_tree`].
@@ -40,13 +54,14 @@ pub fn find_named_entry_single_mount(
     root: &Path,
     names: &[OsString],
 ) -> io::Result<Option<PathBuf>> {
-    find_named_with(&platform::FileSystem, root, names)
+    find_named_with(&platform::FileSystem, root, names, None)
 }
 
 fn find_named_with<Access: TreeAccess>(
     access: &Access,
     root: &Path,
     names: &[OsString],
+    required_uid: Option<u32>,
 ) -> io::Result<Option<PathBuf>> {
     require_absolute(root)?;
     let opened = access.open_root(root)?;
@@ -57,6 +72,13 @@ fn find_named_with<Access: TreeAccess>(
     {
         return Err(root_mount_boundary(root));
     }
+    require_uid(&opened.node.path, opened.node.uid, required_uid)?;
+    require_private_directory(
+        &opened.node.path,
+        opened.node.mode,
+        opened.node.directory.is_some(),
+        required_uid,
+    )?;
     let root_mount = opened.node.mount;
     let Some(directory) = opened.node.directory else {
         return Ok(None);
@@ -66,6 +88,7 @@ fn find_named_with<Access: TreeAccess>(
         root,
         root_mount: &root_mount,
         names,
+        required_uid,
     };
     validation.find(directory)
 }
@@ -86,6 +109,7 @@ struct Validation<'a, Access> {
     root: &'a Path,
     root_mount: &'a MountIdentity,
     names: &'a [OsString],
+    required_uid: Option<u32>,
 }
 
 impl<Access: TreeAccess> Validation<'_, Access> {
@@ -99,6 +123,13 @@ impl<Access: TreeAccess> Validation<'_, Access> {
             if node.mount != *self.root_mount {
                 return Err(mount_boundary(self.root, &node.path));
             }
+            require_uid(&node.path, node.uid, self.required_uid)?;
+            require_private_directory(
+                &node.path,
+                node.mode,
+                node.directory.is_some(),
+                self.required_uid,
+            )?;
             if self.matches(&node.path) {
                 return Ok(Some(node.path));
             }
@@ -135,6 +166,61 @@ fn root_mount_boundary(root: &Path) -> io::Error {
             root.display()
         ),
     )
+}
+
+fn require_uid(path: &Path, actual: Option<u32>, required: Option<u32>) -> io::Result<()> {
+    let Some(required) = required else {
+        return Ok(());
+    };
+    let actual = actual.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "refusing tree mutation: UID metadata unavailable at {}",
+                path.display()
+            ),
+        )
+    })?;
+    if actual == required {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "refusing tree mutation: UID {actual} at {} differs from required UID {required}",
+            path.display()
+        ),
+    ))
+}
+
+fn require_private_directory(
+    path: &Path,
+    mode: Option<u32>,
+    is_directory: bool,
+    required_uid: Option<u32>,
+) -> io::Result<()> {
+    if required_uid.is_none() || !is_directory {
+        return Ok(());
+    }
+    let mode = mode.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "refusing tree mutation: mode metadata unavailable at {}",
+                path.display()
+            ),
+        )
+    })?;
+    if mode & 0o022 == 0 {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "refusing tree mutation: group- or world-writable directory at {}",
+            path.display()
+        ),
+    ))
 }
 
 fn contextual_error(operation: &str, path: &Path, error: io::Error) -> io::Error {

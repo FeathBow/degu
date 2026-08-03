@@ -12,7 +12,9 @@ mod mutation_guard;
 mod safe_read;
 mod walker;
 
-pub use mutation_guard::{find_named_entry_single_mount, validate_single_mount_tree};
+pub use mutation_guard::{
+    find_named_entry_single_mount, validate_owned_single_mount_tree, validate_single_mount_tree,
+};
 pub use safe_read::{
     CappedBytes, open_regular_capped, open_regular_capped_nofollow, read_regular_capped,
     read_regular_capped_nofollow,
@@ -124,6 +126,9 @@ pub struct WalkStats {
     pub skipped_total: u64,
     pub truncated: bool,
     pub unvisited_dirs: u64,
+    /// Directories writable by group or other. They remain measured, but a
+    /// caller granting cleanup authority must treat the tree as shared.
+    pub shared_writable_dirs: u64,
     /// Entries excluded by an explicit name boundary in [`WalkOptions`].
     pub excluded_entries: u64,
     /// Subset of `excluded_entries` whose name is a protected credential
@@ -146,6 +151,9 @@ pub struct WalkOptions {
     /// Stay on one filesystem, so a $HOME scan never wanders into a mounted
     /// scratch or NFS tree
     pub one_filesystem: bool,
+    /// Account only entries owned by this UID. A mismatched entry is recorded
+    /// as skipped, and a mismatched directory is never descended into.
+    pub required_uid: Option<u32>,
     /// Cross-root progress counters; the heartbeat lives here too, so multi-root
     /// scans must share one instance or fast roots never emit a heartbeat.
     pub progress: Option<std::sync::Arc<Progress>>,
@@ -156,6 +164,10 @@ pub struct WalkOptions {
     /// Subset of `excluded_entry_names` that denotes a protected credential
     /// directory, counted separately so a demotion reason stays honest.
     pub credential_entry_names: &'static [&'static str],
+    /// Unit-test-only metadata injection: exercises mixed-UID descendant
+    /// handling without privileged chown and never enters the public build.
+    #[cfg(test)]
+    pub(crate) uid_overrides: Option<std::sync::Arc<std::collections::HashMap<PathBuf, u32>>>,
 }
 
 impl Default for WalkOptions {
@@ -163,10 +175,13 @@ impl Default for WalkOptions {
         Self {
             max_concurrency: None,
             one_filesystem: true,
+            required_uid: None,
             progress: None,
             deadline: None,
             excluded_entry_names: &[],
             credential_entry_names: &[],
+            #[cfg(test)]
+            uid_overrides: None,
         }
     }
 }

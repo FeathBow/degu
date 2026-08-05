@@ -14,8 +14,8 @@ mod walker;
 
 pub use mutation_guard::{
     directory_grants_foreign_mutation, find_named_entry_single_mount,
-    validate_owned_single_mount_tree, validate_single_mount_tree,
-    validate_trusted_parent_namespace,
+    reject_protected_in_owned_single_mount_tree, validate_owned_single_mount_tree,
+    validate_single_mount_tree, validate_trusted_parent_namespace,
 };
 pub use safe_read::{
     CappedBytes, open_regular_capped, open_regular_capped_nofollow, read_regular_capped,

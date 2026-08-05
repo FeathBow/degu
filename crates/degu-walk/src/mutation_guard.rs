@@ -13,34 +13,51 @@ const SHARED_WRITE_MASK: u32 = 0o022;
 /// owner may rename or delete it, so a shared-writable directory is safe.
 const STICKY_BIT: u32 = 0o1000;
 
-/// True when a directory of `mode` grants namespace-mutation authority to a
-/// principal other than an entry's owner: it is group- or world-writable AND is
-/// not sticky. This is the sticky-aware companion to the tree-internal
-/// [`require_private_directory`] predicate (which refuses any shared-writable
-/// directory), used for the finding root's PARENT: a shared parent is safe as
-/// long as the sticky bit confines rename/delete to each entry's owner.
-pub fn directory_grants_foreign_mutation(mode: u32) -> bool {
-    mode & SHARED_WRITE_MASK != 0 && mode & STICKY_BIT == 0
+/// True when a directory of `mode` owned by `uid` grants namespace-mutation
+/// authority to a principal other than the invoking `euid`: the owner is foreign
+/// (a foreign owner can always chmod the directory to `0777` and can, being the
+/// directory owner, rename or delete any entry even when the sticky bit is set),
+/// OR it is group/world-writable AND not sticky. This is the companion to the
+/// tree-internal [`require_private_directory`] predicate (which refuses any
+/// shared-writable directory), used for the finding root's PARENT: a foreign
+/// owner is never trusted, and a same-owner shared parent is safe only when the
+/// sticky bit confines rename/delete to each entry's owner.
+pub fn directory_grants_foreign_mutation(uid: u32, mode: u32, euid: u32) -> bool {
+    uid != euid || (mode & SHARED_WRITE_MASK != 0 && mode & STICKY_BIT == 0)
 }
 
-/// Reads the resolved parent directory's live mode (follows symlinks, matching
-/// the stage-side `open_directory_following`) and fails closed unless it is a
-/// trusted namespace: an untrusted writer must not be able to swap `parent`'s
-/// entries. The directory whose write-permissions matter is the real directory
-/// the entries live in, not a symlink pointing at it. Any error reading the
-/// resolved mode (broken symlink, EACCES, ...) is a refusal, never a pass; the
-/// authoritative anti-swap gate remains the held-FD rename.
-pub fn validate_trusted_parent_namespace(parent: &Path) -> io::Result<()> {
+/// Reads the resolved parent directory's live owner and mode (follows symlinks,
+/// matching the stage-side `open_directory_following`) and fails closed unless it
+/// is a trusted namespace: an untrusted writer must not be able to swap
+/// `parent`'s entries. A foreign owner is untrusted regardless of mode (it can
+/// chmod to `0777` at will and, as the directory owner, sticky does not confine
+/// it), so trust requires ownership by `euid` AND a mode that is not
+/// shared-writable-without-sticky. The directory whose write-permissions matter
+/// is the real directory the entries live in, not a symlink pointing at it. Any
+/// error reading the resolved metadata (broken symlink, EACCES, ...) is a
+/// refusal, never a pass; the authoritative anti-swap gate remains the held-FD
+/// rename.
+pub fn validate_trusted_parent_namespace(parent: &Path, euid: u32) -> io::Result<()> {
     let metadata = std::fs::metadata(parent).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!(
-                "refusing tree mutation: could not read parent directory mode at {}: {error}",
+                "refusing tree mutation: could not read parent directory metadata at {}: {error}",
                 parent.display()
             ),
         )
     })?;
-    if directory_grants_foreign_mutation(metadata.mode()) {
+    if metadata.uid() != euid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing tree mutation: parent directory {} is owned by UID {} not the invoking UID {euid}",
+                parent.display(),
+                metadata.uid()
+            ),
+        ));
+    }
+    if directory_grants_foreign_mutation(metadata.uid(), metadata.mode(), euid) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -85,15 +102,49 @@ pub fn validate_single_mount_tree(root: &Path) -> io::Result<()> {
 /// for staging live findings; trash purge and undo validate mount/identity
 /// separately and must not reinterpret old data.
 pub fn validate_owned_single_mount_tree(root: &Path, required_uid: u32) -> io::Result<()> {
-    validate_owned_with(&platform::FileSystem, root, required_uid)
+    validate_owned_with(&platform::FileSystem, root, required_uid, &[]).map(|_| ())
+}
+
+/// The staging-boundary gate: one no-follow descriptor traversal that enforces
+/// ALL of the invariants the rename-into-trash depends on -- single-mount
+/// boundary, invoking-user ownership, absence of group/world-writable
+/// directories, AND the absence of any descendant whose name matches
+/// `protected_names` (the built-in credential / mixed-state AI-tool directory
+/// names). Folding the protected-name check into the same pass as ownership
+/// closes the window a same-UID process had to plant a protected directory
+/// (`.ssh`, `.aws`, `.codex`, ...) inside the tree DURING an earlier,
+/// non-constant-time ownership traversal. A descendant name match is a refusal,
+/// not a returned path. Config-`protect` PATH overlaps and the root's own name
+/// are outside this descriptor walk and stay in the path-based protection check.
+pub fn reject_protected_in_owned_single_mount_tree(
+    root: &Path,
+    required_uid: u32,
+    protected_names: &[OsString],
+) -> io::Result<()> {
+    match validate_owned_with(&platform::FileSystem, root, required_uid, protected_names)? {
+        None => Ok(()),
+        Some(protected) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing tree mutation: protected directory name at {} inside {}",
+                protected.display(),
+                root.display()
+            ),
+        )),
+    }
 }
 
 fn validate_with(access: &impl TreeAccess, root: &Path) -> io::Result<()> {
     find_named_with(access, root, &[], None).map(|_| ())
 }
 
-fn validate_owned_with(access: &impl TreeAccess, root: &Path, required_uid: u32) -> io::Result<()> {
-    find_named_with(access, root, &[], Some(required_uid)).map(|_| ())
+fn validate_owned_with(
+    access: &impl TreeAccess,
+    root: &Path,
+    required_uid: u32,
+    names: &[OsString],
+) -> io::Result<Option<PathBuf>> {
+    find_named_with(access, root, names, Some(required_uid))
 }
 
 /// Finds a named descendant while enforcing [`validate_single_mount_tree`].

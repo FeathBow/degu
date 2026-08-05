@@ -318,20 +318,34 @@ fn rename_into_noreplace(
 }
 
 /// Open the source's parent as an `O_DIRECTORY` FD and authenticate the opened
-/// directory as a trusted namespace (not group/world-writable, or sticky if it
-/// is). Ancestor symlinks are followed so a stable relocation (an XDG cache home
+/// directory as a trusted namespace: owned by the invoking effective UID AND not
+/// group/world-writable-without-sticky. A foreign owner is untrusted regardless
+/// of mode -- it can chmod the directory to `0777` at will and, being the
+/// directory owner, the sticky bit does not confine its rename/delete authority.
+/// Ancestor symlinks are followed so a stable relocation (an XDG cache home
 /// symlinked elsewhere) resolves, exactly as the restore side's
 /// `open_directory_following` does; the defense against an ancestor swap is not
 /// the open flags but the pinned FD returned here: every later `fstatat`/
 /// `renameat` acts through this handle, not `AT_FDCWD + source`, so a swap after
-/// this open cannot divert the move. The sticky-aware mode check on the opened
-/// FD rejects an untrusted parent a foreign writer could use to swap the source
-/// name once the path-based staging preflight has passed.
+/// this open cannot divert the move. The owner- and sticky-aware check on the
+/// opened FD rejects an untrusted parent a foreign writer could use to swap the
+/// source name once the path-based staging preflight has passed.
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 fn open_source_parent_verified(parent: &Path) -> io::Result<rustix::fd::OwnedFd> {
     let fd = open_directory_following(parent)?;
     let opened = rustix::fs::fstat(&fd).map_err(io::Error::from)?;
-    if degu_walk::directory_grants_foreign_mutation(opened.st_mode as u32) {
+    let euid = rustix::process::geteuid().as_raw();
+    if opened.st_uid != euid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "source parent {} is owned by UID {} not the invoking UID {euid}",
+                parent.display(),
+                opened.st_uid
+            ),
+        ));
+    }
+    if degu_walk::directory_grants_foreign_mutation(opened.st_uid, opened.st_mode as u32, euid) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -683,8 +697,10 @@ mod tests {
         );
     }
 
-    // The held-parent-FD open is no-follow and sticky-aware: a group/world-
-    // writable, non-sticky parent is refused before any rename.
+    // The held-parent-FD open is no-follow, owner- and sticky-aware: a group/
+    // world-writable, non-sticky parent is refused before any rename, and an
+    // EUID-owned sticky (1777) parent -- the crux P1-B regression case -- is
+    // still accepted.
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
     fn open_source_parent_refuses_an_untrusted_parent() {
@@ -699,8 +715,43 @@ mod tests {
         let error = open_source_parent_verified(&parent).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 
-        // The sticky variant of the same mode is accepted.
+        // The EUID-owned sticky variant of the same mode is accepted: sticky
+        // confines rename/delete to the entry owner and the parent is ours.
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
         open_source_parent_verified(&parent).unwrap();
+
+        // Regression: a plain EUID-owned 0700 parent is accepted.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        open_source_parent_verified(&parent).unwrap();
+    }
+
+    // P1-B: a FOREIGN-owned parent is refused regardless of mode -- even a
+    // permissive 0755 that the old mode-only check trusted. A privilege-free
+    // foreign-owned directory is hard to create, so this uses a real
+    // root-owned system directory (`/usr`), searchable by all, and skips
+    // cleanly when the test itself runs as root (no foreign owner exists).
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn open_source_parent_refuses_a_foreign_owned_parent() {
+        use super::open_source_parent_verified;
+        use std::os::unix::fs::MetadataExt;
+
+        let euid = rustix::process::geteuid().as_raw();
+        let foreign = std::path::Path::new("/usr");
+        let Ok(metadata) = std::fs::metadata(foreign) else {
+            eprintln!("skipping: /usr is unavailable on this platform");
+            return;
+        };
+        if metadata.uid() == euid {
+            eprintln!("skipping: /usr is owned by the invoking UID (running as its owner)");
+            return;
+        }
+
+        let error = open_source_parent_verified(foreign).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains("owned by UID"),
+            "foreign owner must be named in the refusal: {error}"
+        );
     }
 }

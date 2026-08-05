@@ -260,16 +260,18 @@ fn validate_source_tree(request: &StageRequest<'_>) -> Result<(), String> {
             ));
         }
     }
+    let required_uid = rustix::process::geteuid().as_raw();
     // The source root's PARENT is above the owned tree the mount/ownership walk
-    // covers, but an untrusted (group/world-writable, non-sticky) parent lets a
-    // foreign writer swap the root name into the trash between here and the
-    // rename. Refuse fail-closed; a sticky parent confines rename/delete to the
-    // owning EUID and is allowed.
+    // covers, but an untrusted parent lets a foreign writer swap the root name
+    // into the trash between here and the rename. A parent is trusted only when
+    // it is owned by the invoking EUID AND not group/world-writable-without-
+    // sticky: a foreign owner can chmod it to 0777 at will and, as the directory
+    // owner, sticky does not confine it. Refuse fail-closed.
     if let Some(parent) = source
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        degu_walk::validate_trusted_parent_namespace(parent).map_err(|error| {
+        degu_walk::validate_trusted_parent_namespace(parent, required_uid).map_err(|error| {
             format!("source parent namespace validation failed before staging: {error}")
         })?;
     } else {
@@ -278,10 +280,28 @@ fn validate_source_tree(request: &StageRequest<'_>) -> Result<(), String> {
             source.display()
         ));
     }
-    let required_uid = rustix::process::geteuid().as_raw();
-    degu_walk::validate_owned_single_mount_tree(source, required_uid).map_err(|error| {
-        format!("ownership and mount safety validation failed before staging: {error}")
-    })
+    // One no-follow descriptor traversal enforces the whole staging invariant:
+    // foreign-UID rejection, shared-writable-directory rejection, the mount
+    // boundary, AND the built-in protected descendant NAMES (credential and
+    // mixed-state AI-tool directories). Folding the name check into the same pass
+    // as ownership closes the window a same-UID process had to plant a protected
+    // directory inside the tree during a separate, non-constant-time ownership
+    // walk. Config-`protect` PATH overlaps and the root's own name stay in the
+    // path-based protection re-check (the `recheck` closure) that runs just
+    // before this call; that portion is not expressible as a descendant-name
+    // descriptor walk.
+    let protected_names = protected_descendant_names();
+    degu_walk::reject_protected_in_owned_single_mount_tree(source, required_uid, &protected_names)
+        .map_err(|error| {
+            format!("ownership and mount safety validation failed before staging: {error}")
+        })
+}
+
+fn protected_descendant_names() -> Vec<std::ffi::OsString> {
+    degu_core::safety::PROTECTED_DESCENDANT_DIR_NAMES
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect()
 }
 
 fn capture_destination_parent(source: &std::path::Path) -> std::io::Result<ObjectIdentity> {

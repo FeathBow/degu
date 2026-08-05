@@ -101,8 +101,10 @@ fn parent_grants_foreign_mutation(path: &std::path::Path) -> bool {
         // No parent to trust means no verifiable namespace: fail closed.
         return true;
     };
-    // A readable, trusted parent is the only pass; every error is a refusal.
-    degu_walk::validate_trusted_parent_namespace(parent).is_err()
+    // A readable, trusted parent (EUID-owned and not shared-writable-non-sticky)
+    // is the only pass; a foreign owner or every error is a refusal.
+    let euid = rustix::process::geteuid().as_raw();
+    degu_walk::validate_trusted_parent_namespace(parent, euid).is_err()
 }
 
 pub(super) fn finalize_candidates(

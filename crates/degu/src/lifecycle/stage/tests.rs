@@ -402,6 +402,61 @@ fn stage_rejects_a_shared_writable_directory_before_pending() {
     assert!(reason.contains("group- or world-writable"), "{reason}");
 }
 
+// P1-A: a protected directory name planted inside the source tree is refused by
+// the SINGLE combined final traversal -- with a no-op recheck, so the refusal
+// comes from the owned-tree validator itself, not a separate protection pass.
+// Nothing is moved and no trash entry survives.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[test]
+fn stage_rejects_a_protected_descendant_name_via_the_combined_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+    let trash = Trash::new(dir.path().join("trash"));
+    let source = dir.path().join("cache");
+    let nested = source.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("data"), b"cached").unwrap();
+    // A protected credential directory name (`.aws`) inside the tree.
+    std::fs::create_dir_all(nested.join(".aws")).unwrap();
+    let finding = finding_for_test(source.clone(), 0, 0);
+    let identity = EntryIdentity::capture(&source).unwrap();
+    let entry = trash.reserve(&source).unwrap();
+    let mut appended = Vec::new();
+
+    let item = stage_finding_with_log(
+        StageRequest {
+            trash: &trash,
+            finding: &finding,
+            identity: &identity,
+            entry: entry.clone(),
+            reclamation_id: "run",
+        },
+        &mut |record: &OpRecord| {
+            appended.push(record.clone());
+            Ok(())
+        },
+        &noop_recheck,
+    )
+    .finish();
+
+    // No move, no trash entry, no op-log record: the combined traversal refuses
+    // before Pending, with a no-op recheck.
+    assert!(source.join("nested/.aws").exists());
+    assert!(source.join("nested/data").exists());
+    assert!(!entry.exists());
+    assert!(
+        appended.is_empty(),
+        "protected-name refusal precedes Pending"
+    );
+    let reason = item.failure_reason().expect("protected-name refusal");
+    assert!(
+        reason.contains("ownership and mount safety validation failed"),
+        "{reason}"
+    );
+    assert!(reason.contains("protected directory name"), "{reason}");
+    assert!(reason.contains(".aws"), "{reason}");
+    assert!(!dir.path().join("trash").join("cache").exists());
+}
+
 #[cfg(target_vendor = "apple")]
 #[test]
 fn stage_rejects_a_real_foreign_owned_descendant_before_pending() {

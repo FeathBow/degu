@@ -693,6 +693,7 @@ mod tests {
             truncated: false,
             unvisited_dirs: 0,
             shared_writable_dirs: 0,
+            parent_grants_foreign_mutation: false,
             protected_boundaries: 1,
             protected_credential_boundaries: 0,
             recovery: crate::finding::Recovery::Unknown,

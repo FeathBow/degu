@@ -228,7 +228,7 @@ fn move_verified(
     }
     match request
         .identity
-        .rename_verified_located(source, &request.entry)
+        .rename_from_verified_parent(source, &request.entry)
     {
         // The destination parent was captured before this rename, while the
         // source was present; the rename removes the entry, not the parent,
@@ -259,6 +259,24 @@ fn validate_source_tree(request: &StageRequest<'_>) -> Result<(), String> {
                 "source identity validation failed before ownership and mount safety validation: {error}"
             ));
         }
+    }
+    // The source root's PARENT is above the owned tree the mount/ownership walk
+    // covers, but an untrusted (group/world-writable, non-sticky) parent lets a
+    // foreign writer swap the root name into the trash between here and the
+    // rename. Refuse fail-closed; a sticky parent confines rename/delete to the
+    // owning EUID and is allowed.
+    if let Some(parent) = source
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        degu_walk::validate_trusted_parent_namespace(parent).map_err(|error| {
+            format!("source parent namespace validation failed before staging: {error}")
+        })?;
+    } else {
+        return Err(format!(
+            "source has no parent directory to authenticate: {}",
+            source.display()
+        ));
     }
     let required_uid = rustix::process::geteuid().as_raw();
     degu_walk::validate_owned_single_mount_tree(source, required_uid).map_err(|error| {
@@ -304,11 +322,11 @@ impl CommitOutcome {
 fn commit_failure(error: RenameFailure) -> CommitOutcome {
     match error {
         RenameFailure::Source(error) => CommitOutcome::Failed(error.to_string()),
-        // Staging renames into a degu-controlled trash entry via
-        // `rename_verified_located`, which never authenticates a parent, so this
-        // arm is unreachable here; keep it total and treat it as a plain failure.
+        // Staging authenticates the SOURCE parent through a held no-follow FD
+        // (`rename_from_verified_parent`); an untrusted or swapped source parent
+        // surfaces here. Treat it as a plain staging failure: nothing was moved.
         RenameFailure::UnauthenticatedParent { parent, error } => CommitOutcome::Failed(format!(
-            "destination parent {} could not be authenticated: {error}",
+            "source parent {} could not be authenticated: {error}",
             parent.display()
         )),
         RenameFailure::UnverifiedDestination { destination, error } => {

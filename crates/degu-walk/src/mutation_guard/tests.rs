@@ -439,3 +439,51 @@ fn accepts_a_single_mount_tree() {
 
     validate_with(&FakeTree::clean(&nodes), Path::new("/root")).unwrap();
 }
+
+#[test]
+fn foreign_mutation_predicate_is_sticky_aware() {
+    use super::directory_grants_foreign_mutation;
+
+    // Group- or world-writable without sticky grants foreign mutation.
+    assert!(directory_grants_foreign_mutation(0o777));
+    assert!(directory_grants_foreign_mutation(0o770));
+    assert!(directory_grants_foreign_mutation(0o707));
+    // Private modes never do.
+    assert!(!directory_grants_foreign_mutation(0o700));
+    assert!(!directory_grants_foreign_mutation(0o755));
+    // Sticky confines rename/delete to each entry's owner, so it is safe even
+    // when group/world-writable.
+    assert!(!directory_grants_foreign_mutation(0o1777));
+    assert!(!directory_grants_foreign_mutation(0o1770));
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[test]
+fn trusted_parent_namespace_fails_closed_on_missing_and_untrusted() {
+    use super::validate_trusted_parent_namespace;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Missing path fails closed.
+    let missing = dir.path().join("absent");
+    assert!(validate_trusted_parent_namespace(&missing).is_err());
+
+    let parent = dir.path().join("parent");
+    std::fs::create_dir(&parent).unwrap();
+
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let error = validate_trusted_parent_namespace(&parent).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(
+        error
+            .to_string()
+            .contains("group- or world-writable without the sticky bit")
+    );
+
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    validate_trusted_parent_namespace(&parent).unwrap();
+
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    validate_trusted_parent_namespace(&parent).unwrap();
+}

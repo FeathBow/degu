@@ -33,6 +33,7 @@ pub(super) fn finding_for_test(path: PathBuf, bytes_allocated: u64, inodes: u64)
         truncated: false,
         unvisited_dirs: 0,
         shared_writable_dirs: 0,
+        parent_grants_foreign_mutation: false,
         protected_boundaries: 0,
         protected_credential_boundaries: 0,
         recovery: Recovery::Regenerable {
@@ -217,6 +218,149 @@ fn stage_fails_closed_before_pending_when_the_source_parent_is_unsearchable() {
             .failure_reason()
             .is_some_and(|reason| reason.contains("before ownership and mount safety validation"))
     );
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[test]
+fn stage_refuses_a_non_sticky_shared_writable_parent_with_no_move() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let trash = Trash::new(dir.path().join("trash"));
+    // A private, fully-EUID-owned tree under a non-sticky mode-0777 parent.
+    let parent = dir.path().join("shared-parent");
+    std::fs::create_dir_all(&parent).unwrap();
+    let source = parent.join("cache");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("data"), b"cached").unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let finding = finding_for_test(source.clone(), 0, 0);
+    let identity = EntryIdentity::capture(&source).unwrap();
+    let entry = trash.reserve(&source).unwrap();
+    let mut appended = Vec::new();
+
+    let item = stage_finding_with_log(
+        StageRequest {
+            trash: &trash,
+            finding: &finding,
+            identity: &identity,
+            entry: entry.clone(),
+            reclamation_id: "run",
+        },
+        &mut |record: &OpRecord| {
+            appended.push(record.clone());
+            Ok(())
+        },
+        &noop_recheck,
+    )
+    .finish();
+
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // No move, no trash entry, no op-log record.
+    assert!(source.join("data").exists());
+    assert!(!entry.exists());
+    assert!(appended.is_empty(), "parent refusal precedes Pending");
+    let reason = item
+        .failure_reason()
+        .expect("shared-writable parent refusal");
+    assert!(
+        reason.contains("source parent namespace validation"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("group- or world-writable without the sticky bit"),
+        "{reason}"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[test]
+fn stage_allows_an_euid_owned_tree_under_a_sticky_shared_parent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let trash = Trash::new(dir.path().join("trash"));
+    // Same shared mode, but sticky (1777): only the entry owner (this EUID, who
+    // owns the root) can rename it, so the swap is impossible and staging runs.
+    let parent = dir.path().join("sticky-parent");
+    std::fs::create_dir_all(&parent).unwrap();
+    let source = parent.join("cache");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("data"), b"cached").unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let finding = finding_for_test(source.clone(), 4096, 2);
+    let identity = EntryIdentity::capture(&source).unwrap();
+    let entry = trash.reserve(&source).unwrap();
+    let mut appended = Vec::new();
+
+    let item = stage_finding_with_log(
+        StageRequest {
+            trash: &trash,
+            finding: &finding,
+            identity: &identity,
+            entry: entry.clone(),
+            reclamation_id: "run",
+        },
+        &mut |record: &OpRecord| {
+            appended.push(record.clone());
+            Ok(())
+        },
+        &noop_recheck,
+    )
+    .finish();
+
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        !source.exists(),
+        "sticky parent is safe, so the tree stages"
+    );
+    assert!(entry.join("data").exists());
+    assert!(item.reported_as_cleaned(false));
+    assert_eq!(appended.len(), 2);
+    assert_eq!(appended[0].outcome, OpOutcome::Pending);
+    assert_eq!(appended[1].outcome, OpOutcome::Ok);
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[test]
+fn stage_is_unaffected_by_a_normal_owned_parent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let trash = Trash::new(dir.path().join("trash"));
+    // Regression guard: a normal 0755 EUID-owned parent still stages cleanly.
+    let parent = dir.path().join("normal-parent");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let source = parent.join("cache");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("data"), b"cached").unwrap();
+    let finding = finding_for_test(source.clone(), 4096, 2);
+    let identity = EntryIdentity::capture(&source).unwrap();
+    let entry = trash.reserve(&source).unwrap();
+    let mut appended = Vec::new();
+
+    let item = stage_finding_with_log(
+        StageRequest {
+            trash: &trash,
+            finding: &finding,
+            identity: &identity,
+            entry: entry.clone(),
+            reclamation_id: "run",
+        },
+        &mut |record: &OpRecord| {
+            appended.push(record.clone());
+            Ok(())
+        },
+        &noop_recheck,
+    )
+    .finish();
+
+    assert!(!source.exists());
+    assert!(entry.join("data").exists());
+    assert!(item.reported_as_cleaned(false));
+    assert_eq!(appended.len(), 2);
+    assert_eq!(appended[1].outcome, OpOutcome::Ok);
 }
 
 #[test]

@@ -175,6 +175,7 @@ pub(crate) fn measure_finding(path: &Path, ctx: &DetectCtx, spec: FindingSpec<'_
         truncated: stats.truncated,
         unvisited_dirs: stats.unvisited_dirs,
         shared_writable_dirs: stats.shared_writable_dirs,
+        parent_grants_foreign_mutation: false,
         protected_boundaries: stats.excluded_entries,
         protected_credential_boundaries: stats.excluded_credential_boundaries,
         recovery,

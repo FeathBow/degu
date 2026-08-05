@@ -1,9 +1,52 @@
 use std::ffi::OsString;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 mod platform;
 use crate::mount::MountIdentity;
+
+/// Group/other write bits: either grants a non-owner the authority to add or
+/// remove names in a directory.
+const SHARED_WRITE_MASK: u32 = 0o022;
+/// Restricted-deletion ("sticky") bit: when set on a directory, only an entry's
+/// owner may rename or delete it, so a shared-writable directory is safe.
+const STICKY_BIT: u32 = 0o1000;
+
+/// True when a directory of `mode` grants namespace-mutation authority to a
+/// principal other than an entry's owner: it is group- or world-writable AND is
+/// not sticky. This is the sticky-aware companion to the tree-internal
+/// [`require_private_directory`] predicate (which refuses any shared-writable
+/// directory), used for the finding root's PARENT: a shared parent is safe as
+/// long as the sticky bit confines rename/delete to each entry's owner.
+pub fn directory_grants_foreign_mutation(mode: u32) -> bool {
+    mode & SHARED_WRITE_MASK != 0 && mode & STICKY_BIT == 0
+}
+
+/// Reads `parent`'s live mode (no-follow) and fails closed unless it is a trusted
+/// namespace: an untrusted writer must not be able to swap `parent`'s entries.
+/// Any error reading the mode is a refusal, never a pass.
+pub fn validate_trusted_parent_namespace(parent: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(parent).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "refusing tree mutation: could not read parent directory mode at {}: {error}",
+                parent.display()
+            ),
+        )
+    })?;
+    if directory_grants_foreign_mutation(metadata.mode()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing tree mutation: parent directory {} is group- or world-writable without the sticky bit",
+                parent.display()
+            ),
+        ));
+    }
+    Ok(())
+}
 
 struct Root<Directory> {
     node: TreeNode<Directory>,

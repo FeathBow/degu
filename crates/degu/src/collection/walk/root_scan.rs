@@ -2,7 +2,8 @@ use super::{AdapterRootScan, Collector, DiscoveryScope};
 use crate::collection::adapters::exclude_claimed_candidates;
 use crate::collection::metrics::elapsed_ms;
 use crate::collection::protection::{
-    apply_candidate_constraints, apply_mixed_state_constraints, finalize_candidates, finding_source,
+    apply_candidate_constraints, apply_mixed_state_constraints, finalize_candidates,
+    finding_source, flag_untrusted_parents,
 };
 use crate::collection::section::SectionObservation;
 use anyhow::{Context, Result};
@@ -77,6 +78,7 @@ impl Collector<'_> {
             self.ctx,
             &mut incomplete_regions,
         )?;
+        flag_untrusted_parents(&mut candidates);
         let findings = finalize_candidates(candidates, source, constraint);
         Ok(RootScan::new(
             findings,
@@ -143,6 +145,7 @@ impl Collector<'_> {
             ));
         }
         apply_candidate_constraints(&mut candidates, self.ctx, &mut incomplete_regions)?;
+        flag_untrusted_parents(&mut candidates);
         let findings = finalize_findings(candidates, FindingSource::ProjectRoot);
         Ok(RootScan::new(
             findings,
@@ -297,6 +300,7 @@ mod tests {
             truncated: false,
             unvisited_dirs: 0,
             shared_writable_dirs: 0,
+            parent_grants_foreign_mutation: false,
             protected_boundaries: 0,
             protected_credential_boundaries: 0,
             recovery: Recovery::Unknown,

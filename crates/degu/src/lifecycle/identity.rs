@@ -55,17 +55,12 @@ impl EntryIdentity {
         Ok(moved)
     }
 
-    /// Stage `source` into `destination` (a degu-controlled trash path) without
-    /// ever re-resolving `AT_FDCWD + source`. The source's parent is opened as a
-    /// verified no-follow `O_DIRECTORY` FD; the source entry's identity is
-    /// authenticated via that held FD (`fstatat`) immediately before a
-    /// `renameat(RENAME_NOREPLACE)` of the basename relative to the same FD. A
-    /// swapped ancestor cannot redirect the move (the pinned parent FD binds the
-    /// original namespace) and a foreign writer cannot swap the entry into the
-    /// window between the identity check and the rename, because both act on the
-    /// one held parent FD. The destination is degu's own validated trash entry,
-    /// so it keeps the plain-path `RENAME_NOREPLACE` guard; the restore side owns
-    /// destination-parent authentication.
+    /// Stage `source` into `destination` without re-resolving `AT_FDCWD + source`:
+    /// open the source's parent as a verified no-follow FD, authenticate the entry
+    /// through it (`fstatat`), then `renameat(RENAME_NOREPLACE)` the basename
+    /// relative to the same FD. Both the check and the rename act on that one held
+    /// FD, so no ancestor or entry swap can slip into the window between them. The
+    /// destination is degu's own validated trash entry (plain-path guard).
     pub(crate) fn rename_from_verified_parent(
         &self,
         source: &Path,
@@ -78,9 +73,8 @@ impl EntryIdentity {
                 error,
             }
         })?;
-        // Authenticate the entry via the held parent FD immediately before the
-        // rename, closing the window a foreign parent-writer would use to swap
-        // the source name after a path-based check.
+        // Authenticate through the held FD immediately before the rename, closing
+        // the swap window a path-based check would leave open.
         let current = entry_identity_via_parent(&parent_fd, &basename, source)
             .map_err(RenameFailure::Source)?;
         if self.0 != current {
@@ -317,22 +311,13 @@ fn rename_into_noreplace(
     ))
 }
 
-/// Open the source's parent as an `O_DIRECTORY` FD and authenticate the opened
-/// directory as a trusted namespace: owned by the invoking effective UID (or
-/// root) AND not group/world-writable-without-sticky. A non-root foreign owner is
-/// untrusted regardless of mode -- it can chmod the directory to `0777` at will
-/// and, being the directory owner, the sticky bit does not confine its
-/// rename/delete authority. Root ownership is exempt because root is outside
-/// degu's unprivileged threat model; the mode check still refuses a root-owned
-/// parent a non-root writer could swap entries in.
-/// Ancestor symlinks are followed so a stable relocation (an XDG cache home
-/// symlinked elsewhere) resolves, exactly as the restore side's
-/// `open_directory_following` does; the defense against an ancestor swap is not
-/// the open flags but the pinned FD returned here: every later `fstatat`/
-/// `renameat` acts through this handle, not `AT_FDCWD + source`, so a swap after
-/// this open cannot divert the move. The owner- and sticky-aware check on the
-/// opened FD rejects an untrusted parent a foreign writer could use to swap the
-/// source name once the path-based staging preflight has passed.
+/// Open the source's parent as an `O_DIRECTORY` FD and authenticate it as a
+/// trusted namespace (owner- and sticky-aware, via
+/// `degu_walk::directory_grants_foreign_mutation`). Ancestor symlinks are followed
+/// so a relocated XDG cache home resolves; the anti-swap defense is not the open
+/// flags but the pinned FD returned here -- every later `fstatat`/`renameat` acts
+/// through this handle, not `AT_FDCWD + source`, so a swap after this open cannot
+/// divert the move.
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 fn open_source_parent_verified(parent: &Path) -> io::Result<rustix::fd::OwnedFd> {
     let fd = open_directory_following(parent)?;
@@ -401,9 +386,7 @@ fn entry_identity_via_parent(
 }
 
 /// Rename `basename` (relative to the held source `parent_fd`) to `destination`
-/// (a degu-controlled trash path resolved from `AT_FDCWD`) with
-/// `RENAME_NOREPLACE`. The source side is pinned to the parent FD; the
-/// destination is degu's own validated trash entry.
+/// with `RENAME_NOREPLACE`. Source pinned to the FD; destination is degu's trash.
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 fn rename_from_parent_noreplace(
     parent_fd: &rustix::fd::OwnedFd,
@@ -620,7 +603,6 @@ mod tests {
             panic!("a swapped source must fail the entry-identity check, not move");
         };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        // The foreign object is untouched and never reached the destination.
         assert_eq!(std::fs::read_to_string(&source).unwrap(), "foreign");
         assert!(!destination.exists());
     }
@@ -692,7 +674,6 @@ mod tests {
         rename_from_parent_noreplace(&parent_fd, std::ffi::OsStr::new("source"), &destination)
             .unwrap();
 
-        // The original source moved; the planted evil entry is untouched.
         assert_eq!(std::fs::read_to_string(&destination).unwrap(), "payload");
         assert_eq!(
             std::fs::read_to_string(evil_holder.join("source")).unwrap(),

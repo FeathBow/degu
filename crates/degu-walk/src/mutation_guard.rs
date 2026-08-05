@@ -14,34 +14,19 @@ const SHARED_WRITE_MASK: u32 = 0o022;
 const STICKY_BIT: u32 = 0o1000;
 
 /// True when a directory of `mode` owned by `uid` grants namespace-mutation
-/// authority to a principal other than the invoking `euid`: the owner is a
-/// NON-ROOT foreigner (who can chmod the directory to `0777` and, being the
-/// directory owner, rename or delete any entry even under the sticky bit), OR it
-/// is group/world-writable AND not sticky. Root ownership is exempt from the
-/// owner clause: degu refuses to run as root and cannot defend against root,
-/// which bypasses all permissions regardless -- so a root-owned parent (`/tmp`,
-/// container roots, HPC scratch) is not an unprivileged threat. The mode clause
-/// still rejects a root-owned directory that is group/world-writable without
-/// sticky, where a non-root principal could swap entries. This is the companion
-/// to the tree-internal [`require_private_directory`] predicate (which refuses
-/// any shared-writable directory), used for the finding root's PARENT.
+/// authority to someone other than the invoking `euid`: a non-root foreign owner,
+/// or a group/world-writable non-sticky mode. Root ownership is exempt because
+/// degu refuses to run as root and cannot defend against it; the mode clause
+/// still catches a root-owned directory a non-root principal could write.
 pub fn directory_grants_foreign_mutation(uid: u32, mode: u32, euid: u32) -> bool {
     (uid != euid && uid != 0) || (mode & SHARED_WRITE_MASK != 0 && mode & STICKY_BIT == 0)
 }
 
-/// Reads the resolved parent directory's live owner and mode (follows symlinks,
-/// matching the stage-side `open_directory_following`) and fails closed unless it
-/// is a trusted namespace: an untrusted writer must not be able to swap
-/// `parent`'s entries. A NON-ROOT foreign owner is untrusted regardless of mode
-/// (it can chmod to `0777` at will and, as the directory owner, sticky does not
-/// confine it), so trust requires ownership by `euid` OR root AND a mode that is
-/// not shared-writable-without-sticky. Root ownership is exempt because root is
-/// outside degu's unprivileged threat model; the mode clause still refuses a
-/// root-owned parent a non-root principal could write. The directory whose
-/// write-permissions matter is the real directory the entries live in, not a
-/// symlink pointing at it. Any error reading the resolved metadata (broken
-/// symlink, EACCES, ...) is a refusal, never a pass; the authoritative anti-swap
-/// gate remains the held-FD rename.
+/// Fails closed unless `parent`'s resolved directory is a trusted namespace (see
+/// [`directory_grants_foreign_mutation`]). Follows symlinks: the write-permissions
+/// that matter belong to the real directory the entries live in, not a symlink
+/// pointing at it. Any metadata error is a refusal. This is a preflight; the
+/// authoritative anti-swap gate remains the held-FD rename.
 pub fn validate_trusted_parent_namespace(parent: &Path, euid: u32) -> io::Result<()> {
     let metadata = std::fs::metadata(parent).map_err(|error| {
         io::Error::new(
@@ -110,17 +95,13 @@ pub fn validate_owned_single_mount_tree(root: &Path, required_uid: u32) -> io::R
     validate_owned_with(&platform::FileSystem, root, required_uid, &[]).map(|_| ())
 }
 
-/// The staging-boundary gate: one no-follow descriptor traversal that enforces
-/// ALL of the invariants the rename-into-trash depends on -- single-mount
-/// boundary, invoking-user ownership, absence of group/world-writable
-/// directories, AND the absence of any descendant whose name matches
-/// `protected_names` (the built-in credential / mixed-state AI-tool directory
-/// names). Folding the protected-name check into the same pass as ownership
-/// closes the window a same-UID process had to plant a protected directory
-/// (`.ssh`, `.aws`, `.codex`, ...) inside the tree DURING an earlier,
-/// non-constant-time ownership traversal. A descendant name match is a refusal,
-/// not a returned path. Config-`protect` PATH overlaps and the root's own name
-/// are outside this descriptor walk and stay in the path-based protection check.
+/// The staging-boundary gate: one no-follow descriptor traversal enforcing every
+/// invariant the rename-into-trash depends on (single mount, invoking-user
+/// ownership, no group/world-writable directory) AND the absence of any
+/// `protected_names` descendant. Folding the name check into the ownership pass
+/// closes the window a same-UID process had to plant a protected directory in the
+/// tree between two separate traversals. Config-`protect` path overlaps and the
+/// root's own name stay in the path-based protection check.
 pub fn reject_protected_in_owned_single_mount_tree(
     root: &Path,
     required_uid: u32,

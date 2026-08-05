@@ -87,10 +87,8 @@ pub(in crate::lifecycle::stage) fn stage_finding_with_log(
     append: &mut dyn FnMut(&OpRecord) -> std::io::Result<()>,
     recheck: &dyn Fn(&Finding) -> Result<(), String>,
 ) -> StageOutcome {
-    // Validate the live source before writing even a Pending record. This is the
-    // cleanup authority boundary: every no-follow descendant must remain on the
-    // source mount and belong to the invoking effective UID. Failure releases
-    // the reservation and leaves both the source and operation log untouched.
+    // Validate the live source before writing even a Pending record, so a failure
+    // leaves the source and operation log untouched.
     if let Err(error) = validate_source_tree(&request) {
         let reason = release_failed_reservation(&request, error);
         return StageOutcome::terminal(CleanExecution::stage_failed(request.finding, reason));
@@ -211,11 +209,9 @@ fn move_verified(
     recheck: &dyn Fn(&Finding) -> Result<(), String>,
 ) -> CommitOutcome {
     let source = request.finding.path();
-    // Re-check protected aliases after Pending, then make the full source-tree
-    // traversal the final callback-free operation before the verified rename.
-    // The first traversal keeps a known-unsafe tree out of the log; this final
-    // traversal closes changes during destination capture, Pending, or the
-    // protection re-check itself.
+    // Re-check protection, then run the full source-tree traversal as the last
+    // operation before the rename, so it catches any change made during
+    // destination capture, Pending, or the re-check itself.
     if let Err(reason) = recheck(request.finding) {
         return CommitOutcome::Failed(format!(
             "protection re-check failed at the staging boundary: {reason}"
@@ -230,11 +226,9 @@ fn move_verified(
         .identity
         .rename_from_verified_parent(source, &request.entry)
     {
-        // The destination parent was captured before this rename, while the
-        // source was present; the rename removes the entry, not the parent,
-        // and the live restore check uses `Stable` (device+inode+kind) which
-        // the rename does not change, so the pre-captured value authenticates
-        // exactly the directory a later restore will find.
+        // The pre-rename destination-parent capture stays valid: the rename
+        // removes the entry, not the parent, and the restore check keys on
+        // `Stable` identity, which the rename does not change.
         Ok(moved) => CommitOutcome::Staged {
             moved,
             destination_parent,
@@ -261,12 +255,9 @@ fn validate_source_tree(request: &StageRequest<'_>) -> Result<(), String> {
         }
     }
     let required_uid = rustix::process::geteuid().as_raw();
-    // The source root's PARENT is above the owned tree the mount/ownership walk
-    // covers, but an untrusted parent lets a foreign writer swap the root name
-    // into the trash between here and the rename. A parent is trusted only when
-    // it is owned by the invoking EUID AND not group/world-writable-without-
-    // sticky: a foreign owner can chmod it to 0777 at will and, as the directory
-    // owner, sticky does not confine it. Refuse fail-closed.
+    // The source root's parent is above the walked tree, so it needs its own
+    // check: an untrusted parent lets a foreign writer swap the root into the
+    // trash between here and the rename. Fail closed.
     if let Some(parent) = source
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -280,16 +271,9 @@ fn validate_source_tree(request: &StageRequest<'_>) -> Result<(), String> {
             source.display()
         ));
     }
-    // One no-follow descriptor traversal enforces the whole staging invariant:
-    // foreign-UID rejection, shared-writable-directory rejection, the mount
-    // boundary, AND the built-in protected descendant NAMES (credential and
-    // mixed-state AI-tool directories). Folding the name check into the same pass
-    // as ownership closes the window a same-UID process had to plant a protected
-    // directory inside the tree during a separate, non-constant-time ownership
-    // walk. Config-`protect` PATH overlaps and the root's own name stay in the
-    // path-based protection re-check (the `recheck` closure) that runs just
-    // before this call; that portion is not expressible as a descendant-name
-    // descriptor walk.
+    // One no-follow traversal enforces mount, ownership, no-shared-writable, and
+    // protected-descendant names together; the path-based recheck above covers
+    // config-`protect` overlaps and the root's own name, which this walk cannot.
     let protected_names = protected_descendant_names();
     degu_walk::reject_protected_in_owned_single_mount_tree(source, required_uid, &protected_names)
         .map_err(|error| {

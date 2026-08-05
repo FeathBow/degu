@@ -6,10 +6,8 @@ use super::*;
 pub enum AuthorityConstraint {
     MixedStateAiToolDirectory,
     SharedWritableDirectory,
-    /// The finding root's parent is an untrusted namespace -- a foreign (non-root)
-    /// owner, group/world-writable without the sticky bit, or unverifiable -- so a
-    /// foreign writer could swap the root name into degu's trash between validation
-    /// and the staging rename.
+    /// An untrusted parent lets a foreign writer swap the root name into degu's
+    /// trash between validation and the staging rename.
     UntrustedParent,
     ProtectedCredentialDirectory,
 }

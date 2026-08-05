@@ -256,7 +256,6 @@ fn stage_refuses_a_non_sticky_shared_writable_parent_with_no_move() {
     .finish();
 
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // No move, no trash entry, no op-log record.
     assert!(source.join("data").exists());
     assert!(!entry.exists());
     assert!(appended.is_empty(), "parent refusal precedes Pending");
@@ -405,7 +404,6 @@ fn stage_rejects_a_shared_writable_directory_before_pending() {
 // P1-A: a protected directory name planted inside the source tree is refused by
 // the SINGLE combined final traversal -- with a no-op recheck, so the refusal
 // comes from the owned-tree validator itself, not a separate protection pass.
-// Nothing is moved and no trash entry survives.
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 #[test]
 fn stage_rejects_a_protected_descendant_name_via_the_combined_traversal() {
@@ -438,8 +436,6 @@ fn stage_rejects_a_protected_descendant_name_via_the_combined_traversal() {
     )
     .finish();
 
-    // No move, no trash entry, no op-log record: the combined traversal refuses
-    // before Pending, with a no-op recheck.
     assert!(source.join("nested/.aws").exists());
     assert!(source.join("nested/data").exists());
     assert!(!entry.exists());

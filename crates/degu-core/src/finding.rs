@@ -44,10 +44,7 @@ pub struct FindingCandidate {
     /// Directories writable by group or other. The bytes remain measured, but
     /// the tree is not an exclusive invoking-user mutation boundary.
     pub shared_writable_dirs: u64,
-    /// The finding root's immediate parent grants namespace-mutation authority
-    /// to another principal: it is group- or world-writable AND not sticky, so a
-    /// foreign writer could swap the root name between validation and rename.
-    /// The collection layer sets this from the parent's live mode; adapters,
+    /// Set by the collection layer from the parent's live owner and mode; adapters,
     /// which only walk the tree contents, always leave it `false`.
     pub parent_grants_foreign_mutation: bool,
     /// Mixed-state directory boundaries excluded while measuring this candidate.

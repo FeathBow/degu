@@ -5,6 +5,10 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AuthorityConstraint {
     MixedStateAiToolDirectory,
+    SharedWritableDirectory,
+    /// An untrusted parent lets a foreign writer swap the root name into degu's
+    /// trash between validation and the staging rename.
+    UntrustedParent,
     ProtectedCredentialDirectory,
 }
 
@@ -65,6 +69,12 @@ fn synthesize_constraint(candidate: &FindingCandidate) -> Option<AuthorityConstr
     if candidate.protected_credential_boundaries > 0 {
         return Some(AuthorityConstraint::ProtectedCredentialDirectory);
     }
+    if candidate.parent_grants_foreign_mutation {
+        return Some(AuthorityConstraint::UntrustedParent);
+    }
+    if candidate.shared_writable_dirs > 0 {
+        return Some(AuthorityConstraint::SharedWritableDirectory);
+    }
     (candidate.protected_boundaries > 0).then_some(AuthorityConstraint::MixedStateAiToolDirectory)
 }
 
@@ -87,6 +97,8 @@ fn finalized_disposition(
 fn constraint_reason(constraint: AuthorityConstraint) -> &'static str {
     match constraint {
         AuthorityConstraint::MixedStateAiToolDirectory => crate::safety::MIXED_STATE_AI_TOOL_REASON,
+        AuthorityConstraint::SharedWritableDirectory => crate::safety::SHARED_WRITABLE_REASON,
+        AuthorityConstraint::UntrustedParent => crate::safety::UNTRUSTED_PARENT_REASON,
         AuthorityConstraint::ProtectedCredentialDirectory => {
             crate::safety::PROTECTED_CREDENTIAL_REASON
         }

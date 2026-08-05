@@ -22,6 +22,8 @@ pub const MIXED_STATE_AI_TOOL_DIR_NAMES: [&str; 3] = [".claude", ".codex", ".her
 pub const MIXED_STATE_AI_TOOL_REASON: &str =
     "path overlaps a protected mixed-state AI tool directory";
 pub const PROTECTED_CREDENTIAL_REASON: &str = "path contains a protected credential directory";
+pub const SHARED_WRITABLE_REASON: &str = "path contains a group- or world-writable directory";
+pub const UNTRUSTED_PARENT_REASON: &str = "parent directory is not a trusted namespace (foreign owner, group- or world-writable without the sticky bit, or unverifiable)";
 
 /// Names that demote any enclosing finding to report-only when found as a
 /// descendant. Built from its two real sources so drift is impossible.

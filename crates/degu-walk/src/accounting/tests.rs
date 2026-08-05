@@ -24,6 +24,7 @@ fn merge_preserves_bounded_diagnostics_and_scan_state() {
     let mut stats = WalkStats {
         skipped_total: u64::MAX - 10,
         unvisited_dirs: u64::MAX - 2,
+        shared_writable_dirs: u64::MAX - 1,
         excluded_entries: u64::MAX - 3,
         ..Default::default()
     };
@@ -44,9 +45,11 @@ fn merge_preserves_bounded_diagnostics_and_scan_state() {
     first.newest_mtime = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(2));
     first.truncated = true;
     first.unvisited_dirs = 1;
+    first.shared_writable_dirs = 1;
     first.excluded_entries = 1;
     second.newest_mtime = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1));
     second.unvisited_dirs = 2;
+    second.shared_writable_dirs = 2;
     second.excluded_entries = 3;
     let expected_newest = first.newest_mtime;
 
@@ -70,6 +73,7 @@ fn merge_saturates_all_numeric_totals() {
         readdir_ops: 1,
         skipped_total: 1,
         unvisited_dirs: 1,
+        shared_writable_dirs: 1,
         excluded_entries: 1,
         ..Default::default()
     };
@@ -90,10 +94,12 @@ fn recording_saturates_numeric_totals() {
         nlink: 2,
         mtime: None,
         dev: 0,
+        uid: 0,
+        mode: 0o755,
     };
 
     record_file(&meta, &mut stats, Some(&progress));
-    record_directory(&mut stats, Some(&progress));
+    record_directory(&meta, &mut stats, Some(&progress));
     record_stat_op(&mut stats, Some(&progress));
     record_readdir_op(&mut stats, Some(&progress));
 
@@ -131,6 +137,7 @@ fn assert_merged_stats(stats: &WalkStats, expected_newest: Option<std::time::Sys
     assert_eq!(stats.newest_mtime, expected_newest);
     assert!(stats.truncated);
     assert_eq!(stats.unvisited_dirs, u64::MAX);
+    assert_eq!(stats.shared_writable_dirs, u64::MAX);
     assert_eq!(stats.excluded_entries, u64::MAX);
     assert_eq!(stats.skipped.len(), SKIP_SAMPLE_CAP);
     assert_eq!(stats.skipped[19].path, PathBuf::from("first-19"));
@@ -150,6 +157,7 @@ fn stats_at_numeric_max() -> WalkStats {
         readdir_ops: u64::MAX,
         skipped_total: u64::MAX,
         unvisited_dirs: u64::MAX,
+        shared_writable_dirs: u64::MAX,
         excluded_entries: u64::MAX,
         ..Default::default()
     }
@@ -168,9 +176,10 @@ fn assert_numeric_totals_are_max(stats: &WalkStats) {
             stats.readdir_ops,
             stats.skipped_total,
             stats.unvisited_dirs,
+            stats.shared_writable_dirs,
             stats.excluded_entries,
         ],
-        [u64::MAX; 11]
+        [u64::MAX; 12]
     );
 }
 

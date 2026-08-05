@@ -117,6 +117,7 @@ pub(crate) struct FindingSpec<'a> {
 pub(crate) fn walk_options(ctx: &DetectCtx) -> degu_walk::WalkOptions {
     degu_walk::WalkOptions {
         max_concurrency: ctx.max_concurrency,
+        required_uid: Some(rustix::process::geteuid().as_raw()),
         progress: ctx.progress.clone(),
         deadline: ctx.deadline,
         excluded_entry_names: &degu_core::safety::PROTECTED_DESCENDANT_DIR_NAMES,
@@ -173,6 +174,8 @@ pub(crate) fn measure_finding(path: &Path, ctx: &DetectCtx, spec: FindingSpec<'_
         skipped: stats.skipped_total,
         truncated: stats.truncated,
         unvisited_dirs: stats.unvisited_dirs,
+        shared_writable_dirs: stats.shared_writable_dirs,
+        parent_grants_foreign_mutation: false,
         protected_boundaries: stats.excluded_entries,
         protected_credential_boundaries: stats.excluded_credential_boundaries,
         recovery,

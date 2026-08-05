@@ -3,7 +3,9 @@ use degu_core::finding::{
     Hazard, Ownership, Recovery, RegenCost, finalize_findings, finalize_findings_with_constraint,
 };
 use degu_core::plan::Plan;
-use degu_core::safety::MIXED_STATE_AI_TOOL_REASON;
+use degu_core::safety::{
+    MIXED_STATE_AI_TOOL_REASON, SHARED_WRITABLE_REASON, UNTRUSTED_PARENT_REASON,
+};
 use std::path::PathBuf;
 
 fn candidate(path: &str) -> FindingCandidate {
@@ -19,6 +21,8 @@ fn candidate(path: &str) -> FindingCandidate {
         skipped: 0,
         truncated: false,
         unvisited_dirs: 0,
+        shared_writable_dirs: 0,
+        parent_grants_foreign_mutation: false,
         protected_boundaries: 0,
         protected_credential_boundaries: 0,
         recovery: Recovery::Regenerable {
@@ -102,6 +106,48 @@ fn incomplete_measurements_remove_cleanup_authority() {
             Some("measurement incomplete: some paths were not measured")
         );
     }
+}
+
+#[test]
+fn shared_writable_directories_remove_authority_without_falsifying_measurement() {
+    let finding = finalize_findings(
+        vec![FindingCandidate {
+            hazard: None,
+            shared_writable_dirs: 1,
+            ..candidate("/cache/shared")
+        }],
+        FindingSource::WellKnownRoot,
+    )
+    .pop()
+    .unwrap();
+
+    assert_eq!(finding.disposition().mode, DispositionMode::ReportOnly);
+    assert_eq!(
+        finding.disposition().reason.as_deref(),
+        Some(SHARED_WRITABLE_REASON)
+    );
+    assert!(!finding.measurement_incomplete());
+}
+
+#[test]
+fn an_untrusted_parent_removes_authority_without_falsifying_measurement() {
+    let finding = finalize_findings(
+        vec![FindingCandidate {
+            hazard: None,
+            parent_grants_foreign_mutation: true,
+            ..candidate("/shared/cache")
+        }],
+        FindingSource::WellKnownRoot,
+    )
+    .pop()
+    .unwrap();
+
+    assert_eq!(finding.disposition().mode, DispositionMode::ReportOnly);
+    assert_eq!(
+        finding.disposition().reason.as_deref(),
+        Some(UNTRUSTED_PARENT_REASON)
+    );
+    assert!(!finding.measurement_incomplete());
 }
 
 #[test]

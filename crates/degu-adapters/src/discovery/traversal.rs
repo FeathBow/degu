@@ -51,6 +51,19 @@ impl<'a> RootDiscovery<'a> {
             tracing::debug!(path = %dir.display(), "skipping mixed-state AI tool directory");
             return;
         }
+        match is_owned_by_effective_uid(dir) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(path = %dir.display(), "foreign-owned project directory refused");
+                self.outcome.mark_incomplete_at(dir);
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(path = %dir.display(), %error, "project directory ownership probe failed");
+                self.outcome.mark_incomplete_at(dir);
+                return;
+            }
+        }
         if is_claimed(dir, self.scope.discovery.claimed_roots) {
             tracing::debug!(path = %dir.display(), "skipping subtree claimed by an adapter root");
             return;
@@ -229,15 +242,21 @@ impl<'a> RootDiscovery<'a> {
             progress.add_resources(1, 0);
         }
         let path = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
             Err(error) => {
                 // The entry itself is the region that could not be inspected; siblings keep scanning.
-                tracing::warn!(path = %path.display(), %error, "entry type probe failed; degrading to an incomplete region");
+                tracing::warn!(path = %path.display(), %error, "entry metadata probe failed; degrading to an incomplete region");
                 self.outcome.mark_incomplete_at(&path);
                 return;
             }
         };
+        if metadata_uid(&metadata) != rustix::process::geteuid().as_raw() {
+            tracing::warn!(path = %path.display(), "foreign-owned project entry refused");
+            self.outcome.mark_incomplete_at(&path);
+            return;
+        }
+        let file_type = metadata.file_type();
         if file_type.is_dir() {
             self.pending.push(path);
         } else if self.scope.discovery.sources.checkpoints
@@ -323,6 +342,17 @@ fn contains_claimed_descendant(path: &Path, scope: DiscoveryScope<'_>) -> bool {
             .dependency_claims
             .iter()
             .any(|dependency| dependency.starts_with(path))
+}
+
+fn is_owned_by_effective_uid(path: &Path) -> std::io::Result<bool> {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata_uid(&metadata) == rustix::process::geteuid().as_raw())
+}
+
+fn metadata_uid(metadata: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.uid()
 }
 
 fn is_dot_dir(path: &Path) -> bool {

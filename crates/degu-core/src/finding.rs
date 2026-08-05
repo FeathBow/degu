@@ -41,6 +41,12 @@ pub struct FindingCandidate {
     /// True when the reported size is a lower bound due to a time budget.
     pub truncated: bool,
     pub unvisited_dirs: u64,
+    /// Directories writable by group or other. The bytes remain measured, but
+    /// the tree is not an exclusive invoking-user mutation boundary.
+    pub shared_writable_dirs: u64,
+    /// Set by the collection layer from the parent's live owner and mode; adapters,
+    /// which only walk the tree contents, always leave it `false`.
+    pub parent_grants_foreign_mutation: bool,
     /// Mixed-state directory boundaries excluded while measuring this candidate.
     pub protected_boundaries: u64,
     /// Subset of `protected_boundaries` that are protected credential

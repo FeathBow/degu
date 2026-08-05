@@ -55,6 +55,45 @@ impl EntryIdentity {
         Ok(moved)
     }
 
+    /// Stage `source` into `destination` without re-resolving `AT_FDCWD + source`:
+    /// open the source's parent as a verified no-follow FD, authenticate the entry
+    /// through it (`fstatat`), then `renameat(RENAME_NOREPLACE)` the basename via the
+    /// same FD. The pinned FD defeats an ancestor-path swap, but `fstatat`+`renameat`
+    /// are two syscalls, not atomic: a basename swap between them is prevented not by
+    /// the FD but by the parent being trusted (no untrusted writer), checked at open.
+    /// The destination is degu's own validated trash entry (plain-path guard).
+    pub(crate) fn rename_from_verified_parent(
+        &self,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<Self, RenameFailure> {
+        let (parent, basename) = split_source_parent(source).map_err(RenameFailure::Source)?;
+        let parent_fd = open_source_parent_verified(parent).map_err(|error| {
+            RenameFailure::UnauthenticatedParent {
+                parent: parent.to_path_buf(),
+                error,
+            }
+        })?;
+        // Authenticate the entry through the held FD; this catches a pre-check swap.
+        // The check->rename gap relies on the trusted parent, not on atomicity.
+        let current = entry_identity_via_parent(&parent_fd, &basename, source)
+            .map_err(RenameFailure::Source)?;
+        if self.0 != current {
+            return Err(RenameFailure::Source(identity_changed(
+                source,
+                "before the move",
+            )));
+        }
+        rename_from_parent_noreplace(&parent_fd, &basename, destination)
+            .map_err(RenameFailure::Source)?;
+        let moved = Self::capture(destination)
+            .map_err(|error| unverified_destination(source, destination, Some(error)))?;
+        if !self.same_object(&moved) {
+            return Err(unverified_destination(source, destination, None));
+        }
+        Ok(moved)
+    }
+
     /// Rename `source` into the directory `destination` names, pinned to
     /// `destination_parent` (physical device+inode+kind) so a swapped ancestor
     /// symlink cannot divert the move. Verified `Stable`, not `Exact`: see
@@ -97,6 +136,19 @@ impl EntryIdentity {
 
     fn same_object(&self, other: &Self) -> bool {
         self.0.same_object(&other.0)
+    }
+}
+
+fn split_source_parent(source: &Path) -> io::Result<(&Path, std::ffi::OsString)> {
+    let parent = source
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    match (parent, source.file_name()) {
+        (Some(parent), Some(name)) => Ok((parent, name.to_os_string())),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("source has no parent or file name: {}", source.display()),
+        )),
     }
 }
 
@@ -253,6 +305,110 @@ fn rename_into_noreplace(
     _source: &Path,
     _parent_fd: &rustix::fd::OwnedFd,
     _basename: &std::ffi::OsStr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "verified no-replace rename is supported only on Linux and macOS",
+    ))
+}
+
+/// Open the source's parent as an `O_DIRECTORY` FD and authenticate it as a
+/// trusted namespace (owner- and sticky-aware, via
+/// `degu_walk::directory_grants_foreign_mutation`). Ancestor symlinks are followed
+/// so a relocated XDG cache home resolves; the anti-swap defense is not the open
+/// flags but the pinned FD returned here -- every later `fstatat`/`renameat` acts
+/// through this handle, not `AT_FDCWD + source`, so a swap after this open cannot
+/// divert the move.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn open_source_parent_verified(parent: &Path) -> io::Result<rustix::fd::OwnedFd> {
+    let fd = open_directory_following(parent)?;
+    let opened = rustix::fs::fstat(&fd).map_err(io::Error::from)?;
+    let euid = rustix::process::geteuid().as_raw();
+    if opened.st_uid != euid && opened.st_uid != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "source parent {} is owned by UID {} not the invoking UID {euid}",
+                parent.display(),
+                opened.st_uid
+            ),
+        ));
+    }
+    if degu_walk::directory_grants_foreign_mutation(opened.st_uid, opened.st_mode as u32, euid) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "source parent {} is group- or world-writable without the sticky bit",
+                parent.display()
+            ),
+        ));
+    }
+    Ok(fd)
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn open_source_parent_verified(_parent: &Path) -> io::Result<rustix::fd::OwnedFd> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "verified source-parent open is supported only on Linux and macOS",
+    ))
+}
+
+/// Capture the identity of `basename` relative to the held `parent_fd`, no-follow,
+/// so the entry is authenticated in the exact namespace the rename will use.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn entry_identity_via_parent(
+    parent_fd: &rustix::fd::OwnedFd,
+    basename: &std::ffi::OsStr,
+    source: &Path,
+) -> io::Result<ObjectIdentity> {
+    use crate::lifecycle::trash::parent_identity;
+
+    let stat = rustix::fs::statat(parent_fd, basename, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| {
+            io::Error::new(
+                io::Error::from(error).kind(),
+                format!("failed to inspect source entry {}", source.display()),
+            )
+        })?;
+    Ok(parent_identity(&stat))
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn entry_identity_via_parent(
+    _parent_fd: &rustix::fd::OwnedFd,
+    _basename: &std::ffi::OsStr,
+    _source: &Path,
+) -> io::Result<ObjectIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "verified source-entry inspection is supported only on Linux and macOS",
+    ))
+}
+
+/// Rename `basename` (relative to the held source `parent_fd`) to `destination`
+/// with `RENAME_NOREPLACE`. Source pinned to the FD; destination is degu's trash.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn rename_from_parent_noreplace(
+    parent_fd: &rustix::fd::OwnedFd,
+    basename: &std::ffi::OsStr,
+    destination: &Path,
+) -> io::Result<()> {
+    rustix::fs::renameat_with(
+        parent_fd,
+        basename,
+        rustix::fs::CWD,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(io::Error::from)
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn rename_from_parent_noreplace(
+    _parent_fd: &rustix::fd::OwnedFd,
+    _basename: &std::ffi::OsStr,
+    _destination: &Path,
 ) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -420,5 +576,171 @@ mod tests {
             std::fs::read_to_string(physical.join("restored")).unwrap(),
             "payload"
         );
+    }
+
+    // Crux: a parent-writer swaps the root entry after the final path-based
+    // validation but before the rename. The held source-parent FD authenticates
+    // the entry's identity immediately before the renameat, so the swapped
+    // foreign object is refused and never lands in the destination.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn rename_from_parent_refuses_a_swapped_source_and_never_moves_the_foreign_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        std::fs::write(&source, "planned").unwrap();
+        let identity = EntryIdentity::capture(&source).unwrap();
+
+        // A parent-writer replaces the root name with a foreign object between
+        // the planned identity capture and the rename.
+        std::fs::rename(&source, dir.path().join("stashed")).unwrap();
+        std::fs::write(&source, "foreign").unwrap();
+
+        let error = identity
+            .rename_from_verified_parent(&source, &destination)
+            .unwrap_err();
+
+        let RenameFailure::Source(error) = error else {
+            panic!("a swapped source must fail the entry-identity check, not move");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "foreign");
+        assert!(!destination.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn rename_from_parent_moves_a_verified_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        std::fs::write(&source, "planned").unwrap();
+        let identity = EntryIdentity::capture(&source).unwrap();
+
+        let moved = identity
+            .rename_from_verified_parent(&source, &destination)
+            .unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "planned");
+        assert!(identity.same_object(&moved));
+    }
+
+    // An ancestor of the source is replaced with a symlink AFTER the parent FD
+    // is open. The held FD binds the original physical parent, so the entry
+    // check and the renameat still act on the original namespace, not the
+    // diverted one. Proven by opening the parent FD ourselves, swapping the
+    // ancestor, then renaming through the held FD.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the fixture swaps an ancestor with raw fs calls; the held-parent-FD rename is the subject under test"
+    )]
+    fn rename_from_parent_binds_the_original_namespace_after_an_ancestor_swap() {
+        use super::{open_source_parent_verified, rename_from_parent_noreplace};
+
+        let dir = tempfile::tempdir().unwrap();
+        let physical = dir.path().join("physical");
+        let evil = dir.path().join("evil");
+        std::fs::create_dir(&physical).unwrap();
+        std::fs::create_dir(&evil).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&physical, &alias).unwrap();
+
+        // The source lives inside the physical directory, reached via the alias.
+        let logical_parent = alias.join("holder");
+        std::fs::create_dir(&logical_parent).unwrap();
+        let source = logical_parent.join("source");
+        std::fs::write(&source, "payload").unwrap();
+        let identity = EntryIdentity::capture(&source).unwrap();
+
+        // Open the parent FD through the alias; it now pins the physical holder.
+        let parent_fd = open_source_parent_verified(&logical_parent).unwrap();
+
+        // Swap the ancestor symlink to the evil tree AFTER the FD is open.
+        let evil_holder = evil.join("holder");
+        std::fs::create_dir(&evil_holder).unwrap();
+        std::fs::write(evil_holder.join("source"), "planted").unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&evil, &alias).unwrap();
+
+        // The entry check via the held FD still sees the original object.
+        let current =
+            super::entry_identity_via_parent(&parent_fd, std::ffi::OsStr::new("source"), &source)
+                .unwrap();
+        assert_eq!(identity.0, current);
+
+        let destination = dir.path().join("destination");
+        rename_from_parent_noreplace(&parent_fd, std::ffi::OsStr::new("source"), &destination)
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "payload");
+        assert_eq!(
+            std::fs::read_to_string(evil_holder.join("source")).unwrap(),
+            "planted"
+        );
+    }
+
+    // The held-parent-FD open is no-follow, owner- and sticky-aware: a group/
+    // world-writable, non-sticky parent is refused before any rename, and an
+    // EUID-owned sticky (1777) parent -- the crux P1-B regression case -- is
+    // still accepted.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn open_source_parent_refuses_an_untrusted_parent() {
+        use super::open_source_parent_verified;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("shared");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = open_source_parent_verified(&parent).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        // The EUID-owned sticky variant of the same mode is accepted: sticky
+        // confines rename/delete to the entry owner and the parent is ours.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        open_source_parent_verified(&parent).unwrap();
+
+        // Regression: a plain EUID-owned 0700 parent is accepted.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        open_source_parent_verified(&parent).unwrap();
+    }
+
+    // A ROOT-owned parent that is not shared-writable-without-sticky is trusted:
+    // root is outside degu's unprivileged threat model, so the owner clause does
+    // not demote a root-owned system directory (`/usr`, `/tmp`, container roots,
+    // HPC scratch). This uses a real root-owned system directory (`/usr`),
+    // searchable by all and mode 0755, and skips cleanly when the test itself
+    // runs as root or owns `/usr` (the root exemption is then indistinguishable
+    // from same-owner trust).
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn open_source_parent_trusts_a_root_owned_parent() {
+        use super::open_source_parent_verified;
+        use std::os::unix::fs::MetadataExt;
+
+        let euid = rustix::process::geteuid().as_raw();
+        let root_owned = std::path::Path::new("/usr");
+        let Ok(metadata) = std::fs::metadata(root_owned) else {
+            eprintln!("skipping: /usr is unavailable on this platform");
+            return;
+        };
+        if metadata.uid() != 0 || metadata.uid() == euid {
+            eprintln!("skipping: /usr is not a foreign root-owned directory here");
+            return;
+        }
+        // Guard against the mode clause: /usr must not be shared-writable without
+        // sticky, or the refusal would come from mode, not the owner exemption.
+        assert_eq!(
+            metadata.mode() & 0o022,
+            0,
+            "/usr is unexpectedly group/world-writable"
+        );
+
+        open_source_parent_verified(root_owned).expect("root-owned 0755 parent must be trusted");
     }
 }

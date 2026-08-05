@@ -87,6 +87,13 @@ pub(in crate::lifecycle::stage) fn stage_finding_with_log(
     append: &mut dyn FnMut(&OpRecord) -> std::io::Result<()>,
     recheck: &dyn Fn(&Finding) -> Result<(), String>,
 ) -> StageOutcome {
+    // Validate the live source before writing even a Pending record, so a failure
+    // leaves the source and operation log untouched.
+    if let Err(error) = validate_source_tree(&request) {
+        let reason = release_failed_reservation(&request, error);
+        return StageOutcome::terminal(CleanExecution::stage_failed(request.finding, reason));
+    }
+
     // Snapshot the restore-destination parent BEFORE the destructive rename and
     // before the pending record, while the source (and therefore its parent) is
     // present. The live restore check uses `Stable` (device+inode+kind), which
@@ -202,45 +209,83 @@ fn move_verified(
     recheck: &dyn Fn(&Finding) -> Result<(), String>,
 ) -> CommitOutcome {
     let source = request.finding.path();
+    // Re-check protection, then run the full source-tree traversal as the last
+    // operation before the rename, so it catches any change made during
+    // destination capture, Pending, or the re-check itself.
+    if let Err(reason) = recheck(request.finding) {
+        return CommitOutcome::Failed(format!(
+            "protection re-check failed at the staging boundary: {reason}"
+        ));
+    }
+    if let Err(reason) = validate_source_tree(request) {
+        return CommitOutcome::Failed(format!(
+            "source safety re-check failed at the staging boundary: {reason}"
+        ));
+    }
+    match request
+        .identity
+        .rename_from_verified_parent(source, &request.entry)
+    {
+        // The pre-rename destination-parent capture stays valid: the rename
+        // removes the entry, not the parent, and the restore check keys on
+        // `Stable` identity, which the rename does not change.
+        Ok(moved) => CommitOutcome::Staged {
+            moved,
+            destination_parent,
+            cleanup_failure: None,
+        },
+        Err(error) => commit_failure(error),
+    }
+}
+
+fn validate_source_tree(request: &StageRequest<'_>) -> Result<(), String> {
+    let source = request.finding.path();
     match request.identity.matches(source) {
         Ok(true) => {}
         Ok(false) => {
-            return CommitOutcome::Failed(format!(
-                "entry identity changed before mount safety validation: {}",
+            return Err(format!(
+                "entry identity changed before ownership and mount safety validation: {}",
                 source.display()
             ));
         }
-        Err(error) => return CommitOutcome::Failed(error.to_string()),
+        Err(error) => {
+            return Err(format!(
+                "source identity validation failed before ownership and mount safety validation: {error}"
+            ));
+        }
     }
-    match degu_walk::validate_single_mount_tree(source) {
-        // The recheck runs after the mount traversal, which is not constant
-        // time: a protected alias created while a large tree is walked would
-        // otherwise slip between the check and the rename.
-        Ok(()) => match recheck(request.finding) {
-            Err(reason) => CommitOutcome::Failed(format!(
-                "protection re-check failed at the staging boundary: {reason}"
-            )),
-            Ok(()) => match request
-                .identity
-                .rename_verified_located(source, &request.entry)
-            {
-                // The destination parent was captured before this rename, while the
-                // source was present; the rename removes the entry, not the parent,
-                // and the live restore check uses `Stable` (device+inode+kind) which
-                // the rename does not change, so the pre-captured value authenticates
-                // exactly the directory a later restore will find.
-                Ok(moved) => CommitOutcome::Staged {
-                    moved,
-                    destination_parent,
-                    cleanup_failure: None,
-                },
-                Err(error) => commit_failure(error),
-            },
-        },
-        Err(error) => CommitOutcome::Failed(format!(
-            "mount safety validation failed before staging: {error}"
-        )),
+    let required_uid = rustix::process::geteuid().as_raw();
+    // The source root's parent is above the walked tree, so it needs its own
+    // check: an untrusted parent lets a foreign writer swap the root into the
+    // trash between here and the rename. Fail closed.
+    if let Some(parent) = source
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        degu_walk::validate_trusted_parent_namespace(parent, required_uid).map_err(|error| {
+            format!("source parent namespace validation failed before staging: {error}")
+        })?;
+    } else {
+        return Err(format!(
+            "source has no parent directory to authenticate: {}",
+            source.display()
+        ));
     }
+    // One no-follow traversal enforces mount, ownership, no-shared-writable, and
+    // protected-descendant names together; the path-based recheck above covers
+    // config-`protect` overlaps and the root's own name, which this walk cannot.
+    let protected_names = protected_descendant_names();
+    degu_walk::reject_protected_in_owned_single_mount_tree(source, required_uid, &protected_names)
+        .map_err(|error| {
+            format!("ownership and mount safety validation failed before staging: {error}")
+        })
+}
+
+fn protected_descendant_names() -> Vec<std::ffi::OsString> {
+    degu_core::safety::PROTECTED_DESCENDANT_DIR_NAMES
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect()
 }
 
 fn capture_destination_parent(source: &std::path::Path) -> std::io::Result<ObjectIdentity> {
@@ -281,11 +326,11 @@ impl CommitOutcome {
 fn commit_failure(error: RenameFailure) -> CommitOutcome {
     match error {
         RenameFailure::Source(error) => CommitOutcome::Failed(error.to_string()),
-        // Staging renames into a degu-controlled trash entry via
-        // `rename_verified_located`, which never authenticates a parent, so this
-        // arm is unreachable here; keep it total and treat it as a plain failure.
+        // Staging authenticates the SOURCE parent through a held no-follow FD
+        // (`rename_from_verified_parent`); an untrusted or swapped source parent
+        // surfaces here. Treat it as a plain staging failure: nothing was moved.
         RenameFailure::UnauthenticatedParent { parent, error } => CommitOutcome::Failed(format!(
-            "destination parent {} could not be authenticated: {error}",
+            "source parent {} could not be authenticated: {error}",
             parent.display()
         )),
         RenameFailure::UnverifiedDestination { destination, error } => {

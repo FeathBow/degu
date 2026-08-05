@@ -106,6 +106,8 @@ fn test_candidate(ecosystem: &str, path: PathBuf, kind: FindingKind) -> FindingC
         skipped: 0,
         truncated: false,
         unvisited_dirs: 0,
+        shared_writable_dirs: 0,
+        parent_grants_foreign_mutation: false,
         protected_boundaries: 0,
         protected_credential_boundaries: 0,
         recovery,

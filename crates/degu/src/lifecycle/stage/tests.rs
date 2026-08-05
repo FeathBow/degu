@@ -32,6 +32,8 @@ pub(super) fn finding_for_test(path: PathBuf, bytes_allocated: u64, inodes: u64)
         skipped: 0,
         truncated: false,
         unvisited_dirs: 0,
+        shared_writable_dirs: 0,
+        parent_grants_foreign_mutation: false,
         protected_boundaries: 0,
         protected_credential_boundaries: 0,
         recovery: Recovery::Regenerable {
@@ -171,7 +173,7 @@ fn stage_does_not_flag_pending_append_failure_as_staged() {
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 #[test]
-fn stage_fails_closed_when_the_destination_parent_cannot_be_captured() {
+fn stage_fails_closed_before_pending_when_the_source_parent_is_unsearchable() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
@@ -206,17 +208,303 @@ fn stage_fails_closed_when_the_destination_parent_cannot_be_captured() {
     .finish();
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-    // Fail closed: nothing was moved, no trash entry exists, and no record (not
-    // even the pending one) was written, because the capture ran before both.
+    // Fail closed: the ownership/mount preflight now runs before destination
+    // capture, so an unsearchable parent is refused before any pending record.
     assert!(source.exists());
     assert!(!entry.exists());
     assert!(appended.is_empty());
-    assert!(item_failed_with_parent_reason(&outcome));
+    assert!(
+        outcome
+            .failure_reason()
+            .is_some_and(|reason| reason.contains("before ownership and mount safety validation"))
+    );
 }
 
-fn item_failed_with_parent_reason(item: &CleanExecution) -> bool {
-    item.failure_reason()
-        .is_some_and(|reason| reason.contains("could not record the restore destination parent"))
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[test]
+fn stage_refuses_a_non_sticky_shared_writable_parent_with_no_move() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let trash = Trash::new(dir.path().join("trash"));
+    // A private, fully-EUID-owned tree under a non-sticky mode-0777 parent.
+    let parent = dir.path().join("shared-parent");
+    std::fs::create_dir_all(&parent).unwrap();
+    let source = parent.join("cache");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("data"), b"cached").unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let finding = finding_for_test(source.clone(), 0, 0);
+    let identity = EntryIdentity::capture(&source).unwrap();
+    let entry = trash.reserve(&source).unwrap();
+    let mut appended = Vec::new();
+
+    let item = stage_finding_with_log(
+        StageRequest {
+            trash: &trash,
+            finding: &finding,
+            identity: &identity,
+            entry: entry.clone(),
+            reclamation_id: "run",
+        },
+        &mut |record: &OpRecord| {
+            appended.push(record.clone());
+            Ok(())
+        },
+        &noop_recheck,
+    )
+    .finish();
+
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(source.join("data").exists());
+    assert!(!entry.exists());
+    assert!(appended.is_empty(), "parent refusal precedes Pending");
+    let reason = item
+        .failure_reason()
+        .expect("shared-writable parent refusal");
+    assert!(
+        reason.contains("source parent namespace validation"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("group- or world-writable without the sticky bit"),
+        "{reason}"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[test]
+fn stage_allows_an_euid_owned_tree_under_a_sticky_shared_parent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let trash = Trash::new(dir.path().join("trash"));
+    // Same shared mode, but sticky (1777): only the entry owner (this EUID, who
+    // owns the root) can rename it, so the swap is impossible and staging runs.
+    let parent = dir.path().join("sticky-parent");
+    std::fs::create_dir_all(&parent).unwrap();
+    let source = parent.join("cache");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("data"), b"cached").unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let finding = finding_for_test(source.clone(), 4096, 2);
+    let identity = EntryIdentity::capture(&source).unwrap();
+    let entry = trash.reserve(&source).unwrap();
+    let mut appended = Vec::new();
+
+    let item = stage_finding_with_log(
+        StageRequest {
+            trash: &trash,
+            finding: &finding,
+            identity: &identity,
+            entry: entry.clone(),
+            reclamation_id: "run",
+        },
+        &mut |record: &OpRecord| {
+            appended.push(record.clone());
+            Ok(())
+        },
+        &noop_recheck,
+    )
+    .finish();
+
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        !source.exists(),
+        "sticky parent is safe, so the tree stages"
+    );
+    assert!(entry.join("data").exists());
+    assert!(item.reported_as_cleaned(false));
+    assert_eq!(appended.len(), 2);
+    assert_eq!(appended[0].outcome, OpOutcome::Pending);
+    assert_eq!(appended[1].outcome, OpOutcome::Ok);
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[test]
+fn stage_is_unaffected_by_a_normal_owned_parent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let trash = Trash::new(dir.path().join("trash"));
+    // Regression guard: a normal 0755 EUID-owned parent still stages cleanly.
+    let parent = dir.path().join("normal-parent");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let source = parent.join("cache");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("data"), b"cached").unwrap();
+    let finding = finding_for_test(source.clone(), 4096, 2);
+    let identity = EntryIdentity::capture(&source).unwrap();
+    let entry = trash.reserve(&source).unwrap();
+    let mut appended = Vec::new();
+
+    let item = stage_finding_with_log(
+        StageRequest {
+            trash: &trash,
+            finding: &finding,
+            identity: &identity,
+            entry: entry.clone(),
+            reclamation_id: "run",
+        },
+        &mut |record: &OpRecord| {
+            appended.push(record.clone());
+            Ok(())
+        },
+        &noop_recheck,
+    )
+    .finish();
+
+    assert!(!source.exists());
+    assert!(entry.join("data").exists());
+    assert!(item.reported_as_cleaned(false));
+    assert_eq!(appended.len(), 2);
+    assert_eq!(appended[1].outcome, OpOutcome::Ok);
+}
+
+#[test]
+fn stage_rejects_a_shared_writable_directory_before_pending() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let trash = Trash::new(dir.path().join("trash"));
+    let source = dir.path().join("cache");
+    let shared = source.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("data"), b"cached").unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let finding = finding_for_test(source.clone(), 0, 0);
+    let identity = EntryIdentity::capture(&source).unwrap();
+    let entry = trash.reserve(&source).unwrap();
+    let mut appended = Vec::new();
+
+    let item = stage_finding_with_log(
+        StageRequest {
+            trash: &trash,
+            finding: &finding,
+            identity: &identity,
+            entry: entry.clone(),
+            reclamation_id: "run",
+        },
+        &mut |record: &OpRecord| {
+            appended.push(record.clone());
+            Ok(())
+        },
+        &noop_recheck,
+    )
+    .finish();
+
+    assert!(source.exists());
+    assert!(!entry.exists());
+    assert!(appended.is_empty(), "shared-write refusal precedes Pending");
+    let reason = item.failure_reason().expect("shared-write refusal");
+    assert!(reason.contains("group- or world-writable"), "{reason}");
+}
+
+// P1-A: a protected directory name planted inside the source tree is refused by
+// the SINGLE combined final traversal -- with a no-op recheck, so the refusal
+// comes from the owned-tree validator itself, not a separate protection pass.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[test]
+fn stage_rejects_a_protected_descendant_name_via_the_combined_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+    let trash = Trash::new(dir.path().join("trash"));
+    let source = dir.path().join("cache");
+    let nested = source.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("data"), b"cached").unwrap();
+    // A protected credential directory name (`.aws`) inside the tree.
+    std::fs::create_dir_all(nested.join(".aws")).unwrap();
+    let finding = finding_for_test(source.clone(), 0, 0);
+    let identity = EntryIdentity::capture(&source).unwrap();
+    let entry = trash.reserve(&source).unwrap();
+    let mut appended = Vec::new();
+
+    let item = stage_finding_with_log(
+        StageRequest {
+            trash: &trash,
+            finding: &finding,
+            identity: &identity,
+            entry: entry.clone(),
+            reclamation_id: "run",
+        },
+        &mut |record: &OpRecord| {
+            appended.push(record.clone());
+            Ok(())
+        },
+        &noop_recheck,
+    )
+    .finish();
+
+    assert!(source.join("nested/.aws").exists());
+    assert!(source.join("nested/data").exists());
+    assert!(!entry.exists());
+    assert!(
+        appended.is_empty(),
+        "protected-name refusal precedes Pending"
+    );
+    let reason = item.failure_reason().expect("protected-name refusal");
+    assert!(
+        reason.contains("ownership and mount safety validation failed"),
+        "{reason}"
+    );
+    assert!(reason.contains("protected directory name"), "{reason}");
+    assert!(reason.contains(".aws"), "{reason}");
+    assert!(!dir.path().join("trash").join("cache").exists());
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn stage_rejects_a_real_foreign_owned_descendant_before_pending() {
+    use std::os::unix::fs::MetadataExt;
+
+    let foreign_source = PathBuf::from("/etc/hosts");
+    let foreign_uid = std::fs::symlink_metadata(&foreign_source).unwrap().uid();
+    if foreign_uid == rustix::process::geteuid().as_raw() {
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let trash = Trash::new(dir.path().join("trash"));
+    let source = dir.path().join("cache");
+    std::fs::create_dir(&source).unwrap();
+    let foreign_entry = source.join("foreign-hosts");
+    if let Err(error) = std::fs::hard_link(&foreign_source, &foreign_entry) {
+        eprintln!("platform refused the unprivileged foreign hardlink fixture: {error}");
+        return;
+    }
+    assert_eq!(
+        std::fs::symlink_metadata(&foreign_entry).unwrap().uid(),
+        foreign_uid
+    );
+    let finding = finding_for_test(source.clone(), 0, 0);
+    let identity = EntryIdentity::capture(&source).unwrap();
+    let entry = trash.reserve(&source).unwrap();
+    let mut appended = Vec::new();
+
+    let item = stage_finding_with_log(
+        StageRequest {
+            trash: &trash,
+            finding: &finding,
+            identity: &identity,
+            entry: entry.clone(),
+            reclamation_id: "run",
+        },
+        &mut |record: &OpRecord| {
+            appended.push(record.clone());
+            Ok(())
+        },
+        &noop_recheck,
+    )
+    .finish();
+
+    assert!(source.exists());
+    assert!(foreign_entry.exists());
+    assert!(!entry.exists());
+    assert!(appended.is_empty(), "ownership refusal precedes Pending");
+    let reason = item.failure_reason().expect("foreign ownership refusal");
+    assert!(reason.contains(&format!("UID {foreign_uid}")), "{reason}");
+    assert!(reason.contains("differs from required UID"), "{reason}");
 }
 
 #[test]
@@ -396,10 +684,99 @@ fn a_protected_alias_created_after_the_pending_append_stops_the_stage() {
     assert_eq!(appended.len(), 2);
 }
 
-// Order proof for the staging boundary: with the mount traversal failing, the
-// recheck must never run -- together with the alias test above this pins the
-// mount -> recheck -> rename sequence, so the traversal cannot reopen a window
-// after the protection re-check.
+#[test]
+fn shared_write_introduced_during_pending_is_caught_before_rename() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let trash = Trash::new(dir.path().join("trash"));
+    let source = dir.path().join("cache");
+    let sub = source.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("data"), b"cached").unwrap();
+    let finding = finding_for_test(source.clone(), 0, 0);
+    let identity = EntryIdentity::capture(&source).unwrap();
+    let entry = trash.reserve(&source).unwrap();
+    let mut appended = Vec::new();
+    let mut append = |record: &OpRecord| {
+        if record.outcome == OpOutcome::Pending {
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o770)).unwrap();
+        }
+        appended.push(record.clone());
+        Ok(())
+    };
+
+    let item = stage_finding_with_log(
+        StageRequest {
+            trash: &trash,
+            finding: &finding,
+            identity: &identity,
+            entry: entry.clone(),
+            reclamation_id: "run",
+        },
+        &mut append,
+        &noop_recheck,
+    )
+    .finish();
+
+    assert!(source.join("sub/data").exists());
+    assert!(!entry.exists());
+    let reason = item.failure_reason().expect("post-Pending safety refusal");
+    assert!(reason.contains("source safety re-check failed"), "{reason}");
+    assert!(reason.contains("group- or world-writable"), "{reason}");
+    assert_eq!(appended.len(), 2);
+    assert_eq!(appended[0].outcome, OpOutcome::Pending);
+    assert!(matches!(appended[1].outcome, OpOutcome::Failed { .. }));
+}
+
+#[test]
+fn shared_write_introduced_during_protection_recheck_is_caught_before_rename() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let trash = Trash::new(dir.path().join("trash"));
+    let source = dir.path().join("cache");
+    let sub = source.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("data"), b"cached").unwrap();
+    let finding = finding_for_test(source.clone(), 0, 0);
+    let identity = EntryIdentity::capture(&source).unwrap();
+    let entry = trash.reserve(&source).unwrap();
+    let mut appended = Vec::new();
+    let recheck = |_: &Finding| -> Result<(), String> {
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o770)).unwrap();
+        Ok(())
+    };
+
+    let item = stage_finding_with_log(
+        StageRequest {
+            trash: &trash,
+            finding: &finding,
+            identity: &identity,
+            entry: entry.clone(),
+            reclamation_id: "run",
+        },
+        &mut |record: &OpRecord| {
+            appended.push(record.clone());
+            Ok(())
+        },
+        &recheck,
+    )
+    .finish();
+
+    assert!(source.join("sub/data").exists());
+    assert!(!entry.exists());
+    let reason = item.failure_reason().expect("final source safety refusal");
+    assert!(reason.contains("source safety re-check failed"), "{reason}");
+    assert!(reason.contains("group- or world-writable"), "{reason}");
+    assert_eq!(appended.len(), 2);
+    assert_eq!(appended[0].outcome, OpOutcome::Pending);
+    assert!(matches!(appended[1].outcome, OpOutcome::Failed { .. }));
+}
+
+// Order proof for the staging boundary: an unsafe source fails the initial
+// traversal before recheck or Pending. The mutation-during-recheck test above
+// separately pins protection recheck -> final traversal -> rename.
 #[cfg(unix)]
 #[test]
 fn the_protection_recheck_runs_after_the_mount_traversal() {

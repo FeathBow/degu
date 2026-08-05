@@ -139,6 +139,8 @@ fn checkpoint_candidate(
         skipped: stats.skipped_total,
         truncated: stats.truncated,
         unvisited_dirs: stats.unvisited_dirs,
+        shared_writable_dirs: stats.shared_writable_dirs,
+        parent_grants_foreign_mutation: false,
         protected_boundaries: stats.excluded_entries,
         protected_credential_boundaries: stats.excluded_credential_boundaries,
         recovery: Recovery::UserAsset,

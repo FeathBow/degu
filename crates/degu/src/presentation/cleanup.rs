@@ -6,8 +6,8 @@ use degu_core::disposition::{
 };
 use degu_core::finding::{DispositionMode, Finding};
 use degu_core::safety::{
-    MIXED_STATE_AI_TOOL_REASON, PROTECTED_CREDENTIAL_REASON, SHARED_WRITABLE_PARENT_REASON,
-    SHARED_WRITABLE_REASON,
+    MIXED_STATE_AI_TOOL_REASON, PROTECTED_CREDENTIAL_REASON, SHARED_WRITABLE_REASON,
+    UNTRUSTED_PARENT_REASON,
 };
 
 const REVIEW_EXPLANATION: &str = "Excluded by default; preview a path before including it.";
@@ -47,7 +47,7 @@ pub(crate) fn short_reason(reason: &str, ecosystem: &str) -> Option<String> {
         COSTLY_REGEN => "costly to regenerate",
         MIXED_STATE_AI_TOOL_REASON => "contains protected AI tool state",
         SHARED_WRITABLE_REASON => "shared-writable directory",
-        SHARED_WRITABLE_PARENT_REASON => "shared-writable parent",
+        UNTRUSTED_PARENT_REASON => "untrusted parent",
         PROTECTED_CREDENTIAL_REASON => "contains protected credentials",
         _ => return None,
     };
@@ -226,7 +226,7 @@ mod tests {
         let reasons = degu_core::disposition::STATIC_REASONS.into_iter().chain([
             degu_core::safety::MIXED_STATE_AI_TOOL_REASON,
             degu_core::safety::SHARED_WRITABLE_REASON,
-            degu_core::safety::SHARED_WRITABLE_PARENT_REASON,
+            degu_core::safety::UNTRUSTED_PARENT_REASON,
             degu_core::safety::PROTECTED_CREDENTIAL_REASON,
         ]);
         for reason in reasons {

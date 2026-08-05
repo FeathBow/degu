@@ -4,7 +4,7 @@ use degu_core::finding::{
 };
 use degu_core::plan::Plan;
 use degu_core::safety::{
-    MIXED_STATE_AI_TOOL_REASON, SHARED_WRITABLE_PARENT_REASON, SHARED_WRITABLE_REASON,
+    MIXED_STATE_AI_TOOL_REASON, SHARED_WRITABLE_REASON, UNTRUSTED_PARENT_REASON,
 };
 use std::path::PathBuf;
 
@@ -145,7 +145,7 @@ fn an_untrusted_parent_removes_authority_without_falsifying_measurement() {
     assert_eq!(finding.disposition().mode, DispositionMode::ReportOnly);
     assert_eq!(
         finding.disposition().reason.as_deref(),
-        Some(SHARED_WRITABLE_PARENT_REASON)
+        Some(UNTRUSTED_PARENT_REASON)
     );
     assert!(!finding.measurement_incomplete());
 }

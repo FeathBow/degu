@@ -81,12 +81,14 @@ fn candidate_is_protected(policy: &ProtectionPolicy, candidate: &FindingCandidat
 }
 
 /// Flag every candidate whose finding root sits directly under an untrusted
-/// (group/world-writable, non-sticky) parent, so it is demoted to report-only.
-/// Such a parent lets a foreign writer swap the root name into degu's trash
-/// between validation and the staging rename; a shared parent that is sticky (or
-/// not other-writable) is left alone. The parent lives above every measured
-/// tree, so this cannot ride the walk and runs here on the finalized paths.
-/// Fails closed: an unreadable parent mode marks the candidate unsafe.
+/// parent, so it is demoted to report-only. A parent is untrusted when it has a
+/// foreign (non-root) owner, is group- or world-writable without the sticky bit,
+/// or its ownership and mode cannot be read -- any of these lets a principal
+/// other than the invoking user swap the root name into degu's trash between
+/// validation and the staging rename. A same-owner sticky (or not-other-writable)
+/// parent is left alone. The parent lives above every measured tree, so this
+/// cannot ride the walk and runs here on the finalized paths. Fails closed: an
+/// unreadable parent marks the candidate unsafe.
 pub(super) fn flag_untrusted_parents(candidates: &mut [FindingCandidate]) {
     for candidate in candidates {
         candidate.parent_grants_foreign_mutation = parent_grants_foreign_mutation(&candidate.path);
@@ -101,8 +103,9 @@ fn parent_grants_foreign_mutation(path: &std::path::Path) -> bool {
         // No parent to trust means no verifiable namespace: fail closed.
         return true;
     };
-    // A readable, trusted parent (EUID-owned and not shared-writable-non-sticky)
-    // is the only pass; a foreign owner or every error is a refusal.
+    // A trusted parent (owned by the invoking user or root, and not
+    // shared-writable-without-sticky) is the only pass; a foreign owner or any
+    // error is a refusal.
     let euid = rustix::process::geteuid().as_raw();
     degu_walk::validate_trusted_parent_namespace(parent, euid).is_err()
 }
@@ -126,7 +129,7 @@ mod tests {
         DispositionMode, FindingCandidate, FindingKind, FindingSource, Ownership, Recovery,
         RegenCost,
     };
-    use degu_core::safety::SHARED_WRITABLE_PARENT_REASON;
+    use degu_core::safety::UNTRUSTED_PARENT_REASON;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
@@ -180,7 +183,7 @@ mod tests {
         assert_eq!(finding.disposition().mode, DispositionMode::ReportOnly);
         assert_eq!(
             finding.disposition().reason.as_deref(),
-            Some(SHARED_WRITABLE_PARENT_REASON)
+            Some(UNTRUSTED_PARENT_REASON)
         );
     }
 
@@ -200,7 +203,7 @@ mod tests {
             .unwrap();
         assert_ne!(
             finding.disposition().reason.as_deref(),
-            Some(SHARED_WRITABLE_PARENT_REASON)
+            Some(UNTRUSTED_PARENT_REASON)
         );
     }
 

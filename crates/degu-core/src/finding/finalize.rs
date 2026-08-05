@@ -6,10 +6,11 @@ use super::*;
 pub enum AuthorityConstraint {
     MixedStateAiToolDirectory,
     SharedWritableDirectory,
-    /// The finding root's parent is an untrusted (group/world-writable,
-    /// non-sticky) directory, so a foreign writer could swap the root name into
-    /// degu's trash between validation and the staging rename.
-    SharedWritableParent,
+    /// The finding root's parent is an untrusted namespace -- a foreign (non-root)
+    /// owner, group/world-writable without the sticky bit, or unverifiable -- so a
+    /// foreign writer could swap the root name into degu's trash between validation
+    /// and the staging rename.
+    UntrustedParent,
     ProtectedCredentialDirectory,
 }
 
@@ -71,7 +72,7 @@ fn synthesize_constraint(candidate: &FindingCandidate) -> Option<AuthorityConstr
         return Some(AuthorityConstraint::ProtectedCredentialDirectory);
     }
     if candidate.parent_grants_foreign_mutation {
-        return Some(AuthorityConstraint::SharedWritableParent);
+        return Some(AuthorityConstraint::UntrustedParent);
     }
     if candidate.shared_writable_dirs > 0 {
         return Some(AuthorityConstraint::SharedWritableDirectory);
@@ -99,7 +100,7 @@ fn constraint_reason(constraint: AuthorityConstraint) -> &'static str {
     match constraint {
         AuthorityConstraint::MixedStateAiToolDirectory => crate::safety::MIXED_STATE_AI_TOOL_REASON,
         AuthorityConstraint::SharedWritableDirectory => crate::safety::SHARED_WRITABLE_REASON,
-        AuthorityConstraint::SharedWritableParent => crate::safety::SHARED_WRITABLE_PARENT_REASON,
+        AuthorityConstraint::UntrustedParent => crate::safety::UNTRUSTED_PARENT_REASON,
         AuthorityConstraint::ProtectedCredentialDirectory => {
             crate::safety::PROTECTED_CREDENTIAL_REASON
         }

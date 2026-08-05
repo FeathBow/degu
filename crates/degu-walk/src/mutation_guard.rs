@@ -25,8 +25,9 @@ pub fn directory_grants_foreign_mutation(uid: u32, mode: u32, euid: u32) -> bool
 /// Fails closed unless `parent`'s resolved directory is a trusted namespace (see
 /// [`directory_grants_foreign_mutation`]). Follows symlinks: the write-permissions
 /// that matter belong to the real directory the entries live in, not a symlink
-/// pointing at it. Any metadata error is a refusal. This is a preflight; the
-/// authoritative anti-swap gate remains the held-FD rename.
+/// pointing at it. Any metadata error is a refusal. This path-based check is a
+/// preflight; staging re-verifies the same trust on a held parent FD, which pins
+/// the parent against an ancestor-path swap.
 pub fn validate_trusted_parent_namespace(parent: &Path, euid: u32) -> io::Result<()> {
     let metadata = std::fs::metadata(parent).map_err(|error| {
         io::Error::new(

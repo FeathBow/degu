@@ -57,10 +57,11 @@ impl EntryIdentity {
 
     /// Stage `source` into `destination` without re-resolving `AT_FDCWD + source`:
     /// open the source's parent as a verified no-follow FD, authenticate the entry
-    /// through it (`fstatat`), then `renameat(RENAME_NOREPLACE)` the basename
-    /// relative to the same FD. Both the check and the rename act on that one held
-    /// FD, so no ancestor or entry swap can slip into the window between them. The
-    /// destination is degu's own validated trash entry (plain-path guard).
+    /// through it (`fstatat`), then `renameat(RENAME_NOREPLACE)` the basename via the
+    /// same FD. The pinned FD defeats an ancestor-path swap, but `fstatat`+`renameat`
+    /// are two syscalls, not atomic: a basename swap between them is prevented not by
+    /// the FD but by the parent being trusted (no untrusted writer), checked at open.
+    /// The destination is degu's own validated trash entry (plain-path guard).
     pub(crate) fn rename_from_verified_parent(
         &self,
         source: &Path,
@@ -73,8 +74,8 @@ impl EntryIdentity {
                 error,
             }
         })?;
-        // Authenticate through the held FD immediately before the rename, closing
-        // the swap window a path-based check would leave open.
+        // Authenticate the entry through the held FD; this catches a pre-check swap.
+        // The check->rename gap relies on the trusted parent, not on atomicity.
         let current = entry_identity_via_parent(&parent_fd, &basename, source)
             .map_err(RenameFailure::Source)?;
         if self.0 != current {

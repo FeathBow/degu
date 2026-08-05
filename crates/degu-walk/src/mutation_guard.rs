@@ -23,11 +23,15 @@ pub fn directory_grants_foreign_mutation(mode: u32) -> bool {
     mode & SHARED_WRITE_MASK != 0 && mode & STICKY_BIT == 0
 }
 
-/// Reads `parent`'s live mode (no-follow) and fails closed unless it is a trusted
-/// namespace: an untrusted writer must not be able to swap `parent`'s entries.
-/// Any error reading the mode is a refusal, never a pass.
+/// Reads the resolved parent directory's live mode (follows symlinks, matching
+/// the stage-side `open_directory_following`) and fails closed unless it is a
+/// trusted namespace: an untrusted writer must not be able to swap `parent`'s
+/// entries. The directory whose write-permissions matter is the real directory
+/// the entries live in, not a symlink pointing at it. Any error reading the
+/// resolved mode (broken symlink, EACCES, ...) is a refusal, never a pass; the
+/// authoritative anti-swap gate remains the held-FD rename.
 pub fn validate_trusted_parent_namespace(parent: &Path) -> io::Result<()> {
-    let metadata = std::fs::symlink_metadata(parent).map_err(|error| {
+    let metadata = std::fs::metadata(parent).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!(

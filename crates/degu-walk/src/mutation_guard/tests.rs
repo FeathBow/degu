@@ -487,3 +487,37 @@ fn trusted_parent_namespace_fails_closed_on_missing_and_untrusted() {
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
     validate_trusted_parent_namespace(&parent).unwrap();
 }
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[test]
+fn trusted_parent_namespace_follows_a_symlinked_parent() {
+    use super::validate_trusted_parent_namespace;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // A symlink to a private 0700 directory resolves to a trusted namespace: the
+    // resolved directory's mode is authoritative, not the symlink's own mode
+    // (which is 0o777 on Linux, where the old no-follow read wrongly refused).
+    let trusted_target = dir.path().join("trusted-target");
+    std::fs::create_dir(&trusted_target).unwrap();
+    std::fs::set_permissions(&trusted_target, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let trusted_link = dir.path().join("trusted-link");
+    std::os::unix::fs::symlink(&trusted_target, &trusted_link).unwrap();
+    validate_trusted_parent_namespace(&trusted_link).unwrap();
+
+    // A symlink to a world-writable, non-sticky directory is refused: following
+    // resolves to the untrusted target.
+    let untrusted_target = dir.path().join("untrusted-target");
+    std::fs::create_dir(&untrusted_target).unwrap();
+    std::fs::set_permissions(&untrusted_target, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let untrusted_link = dir.path().join("untrusted-link");
+    std::os::unix::fs::symlink(&untrusted_target, &untrusted_link).unwrap();
+    let error = validate_trusted_parent_namespace(&untrusted_link).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(
+        error
+            .to_string()
+            .contains("group- or world-writable without the sticky bit")
+    );
+}

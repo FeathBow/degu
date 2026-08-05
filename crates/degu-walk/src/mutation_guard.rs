@@ -14,29 +14,34 @@ const SHARED_WRITE_MASK: u32 = 0o022;
 const STICKY_BIT: u32 = 0o1000;
 
 /// True when a directory of `mode` owned by `uid` grants namespace-mutation
-/// authority to a principal other than the invoking `euid`: the owner is foreign
-/// (a foreign owner can always chmod the directory to `0777` and can, being the
-/// directory owner, rename or delete any entry even when the sticky bit is set),
-/// OR it is group/world-writable AND not sticky. This is the companion to the
-/// tree-internal [`require_private_directory`] predicate (which refuses any
-/// shared-writable directory), used for the finding root's PARENT: a foreign
-/// owner is never trusted, and a same-owner shared parent is safe only when the
-/// sticky bit confines rename/delete to each entry's owner.
+/// authority to a principal other than the invoking `euid`: the owner is a
+/// NON-ROOT foreigner (who can chmod the directory to `0777` and, being the
+/// directory owner, rename or delete any entry even under the sticky bit), OR it
+/// is group/world-writable AND not sticky. Root ownership is exempt from the
+/// owner clause: degu refuses to run as root and cannot defend against root,
+/// which bypasses all permissions regardless -- so a root-owned parent (`/tmp`,
+/// container roots, HPC scratch) is not an unprivileged threat. The mode clause
+/// still rejects a root-owned directory that is group/world-writable without
+/// sticky, where a non-root principal could swap entries. This is the companion
+/// to the tree-internal [`require_private_directory`] predicate (which refuses
+/// any shared-writable directory), used for the finding root's PARENT.
 pub fn directory_grants_foreign_mutation(uid: u32, mode: u32, euid: u32) -> bool {
-    uid != euid || (mode & SHARED_WRITE_MASK != 0 && mode & STICKY_BIT == 0)
+    (uid != euid && uid != 0) || (mode & SHARED_WRITE_MASK != 0 && mode & STICKY_BIT == 0)
 }
 
 /// Reads the resolved parent directory's live owner and mode (follows symlinks,
 /// matching the stage-side `open_directory_following`) and fails closed unless it
 /// is a trusted namespace: an untrusted writer must not be able to swap
-/// `parent`'s entries. A foreign owner is untrusted regardless of mode (it can
-/// chmod to `0777` at will and, as the directory owner, sticky does not confine
-/// it), so trust requires ownership by `euid` AND a mode that is not
-/// shared-writable-without-sticky. The directory whose write-permissions matter
-/// is the real directory the entries live in, not a symlink pointing at it. Any
-/// error reading the resolved metadata (broken symlink, EACCES, ...) is a
-/// refusal, never a pass; the authoritative anti-swap gate remains the held-FD
-/// rename.
+/// `parent`'s entries. A NON-ROOT foreign owner is untrusted regardless of mode
+/// (it can chmod to `0777` at will and, as the directory owner, sticky does not
+/// confine it), so trust requires ownership by `euid` OR root AND a mode that is
+/// not shared-writable-without-sticky. Root ownership is exempt because root is
+/// outside degu's unprivileged threat model; the mode clause still refuses a
+/// root-owned parent a non-root principal could write. The directory whose
+/// write-permissions matter is the real directory the entries live in, not a
+/// symlink pointing at it. Any error reading the resolved metadata (broken
+/// symlink, EACCES, ...) is a refusal, never a pass; the authoritative anti-swap
+/// gate remains the held-FD rename.
 pub fn validate_trusted_parent_namespace(parent: &Path, euid: u32) -> io::Result<()> {
     let metadata = std::fs::metadata(parent).map_err(|error| {
         io::Error::new(
@@ -47,7 +52,7 @@ pub fn validate_trusted_parent_namespace(parent: &Path, euid: u32) -> io::Result
             ),
         )
     })?;
-    if metadata.uid() != euid {
+    if metadata.uid() != euid && metadata.uid() != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(

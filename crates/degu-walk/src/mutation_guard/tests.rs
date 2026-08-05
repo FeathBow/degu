@@ -532,9 +532,35 @@ fn foreign_mutation_predicate_is_sticky_and_owner_aware() {
     // owner, so it is safe even when group/world-writable.
     assert!(!directory_grants_foreign_mutation(EUID, 0o1777, EUID));
     assert!(!directory_grants_foreign_mutation(EUID, 0o1770, EUID));
-    // A foreign owner is never trusted regardless of mode: the owner can chmod
-    // to 0777 at will and, as the directory owner, sticky does not confine it.
+    // A non-root foreign owner is never trusted regardless of mode: the owner can
+    // chmod to 0777 at will and, as the directory owner, sticky does not confine
+    // it.
     assert!(directory_grants_foreign_mutation(FOREIGN_UID, 0o700, EUID));
+    assert!(directory_grants_foreign_mutation(FOREIGN_UID, 0o755, EUID));
+    assert!(directory_grants_foreign_mutation(FOREIGN_UID, 0o1777, EUID));
+}
+
+#[test]
+fn foreign_mutation_predicate_exempts_root_owner_from_the_owner_clause() {
+    use super::directory_grants_foreign_mutation;
+
+    const EUID: u32 = TEST_UID;
+    const ROOT_UID: u32 = 0;
+
+    // Root ownership is out of the unprivileged threat model, so the OWNER clause
+    // never demotes a root-owned parent: a private or sticky-world-writable
+    // root-owned dir (`/tmp`, container roots, HPC scratch) stays trusted.
+    assert!(!directory_grants_foreign_mutation(ROOT_UID, 0o755, EUID));
+    assert!(!directory_grants_foreign_mutation(ROOT_UID, 0o1777, EUID));
+    // The MODE clause still fires for a root-owned dir that is world-writable
+    // without sticky: a non-root principal could swap its entries.
+    assert!(directory_grants_foreign_mutation(ROOT_UID, 0o777, EUID));
+    // The euid-owner cases are unaffected by the exemption.
+    assert!(!directory_grants_foreign_mutation(EUID, 0o755, EUID));
+    assert!(!directory_grants_foreign_mutation(EUID, 0o1777, EUID));
+    assert!(directory_grants_foreign_mutation(EUID, 0o777, EUID));
+    // A NON-root foreign owner is still distrusted by the owner clause, even when
+    // sticky -- the owner can rename or delete any entry.
     assert!(directory_grants_foreign_mutation(FOREIGN_UID, 0o755, EUID));
     assert!(directory_grants_foreign_mutation(FOREIGN_UID, 0o1777, EUID));
 }

@@ -318,10 +318,13 @@ fn rename_into_noreplace(
 }
 
 /// Open the source's parent as an `O_DIRECTORY` FD and authenticate the opened
-/// directory as a trusted namespace: owned by the invoking effective UID AND not
-/// group/world-writable-without-sticky. A foreign owner is untrusted regardless
-/// of mode -- it can chmod the directory to `0777` at will and, being the
-/// directory owner, the sticky bit does not confine its rename/delete authority.
+/// directory as a trusted namespace: owned by the invoking effective UID (or
+/// root) AND not group/world-writable-without-sticky. A non-root foreign owner is
+/// untrusted regardless of mode -- it can chmod the directory to `0777` at will
+/// and, being the directory owner, the sticky bit does not confine its
+/// rename/delete authority. Root ownership is exempt because root is outside
+/// degu's unprivileged threat model; the mode check still refuses a root-owned
+/// parent a non-root writer could swap entries in.
 /// Ancestor symlinks are followed so a stable relocation (an XDG cache home
 /// symlinked elsewhere) resolves, exactly as the restore side's
 /// `open_directory_following` does; the defense against an ancestor swap is not
@@ -335,7 +338,7 @@ fn open_source_parent_verified(parent: &Path) -> io::Result<rustix::fd::OwnedFd>
     let fd = open_directory_following(parent)?;
     let opened = rustix::fs::fstat(&fd).map_err(io::Error::from)?;
     let euid = rustix::process::geteuid().as_raw();
-    if opened.st_uid != euid {
+    if opened.st_uid != euid && opened.st_uid != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -725,33 +728,37 @@ mod tests {
         open_source_parent_verified(&parent).unwrap();
     }
 
-    // P1-B: a FOREIGN-owned parent is refused regardless of mode -- even a
-    // permissive 0755 that the old mode-only check trusted. A privilege-free
-    // foreign-owned directory is hard to create, so this uses a real
-    // root-owned system directory (`/usr`), searchable by all, and skips
-    // cleanly when the test itself runs as root (no foreign owner exists).
+    // A ROOT-owned parent that is not shared-writable-without-sticky is trusted:
+    // root is outside degu's unprivileged threat model, so the owner clause does
+    // not demote a root-owned system directory (`/usr`, `/tmp`, container roots,
+    // HPC scratch). This uses a real root-owned system directory (`/usr`),
+    // searchable by all and mode 0755, and skips cleanly when the test itself
+    // runs as root or owns `/usr` (the root exemption is then indistinguishable
+    // from same-owner trust).
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
-    fn open_source_parent_refuses_a_foreign_owned_parent() {
+    fn open_source_parent_trusts_a_root_owned_parent() {
         use super::open_source_parent_verified;
         use std::os::unix::fs::MetadataExt;
 
         let euid = rustix::process::geteuid().as_raw();
-        let foreign = std::path::Path::new("/usr");
-        let Ok(metadata) = std::fs::metadata(foreign) else {
+        let root_owned = std::path::Path::new("/usr");
+        let Ok(metadata) = std::fs::metadata(root_owned) else {
             eprintln!("skipping: /usr is unavailable on this platform");
             return;
         };
-        if metadata.uid() == euid {
-            eprintln!("skipping: /usr is owned by the invoking UID (running as its owner)");
+        if metadata.uid() != 0 || metadata.uid() == euid {
+            eprintln!("skipping: /usr is not a foreign root-owned directory here");
             return;
         }
-
-        let error = open_source_parent_verified(foreign).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(
-            error.to_string().contains("owned by UID"),
-            "foreign owner must be named in the refusal: {error}"
+        // Guard against the mode clause: /usr must not be shared-writable without
+        // sticky, or the refusal would come from mode, not the owner exemption.
+        assert_eq!(
+            metadata.mode() & 0o022,
+            0,
+            "/usr is unexpectedly group/world-writable"
         );
+
+        open_source_parent_verified(root_owned).expect("root-owned 0755 parent must be trusted");
     }
 }

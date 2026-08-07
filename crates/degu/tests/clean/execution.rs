@@ -33,6 +33,7 @@ fn clean_yes_json_keeps_redirected_pip_cache_report_only() {
     let cache = home.path().join("scratch/pip-cache");
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join("wheel.whl"), [0u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     let out = degu()
         .env("HOME", home.path())
         .env("PIP_CACHE_DIR", &cache)

@@ -98,7 +98,11 @@ fn lexical_aliases_of_one_trash_root_resolve_to_a_single_root() {
 
     let base = home.path().join("cache");
     std::fs::create_dir_all(&base).unwrap();
-    std::fs::create_dir_all(base.join("sub")).unwrap();
+    let sub = base.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    for path in [home.path(), base.as_path(), sub.as_path()] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let real = base.join(".degu-trash");
     ensure_managed_trash_root(&real, ".degu-trash").unwrap();
 

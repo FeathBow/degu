@@ -132,6 +132,7 @@ fn clean_json_omits_a_native_path_and_keeps_representable_findings() {
     let pip = home.path().join(OsString::from_vec(b"pip-\xff".to_vec()));
     std::fs::create_dir_all(&pip).unwrap();
     std::fs::write(pip.join("wheel.whl"), [0_u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let out = degu()
         .env("HOME", home.path())
@@ -265,6 +266,7 @@ fn path_clean_under_an_unclassifiable_ancestor_cache_region_is_refused() {
     std::fs::write(target.join("CACHEDIR.TAG"), CACHEDIR_TAG_SIGNATURE).unwrap();
     std::fs::write(target.join(".rustc_info.json"), "{}").unwrap();
     std::fs::write(target.join("artifact.bin"), [0u8; 4096]).unwrap();
+    crate::common::make_tree_non_shared_writable(root.path()).unwrap();
     set_mode(&ancestor_tag, 0o000);
 
     let out = run_clean(
@@ -354,6 +356,7 @@ fn fake_cargo_home_with_unreadable_git(
     std::fs::write(registry.join("cache/crate.crate"), [0u8; 4096]).unwrap();
     let git_db = home.path().join(".cargo/git/db");
     std::fs::create_dir_all(&git_db).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     set_mode(&git_db, 0o000);
     (registry, git_db)
 }

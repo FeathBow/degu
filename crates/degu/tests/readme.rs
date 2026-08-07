@@ -39,6 +39,8 @@ fn readme_scan_demo_matches_real_cli_output() {
     std::fs::create_dir_all(&uv).unwrap();
     std::fs::write(uv.join("cache.bin"), vec![b'x'; 4 * MIB]).unwrap();
 
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+
     let output = common::isolated_degu()
         .env("HOME", home.path())
         .env("XDG_STATE_HOME", state.path())

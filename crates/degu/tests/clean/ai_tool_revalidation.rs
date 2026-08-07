@@ -28,6 +28,7 @@ impl Fixture {
         .unwrap();
         std::fs::write(target.join(".rustc_info.json"), "{}").unwrap();
         std::fs::write(target.join("artifact.o"), [0_u8; 4096]).unwrap();
+        crate::common::make_tree_non_shared_writable(project.path()).unwrap();
         Self {
             home,
             config,

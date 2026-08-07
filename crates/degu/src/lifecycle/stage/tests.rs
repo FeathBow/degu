@@ -6,6 +6,7 @@ use degu_core::finding::{
     finalize_findings,
 };
 use degu_core::oplog::{OpOutcome, OpRecord};
+use std::os::unix::fs::PermissionsExt;
 
 use super::execution::{CleanFailure, StageOutcome, record_clean_failure};
 use super::{CleanExecution, StageRequest, cleaned_resources, stage_finding_with_log};
@@ -62,6 +63,9 @@ fn final_append_failure_fixture() -> FinalAppendFailureFixture {
     let source = dir.path().join("cache");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("data"), b"cached").unwrap();
+    for path in [dir.path(), source.as_path()] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let finding = finding_for_test(source.clone(), 4096, 2);
     let identity = EntryIdentity::capture(&source).unwrap();
     let entry = trash.reserve(&source).unwrap();
@@ -145,6 +149,9 @@ fn stage_does_not_flag_pending_append_failure_as_staged() {
     let trash = Trash::new(dir.path().join("trash"));
     let source = dir.path().join("cache");
     std::fs::create_dir_all(&source).unwrap();
+    for path in [dir.path(), source.as_path()] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let finding = finding_for_test(source.clone(), 0, 0);
     let identity = EntryIdentity::capture(&source).unwrap();
     let entry = trash.reserve(&source).unwrap();
@@ -185,6 +192,9 @@ fn stage_fails_closed_before_pending_when_the_source_parent_is_unsearchable() {
     let source = parent.join("cache");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("data"), b"cached").unwrap();
+    for path in [dir.path(), source.as_path()] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let finding = finding_for_test(source.clone(), 0, 0);
     let identity = EntryIdentity::capture(&source).unwrap();
     let entry = trash.reserve(&source).unwrap();
@@ -233,6 +243,9 @@ fn stage_refuses_a_non_sticky_shared_writable_parent_with_no_move() {
     let source = parent.join("cache");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("data"), b"cached").unwrap();
+    for path in [dir.path(), source.as_path()] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
     let finding = finding_for_test(source.clone(), 0, 0);
     let identity = EntryIdentity::capture(&source).unwrap();
@@ -286,6 +299,9 @@ fn stage_allows_an_euid_owned_tree_under_a_sticky_shared_parent() {
     let source = parent.join("cache");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("data"), b"cached").unwrap();
+    for path in [dir.path(), source.as_path()] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
     let finding = finding_for_test(source.clone(), 4096, 2);
     let identity = EntryIdentity::capture(&source).unwrap();
@@ -334,6 +350,7 @@ fn stage_is_unaffected_by_a_normal_owned_parent() {
     let source = parent.join("cache");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("data"), b"cached").unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
     let finding = finding_for_test(source.clone(), 4096, 2);
     let identity = EntryIdentity::capture(&source).unwrap();
     let entry = trash.reserve(&source).unwrap();
@@ -372,6 +389,9 @@ fn stage_rejects_a_shared_writable_directory_before_pending() {
     let shared = source.join("shared");
     std::fs::create_dir_all(&shared).unwrap();
     std::fs::write(shared.join("data"), b"cached").unwrap();
+    for path in [dir.path(), source.as_path()] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
     let finding = finding_for_test(source.clone(), 0, 0);
     let identity = EntryIdentity::capture(&source).unwrap();
@@ -414,7 +434,16 @@ fn stage_rejects_a_protected_descendant_name_via_the_combined_traversal() {
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::write(nested.join("data"), b"cached").unwrap();
     // A protected credential directory name (`.aws`) inside the tree.
-    std::fs::create_dir_all(nested.join(".aws")).unwrap();
+    let protected = nested.join(".aws");
+    std::fs::create_dir_all(&protected).unwrap();
+    for path in [
+        dir.path(),
+        source.as_path(),
+        nested.as_path(),
+        protected.as_path(),
+    ] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let finding = finding_for_test(source.clone(), 0, 0);
     let identity = EntryIdentity::capture(&source).unwrap();
     let entry = trash.reserve(&source).unwrap();
@@ -468,6 +497,9 @@ fn stage_rejects_a_real_foreign_owned_descendant_before_pending() {
     let trash = Trash::new(dir.path().join("trash"));
     let source = dir.path().join("cache");
     std::fs::create_dir(&source).unwrap();
+    for path in [dir.path(), source.as_path()] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let foreign_entry = source.join("foreign-hosts");
     if let Err(error) = std::fs::hard_link(&foreign_source, &foreign_entry) {
         eprintln!("platform refused the unprivileged foreign hardlink fixture: {error}");
@@ -582,6 +614,7 @@ fn staged_item_blocks_purge_when_reservation_cleanup_fails() {
     let trash = Trash::new(dir.path().join("trash"));
     let source = dir.path().join("cache");
     std::fs::write(&source, "planned").unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let identity = EntryIdentity::capture(&source).unwrap();
     let finding = finding_for_test(source.clone(), 0, 0);
     let entry = trash.reserve(&source).unwrap();
@@ -636,6 +669,9 @@ fn a_protected_alias_created_after_the_pending_append_stops_the_stage() {
     let source = home.path().join("cache");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("data"), b"cached").unwrap();
+    for path in [home.path(), source.as_path()] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let finding = finding_for_test(source.clone(), 0, 0);
     let identity = EntryIdentity::capture(&source).unwrap();
     let entry = trash.reserve(&source).unwrap();
@@ -694,6 +730,9 @@ fn shared_write_introduced_during_pending_is_caught_before_rename() {
     let sub = source.join("sub");
     std::fs::create_dir_all(&sub).unwrap();
     std::fs::write(sub.join("data"), b"cached").unwrap();
+    for path in [dir.path(), source.as_path(), sub.as_path()] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let finding = finding_for_test(source.clone(), 0, 0);
     let identity = EntryIdentity::capture(&source).unwrap();
     let entry = trash.reserve(&source).unwrap();
@@ -739,6 +778,9 @@ fn shared_write_introduced_during_protection_recheck_is_caught_before_rename() {
     let sub = source.join("sub");
     std::fs::create_dir_all(&sub).unwrap();
     std::fs::write(sub.join("data"), b"cached").unwrap();
+    for path in [dir.path(), source.as_path(), sub.as_path()] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let finding = finding_for_test(source.clone(), 0, 0);
     let identity = EntryIdentity::capture(&source).unwrap();
     let entry = trash.reserve(&source).unwrap();
@@ -787,6 +829,9 @@ fn the_protection_recheck_runs_after_the_mount_traversal() {
     let source = dir.path().join("cache");
     let sub = source.join("sub");
     std::fs::create_dir_all(&sub).unwrap();
+    for path in [dir.path(), source.as_path(), sub.as_path()] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let finding = finding_for_test(source.clone(), 0, 0);
     let identity = EntryIdentity::capture(&source).unwrap();
     let entry = trash.reserve(&source).unwrap();

@@ -10,6 +10,7 @@ fn scan_json_reports_huggingface_hub_cache() {
     std::fs::create_dir_all(&beta).unwrap();
     std::fs::write(alpha.join("model.bin"), [0u8; 8192]).unwrap();
     std::fs::write(beta.join("model.bin"), [0u8; 128 * 1024]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let out = degu()
         .env("HOME", home.path())
@@ -275,6 +276,7 @@ fn scan_json_reports_huggingface_orphan_locks_and_skips_busy_repos() {
     std::fs::create_dir_all(&busy_locks).unwrap();
     std::fs::write(busy.join("model.bin"), [0u8; 8192]).unwrap();
     std::fs::write(gone_locks.join("x.lock"), []).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     let busy_lock = std::fs::File::create(busy_locks.join("y.lock")).unwrap();
     rustix::fs::flock(
         &busy_lock,

@@ -320,13 +320,20 @@ fn unreadable_nested_claimed_root_reports_incomplete() {
 #[cfg(unix)]
 #[test]
 fn unreadable_nested_artifact_dir_reports_incomplete_instead_of_failing() {
+    use std::os::unix::fs::PermissionsExt;
+
     let fixture = Fixture::new();
     let unreadable = fixture.root.path().join("__pycache__");
     std::fs::create_dir(&unreadable).unwrap();
     let region = unreadable.canonicalize().unwrap();
-    let readable = fixture.root.path().join("pkg/__pycache__");
+    let pkg = fixture.root.path().join("pkg");
+    let readable = pkg.join("__pycache__");
     std::fs::create_dir_all(&readable).unwrap();
     std::fs::write(readable.join("module.pyc"), [0_u8; 512]).unwrap();
+    for path in [&pkg, &readable] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(TRAVERSABLE_DIR_MODE))
+            .unwrap();
+    }
     let readable = readable.canonicalize().unwrap();
 
     let mut command = fixture.command();
@@ -385,6 +392,8 @@ fn unreadable_nested_artifact_dir_reports_incomplete_instead_of_failing() {
 #[cfg(unix)]
 #[test]
 fn unreadable_claimed_node_modules_records_a_region_but_loses_its_finding() {
+    use std::os::unix::fs::PermissionsExt;
+
     let fixture = Fixture::new();
     let app = fixture.root.path().join("app");
     std::fs::create_dir(&app).unwrap();
@@ -392,9 +401,14 @@ fn unreadable_claimed_node_modules_records_a_region_but_loses_its_finding() {
     let unreadable = app.join("node_modules");
     std::fs::create_dir(&unreadable).unwrap();
     let region = unreadable.canonicalize().unwrap();
-    let readable = fixture.root.path().join("pkg/__pycache__");
+    let pkg = fixture.root.path().join("pkg");
+    let readable = pkg.join("__pycache__");
     std::fs::create_dir_all(&readable).unwrap();
     std::fs::write(readable.join("module.pyc"), [0_u8; 512]).unwrap();
+    for path in [&pkg, &readable] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(TRAVERSABLE_DIR_MODE))
+            .unwrap();
+    }
     let readable = readable.canonicalize().unwrap();
 
     let mut command = fixture.command();

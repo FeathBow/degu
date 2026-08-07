@@ -31,6 +31,7 @@ fn scan_json_keeps_default_pip_cache_eligible() {
     let cache = crate::common::platform_cache_dir(home.path(), "pip");
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join("wheel.whl"), [0u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let out = degu()
         .env("HOME", home.path())
@@ -69,6 +70,7 @@ fn scan_json_keeps_env_derived_xdg_cache_pip_verified_and_eligible() {
     let cache = xdg.join("pip");
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join("wheel.whl"), [0u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let out = degu()
         .env("HOME", home.path())
@@ -102,6 +104,7 @@ fn scan_json_keeps_default_go_build_cache_eligible() {
     let cache = crate::common::platform_cache_dir(home.path(), "go-build");
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join("artifact.a"), [0u8; 4096]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let out = degu()
         .env("HOME", home.path())

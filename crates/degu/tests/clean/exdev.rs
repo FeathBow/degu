@@ -25,6 +25,7 @@ impl ShmCache {
         let cache = root.path().join(".cache/pip");
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join("wheel.whl"), b"cached wheel").unwrap();
+        crate::common::make_tree_non_shared_writable(root.path()).unwrap();
         Self { root, cache }
     }
 

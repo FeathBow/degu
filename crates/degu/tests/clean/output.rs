@@ -194,6 +194,7 @@ fn clean_human_dry_run_explicitly_reports_no_mutation() {
         .join(".cache/huggingface/hub/models--org--name/snapshots/main");
     std::fs::create_dir_all(&model).unwrap();
     std::fs::write(model.join("model.bin"), [0u8; 4096]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     let out = run_clean(&home, &state, &["clean", "--dry-run"]);
 
     assert!(out.status.success());
@@ -235,6 +236,7 @@ fn clean_include_review_keeps_review_authority_visible_in_the_plan() {
     let repo = home.path().join(".cache/huggingface/hub/models--org--name");
     std::fs::create_dir_all(repo.join("snapshots/main")).unwrap();
     std::fs::write(repo.join("snapshots/main/model.bin"), [0_u8; 4096]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let out = run_clean(&home, &state, &["clean", "--dry-run", "--include-review"]);
 

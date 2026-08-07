@@ -6,6 +6,7 @@ fn scan_json_keeps_default_torch_cache_opt_in() {
     let cache = home.path().join(".cache/torch");
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join("model.pt"), [0u8; 8192]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let out = degu()
         .env("HOME", home.path())
@@ -153,6 +154,7 @@ fn scan_json_uses_the_first_python_temp_candidate_and_sanitizes_username() {
     std::fs::write(cache.join("kernel.so"), [0_u8; 4096]).unwrap();
     std::fs::write(fallback_cache.join("kernel.so"), [0_u8; 4096]).unwrap();
     std::fs::write(escaped.join("user-data"), [0_u8; 8192]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let out = degu()
         .env("HOME", home.path())

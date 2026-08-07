@@ -30,6 +30,7 @@ impl Fixture {
         tagged_cache(&uv_cache);
         eligible_cargo_target(&target);
         symlink(&uv_cache, &uv_alias).unwrap();
+        crate::common::make_tree_non_shared_writable(root.path()).unwrap();
         Self {
             home,
             config,

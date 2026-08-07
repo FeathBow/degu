@@ -4,6 +4,7 @@ use super::{finding_for_test, noop_recheck};
 use crate::lifecycle::trash::Trash;
 use crate::lifecycle::{EntryIdentity, PurgeReport};
 use degu_core::ecosystem::DetectCtx;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 struct CommittedFixture {
@@ -17,6 +18,7 @@ fn committed_fixture(bytes_allocated: u64, inodes: u64) -> CommittedFixture {
     let trash = Trash::new(dir.path().join("trash"));
     let source = dir.path().join("cache");
     std::fs::write(&source, "cached").unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let finding = finding_for_test(source.clone(), bytes_allocated, inodes);
     let identity = EntryIdentity::capture(&source).unwrap();
     let entry = trash.reserve(&source).unwrap();

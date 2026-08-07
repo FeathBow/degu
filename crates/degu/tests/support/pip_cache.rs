@@ -8,5 +8,6 @@ pub fn seed(home: impl AsRef<Path>) -> PathBuf {
     let cache = home.as_ref().join(".cache/pip");
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join("wheel.whl"), [0_u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.as_ref()).unwrap();
     cache
 }

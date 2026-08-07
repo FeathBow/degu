@@ -120,6 +120,7 @@ fn pycache_containing_only_bytecode_remains_eligible() {
     let fixture = Fixture::new();
     let cache = fixture.cache();
     std::fs::write(cache.join("module.cpython-313.pyc"), b"bytecode").unwrap();
+    crate::common::make_tree_non_shared_writable(fixture.root.path()).unwrap();
 
     let findings = fixture.scan();
     let findings = findings.as_array().unwrap();

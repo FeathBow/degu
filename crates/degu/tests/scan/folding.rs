@@ -31,6 +31,7 @@ fn fourteen_eligible_targets(root: &std::path::Path) {
     for index in 0..13 {
         cargo_target(root, &format!("small-{index:02}"), SMALL_PAYLOAD);
     }
+    crate::common::make_tree_non_shared_writable(root).unwrap();
 }
 
 fn scan(home: &std::path::Path, root: &std::path::Path, extra: &[&str]) -> String {
@@ -114,6 +115,7 @@ fn folded_review_tier_keeps_the_largest_preview_target() {
     for index in 0..11 {
         seed_model(&format!("models--org--small-{index:02}"), 8 * 1024);
     }
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let out = degu()
         .env("HOME", home.path())

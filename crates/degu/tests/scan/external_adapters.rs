@@ -8,6 +8,7 @@ fn clean_never_plans_vscode_server_state() {
     let settings = root.join("data/Machine/settings.json");
     std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
     std::fs::write(&settings, r#"{"remote.setting":true}"#).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let out = degu()
         .env("HOME", home.path())

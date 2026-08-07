@@ -14,6 +14,7 @@ fn clean_preserves_strictest_same_path_authority_across_source_filters() {
     )
     .unwrap();
     std::fs::write(cache.join("payload"), [0_u8; 4096]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let out = degu()
         .env("HOME", home.path())
@@ -134,6 +135,7 @@ fn clean_opt_in_trashes_huggingface_hub_cache() {
     let repo = hub.join("models--org--name");
     std::fs::create_dir_all(repo.join("snapshots/main")).unwrap();
     std::fs::write(repo.join("snapshots/main/model.bin"), [0u8; 8192]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     let repo_path = canonical_path_string(&repo);
 
     let default = run_clean(&home, &state, &["clean", "--yes", "--json"]);
@@ -159,6 +161,7 @@ fn clean_policy_evidence_respects_source_and_top_scope() {
         std::fs::write(snapshot.join("model.bin"), vec![0_u8; bytes]).unwrap();
     }
     let conda = fake_conda_env(&home);
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let out = run_clean(
         &home,
@@ -202,6 +205,7 @@ fn clean_review_first_path_can_preview_the_same_scope() {
     std::fs::create_dir_all(repo.join("snapshots/main")).unwrap();
     std::fs::write(repo.join("snapshots/main/model.bin"), [0_u8; 8192]).unwrap();
     fake_conda_env(&home);
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     let repo = repo.canonicalize().unwrap();
     let out = run_terminal_clean_path(&home, &state, &repo);
 

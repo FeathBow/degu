@@ -66,6 +66,7 @@ impl AgeFixture {
         let stale_file = pip.join("wheel.whl");
         std::fs::write(&stale_file, [0u8; 2048]).unwrap();
         std::fs::write(uv.join("archive"), [0u8; 2048]).unwrap();
+        crate::common::make_tree_non_shared_writable(home.path()).unwrap();
         let age = std::time::Duration::from_secs(30 * 24 * 60 * 60);
         std::fs::File::open(&stale_file)
             .unwrap()
@@ -125,6 +126,7 @@ impl SizeFixture {
         std::fs::write(small.join("obj.a"), [0u8; 1024]).unwrap();
         std::fs::write(large.join("wheel.whl"), vec![0u8; 128 * 1024]).unwrap();
         std::fs::hard_link(large.join("wheel.whl"), large.join("wheel-link.whl")).unwrap();
+        crate::common::make_tree_non_shared_writable(home.path()).unwrap();
         Self {
             small_path: canonical_path_string(&small),
             large_path: canonical_path_string(&large),

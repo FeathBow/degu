@@ -130,6 +130,7 @@ fn precise_adapter_leaves_are_report_only_and_never_planned() {
     let state = tempfile::tempdir().unwrap();
     for name in MIXED_STATE_AI_TOOL_DIR_NAMES {
         let cache = seed_tagged_pip_cache(&home.path().join(name));
+        crate::common::make_tree_non_shared_writable(home.path()).unwrap();
         assert_report_only_pip_cache(&home, &cache);
         for args in [
             &["clean", "--dry-run", "--json"][..],
@@ -160,6 +161,7 @@ fn redirected_adapter_ancestor_with_ai_state_is_report_only() {
     let cache = home.path().join("redirected-pip");
     tagged_dir(&cache);
     seed_mixed_state_tree(&cache.join("nested/.hermes"));
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     assert_report_only_pip_cache(&home, &cache);
 }
@@ -174,6 +176,7 @@ fn unrelated_local_cache_remains_cleanable() {
     tagged_dir(&target);
     std::fs::write(project.join("Cargo.toml"), "[package]\n").unwrap();
     std::fs::write(target.join(".rustc_info.json"), "{}").unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     let clean = degu()
         .env("HOME", home.path())
         .args(["clean", "--dry-run", "--json"])

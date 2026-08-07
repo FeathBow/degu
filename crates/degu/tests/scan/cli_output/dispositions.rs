@@ -20,6 +20,7 @@ impl DispositionFixture {
         std::fs::create_dir_all(env.join("conda-meta")).unwrap();
         std::fs::write(env.join("conda-meta/somepkg.json"), "{}").unwrap();
         std::fs::write(env.join("payload.bin"), vec![0u8; 8 * 1024 * 1024]).unwrap();
+        crate::common::make_tree_non_shared_writable(home.path()).unwrap();
         Self { home }
     }
 }

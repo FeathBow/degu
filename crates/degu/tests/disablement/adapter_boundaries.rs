@@ -8,6 +8,7 @@ fn disabled_runtime_enumerator_does_not_claim_project_roots() {
     let project = tmp.path().join("project");
     let target = project.join("target");
     eligible_cargo_target(&target);
+    crate::common::make_tree_non_shared_writable(tmp.path()).unwrap();
     let canonical_target = target.canonicalize().unwrap();
 
     let scan = degu(home.path(), config.path())

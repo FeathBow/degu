@@ -47,6 +47,7 @@ fn scan_headline_carries_elapsed_only_on_terminals() {
     let cache = crate::common::platform_cache_dir(home.path(), "pip");
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join("wheel.whl"), [0u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     let state = tempfile::tempdir().unwrap();
     let terminal = run_pty(PtyRun {
         body: r#"
@@ -119,6 +120,7 @@ fn scan_details_human_table_shows_kind_and_rationale() {
     let hub = home.path().join(".cache/huggingface/hub/models--org--name");
     std::fs::create_dir_all(hub.join("snapshots/main")).unwrap();
     std::fs::write(hub.join("snapshots/main/model.bin"), [0u8; 8192]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let out = degu()
         .env("HOME", home.path())

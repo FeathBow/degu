@@ -419,6 +419,8 @@ fn rename_from_parent_noreplace(
 #[cfg(test)]
 mod tests {
     use super::{EntryIdentity, RenameFailure, unverified_destination};
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn verified_rename_rejects_a_replaced_source_without_moving_it() {
@@ -589,6 +591,7 @@ mod tests {
         let source = dir.path().join("source");
         let destination = dir.path().join("destination");
         std::fs::write(&source, "planned").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let identity = EntryIdentity::capture(&source).unwrap();
 
         // A parent-writer replaces the root name with a foreign object between
@@ -615,6 +618,7 @@ mod tests {
         let source = dir.path().join("source");
         let destination = dir.path().join("destination");
         std::fs::write(&source, "planned").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let identity = EntryIdentity::capture(&source).unwrap();
 
         let moved = identity
@@ -653,6 +657,9 @@ mod tests {
         std::fs::create_dir(&logical_parent).unwrap();
         let source = logical_parent.join("source");
         std::fs::write(&source, "payload").unwrap();
+        for path in [&physical, &logical_parent] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let identity = EntryIdentity::capture(&source).unwrap();
 
         // Open the parent FD through the alias; it now pins the physical holder.

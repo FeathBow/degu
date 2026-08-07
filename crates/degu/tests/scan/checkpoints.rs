@@ -190,6 +190,7 @@ fn scan_json_counts_checkpoints_inside_artifact_root_once() {
     std::fs::write(target.join(".rustc_info.json"), "{}").unwrap();
     std::fs::write(target.join("epoch-1.pt"), [0u8; 1024]).unwrap();
     std::fs::write(target.join("epoch-2.pt"), [0u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(&root).unwrap();
 
     let out = degu()
         .env("HOME", home.path())

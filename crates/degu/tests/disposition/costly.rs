@@ -50,7 +50,9 @@ fn seed_compile_caches(home: &tempfile::TempDir) -> Redirects {
         )
         .unwrap();
         std::fs::write(root.join("payload.bin"), [0u8; 4096]).unwrap();
+        crate::common::make_tree_non_shared_writable(root).unwrap();
     }
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     redirects
 }
 
@@ -114,6 +116,7 @@ impl MixedCaches {
         std::fs::create_dir_all(&uv).unwrap();
         let uv_sentinel = uv.join("archive.zip");
         std::fs::write(&uv_sentinel, [0u8; 4096]).unwrap();
+        crate::common::make_tree_non_shared_writable(home.path()).unwrap();
         Self {
             ccache: ccache.canonicalize().unwrap(),
             uv: uv.canonicalize().unwrap(),

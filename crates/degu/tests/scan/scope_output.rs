@@ -168,6 +168,7 @@ fn protected_only_incompleteness_keeps_the_clean_hint() {
     std::fs::create_dir_all(uv.join("nested/.aws")).unwrap();
     std::fs::write(uv.join("cache.bin"), [0_u8; 2048]).unwrap();
     std::fs::write(uv.join("nested/.aws/credentials"), [0_u8; 64]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     let extra_env = [("PIP_CACHE_DIR", cache.as_os_str())];
 
     let out = run_pty(PtyRun {

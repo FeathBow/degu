@@ -383,13 +383,20 @@ fn owned_validation_finds_a_protected_descendant_name_in_the_ownership_pass() {
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 #[test]
 fn combined_owned_validator_refuses_a_real_protected_descendant() {
+    use std::os::unix::fs::PermissionsExt;
+
     // The public FS-backed combined entry point turns a protected descendant
     // name into a fail-closed PermissionDenied error in a single traversal.
     let euid = rustix::process::geteuid().as_raw();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("cache");
     let nested = root.join("nested");
-    std::fs::create_dir_all(nested.join(".aws")).unwrap();
+    let protected_dir = nested.join(".aws");
+    std::fs::create_dir_all(&protected_dir).unwrap();
+    // Keep the ambient umask from triggering the mode guard before the name guard.
+    for path in [&root, &nested, &protected_dir] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let protected = [OsString::from(".aws"), OsString::from(".ssh")];
 
     let error = reject_protected_in_owned_single_mount_tree(&root, euid, &protected).unwrap_err();
@@ -403,7 +410,12 @@ fn combined_owned_validator_refuses_a_real_protected_descendant() {
     // A sibling tree with the same shape but no protected descendant passes: the
     // refusal above is the name check, not ownership or mount.
     let clean_root = dir.path().join("clean");
-    std::fs::create_dir_all(clean_root.join("nested").join("safe")).unwrap();
+    let clean_nested = clean_root.join("nested");
+    let safe = clean_nested.join("safe");
+    std::fs::create_dir_all(&safe).unwrap();
+    for path in [&clean_root, &clean_nested, &safe] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     reject_protected_in_owned_single_mount_tree(&clean_root, euid, &protected).unwrap();
 }
 

@@ -8,6 +8,7 @@ fn well_known_cache_with_ai_state_descendant_is_report_only() {
     let cache = default_pip_cache(&home);
     std::fs::create_dir_all(cache.join("sessions/.claude")).unwrap();
     std::fs::write(cache.join("sessions/.claude/state.json"), "{}").unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     assert_report_only_pip(&home, &cache);
     assert_never_planned(&home, &state, &cache);
@@ -22,6 +23,7 @@ fn home_ai_symlink_target_inside_cache_is_report_only() {
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(state.join("session.json"), "{}").unwrap();
     std::os::unix::fs::symlink(&state, home.path().join(".claude")).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     assert_report_only_pip(&home, &cache);
 }
@@ -61,6 +63,7 @@ fn protection_is_applied_per_huggingface_candidate() {
     seed_huggingface_repo(&ordinary);
     std::fs::create_dir_all(protected.join(".codex")).unwrap();
     std::fs::write(protected.join(".codex/session.json"), "{}").unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let out = degu()
         .env("HOME", home.path())

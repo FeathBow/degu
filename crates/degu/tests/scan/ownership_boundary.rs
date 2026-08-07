@@ -13,6 +13,7 @@ fn shared_writable_cache_is_measured_but_report_only() {
     )
     .unwrap();
     std::fs::write(cache.join("data.bin"), [1_u8; 32]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o770)).unwrap();
 
     let out = degu()
@@ -65,6 +66,7 @@ fn foreign_owned_cache_entry_is_excluded_and_never_cleaned() {
         std::fs::symlink_metadata(&foreign_entry).unwrap().uid(),
         foreign_uid
     );
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let scan = degu()
         .env("HOME", home.path())

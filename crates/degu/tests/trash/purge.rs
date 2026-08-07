@@ -137,6 +137,7 @@ fn trash_purge_confirmation_cannot_expand_to_concurrently_staged_data() {
     clean_pip_cache(&home, &state);
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join("new-wheel.whl"), b"new cache").unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     let out = run_purge_during_concurrent_clean(home.path(), state.path());
 
     assert!(out.status.success());

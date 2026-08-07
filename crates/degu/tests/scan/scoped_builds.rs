@@ -400,6 +400,7 @@ fn scan_json_reports_cmake_build_tree_artifacts() {
     )
     .unwrap();
     std::fs::write(in_source.join("artifact.o"), [0u8; 1024]).unwrap();
+    crate::common::make_tree_non_shared_writable(&root).unwrap();
 
     let out = degu()
         .env("HOME", home.path())
@@ -596,6 +597,7 @@ fn node_modules_reaches_eligible_only_with_a_valid_lockfile() {
             r#"{"name":7,"version":false,"lockfileVersion":1,"requires":true,"dependencies":{"x":{"version":"1.0.0"}}}"#,
         )],
     );
+    crate::common::make_tree_non_shared_writable(root.path()).unwrap();
 
     let out = degu()
         .env("HOME", home.path())

@@ -214,6 +214,7 @@ fn conda_package_and_environment_fixture()
         ),
     )
     .unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     (home, cache, env)
 }
 
@@ -288,6 +289,8 @@ fn scan_json_reports_derived_conda_pkgs_for_home_external_base() {
         format!("{}\n", env.display()),
     )
     .unwrap();
+    crate::common::make_tree_non_shared_writable(external.path()).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let out = degu()
         .env("HOME", home.path())
@@ -393,6 +396,7 @@ fn scan_priority_matches_finding_disposition_class() {
     let uv_cache = home.path().join(".cache/uv");
     std::fs::create_dir_all(&uv_cache).unwrap();
     std::fs::write(uv_cache.join("archive.zst"), [0_u8; 1024]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let out = degu()
         .env("HOME", home.path())

@@ -40,6 +40,7 @@ fn undo_restores_latest_trash_record_once() {
 fn undo_restores_entire_latest_reclamation() {
     let (home, state, pip_cache) = fake_pip_cache();
     let go_build_cache = fake_go_build_cache(&home);
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     // Both caches share the same parent so this exercises sibling restores.
     assert_eq!(pip_cache.parent(), go_build_cache.parent());
     clean_all_caches(&home, &state);
@@ -67,6 +68,7 @@ fn undo_restores_entire_latest_reclamation() {
 fn undo_resumes_same_reclamation_after_failed_restore() {
     let (home, state, _) = fake_pip_cache();
     let _go_build_cache = fake_go_build_cache(&home);
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     clean_all_caches(&home, &state);
     let records = oplog_records(&state);
     let trashed = ok_trash_records(&records);
@@ -109,6 +111,7 @@ fn undo_resumes_same_reclamation_after_failed_restore() {
 fn undo_reports_gone_entry_without_writing_log_record() {
     let (home, state, _) = fake_pip_cache();
     let _go_build_cache = fake_go_build_cache(&home);
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     clean_all_caches(&home, &state);
     let records = oplog_records(&state);
     let trashed = ok_trash_records(&records);

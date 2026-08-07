@@ -66,6 +66,7 @@ fn assert_prune_does_not_block_the_whole_plan(name: &str, reason: &str) {
     let state = tempfile::tempdir().unwrap();
     let cache = seed_pruned_pip_cache(home.path(), name);
     seed_cargo_registry(home.path());
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let scan = run_with_pip_cache(&home, &state, &cache, &["scan", "--json"]);
     assert!(
@@ -141,6 +142,7 @@ fn mixed_protected_and_unreadable_prune_refuses_the_whole_plan() {
     seed_cargo_registry(home.path());
     let unreadable = cache.join("unreadable");
     std::fs::create_dir_all(&unreadable).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     set_mode(&unreadable, 0o000);
 
     let out = run_with_pip_cache(&home, &state, &cache, &["clean", "--dry-run"]);
@@ -173,6 +175,7 @@ fn path_clean_covering_the_parent_of_a_protected_prune_proceeds() {
     let pruned = pruned_target.join(".claude");
     std::fs::create_dir_all(&pruned).unwrap();
     std::fs::write(pruned.join("settings.json"), "{}").unwrap();
+    crate::common::make_tree_non_shared_writable(root.path()).unwrap();
 
     // The positional root authorizes artifact discovery; --path selects the
     // parent of the pruned region (the same directory).

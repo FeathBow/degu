@@ -44,6 +44,7 @@ fn clean_through_alias(
     let physical_cache = physical_cache_home.join("pip");
     std::fs::create_dir_all(&physical_cache).unwrap();
     std::fs::write(physical_cache.join("wheel.whl"), [7_u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(physical_cache_home).unwrap();
     let out = degu()
         .env("HOME", home.path())
         .env("XDG_STATE_HOME", state.path())
@@ -117,6 +118,7 @@ fn undo_refuses_a_replaced_destination_parent() {
     let cache = cache_home.join("pip");
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join("wheel.whl"), [7_u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     let out = degu()
         .env("HOME", home.path())
         .env("XDG_STATE_HOME", state.path())
@@ -153,6 +155,7 @@ fn undo_restores_through_a_stable_cache_symlink() {
     let cache = dot_cache.join("pip");
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join("wheel.whl"), [7_u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(physical.path()).unwrap();
     let out = degu()
         .env("HOME", home.path())
         .env("XDG_STATE_HOME", state.path())
@@ -292,6 +295,7 @@ fn undo_refuses_when_the_destination_parent_is_gone() {
     let cache = cache_home.join("pip");
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join("wheel.whl"), [7_u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     let out = degu()
         .env("HOME", home.path())
         .env("XDG_STATE_HOME", state.path())

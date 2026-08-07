@@ -54,6 +54,7 @@ fn scan_review_preview_executes_with_mixed_cache_and_runtime_sources() {
     let home = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let repo = seed_review_finding(&home);
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
 
     let scan = degu()
         .env("HOME", home.path())
@@ -104,6 +105,7 @@ fn scan_review_preview_command_runs_despite_unrelated_incomplete_source() {
     let unreadable = pip.join("unreadable");
     std::fs::create_dir_all(&unreadable).unwrap();
     std::fs::write(pip.join("wheel.whl"), [0u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     set_mode(&unreadable, 0o000);
 
     let scan = run_clean(&home, &state, &["scan"]);
@@ -151,6 +153,7 @@ fn scan_withholds_the_review_preview_when_executing_it_would_be_refused() {
     std::fs::create_dir_all(&uppercase).unwrap();
     std::fs::write(lowercase.join("lowercase.tgz"), [0u8; 2048]).unwrap();
     std::fs::write(uppercase.join("uppercase.tgz"), [0u8; 4096]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     let mismatched = run_npm_scan(
         &home,
         &state,

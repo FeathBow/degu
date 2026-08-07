@@ -2,6 +2,9 @@ use assert_cmd::Command;
 
 #[path = "disablement/adapter_boundaries.rs"]
 mod adapter_boundaries;
+#[allow(dead_code)]
+#[path = "support/mod.rs"]
+mod common;
 #[path = "support/pty.rs"]
 mod pty;
 #[path = "disablement/revalidation.rs"]
@@ -144,6 +147,7 @@ impl DisabledFixture {
         std::fs::write(tagged_ancestor.join("node_modules/module.js"), [0_u8; 4096]).unwrap();
         std::fs::create_dir_all(&ccache).unwrap();
         std::fs::write(ccache.join("object.o"), [0_u8; 4096]).unwrap();
+        common::make_tree_non_shared_writable(home.path()).unwrap();
         Self {
             home,
             config: config_home(&["uv", "ccache"]),

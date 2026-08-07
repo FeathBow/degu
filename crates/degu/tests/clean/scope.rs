@@ -33,6 +33,7 @@ impl ProjectRootFixture {
         .unwrap();
         std::fs::write(target.join(".rustc_info.json"), "{}").unwrap();
         std::fs::write(target.join("artifact.bin"), [0u8; 1024]).unwrap();
+        crate::common::make_tree_non_shared_writable(home.path()).unwrap();
         Self {
             target: canonical_path_string(&target),
             home,

@@ -7,6 +7,7 @@ fn clean_never_enables_runtime_adapters_even_with_config_runtime_true() {
     let pip = crate::common::platform_cache_dir(home.path(), "pip");
     std::fs::create_dir_all(&pip).unwrap();
     std::fs::write(pip.join("wheel.whl"), [0u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     let (tmp, _stale_file) = fake_stale_tmpdir();
     let config_home = runtime_config_home("runtime = true\n");
 

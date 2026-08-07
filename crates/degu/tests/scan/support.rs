@@ -22,6 +22,7 @@ pub(super) fn fake_cache(
     let cache = home.path().join(cache_subdir);
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join(filename), vec![0u8; bytes]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     (home, cache)
 }
 

@@ -41,6 +41,7 @@ fn clean_rejects_canonical_alias_overlap_before_mutation() {
     .unwrap();
     let payload = cache.join("payload");
     std::fs::write(&payload, [0_u8; 4096]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     std::os::unix::fs::symlink(home.path(), &alias_parent).unwrap();
 
     let out = degu()
@@ -128,6 +129,7 @@ fn clean_stages_a_cache_beneath_a_symlinked_xdg_parent() {
     std::fs::create_dir(&cache).unwrap();
     let expected = [7_u8; 2048];
     std::fs::write(cache.join("wheel.whl"), expected).unwrap();
+    crate::common::make_tree_non_shared_writable(real_cache_home.path()).unwrap();
 
     let out = degu()
         .env("HOME", home.path())
@@ -166,6 +168,7 @@ fn clean_guard_abort_rejects_protected_paths_before_mutation_or_logging() {
     .unwrap();
     std::fs::write(target.join(".rustc_info.json"), "{}").unwrap();
     std::fs::write(target.join("artifact.o"), [0u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
     let out = degu()
         .env("HOME", home.path())
         .env("XDG_STATE_HOME", state.path())
@@ -265,6 +268,7 @@ fn clean_rejects_symlink_spelling_protected_cache_before_mutation_or_logging() {
         format!("protect = [\"{cache_subdir}\"]\n"),
     )
     .unwrap();
+    crate::common::make_tree_non_shared_writable(real_home.path()).unwrap();
     let out = degu()
         .env("HOME", &home_link)
         .env("XDG_CONFIG_HOME", real_home.path().join(".config"))

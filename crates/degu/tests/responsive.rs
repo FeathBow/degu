@@ -2,6 +2,9 @@
 //! group stats split into indented lines, and suggested commands keep a
 //! full line of their own.
 
+#[allow(dead_code)]
+#[path = "support/mod.rs"]
+mod common;
 #[path = "support/pty.rs"]
 mod pty;
 
@@ -90,6 +93,7 @@ fn narrow_scan_wraps_the_unavailable_preview_reason() {
 }
 
 fn scan_at_width(columns: u16, args: &str, home: &Path) -> String {
+    common::make_tree_non_shared_writable(home).unwrap();
     let config = config_home();
     let state = tempfile::tempdir().unwrap();
     let body = format!(

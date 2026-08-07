@@ -1,3 +1,7 @@
+#[allow(dead_code)]
+#[path = "support/mod.rs"]
+mod common;
+
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};
 
@@ -21,6 +25,7 @@ impl Fixture {
         std::fs::write(config.join("degu/config.toml"), "").unwrap();
         let mut paths = huggingface_paths(&home);
         paths.extend(conda_paths(&home));
+        common::make_tree_non_shared_writable(&home).unwrap();
         Self {
             _home: temp,
             home,

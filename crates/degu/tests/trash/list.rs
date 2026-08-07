@@ -83,6 +83,7 @@ fn trash_commands_fail_closed_on_a_corrupt_registry() {
         b"\"/external/.degu-trash\"TRUNCATED\n",
     )
     .unwrap();
+    crate::common::make_tree_non_shared_writable(state.path()).unwrap();
 
     for args in [
         &["trash", "list", "--json"][..],

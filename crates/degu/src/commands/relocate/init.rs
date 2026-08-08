@@ -203,6 +203,7 @@ fn resolve_trusted_directory(path: &Path) -> Result<OwnedFd> {
             let candidate = walked.parent().unwrap_or(root).to_path_buf();
             let next = open_directory_at(&current, "..", &candidate)?;
             require_trusted_namespace(&stat_fd(&next, &candidate)?, &candidate)?;
+            require_stable_filesystem(&next, &candidate)?;
             current = next;
             walked = candidate;
             continue;
@@ -243,6 +244,7 @@ fn resolve_trusted_directory(path: &Path) -> Result<OwnedFd> {
             let opened = stat_fd(&next, &candidate)?;
             require_same_identity(&entry, &opened, &candidate)?;
             require_trusted_namespace(&opened, &candidate)?;
+            require_stable_filesystem(&next, &candidate)?;
             current = next;
             walked = candidate;
         } else {
@@ -297,6 +299,31 @@ fn require_owner_is_local(stat: &Stat, path: &Path, euid: u32, label: &str) -> R
             stat.st_uid
         );
     }
+    Ok(())
+}
+
+/// Reject a directory on procfs. Its magic links (`/proc/self/cwd`,
+/// `/proc/self/root`, `/proc/self/fd/N`, `/proc/thread-self`, and `/dev/fd`
+/// aliases that resolve through it) are process-dependent, so a lexical export
+/// naming one would resolve to a different directory in the sourcing shell than
+/// the one degu validated and initialized. Refuse any path that traverses procfs
+/// rather than emit an export whose meaning depends on who reads it.
+#[cfg(target_os = "linux")]
+fn require_stable_filesystem(fd: &OwnedFd, path: &Path) -> Result<()> {
+    const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+    let statfs = rustix::fs::fstatfs(fd)
+        .map_err(|error| fs_error("inspect relocate target filesystem", path, error))?;
+    if statfs.f_type as u64 == PROC_SUPER_MAGIC {
+        anyhow::bail!(
+            "relocate target ancestor {} is on procfs, whose magic links resolve differently per process",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn require_stable_filesystem(_fd: &OwnedFd, _path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -512,10 +539,17 @@ fn create_tag(root: &OwnedFd, root_path: &Path, transaction: &mut Transaction) -
 }
 
 fn validate_existing_tag(root: &OwnedFd, root_path: &Path) -> Result<()> {
-    // A regular pyvenv.cfg marks a virtualenv, which the scanner vetoes as not a
-    // pure cache; --init must not report such a root already initialized either.
+    // A pyvenv.cfg marks a virtualenv, which the scanner vetoes as not a pure
+    // cache (its metadata probe follows a symlink, so a symlinked pyvenv.cfg
+    // counts). --init must not report such a root already initialized either, so
+    // a regular file or a symlink named pyvenv.cfg is refused alike.
     match stat_at(root, "pyvenv.cfg") {
-        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => {
+        Ok(stat)
+            if matches!(
+                FileType::from_raw_mode(stat.st_mode),
+                FileType::RegularFile | FileType::Symlink
+            ) =>
+        {
             anyhow::bail!(
                 "cache root {} is a virtualenv (pyvenv.cfg present), not a pure cache; refusing to initialize it",
                 root_path.display()
@@ -1247,5 +1281,44 @@ mod tests {
                 .expect("a virtualenv root must be refused")
         );
         assert!(error.contains("virtualenv"), "{error}");
+    }
+
+    #[test]
+    fn a_symlinked_pyvenv_cfg_is_refused() {
+        let scratch = private_scratch();
+        let target = scratch.path().join("target");
+        let root = target.join("pip");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(CACHEDIR_TAG), TAG_CONTENT).unwrap();
+        let outside = scratch.path().join("real-pyvenv");
+        std::fs::write(&outside, b"home = /usr\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("pyvenv.cfg")).unwrap();
+        strip_shared_write(&target);
+
+        let error = format!(
+            "{:#}",
+            initialize(&target, &[PathBuf::from("pip")])
+                .err()
+                .expect("a symlinked pyvenv.cfg must be refused")
+        );
+        assert!(error.contains("virtualenv"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_procfs_magic_link_target_is_refused() {
+        // /proc/self/cwd is a process-dependent magic link: degu would resolve it
+        // to its own cwd, but the exported lexical path resolves elsewhere in the
+        // sourcing shell. It must be refused rather than followed.
+        let error = format!(
+            "{:#}",
+            initialize(Path::new("/proc/self/cwd/cache"), &[PathBuf::from("pip")])
+                .err()
+                .expect("a procfs magic-link target must be refused")
+        );
+        assert!(
+            error.contains("procfs") || error.contains("process"),
+            "{error}"
+        );
     }
 }

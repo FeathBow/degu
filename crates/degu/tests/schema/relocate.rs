@@ -36,25 +36,48 @@ fn relocate_init_json_schema_is_frozen() {
     let scratch = tempfile::tempdir().unwrap();
     std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let target = scratch.path().join("cache");
-    let json = json_stdout(
-        degu()
-            .env("HOME", home.path())
-            .args(["relocate", "--init", "--json"])
-            .arg(&target)
-            .output()
-            .unwrap(),
-    );
+    let run = || {
+        json_stdout(
+            degu()
+                .env("HOME", home.path())
+                .args(["relocate", "--init", "--json"])
+                .arg(&target)
+                .output()
+                .unwrap(),
+        )
+    };
 
-    assert_keys(&json, RELOCATE_INIT_REPORT_KEYS);
-    assert_keys(&json["initialization"], RELOCATE_INITIALIZATION_KEYS);
-    for entry in assert_non_empty_array(&json["initialization"]["initialized"], "initialized roots")
+    let first = run();
+    assert_keys(&first, RELOCATE_INIT_REPORT_KEYS);
+    assert_keys(&first["initialization"], RELOCATE_INITIALIZATION_KEYS);
+    for entry in
+        assert_non_empty_array(&first["initialization"]["initialized"], "initialized roots")
     {
         assert!(entry.is_string(), "initialized entry must be a path string");
     }
     assert!(
-        json["initialization"]["already_initialized"]
+        first["initialization"]["already_initialized"]
             .as_array()
             .unwrap()
             .is_empty()
     );
+
+    let second = run();
+    assert_keys(&second, RELOCATE_INIT_REPORT_KEYS);
+    assert_keys(&second["initialization"], RELOCATE_INITIALIZATION_KEYS);
+    assert!(
+        second["initialization"]["initialized"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    for entry in assert_non_empty_array(
+        &second["initialization"]["already_initialized"],
+        "already-initialized roots",
+    ) {
+        assert!(
+            entry.is_string(),
+            "already_initialized entry must be a path string"
+        );
+    }
 }

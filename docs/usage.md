@@ -124,4 +124,15 @@ cat "$relocate_script"
 
 Add the reviewed export lines to your shell profile to direct future logins to the same cache paths. Existing data stays in place.
 
+By default, `degu relocate TARGET` performs no filesystem mutation. To initialize the proposed cache roots before receiving the script, opt in with `--init`:
+
+```sh
+relocate_script=$(mktemp "${TMPDIR:-/tmp}/degu-relocate.XXXXXX")
+degu relocate --init "/scratch/$USER/degu-cache" > "$relocate_script"
+```
+
+`--init` creates only the exact cache roots named by cache-specific relocation exports, with mode `0700`, and writes a standard `CACHEDIR.TAG` with mode `0600` in each root. It does not tag the target base, initialize mixed-state homes such as `HF_HOME` or `CARGO_HOME`, move existing cache contents, or edit shell profiles. A pre-existing cache root is accepted only when it is already safely owned and carries a valid, safely owned `CACHEDIR.TAG`; an untagged pre-existing directory is rejected even when empty.
+
+Initialization is transactional. Degu validates the full relocation plan before creating anything, prints no sourceable exports on failure, and removes only entries created by that invocation whose recorded identities still match. A rollback failure is reported with every known residual path. With `--init --json`, the otherwise unchanged relocation report also includes an `initialization` object listing newly created and already initialized roots.
+
 Use `degu <command> --help`, `degu man <command>`, or the corresponding shipped page for the complete command-line reference. Nested pages use the full command path, such as `degu man trash purge`.

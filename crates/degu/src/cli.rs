@@ -246,6 +246,9 @@ pub(crate) struct CleanArgs {
 pub(crate) struct RelocateArgs {
     #[command(flatten)]
     pub(crate) output: JsonArgs,
+    /// Safely initialize the relocated cache roots and their CACHEDIR.TAG files
+    #[arg(long)]
+    pub(crate) init: bool,
     /// Absolute scratch/cache target
     pub(crate) target: PathBuf,
 }

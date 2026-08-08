@@ -4,6 +4,8 @@ use degu_core::ecosystem::DetectCtx;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
+mod init;
+
 const SHELL_QUOTE_DELIMITERS: usize = 2;
 
 #[derive(Serialize)]
@@ -30,6 +32,7 @@ struct RelocateRefusal {
 struct RelocationPlan {
     exports: Vec<RelocateExport>,
     refusals: Vec<RelocateRefusal>,
+    subdirs: Vec<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -37,9 +40,11 @@ struct RelocationReport<'a> {
     target: &'a str,
     exports: &'a [RelocateExport],
     not_relocatable: &'a [RelocateRefusal],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initialization: Option<&'a init::InitializationReport>,
 }
 
-pub(crate) fn run(json: bool, target: PathBuf) -> Result<()> {
+pub(crate) fn run(json: bool, initialize: bool, target: PathBuf) -> Result<()> {
     if !target.is_absolute() {
         anyhow::bail!("relocate target must be an absolute path");
     }
@@ -49,10 +54,13 @@ pub(crate) fn run(json: bool, target: PathBuf) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("relocate target must be valid UTF-8"))?;
     let ctx = DetectCtx::from_process()?;
     let plan = relocation_plan(&ctx, &target)?;
+    let initialization = initialize
+        .then(|| init::initialize(&target, &plan.subdirs))
+        .transpose()?;
     if json {
-        print_json(target_utf8, &plan)?;
+        print_json(target_utf8, &plan, initialization.as_ref())?;
     } else {
-        print_script(&plan)?;
+        print_script(&plan, initialization.is_some())?;
     }
     Ok(())
 }
@@ -73,6 +81,7 @@ fn validate_target_is_not_a_file(target: &Path) -> Result<()> {
 fn relocation_plan(ctx: &DetectCtx, target: &Path) -> Result<RelocationPlan> {
     let mut exports = Vec::new();
     let mut refusals = Vec::new();
+    let mut subdirs = Vec::new();
     for registration in degu_adapters::all() {
         let adapter = registration.ecosystem();
         let ecosystem = adapter.id().to_string();
@@ -93,6 +102,7 @@ fn relocation_plan(ctx: &DetectCtx, target: &Path) -> Result<RelocationPlan> {
         let current_roots = existing_roots(adapter, ctx)?;
         let sibling_relocations = relocations.len() > 1;
         for relocation in relocations {
+            subdirs.push(PathBuf::from(relocation.subdir));
             let current = current_roots
                 .iter()
                 .filter(|root| relocation.role.is_none() || root.role == relocation.role)
@@ -118,7 +128,11 @@ fn relocation_plan(ctx: &DetectCtx, target: &Path) -> Result<RelocationPlan> {
             });
         }
     }
-    Ok(RelocationPlan { exports, refusals })
+    Ok(RelocationPlan {
+        exports,
+        refusals,
+        subdirs,
+    })
 }
 
 struct ExistingRoot {
@@ -150,24 +164,35 @@ fn existing_roots(
         .collect()
 }
 
-fn print_json(target: &str, plan: &RelocationPlan) -> Result<()> {
+fn print_json(
+    target: &str,
+    plan: &RelocationPlan,
+    initialization: Option<&init::InitializationReport>,
+) -> Result<()> {
     let report = RelocationReport {
         target,
         exports: &plan.exports,
         not_relocatable: &plan.refusals,
+        initialization,
     };
     stdoutln!("{}", serde_json::to_string_pretty(&report)?)
 }
 
-fn print_script(plan: &RelocationPlan) -> Result<()> {
+fn print_script(plan: &RelocationPlan, initialized: bool) -> Result<()> {
     stdoutln!(
         "# degu {}: review, run, then append the exports to your shell profile",
         env!("CARGO_PKG_VERSION")
     )?;
-    stdoutln!(
-        "# degu only printed this script — nothing was moved and no shell profile was edited; \
-         evaluating it only creates the proposed cache directories and exports cache-specific variables"
-    )?;
+    if initialized {
+        stdoutln!(
+            "# degu initialized the proposed cache directories; nothing was moved and no shell profile was edited"
+        )?;
+    } else {
+        stdoutln!(
+            "# degu only printed this script — nothing was moved and no shell profile was edited; \
+             evaluating it only creates the proposed cache directories and exports cache-specific variables"
+        )?;
+    }
     print_commands(&plan.exports)?;
     for refusal in &plan.refusals {
         stdoutln!("# refused: {} — {}", refusal.var, refusal.reason)?;

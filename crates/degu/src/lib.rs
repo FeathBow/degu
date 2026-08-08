@@ -81,7 +81,9 @@ fn dispatch(command: Command, ui: runtime::Ui) -> Result<()> {
         Command::Trash { command } => commands::trash::run(command, ui),
         Command::Ops { output } => commands::ops::run(output.json, ui),
         Command::Undo { output } => commands::undo::run(output.json, ui),
-        Command::Relocate(args) => commands::relocate::run(args.output.json, args.target),
+        Command::Relocate(args) => {
+            commands::relocate::run(args.output.json, args.init, args.target)
+        }
         Command::Completions { .. } | Command::Man { .. } | Command::Adapters => {
             unreachable!("handled before guarded run")
         }

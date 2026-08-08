@@ -23,6 +23,12 @@ Two related location forms remain verified:
 
 Cache subdirectories derived from `HF_HOME` and `CARGO_HOME` remain unverified unless their exact roots carry valid `CACHEDIR.TAG` files. The variables still select mixed-state tool homes that can also hold tokens or installed binaries, so `degu relocate` points cache-only variables such as `HF_HUB_CACHE` at scratch and never proposes moving either mixed-state home.
 
+`degu relocate --init` uses the same structural authority split: it initializes only exact roots declared by adapters as cache relocations and never acts on relocation refusals such as `HF_HOME` or `CARGO_HOME`. The target base itself is never tagged. Default `degu relocate TARGET` remains read-only and only prints the proposed shell configuration.
+
+Initialization opens directories and tags with descriptor-relative, no-follow operations, rechecks type, effective-user ownership, mode, and device/inode identity after creation, and rejects symlinks and non-regular tags without reading through them. New target bases and cache roots are forced to mode `0700`; new tags are forced to `0600`, independent of umask. Existing target bases and cache roots must be real effective-user-owned directories without group or world write bits, and existing tags must be safe effective-user-owned regular files whose first line is the standard signature.
+
+The full set of relocation subdirectories is component-validated and preflighted before mutation. If a later operation fails, rollback works in reverse through held parent descriptors and removes only this invocation's identity-matched tags and empty directories. Identity changes, non-empty directories, and other rollback failures are left in place and reported as residue rather than risking deletion of a replacement or pre-existing object.
+
 ## Staging, undo, and purge
 
 `degu clean` normally stages findings under `$XDG_STATE_HOME/degu/trash`, or `~/.local/state/degu/trash` when `XDG_STATE_HOME` is unset. Staging keeps the operation undoable with `degu undo`, but staged data continues to consume filesystem quota.

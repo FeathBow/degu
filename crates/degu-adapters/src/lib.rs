@@ -18,6 +18,7 @@ mod helm;
 mod huggingface;
 mod inductor;
 mod jax;
+mod modelscope;
 mod npm;
 mod ollama;
 mod orbstack;
@@ -35,6 +36,7 @@ mod triton;
 mod uv;
 mod vllm;
 mod vscode;
+mod wandb;
 
 use degu_core::ecosystem::{DetectCtx, Ecosystem, Root, RootOutcome, ScanOutcome};
 use degu_core::finding::{FindingCandidate, FindingFacts, FindingKind};
@@ -257,6 +259,7 @@ pub fn all() -> Vec<RegisteredAdapter> {
         RegisteredAdapter::new(pixi::Pixi, Cache),
         RegisteredAdapter::new(vscode::Vscode, Cache),
         RegisteredAdapter::new(huggingface::Huggingface, Cache),
+        RegisteredAdapter::new(modelscope::Modelscope, Cache),
         RegisteredAdapter::new(ollama::Ollama, Cache),
         RegisteredAdapter::new(podman::Podman, Cache),
         RegisteredAdapter::new(docker::Docker, Cache),
@@ -273,6 +276,7 @@ pub fn all() -> Vec<RegisteredAdapter> {
         RegisteredAdapter::new(gobuild::Gobuild, Cache),
         RegisteredAdapter::new(sccache::Sccache, Cache),
         RegisteredAdapter::new(inductor::Inductor, Cache),
+        RegisteredAdapter::new(wandb::Wandb, Cache),
         RegisteredAdapter::new(shm::Shm, Runtime),
         RegisteredAdapter::new(tmp::Tmp, Runtime),
     ]
@@ -418,6 +422,7 @@ mod tests {
             ("pixi", Cache),
             ("vscode", Cache),
             ("huggingface", Cache),
+            ("modelscope", Cache),
             ("ollama", Cache),
             ("podman", Cache),
             ("docker", Cache),
@@ -434,6 +439,7 @@ mod tests {
             ("go-build", Cache),
             ("sccache", Cache),
             ("inductor", Cache),
+            ("wandb", Cache),
             ("shm", Runtime),
             ("tmp", Runtime),
         ];

@@ -44,6 +44,18 @@ fn assert_relocation_exports(report: &serde_json::Value, uv_cache: &std::path::P
         .unwrap();
     assert_eq!(xet["ecosystem"], "huggingface");
     assert_eq!(xet["value"], "/scratch/x/huggingface/xet");
+    let modelscope = exports
+        .iter()
+        .find(|export| export["ecosystem"] == "modelscope")
+        .unwrap();
+    assert_eq!(modelscope["var"], "MODELSCOPE_CACHE");
+    assert_eq!(modelscope["value"], "/scratch/x/modelscope");
+    let wandb = exports
+        .iter()
+        .find(|export| export["ecosystem"] == "wandb")
+        .unwrap();
+    assert_eq!(wandb["var"], "WANDB_CACHE_DIR");
+    assert_eq!(wandb["value"], "/scratch/x/wandb");
 }
 
 fn assert_relocation_refusals(report: &serde_json::Value) {

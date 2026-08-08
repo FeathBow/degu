@@ -8,7 +8,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 const CACHEDIR_TAG: &str = "CACHEDIR.TAG";
-const SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
 const TAG_CONTENT: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n";
 const SHARED_WRITE_MASK: rustix::fs::RawMode = 0o022;
 const PERMISSION_MASK: rustix::fs::RawMode = 0o777;
@@ -44,9 +43,10 @@ enum PlannedState {
     AlreadyInitialized,
 }
 
-enum TargetState {
-    Missing,
-    Existing(OwnedFd),
+struct Base {
+    fd: OwnedFd,
+    identity: Identity,
+    existed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -87,18 +87,14 @@ fn initialize_with_hook(
     after_root: &mut dyn FnMut(usize, &Path) -> Result<()>,
 ) -> Result<InitializationReport> {
     let roots = validate_subdirs(target, subdirs)?;
-    let target_state = inspect_target(target)?;
-    let roots = match &target_state {
-        TargetState::Existing(base) => preflight_roots(base, roots)?,
-        TargetState::Missing => roots
-            .into_iter()
-            .map(|(relative, path)| PlannedRoot { relative, path })
-            .collect(),
-    };
-
     let mut transaction = Transaction::default();
-    let result = execute(target, target_state, roots, &mut transaction, after_root);
-    match result {
+    let outcome = run_transaction(target, roots, &mut transaction, after_root).and_then(
+        |(report, base_identity)| {
+            revalidate_target_binding(target, base_identity)?;
+            Ok(report)
+        },
+    );
+    match outcome {
         Ok(report) => Ok(report),
         Err(error) => match transaction.rollback() {
             Ok(()) => Err(error.context(
@@ -110,6 +106,28 @@ fn initialize_with_hook(
             ))),
         },
     }
+}
+
+/// Obtain the trusted base directory, plan the roots against it, and initialize
+/// them. Returns the report and the base directory identity so the caller can
+/// confirm the target binding is unchanged before printing exports.
+fn run_transaction(
+    target: &Path,
+    roots: Vec<(PathBuf, PathBuf)>,
+    transaction: &mut Transaction,
+    after_root: &mut dyn FnMut(usize, &Path) -> Result<()>,
+) -> Result<(InitializationReport, Identity)> {
+    let base = obtain_base(target, transaction)?;
+    let planned = if base.existed {
+        preflight_roots(&base.fd, roots)?
+    } else {
+        roots
+            .into_iter()
+            .map(|(relative, path)| PlannedRoot { relative, path })
+            .collect()
+    };
+    let report = execute_roots(&base.fd, planned, transaction, after_root)?;
+    Ok((report, base.identity))
 }
 
 fn validate_subdirs(target: &Path, subdirs: &[PathBuf]) -> Result<Vec<(PathBuf, PathBuf)>> {
@@ -137,13 +155,23 @@ fn validate_subdirs(target: &Path, subdirs: &[PathBuf]) -> Result<Vec<(PathBuf, 
     Ok(roots)
 }
 
-fn inspect_target(target: &Path) -> Result<TargetState> {
-    let Some(name) = target.file_name() else {
-        let fd = open_directory_at(rustix::fs::CWD, target, target)?;
-        let stat = stat_fd(&fd, target)?;
-        require_existing_directory(&stat, target, "relocate target")?;
-        return Ok(TargetState::Existing(fd));
-    };
+/// Open the target's immediate parent, refusing a symlinked immediate parent
+/// (`O_NOFOLLOW`). The returned descriptor is pinned: every later step is
+/// relative to it and re-verifies identity, so the parent cannot be swapped from
+/// under the run. Intermediate ancestors resolve normally on purpose — trusted
+/// deployments legitimately reach a target through symlinked system or scratch
+/// mounts (`/tmp`, `/scratch`), and walking each component with `O_NOFOLLOW`
+/// would break those. A hostile redirect is instead caught downstream: a
+/// substituted parent is foreign-owned or writable and fails the parent-trust
+/// check in [`obtain_base`], and [`revalidate_target_binding`] confirms the
+/// target still names the initialized inode before any export is printed.
+fn open_trusted_parent(target: &Path) -> Result<(OwnedFd, PathBuf, OsString)> {
+    let name = target.file_name().ok_or_else(|| {
+        anyhow::anyhow!(
+            "relocate target {} has no final path component",
+            target.display()
+        )
+    })?;
     let parent_path = target.parent().ok_or_else(|| {
         anyhow::anyhow!(
             "relocate target {} has no parent directory",
@@ -151,18 +179,63 @@ fn inspect_target(target: &Path) -> Result<TargetState> {
         )
     })?;
     let parent = open_directory_at(rustix::fs::CWD, parent_path, parent_path)?;
-    match stat_at(&parent, name) {
+    Ok((parent, parent_path.to_path_buf(), name.to_os_string()))
+}
+
+/// Open (existing) or create (missing) the target directory through its
+/// no-follow-resolved, trust-validated parent. The parent-trust check applies to
+/// both cases so an existing private target under a group-writable parent is
+/// refused exactly as a to-be-created one is.
+fn obtain_base(target: &Path, transaction: &mut Transaction) -> Result<Base> {
+    let (parent, parent_path, name) = open_trusted_parent(target)?;
+    let parent_stat = stat_fd(&parent, &parent_path)?;
+    require_creation_parent(&parent_stat, &parent_path)?;
+    match stat_at(&parent, name.as_os_str()) {
         Ok(stat) => {
             require_kind(&stat, CreatedKind::Directory, target, "relocate target")?;
-            let fd = open_directory_at(&parent, name, target)?;
+            let fd = open_directory_at(&parent, name.as_os_str(), target)?;
             let opened = stat_fd(&fd, target)?;
             require_same_identity(&stat, &opened, target)?;
             require_existing_directory(&opened, target, "relocate target")?;
-            Ok(TargetState::Existing(fd))
+            Ok(Base {
+                identity: identity(&opened, CreatedKind::Directory),
+                fd,
+                existed: true,
+            })
         }
-        Err(error) if error == rustix::io::Errno::NOENT => Ok(TargetState::Missing),
+        Err(error) if error == rustix::io::Errno::NOENT => {
+            let (fd, created) = create_directory(&parent, name.as_os_str(), target, transaction)?;
+            let stat = stat_fd(&fd, target)?;
+            if !created {
+                require_existing_directory(&stat, target, "relocate target")?;
+            }
+            Ok(Base {
+                identity: identity(&stat, CreatedKind::Directory),
+                fd,
+                existed: !created,
+            })
+        }
         Err(error) => Err(fs_error("inspect relocate target", target, error)),
     }
+}
+
+/// Re-resolve the target through the same no-follow walk and confirm it still
+/// names the initialized directory before any export is printed. A group member
+/// who renamed our private target and dropped a replacement in its place would
+/// otherwise receive exports pointing at the replacement.
+fn revalidate_target_binding(target: &Path, expected: Identity) -> Result<()> {
+    let (parent, _parent_path, name) = open_trusted_parent(target)?;
+    let stat = stat_at(&parent, name.as_os_str())
+        .map_err(|error| fs_error("revalidate relocate target", target, error))?;
+    require_kind(&stat, CreatedKind::Directory, target, "relocate target")?;
+    let current = identity(&stat, CreatedKind::Directory);
+    if current.device != expected.device || current.inode != expected.inode {
+        anyhow::bail!(
+            "relocate target {} no longer names the directory this run initialized; refusing to print exports",
+            target.display()
+        );
+    }
+    Ok(())
 }
 
 fn preflight_roots(base: &OwnedFd, roots: Vec<(PathBuf, PathBuf)>) -> Result<Vec<PlannedRoot>> {
@@ -199,17 +272,12 @@ fn inspect_root(base: &OwnedFd, relative: &Path, path: &Path) -> Result<PlannedS
     Ok(PlannedState::AlreadyInitialized)
 }
 
-fn execute(
-    target: &Path,
-    target_state: TargetState,
+fn execute_roots(
+    base: &OwnedFd,
     roots: Vec<PlannedRoot>,
     transaction: &mut Transaction,
     after_root: &mut dyn FnMut(usize, &Path) -> Result<()>,
 ) -> Result<InitializationReport> {
-    let base = match target_state {
-        TargetState::Existing(fd) => fd,
-        TargetState::Missing => create_target(target, transaction)?,
-    };
     let mut report = InitializationReport {
         requested: true,
         initialized: Vec::new(),
@@ -217,7 +285,7 @@ fn execute(
         failed: Vec::new(),
     };
     for (index, root) in roots.into_iter().enumerate() {
-        let state = initialize_root(&base, &root, transaction)?;
+        let state = initialize_root(base, &root, transaction)?;
         let entry = InitializationEntry {
             path: root
                 .path
@@ -236,30 +304,6 @@ fn execute(
         after_root(index, &root.path)?;
     }
     Ok(report)
-}
-
-fn create_target(target: &Path, transaction: &mut Transaction) -> Result<OwnedFd> {
-    let parent_path = target.parent().ok_or_else(|| {
-        anyhow::anyhow!(
-            "relocate target {} has no parent directory",
-            target.display()
-        )
-    })?;
-    let name = target.file_name().ok_or_else(|| {
-        anyhow::anyhow!(
-            "relocate target {} has no final path component",
-            target.display()
-        )
-    })?;
-    let parent = open_directory_at(rustix::fs::CWD, parent_path, parent_path)?;
-    let parent_stat = stat_fd(&parent, parent_path)?;
-    require_creation_parent(&parent_stat, parent_path)?;
-    let (target_fd, created) = create_directory(&parent, name, target, transaction)?;
-    if !created {
-        let stat = stat_fd(&target_fd, target)?;
-        require_existing_directory(&stat, target, "relocate target")?;
-    }
-    Ok(target_fd)
 }
 
 fn initialize_root(
@@ -395,7 +439,7 @@ fn validate_existing_tag(root: &OwnedFd, root_path: &Path) -> Result<()> {
 }
 
 fn has_exact_signature(fd: &OwnedFd, path: &Path) -> Result<bool> {
-    let mut prefix = vec![0_u8; SIGNATURE.len() + 1];
+    let mut prefix = vec![0_u8; degu_adapters::SIGNATURE_PROBE_LEN];
     let mut read = 0;
     while read < prefix.len() {
         match rustix::io::read(fd, &mut prefix[read..]) {
@@ -406,8 +450,9 @@ fn has_exact_signature(fd: &OwnedFd, path: &Path) -> Result<bool> {
         }
     }
     prefix.truncate(read);
-    Ok(prefix == SIGNATURE
-        || (prefix.starts_with(SIGNATURE) && prefix.get(SIGNATURE.len()) == Some(&b'\n')))
+    // Share the scanner's byte-level predicate so `--init` and scan never
+    // disagree on a valid tag (a CRLF-terminated signature included).
+    Ok(degu_adapters::prefix_has_signature(&prefix))
 }
 
 fn write_all(fd: &OwnedFd, mut bytes: &[u8], path: &Path) -> Result<()> {
@@ -902,5 +947,85 @@ mod tests {
             std::fs::read(created.join("replacement.bin")).unwrap(),
             b"replacement"
         );
+    }
+
+    #[test]
+    fn existing_target_under_a_group_writable_parent_is_refused() {
+        let scratch = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        let target = scratch.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let result = initialize(&target, &[PathBuf::from("pip")]);
+
+        let error = format!(
+            "{:#}",
+            result.err().expect("an untrusted parent must be refused")
+        );
+        assert!(error.contains("not a trusted namespace"), "{error}");
+        assert!(!target.join("pip").exists());
+    }
+
+    #[test]
+    fn a_symlinked_immediate_parent_is_refused() {
+        let scratch = private_scratch();
+        let real = scratch.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = scratch.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let target = link.join("cache");
+
+        let result = initialize(&target, &[PathBuf::from("pip")]);
+
+        assert!(
+            result.is_err(),
+            "a symlinked immediate parent must be refused"
+        );
+        assert!(!real.join("cache").exists());
+    }
+
+    #[test]
+    fn a_target_swapped_after_initialization_is_refused_before_output() {
+        let scratch = private_scratch();
+        let target = scratch.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        strip_shared_write(&target);
+        let moved = scratch.path().join("moved");
+        let target_for_hook = target.clone();
+        let moved_for_hook = moved.clone();
+        let mut hook = move |_index: usize, _path: &Path| {
+            std::fs::rename(&target_for_hook, &moved_for_hook)?;
+            std::fs::create_dir(&target_for_hook)?;
+            Ok(())
+        };
+
+        let result = initialize_with_hook(&target, &[PathBuf::from("pip")], &mut hook);
+
+        let error = format!(
+            "{:#}",
+            result.err().expect("a swapped target must be refused")
+        );
+        assert!(error.contains("no longer names"), "{error}");
+        assert!(!target.join("pip").exists());
+    }
+
+    #[test]
+    fn a_crlf_terminated_signature_tag_is_accepted() {
+        let scratch = private_scratch();
+        let target = scratch.path().join("target");
+        let root = target.join("pip");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(CACHEDIR_TAG),
+            b"Signature: 8a477f597d28d172789f06886806bc55\r\n",
+        )
+        .unwrap();
+        strip_shared_write(&target);
+
+        let report = initialize(&target, &[PathBuf::from("pip")]).unwrap();
+
+        assert_eq!(report.already_initialized.len(), 1);
+        assert!(report.initialized.is_empty());
     }
 }

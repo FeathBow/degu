@@ -374,3 +374,93 @@ fn relocate_script_preserves_failure_when_an_export_is_readonly() {
     assert_ne!(sourced.status.code(), Some(99));
     assert!(script.exists());
 }
+
+#[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the test removes an initialized root to prove a stale saved script fails visibly instead of recreating it"
+)]
+fn initialized_script_verifies_roots_without_recreating_them() {
+    let home = private_scratch();
+    let scratch = private_scratch();
+    let target = scratch.path().join("cache");
+    let output = crate::relocate_support::degu()
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", crate::common::isolated_config_home())
+        .args(["relocate", "--init"])
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let script = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        script.contains("[ -d "),
+        "initialized script must verify roots exist: {script}"
+    );
+    assert!(
+        !script.contains("mkdir -p"),
+        "initialized script must not recreate roots: {script}"
+    );
+
+    let pip = target.join("pip");
+    assert!(pip.is_dir());
+    std::fs::remove_dir_all(&pip).unwrap();
+    let script_path = scratch.path().join("relocate.sh");
+    std::fs::write(&script_path, &script).unwrap();
+    let sourced = std::process::Command::new("sh")
+        .args(["-c", "umask 002; . \"$1\"", "sh"])
+        .arg(&script_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        !sourced.status.success(),
+        "sourcing must fail after an initialized root was removed"
+    );
+    assert!(!pip.exists(), "sourcing must not recreate a removed root");
+}
+
+#[test]
+fn a_group_writable_descendant_keeps_an_initialized_root_report_only() {
+    let home = private_scratch();
+    let scratch = private_scratch();
+    let target = scratch.path().join("cache");
+    let init = relocate_init(home.path(), &target);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let pip = target.join("pip");
+    // A cache tool running under umask 002 leaves a group-writable descendant;
+    // degu keeps the tree report-only until a cooperative-trust policy lands.
+    let descendant = pip.join("http-cache");
+    std::fs::create_dir(&descendant).unwrap();
+    std::fs::set_permissions(&descendant, std::fs::Permissions::from_mode(0o775)).unwrap();
+    std::fs::write(descendant.join("blob"), [0_u8; 4096]).unwrap();
+
+    let output = crate::relocate_support::degu()
+        .env("HOME", home.path())
+        .env("PIP_CACHE_DIR", &pip)
+        .args(["scan", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pip_finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["ecosystem"] == "pip")
+        .unwrap();
+    assert_eq!(pip_finding["confidence"], "verified");
+    assert_eq!(pip_finding["disposition"]["mode"], "report_only");
+}

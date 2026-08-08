@@ -2,7 +2,22 @@ use degu_core::ecosystem::DetectCtx;
 use std::path::Path;
 
 const SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
-const LINE_LIMIT: usize = SIGNATURE.len() + 2;
+/// Bytes to read before deciding a tag: the signature plus a possible CRLF.
+pub const SIGNATURE_PROBE_LEN: usize = SIGNATURE.len() + 2;
+
+/// The one byte-level CACHEDIR.TAG signature predicate, shared by scanning and
+/// `relocate --init` so the two never disagree on what a valid tag is. `prefix`
+/// is the leading bytes of the file (read up to [`SIGNATURE_PROBE_LEN`]); the
+/// tag is valid when its first line — a trailing CR tolerated — is exactly the
+/// signature.
+pub fn prefix_has_signature(prefix: &[u8]) -> bool {
+    let first_line = prefix
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let first_line = first_line.strip_suffix(b"\r").unwrap_or(first_line);
+    first_line == SIGNATURE.as_bytes()
+}
 
 /// Incomplete: tag state undeterminable (I/O error); Truncated: the deadline
 /// elapsed before the probe finished.
@@ -44,7 +59,7 @@ fn probe_tag(path: &Path, ctx: Option<&DetectCtx>) -> Probe {
     let tag = path.join("CACHEDIR.TAG");
     // Only the signature prefix is needed: cap the read and use the safe primitive
     // so a FIFO cannot hang the scan; a non-regular tag can never match (Miss).
-    let prefix = match degu_walk::read_regular_capped(&tag, LINE_LIMIT) {
+    let prefix = match degu_walk::read_regular_capped(&tag, SIGNATURE_PROBE_LEN) {
         Ok(Some(read)) => read.bytes,
         Ok(None) => return Probe::Miss,
         Err(err) if crate::is_missing_path_error(&err) => return Probe::Miss,
@@ -56,12 +71,7 @@ fn probe_tag(path: &Path, ctx: Option<&DetectCtx>) -> Probe {
     if ctx.is_some_and(DetectCtx::deadline_elapsed) {
         return Probe::Truncated;
     }
-    let first_line = prefix
-        .split(|byte| *byte == b'\n')
-        .next()
-        .unwrap_or_default();
-    let first_line = first_line.strip_suffix(b"\r").unwrap_or(first_line);
-    if first_line == SIGNATURE.as_bytes() {
+    if prefix_has_signature(&prefix) {
         Probe::Match
     } else {
         Probe::Miss

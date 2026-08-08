@@ -185,7 +185,9 @@ fn print_script(plan: &RelocationPlan, initialized: bool) -> Result<()> {
     )?;
     if initialized {
         stdoutln!(
-            "# degu initialized the proposed cache directories; nothing was moved and no shell profile was edited"
+            "# degu initialized the proposed cache directories (private modes, CACHEDIR.TAG); \
+             sourcing this only sets the exports after confirming the roots still exist — \
+             it never recreates them, moves data, or edits a shell profile"
         )?;
     } else {
         stdoutln!(
@@ -193,7 +195,7 @@ fn print_script(plan: &RelocationPlan, initialized: bool) -> Result<()> {
              evaluating it only creates the proposed cache directories and exports cache-specific variables"
         )?;
     }
-    print_commands(&plan.exports)?;
+    print_commands(&plan.exports, initialized)?;
     for refusal in &plan.refusals {
         stdoutln!("# refused: {} — {}", refusal.var, refusal.reason)?;
     }
@@ -214,7 +216,7 @@ fn print_existing(exports: &[RelocateExport]) -> Result<()> {
     Ok(())
 }
 
-fn print_commands(exports: &[RelocateExport]) -> Result<()> {
+fn print_commands(exports: &[RelocateExport], initialized: bool) -> Result<()> {
     if exports.is_empty() {
         return Ok(());
     }
@@ -226,7 +228,16 @@ fn print_commands(exports: &[RelocateExport]) -> Result<()> {
         } else {
             ""
         };
-        stdoutln!("  mkdir -p {}{suffix}", sh_double_quote(&export.value))?;
+        let quoted = sh_double_quote(&export.value);
+        if initialized {
+            // degu already created these roots privately with a CACHEDIR.TAG;
+            // only confirm they still exist so a stale saved script fails
+            // visibly instead of recreating a removed root with the caller's
+            // umask and no tag.
+            stdoutln!("  [ -d {quoted} ]{suffix}")?;
+        } else {
+            stdoutln!("  mkdir -p {quoted}{suffix}")?;
+        }
     }
     stdoutln!("then")?;
     for export in exports {

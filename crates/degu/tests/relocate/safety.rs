@@ -60,15 +60,8 @@ fn relocate_init_creates_only_exact_cache_roots_with_private_modes() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["initialization"]["requested"], true);
     assert!(
         report["initialization"]["already_initialized"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        report["initialization"]["failed"]
             .as_array()
             .unwrap()
             .is_empty()
@@ -81,8 +74,11 @@ fn relocate_init_creates_only_exact_cache_roots_with_private_modes() {
         .map(|export| std::path::PathBuf::from(export["value"].as_str().unwrap()))
         .collect::<BTreeSet<_>>();
     let initialized = report["initialization"]["initialized"].as_array().unwrap();
-    assert_eq!(initialized.len(), roots.len());
-    assert!(initialized.iter().all(|entry| entry["state"] == "created"));
+    let initialized_paths = initialized
+        .iter()
+        .map(|entry| std::path::PathBuf::from(entry.as_str().unwrap()))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(initialized_paths, roots);
 
     assert_eq!(
         std::fs::symlink_metadata(&target)
@@ -165,7 +161,7 @@ fn relocate_init_creates_private_directories_under_a_restrictive_umask() {
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     for entry in report["initialization"]["initialized"].as_array().unwrap() {
-        let root = std::path::Path::new(entry["path"].as_str().unwrap());
+        let root = std::path::Path::new(entry.as_str().unwrap());
         assert_eq!(
             std::fs::symlink_metadata(root)
                 .unwrap()
@@ -243,13 +239,6 @@ fn relocate_init_is_idempotent_and_preserves_existing_payloads() {
             .unwrap()
             .len(),
         report["exports"].as_array().unwrap().len()
-    );
-    assert!(
-        report["initialization"]["already_initialized"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|entry| entry["state"] == "already_initialized")
     );
     assert_eq!(std::fs::read(payload).unwrap(), b"existing cache bytes");
 }

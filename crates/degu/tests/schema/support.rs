@@ -88,6 +88,9 @@ pub(super) const SCAN_SUMMARY_TOTAL_KEYS: &[&str] = &[
 pub(super) const RELOCATE_EXPORT_KEYS: &[&str] = &["current", "ecosystem", "value", "var"];
 pub(super) const RELOCATE_NOT_RELOCATABLE_KEYS: &[&str] = &["ecosystem", "reason", "var"];
 pub(super) const RELOCATE_REPORT_KEYS: &[&str] = &["exports", "not_relocatable", "target"];
+pub(super) const RELOCATE_INIT_REPORT_KEYS: &[&str] =
+    &["exports", "initialization", "not_relocatable", "target"];
+pub(super) const RELOCATE_INITIALIZATION_KEYS: &[&str] = &["already_initialized", "initialized"];
 pub(super) const TRASH_LIST_REPORT_KEYS: &[&str] = &["entries", "omitted"];
 pub(super) const TRASH_LIST_ROW_KEYS: &[&str] = &[
     "age_days",

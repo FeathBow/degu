@@ -2,14 +2,17 @@ use anyhow::{Context, Result};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 const CACHEDIR_TAG: &str = "CACHEDIR.TAG";
 const TAG_CONTENT: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n";
 const SHARED_WRITE_MASK: rustix::fs::RawMode = 0o022;
+const STICKY_BIT: u32 = 0o1000;
+const SYMLINK_BUDGET: u32 = 40;
 const PERMISSION_MASK: rustix::fs::RawMode = 0o777;
 const PRIVATE_UMASK: Mode = Mode::from_raw_mode(0o077);
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
@@ -18,18 +21,14 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC);
 static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
+/// Minimal, reachable `--init --json` shape: the two lists of exact cache-root
+/// paths this run created and found already initialized. There is no `failed`
+/// list (an initialization failure returns an error and prints no JSON) and no
+/// per-entry state (the list an entry lands in already names its state).
 #[derive(Serialize)]
 pub(super) struct InitializationReport {
-    requested: bool,
-    initialized: Vec<InitializationEntry>,
-    already_initialized: Vec<InitializationEntry>,
-    failed: Vec<InitializationEntry>,
-}
-
-#[derive(Serialize)]
-struct InitializationEntry {
-    path: String,
-    state: &'static str,
+    initialized: Vec<String>,
+    already_initialized: Vec<String>,
 }
 
 struct PlannedRoot {
@@ -155,16 +154,18 @@ fn validate_subdirs(target: &Path, subdirs: &[PathBuf]) -> Result<Vec<(PathBuf, 
     Ok(roots)
 }
 
-/// Open the target's immediate parent, refusing a symlinked immediate parent
-/// (`O_NOFOLLOW`). The returned descriptor is pinned: every later step is
-/// relative to it and re-verifies identity, so the parent cannot be swapped from
-/// under the run. Intermediate ancestors resolve normally on purpose — trusted
-/// deployments legitimately reach a target through symlinked system or scratch
-/// mounts (`/tmp`, `/scratch`), and walking each component with `O_NOFOLLOW`
-/// would break those. A hostile redirect is instead caught downstream: a
-/// substituted parent is foreign-owned or writable and fails the parent-trust
-/// check in [`obtain_base`], and [`revalidate_target_binding`] confirms the
-/// target still names the initialized inode before any export is printed.
+/// Resolve the target's parent through a full trusted-namespace walk and return
+/// the pinned parent descriptor, its path, and the target's final component.
+///
+/// Every directory the resolution touches — each lexical ancestor and each
+/// directory a followed symlink resolves through — must grant no foreign mutation
+/// authority (see [`require_trusted_namespace`]), so no foreign principal can
+/// rename a component or re-point a symlink to redirect the target after the
+/// fact. A symlink is followed only when it lives in such a namespace and is
+/// itself owned by the effective user or root, and its target chain is validated
+/// the same way. This admits root-managed system links (`/var`, `/tmp`) and
+/// admin- or user-managed scratch links while refusing anything reachable
+/// through a group-writable, non-sticky namespace.
 fn open_trusted_parent(target: &Path) -> Result<(OwnedFd, PathBuf, OsString)> {
     let name = target.file_name().ok_or_else(|| {
         anyhow::anyhow!(
@@ -178,18 +179,133 @@ fn open_trusted_parent(target: &Path) -> Result<(OwnedFd, PathBuf, OsString)> {
             target.display()
         )
     })?;
-    let parent = open_directory_at(rustix::fs::CWD, parent_path, parent_path)?;
+    let parent = resolve_trusted_directory(parent_path)?;
     Ok((parent, parent_path.to_path_buf(), name.to_os_string()))
 }
 
+/// Walk `path` from `/` one component at a time on held descriptors, requiring
+/// every directory it descends into to be a trusted namespace and following a
+/// symlink only from a trusted namespace when the link is owned by the effective
+/// user or root. Returns the descriptor for the fully validated directory.
+fn resolve_trusted_directory(path: &Path) -> Result<OwnedFd> {
+    let euid = rustix::process::geteuid().as_raw();
+    let root = Path::new("/");
+    let mut current = open_directory_at(rustix::fs::CWD, "/", root)?;
+    require_trusted_namespace(&stat_fd(&current, root)?, root)?;
+    let mut pending = lexical_components(path)?;
+    let mut walked = PathBuf::from("/");
+    let mut symlink_budget = SYMLINK_BUDGET;
+    while let Some(component) = pending.pop_front() {
+        if component == *OsStr::new(".") {
+            continue;
+        }
+        if component == *OsStr::new("..") {
+            let candidate = walked.parent().unwrap_or(root).to_path_buf();
+            let next = open_directory_at(&current, "..", &candidate)?;
+            require_trusted_namespace(&stat_fd(&next, &candidate)?, &candidate)?;
+            current = next;
+            walked = candidate;
+            continue;
+        }
+        let candidate = walked.join(&component);
+        let parent_sticky = is_sticky(&stat_fd(&current, &walked)?);
+        let entry = stat_at(&current, component.as_os_str())
+            .map_err(|error| fs_error("resolve relocate target ancestor", &candidate, error))?;
+        if FileType::from_raw_mode(entry.st_mode) == FileType::Symlink {
+            require_owner_is_local(
+                &entry,
+                &candidate,
+                euid,
+                "symlinked relocate target ancestor",
+            )?;
+            symlink_budget = symlink_budget.checked_sub(1).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "too many symbolic links resolving relocate target {}",
+                    path.display()
+                )
+            })?;
+            let link = rustix::fs::readlinkat(&current, component.as_os_str(), Vec::new())
+                .map_err(|error| {
+                    fs_error("read symlinked relocate target ancestor", &candidate, error)
+                })?;
+            let link = PathBuf::from(OsString::from_vec(link.into_bytes()));
+            if link.is_absolute() {
+                current = open_directory_at(rustix::fs::CWD, "/", root)?;
+                require_trusted_namespace(&stat_fd(&current, root)?, root)?;
+                walked = PathBuf::from("/");
+            }
+            push_front_components(&mut pending, &link);
+        } else if FileType::from_raw_mode(entry.st_mode) == FileType::Directory {
+            if parent_sticky {
+                require_owner_is_local(&entry, &candidate, euid, "relocate target ancestor")?;
+            }
+            let next = open_directory_at(&current, component.as_os_str(), &candidate)?;
+            let opened = stat_fd(&next, &candidate)?;
+            require_same_identity(&entry, &opened, &candidate)?;
+            require_trusted_namespace(&opened, &candidate)?;
+            current = next;
+            walked = candidate;
+        } else {
+            anyhow::bail!(
+                "relocate target ancestor {} is not a directory",
+                candidate.display()
+            );
+        }
+    }
+    Ok(current)
+}
+
+fn lexical_components(path: &Path) -> Result<VecDeque<OsString>> {
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        anyhow::bail!("relocate target parent {} must be absolute", path.display());
+    }
+    let mut pending = VecDeque::new();
+    for component in components {
+        match component {
+            Component::Normal(name) => pending.push_back(name.to_os_string()),
+            Component::ParentDir => pending.push_back(OsString::from("..")),
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => anyhow::bail!(
+                "relocate target parent {} has an unexpected path component",
+                path.display()
+            ),
+        }
+    }
+    Ok(pending)
+}
+
+fn push_front_components(pending: &mut VecDeque<OsString>, link: &Path) {
+    for component in link.components().rev() {
+        match component {
+            Component::Normal(name) => pending.push_front(name.to_os_string()),
+            Component::ParentDir => pending.push_front(OsString::from("..")),
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+}
+
+fn is_sticky(stat: &Stat) -> bool {
+    raw_mode_u32(stat.st_mode) & STICKY_BIT != 0
+}
+
+fn require_owner_is_local(stat: &Stat, path: &Path, euid: u32, label: &str) -> Result<()> {
+    if stat.st_uid != euid && stat.st_uid != 0 {
+        anyhow::bail!(
+            "{label} {} is owned by UID {}, which could rename or re-point it",
+            path.display(),
+            stat.st_uid
+        );
+    }
+    Ok(())
+}
+
 /// Open (existing) or create (missing) the target directory through its
-/// no-follow-resolved, trust-validated parent. The parent-trust check applies to
-/// both cases so an existing private target under a group-writable parent is
-/// refused exactly as a to-be-created one is.
+/// trust-validated parent. [`open_trusted_parent`] has already required every
+/// ancestor to be a trusted namespace, so both an existing private target under
+/// a group-writable ancestor and a to-be-created one are refused identically.
 fn obtain_base(target: &Path, transaction: &mut Transaction) -> Result<Base> {
-    let (parent, parent_path, name) = open_trusted_parent(target)?;
-    let parent_stat = stat_fd(&parent, &parent_path)?;
-    require_creation_parent(&parent_stat, &parent_path)?;
+    let (parent, _parent_path, name) = open_trusted_parent(target)?;
     match stat_at(&parent, name.as_os_str()) {
         Ok(stat) => {
             require_kind(&stat, CreatedKind::Directory, target, "relocate target")?;
@@ -279,27 +395,19 @@ fn execute_roots(
     after_root: &mut dyn FnMut(usize, &Path) -> Result<()>,
 ) -> Result<InitializationReport> {
     let mut report = InitializationReport {
-        requested: true,
         initialized: Vec::new(),
         already_initialized: Vec::new(),
-        failed: Vec::new(),
     };
     for (index, root) in roots.into_iter().enumerate() {
         let state = initialize_root(base, &root, transaction)?;
-        let entry = InitializationEntry {
-            path: root
-                .path
-                .to_str()
-                .expect("relocation plan paths were validated as UTF-8")
-                .to_owned(),
-            state: match state {
-                PlannedState::Create => "created",
-                PlannedState::AlreadyInitialized => "already_initialized",
-            },
-        };
+        let path = root
+            .path
+            .to_str()
+            .expect("relocation plan paths were validated as UTF-8")
+            .to_owned();
         match state {
-            PlannedState::Create => report.initialized.push(entry),
-            PlannedState::AlreadyInitialized => report.already_initialized.push(entry),
+            PlannedState::Create => report.initialized.push(path),
+            PlannedState::AlreadyInitialized => report.already_initialized.push(path),
         }
         after_root(index, &root.path)?;
     }
@@ -404,6 +512,25 @@ fn create_tag(root: &OwnedFd, root_path: &Path, transaction: &mut Transaction) -
 }
 
 fn validate_existing_tag(root: &OwnedFd, root_path: &Path) -> Result<()> {
+    // A regular pyvenv.cfg marks a virtualenv, which the scanner vetoes as not a
+    // pure cache; --init must not report such a root already initialized either.
+    match stat_at(root, "pyvenv.cfg") {
+        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => {
+            anyhow::bail!(
+                "cache root {} is a virtualenv (pyvenv.cfg present), not a pure cache; refusing to initialize it",
+                root_path.display()
+            )
+        }
+        Ok(_) => {}
+        Err(error) if error == rustix::io::Errno::NOENT => {}
+        Err(error) => {
+            return Err(fs_error(
+                "inspect pyvenv.cfg",
+                &root_path.join("pyvenv.cfg"),
+                error,
+            ));
+        }
+    }
     let tag_path = root_path.join(CACHEDIR_TAG);
     let inspected = match stat_at(root, CACHEDIR_TAG) {
         Ok(stat) => stat,
@@ -508,12 +635,17 @@ fn require_existing_directory(stat: &Stat, path: &Path, label: &str) -> Result<(
     require_owned_safe(stat, path, label)
 }
 
-fn require_creation_parent(stat: &Stat, path: &Path) -> Result<()> {
-    require_kind(stat, CreatedKind::Directory, path, "relocate target parent")?;
+fn require_trusted_namespace(stat: &Stat, path: &Path) -> Result<()> {
+    require_kind(
+        stat,
+        CreatedKind::Directory,
+        path,
+        "relocate target ancestor",
+    )?;
     let euid = rustix::process::geteuid().as_raw();
     if degu_walk::directory_grants_foreign_mutation(stat.st_uid, raw_mode_u32(stat.st_mode), euid) {
         anyhow::bail!(
-            "relocate target parent {} is not a trusted namespace for effective UID {euid}",
+            "relocate target ancestor {} is not a trusted namespace for effective UID {euid}",
             path.display()
         );
     }
@@ -781,7 +913,7 @@ mod tests {
 
         assert_eq!(report.initialized.len(), 1);
         assert_eq!(
-            report.initialized[0].path,
+            report.initialized[0],
             target.join("pip").display().to_string()
         );
     }
@@ -968,21 +1100,90 @@ mod tests {
     }
 
     #[test]
-    fn a_symlinked_immediate_parent_is_refused() {
+    fn a_group_writable_grandparent_is_refused() {
+        for create_target in [false, true] {
+            let grandparent = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(grandparent.path(), std::fs::Permissions::from_mode(0o775))
+                .unwrap();
+            let private_parent = grandparent.path().join("private-parent");
+            std::fs::create_dir(&private_parent).unwrap();
+            std::fs::set_permissions(&private_parent, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let target = private_parent.join("cache");
+            if create_target {
+                std::fs::create_dir(&target).unwrap();
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+
+            let error = format!(
+                "{:#}",
+                initialize(&target, &[PathBuf::from("pip")])
+                    .err()
+                    .expect("a group-writable grandparent must be refused")
+            );
+            assert!(error.contains("not a trusted namespace"), "{error}");
+            assert!(!target.join("pip").exists());
+        }
+    }
+
+    #[test]
+    fn a_symlink_in_a_trusted_namespace_is_followed() {
         let scratch = private_scratch();
         let real = scratch.path().join("real");
         std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
         let link = scratch.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let target = link.join("cache");
 
-        let result = initialize(&target, &[PathBuf::from("pip")]);
+        let report = initialize(&target, &[PathBuf::from("pip")]).unwrap();
 
-        assert!(
-            result.is_err(),
-            "a symlinked immediate parent must be refused"
+        assert_eq!(report.initialized.len(), 1);
+        assert!(real.join("cache/pip/CACHEDIR.TAG").exists());
+    }
+
+    #[test]
+    fn a_symlink_in_a_group_writable_namespace_is_refused() {
+        let scratch = private_scratch();
+        let shared = scratch.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let real = scratch.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, shared.join("link")).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let target = shared.join("link").join("cache");
+
+        let error = format!(
+            "{:#}",
+            initialize(&target, &[PathBuf::from("pip")])
+                .err()
+                .expect("a symlink in a group-writable namespace must be refused")
         );
+        assert!(error.contains("not a trusted namespace"), "{error}");
         assert!(!real.join("cache").exists());
+    }
+
+    #[test]
+    fn a_symlink_target_through_a_group_writable_dir_is_refused() {
+        let scratch = private_scratch();
+        let shared = scratch.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let inner = shared.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let link = scratch.path().join("link");
+        std::os::unix::fs::symlink(&inner, &link).unwrap();
+        let target = link.join("cache");
+
+        let error = format!(
+            "{:#}",
+            initialize(&target, &[PathBuf::from("pip")])
+                .err()
+                .expect("a symlink target chain through a group-writable dir must be refused")
+        );
+        assert!(error.contains("not a trusted namespace"), "{error}");
+        assert!(!inner.join("cache").exists());
     }
 
     #[test]
@@ -1027,5 +1228,24 @@ mod tests {
 
         assert_eq!(report.already_initialized.len(), 1);
         assert!(report.initialized.is_empty());
+    }
+
+    #[test]
+    fn a_root_with_a_pyvenv_cfg_is_refused_even_with_a_valid_tag() {
+        let scratch = private_scratch();
+        let target = scratch.path().join("target");
+        let root = target.join("pip");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(CACHEDIR_TAG), TAG_CONTENT).unwrap();
+        std::fs::write(root.join("pyvenv.cfg"), b"home = /usr\n").unwrap();
+        strip_shared_write(&target);
+
+        let error = format!(
+            "{:#}",
+            initialize(&target, &[PathBuf::from("pip")])
+                .err()
+                .expect("a virtualenv root must be refused")
+        );
+        assert!(error.contains("virtualenv"), "{error}");
     }
 }

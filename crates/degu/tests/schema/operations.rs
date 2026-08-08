@@ -40,6 +40,40 @@ fn trash_purge_json_schema_is_frozen() {
     assert_keys(&json, TRASH_PURGE_REPORT_KEYS);
     assert_non_empty_array(&json["purged"], "trash purge purged entries");
     json["failed"].as_array().unwrap();
+    assert_quota_action(&json["quota_observations"]);
+}
+
+#[test]
+fn empty_trash_purge_json_explicitly_observes_housekeeping() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let json = json_stdout(
+        degu()
+            .env("HOME", home.path())
+            .env("XDG_STATE_HOME", state.path())
+            .args(["trash", "purge", "--yes", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(json["quota_observations"]["observation_state"], "resolved");
+    assert_eq!(
+        json["quota_observations"]["quota_observations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+fn assert_quota_action(action: &serde_json::Value) {
+    assert_keys(action, QUOTA_ACTION_KEYS);
+    assert!(action["id"].is_string());
+    assert!(action["kind"].is_string());
+    for scope in assert_non_empty_array(&action["quota_observations"], "quota scopes") {
+        assert_keys(scope, QUOTA_SCOPE_KEYS);
+        assert!(scope["anchors"].is_array());
+        assert!(scope["quota_observed_usage_delta"]["state"].is_string());
+    }
 }
 
 #[test]

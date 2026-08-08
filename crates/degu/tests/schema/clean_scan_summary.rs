@@ -23,6 +23,12 @@ fn clean_json_schema_is_frozen() {
     assert!(json["expiry"]["retention_days"].is_number());
     assert!(json["expiry"]["planned"].is_array());
     assert!(json["expiry"]["purged"].is_array());
+    assert_keys(
+        &json["quota_observations"],
+        &["direct_purge", "expiry_purge"],
+    );
+    assert!(json["quota_observations"]["direct_purge"]["observation_state"].is_string());
+    assert!(json["quota_observations"]["expiry_purge"]["observation_state"].is_string());
     for failure in json["expiry"]["failed"].as_array().unwrap() {
         assert_keys(failure, CLEAN_EXPIRY_FAILURE_KEYS);
     }
@@ -36,6 +42,35 @@ fn clean_json_schema_is_frozen() {
         assert_keys(execution, CLEAN_EXECUTION_KEYS);
         assert_clean_outcome(&execution["outcome"]);
     }
+}
+
+#[test]
+fn clean_purge_quota_observation_is_one_batch_scope_not_per_finding() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let _pip_cache = fake_pip_cache(&home);
+    let _hf_home = fake_huggingface_cache(&home);
+    let json = json_stdout(
+        degu()
+            .env("HOME", home.path())
+            .env("XDG_STATE_HOME", state.path())
+            .args(["clean", "--purge", "--include-review", "--yes", "--json"])
+            .output()
+            .unwrap(),
+    );
+
+    let action = &json["quota_observations"]["direct_purge"];
+    assert_keys(action, QUOTA_ACTION_KEYS);
+    assert_eq!(action["kind"], "direct_purge");
+    let executed = json["executed"].as_array().unwrap().len();
+    let scopes = assert_non_empty_array(&action["quota_observations"], "direct quota scopes");
+    assert!(
+        executed > 1,
+        "folding needs multiple findings; got {executed}"
+    );
+    assert_eq!(scopes.len(), 1, "one trash scope, not one per finding");
+    assert_keys(&scopes[0], QUOTA_SCOPE_KEYS);
+    assert!(scopes[0]["quota_observed_usage_delta"]["state"].is_string());
 }
 
 #[test]

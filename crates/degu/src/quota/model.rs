@@ -35,20 +35,55 @@ pub(crate) struct ActiveQuota {
     pub(crate) inodes: QuotaDimension,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct QuotaScopeIdentity {
+    mount_id: u64,
+    device_major: u32,
+    device_minor: u32,
+    source: PathBuf,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl QuotaScopeIdentity {
+    pub(crate) fn new(
+        mount_id: u64,
+        device_major: u32,
+        device_minor: u32,
+        source: PathBuf,
+    ) -> Self {
+        Self {
+            mount_id,
+            device_major,
+            device_minor,
+            source,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct QuotaScope {
     pub(crate) path: PathBuf,
     pub(crate) mount_point: PathBuf,
     pub(crate) filesystem: String,
+    /// Provider-private identity used to reject comparisons across mount
+    /// replacement. It is evidence for observation only, not public quota data.
+    #[serde(skip)]
+    pub(crate) identity: QuotaScopeIdentity,
 }
 
 #[cfg(any(target_os = "linux", test))]
 impl QuotaScope {
-    pub(crate) fn new(path: PathBuf, mount_point: PathBuf, filesystem: String) -> Self {
+    pub(crate) fn new(
+        path: PathBuf,
+        mount_point: PathBuf,
+        filesystem: String,
+        identity: QuotaScopeIdentity,
+    ) -> Self {
         Self {
             path,
             mount_point,
             filesystem,
+            identity,
         }
     }
 }
@@ -152,7 +187,7 @@ fn headroom(limit: Option<u64>, used: u64) -> Option<u64> {
 mod tests {
     use super::{
         ActiveQuota, QuotaDimension, QuotaGrace, QuotaGraceState, QuotaLimits, QuotaScope,
-        QuotaSnapshot,
+        QuotaScopeIdentity, QuotaSnapshot,
     };
     use std::path::PathBuf;
 
@@ -234,6 +269,7 @@ mod tests {
             PathBuf::from("/home/me"),
             PathBuf::from("/home"),
             "ext4".to_owned(),
+            QuotaScopeIdentity::new(36, 8, 1, PathBuf::from("/dev/root")),
         );
         let report = QuotaSnapshot::active(
             scope,

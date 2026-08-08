@@ -17,6 +17,7 @@ mod lifecycle;
 mod output;
 mod presentation;
 mod quota;
+mod quota_observation;
 mod runtime;
 mod source_selection;
 mod value_parser;

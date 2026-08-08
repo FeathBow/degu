@@ -1,7 +1,107 @@
 use super::support::*;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
+
+fn aged_claim_marker(state: &tempfile::TempDir) -> std::path::PathBuf {
+    let claims = private_trash_root(state).join(".claims");
+    std::fs::create_dir_all(&claims).unwrap();
+    std::fs::set_permissions(&claims, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = claims.join("12345");
+    let file = std::fs::File::create(&marker).unwrap();
+    file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 86_400))
+        .unwrap();
+    marker
+}
+
+#[test]
+fn xdg_state_parent_alias_does_not_block_trash_purge() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let alias = state.path().join("alias");
+    let real = state.path().join("real");
+    std::fs::create_dir(&alias).unwrap();
+    std::fs::create_dir(&real).unwrap();
+    let request = alias.join("..").join("real");
+    let cache = crate::common::platform_cache_dir(home.path(), "pip");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("wheel.whl"), b"cache").unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+    let staged = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", &request)
+        .args(["clean", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        staged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&staged.stderr)
+    );
+
+    let out = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", &request)
+        .args(["trash", "purge", "--yes", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["purged"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        report["quota_observations"]["observation_state"],
+        "resolved"
+    );
+}
+
+#[test]
+fn trash_json_empty_entries_still_runs_observed_claim_housekeeping() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let marker = aged_claim_marker(&state);
+
+    let out = run(&home, &state, &["trash", "purge", "--yes", "--json"]);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!marker.exists());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(report["purged"].as_array().unwrap().is_empty());
+    assert_eq!(
+        report["quota_observations"]["observation_state"],
+        "resolved"
+    );
+}
+
+#[test]
+fn trash_human_empty_entries_still_runs_claim_housekeeping() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let marker = aged_claim_marker(&state);
+
+    let out = run(&home, &state, &["trash", "purge", "--yes"]);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!marker.exists());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("expired trash claim markers, if present, will be permanently deleted")
+    );
+    assert!(stdout.contains("Purged 0 trash entries"));
+    assert!(!stdout.contains("Trash is empty."));
+}
 
 #[test]
 fn trash_purge_colors_the_permanent_deletion_plan() {

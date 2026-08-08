@@ -2,11 +2,15 @@ use anyhow::Result;
 use degu_core::ecosystem::DetectCtx;
 use std::path::Path;
 
+use crate::action_result::{ActionKind, ActionResultOwner, NotStartedReason};
 use crate::commands::prompt::confirm_permanent_delete;
 use crate::lifecycle::{Lifecycle, TrashPurgePlan};
 use crate::output::{flush_stdout, stdoutln};
 use crate::presentation::semantic::Tone;
 use crate::presentation::{display_path, escape_terminal_text, semantic};
+use crate::quota_observation::{
+    QuotaActionReport, coordinate, not_attempted_action, planned_action,
+};
 use crate::runtime::Ui;
 use serde::Serialize;
 
@@ -20,7 +24,7 @@ pub(super) fn run(json: bool, yes: bool, ui: Ui) -> Result<()> {
     if json {
         validate_json_plan(&plan)?;
     } else {
-        if plan.is_empty() {
+        if !plan.has_housekeeping_scope() {
             return stdoutln!("{}", super::output::TRASH_IS_EMPTY);
         }
         print_plan(&plan, &ctx.home, ui.colors.stdout)?;
@@ -29,12 +33,42 @@ pub(super) fn run(json: bool, yes: bool, ui: Ui) -> Result<()> {
     if !yes && !confirm_permanent_delete(ui.colors)? {
         anyhow::bail!("Purge cancelled; no trash entries were deleted.");
     }
+    if crate::output::stdout_consumer_gone() {
+        return Err(crate::output::stdout_closed_error());
+    }
 
-    let report = session.execute_purge_all(plan);
+    let (report, observation) = if !plan.has_housekeeping_scope() {
+        let observation = not_attempted_action(
+            ActionResultOwner::TrashPurgeCommand,
+            ActionKind::TrashPurge,
+            "trash:purge-all",
+            [],
+            NotStartedReason::Empty,
+        )
+        .map_err(|error| anyhow::anyhow!("invalid trash observation contract: {error:?}"))?;
+        (session.execute_purge_all(plan), observation)
+    } else {
+        let action = planned_action(
+            ActionResultOwner::TrashPurgeCommand,
+            ActionKind::TrashPurge,
+            "trash:purge-all",
+            plan.trash_roots().map(std::path::PathBuf::from),
+        )
+        .map_err(|error| anyhow::anyhow!("invalid trash-purge observation contract: {error:?}"))?;
+        let mut probe = crate::quota::probe;
+        let (report, completed) = coordinate(action, &mut probe, || {
+            let report = session.execute_purge_all(plan);
+            let outcome = crate::commands::purge_outcome(&report);
+            (report, outcome)
+        });
+        (report, QuotaActionReport::Attempted(completed))
+    };
     let output_result = if json {
-        print_json_report(&report)
+        crate::quota_observation::print_warnings(&observation, ui.colors);
+        print_json_report(&report, &observation)
     } else {
         print_human_report(&report.purged, &report.failed, ui.colors)
+            .and_then(|()| crate::quota_observation::print_human(&observation, ui.colors))
     };
     if !report.failed.is_empty() {
         anyhow::bail!("one or more trash entries failed to purge")
@@ -42,8 +76,14 @@ pub(super) fn run(json: bool, yes: bool, ui: Ui) -> Result<()> {
     output_result
 }
 
-fn print_json_report(report: &crate::lifecycle::PurgeReport) -> Result<()> {
-    stdoutln!("{}", serde_json::to_string_pretty(&json_report(report))?)
+fn print_json_report(
+    report: &crate::lifecycle::PurgeReport,
+    observation: &QuotaActionReport,
+) -> Result<()> {
+    stdoutln!(
+        "{}",
+        serde_json::to_string_pretty(&json_report(report, observation))?
+    )
 }
 
 fn validate_json_plan(plan: &TrashPurgePlan) -> Result<()> {
@@ -61,6 +101,7 @@ fn validate_json_plan(plan: &TrashPurgePlan) -> Result<()> {
 struct PurgeJsonReport<'a> {
     purged: &'a [std::path::PathBuf],
     failed: Vec<PurgeFailureJson<'a>>,
+    quota_observations: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -69,7 +110,10 @@ struct PurgeFailureJson<'a> {
     reason: &'a str,
 }
 
-fn json_report(report: &crate::lifecycle::PurgeReport) -> PurgeJsonReport<'_> {
+fn json_report<'a>(
+    report: &'a crate::lifecycle::PurgeReport,
+    observation: &QuotaActionReport,
+) -> PurgeJsonReport<'a> {
     let failed = report
         .failed
         .iter()
@@ -78,16 +122,20 @@ fn json_report(report: &crate::lifecycle::PurgeReport) -> PurgeJsonReport<'_> {
     PurgeJsonReport {
         purged: &report.purged,
         failed,
+        quota_observations: crate::quota_observation::json(observation),
     }
 }
 
 fn print_plan(plan: &TrashPurgePlan, home: &Path, color_enabled: bool) -> Result<()> {
-    let noun = if plan.len() == 1 { "entry" } else { "entries" };
     let action = semantic::paint(
         "will be permanently deleted",
         Tone::Destructive,
         color_enabled,
     );
+    if plan.is_empty() {
+        return stdoutln!("Purge plan: expired trash claim markers, if present, {action}.");
+    }
+    let noun = if plan.len() == 1 { "entry" } else { "entries" };
     stdoutln!("Purge plan: all {} trash {noun} {action}.", plan.len(),)?;
     for entry in plan.entries() {
         stdoutln!("  {}", escape_terminal_text(&display_path(entry, home)))?;
@@ -154,8 +202,20 @@ mod tests {
                 "changed".to_owned(),
             )],
         };
-        let json = serde_json::to_value(json_report(&report)).unwrap();
-        assert_eq!(keys(&json), ["failed", "purged"]);
+        let observation = crate::quota_observation::not_attempted_action(
+            crate::action_result::ActionResultOwner::TrashPurgeCommand,
+            crate::action_result::ActionKind::TrashPurge,
+            "trash:test",
+            [],
+            crate::action_result::NotStartedReason::Empty,
+        )
+        .unwrap();
+        let json = serde_json::to_value(json_report(&report, &observation)).unwrap();
+        assert_eq!(keys(&json), ["failed", "purged", "quota_observations"]);
+        assert_eq!(
+            json["quota_observations"]["observation_state"],
+            "not_attempted"
+        );
         assert_eq!(keys(&json["failed"][0]), ["path", "reason"]);
     }
 }

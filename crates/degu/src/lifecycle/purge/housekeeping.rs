@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use degu_core::oplog::ObjectIdentity;
 
 use crate::lifecycle::claims::{reservation_marker_metadata, validate_existing_claims_dir};
-use crate::lifecycle::expiry::{TRASH_TTL, fallback_age};
+use crate::lifecycle::expiry::{TRASH_TTL, fallback_mtime_age};
 
 pub(super) fn purge_expired_claims(root: &Path) -> Result<()> {
     let Some(claims) = validate_existing_claims_dir(root)
@@ -24,7 +24,7 @@ pub(super) fn purge_expired_claims(root: &Path) -> Result<()> {
         };
         let path = entry.path();
         let expected = ObjectIdentity::from_metadata(&metadata);
-        if fallback_age(&metadata, now) >= TRASH_TTL {
+        if fallback_mtime_age(&metadata, now) >= TRASH_TTL {
             trash.purge_entry_verified(&path, expected)?;
         }
     }

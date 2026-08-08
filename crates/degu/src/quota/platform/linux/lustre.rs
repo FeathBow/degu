@@ -1042,6 +1042,9 @@ mod tests {
             mount_point: PathBuf::from(MOUNT),
             filesystem: "lustre".to_owned(),
             source: PathBuf::from("10.0.0.1@tcp:/scratch"),
+            mount_id: 40,
+            device_major: 0,
+            device_minor: 42,
         }
     }
 
@@ -1191,6 +1194,9 @@ mod tests {
             mount_point: dir.path().to_owned(),
             filesystem: "lustre".to_owned(),
             source: PathBuf::from("10.0.0.1@tcp:/scratch"),
+            mount_id: 40,
+            device_major: 0,
+            device_minor: 42,
         };
         let error = verify_statfs_is_lustre(&mount).unwrap_err();
         assert!(matches!(error, ProbeError::Incomplete { .. }), "{error:?}");
@@ -1202,6 +1208,9 @@ mod tests {
             mount_point: PathBuf::from("scratch"),
             filesystem: "lustre".to_owned(),
             source: PathBuf::from("10.0.0.1@tcp:/scratch"),
+            mount_id: 40,
+            device_major: 0,
+            device_minor: 42,
         };
         let error = require_rooted_mount_point(&mount).unwrap_err();
         assert!(matches!(error, ProbeError::Incomplete { .. }), "{error:?}");

@@ -38,6 +38,11 @@ impl ExpiryPlan {
         self.entries().next().is_none()
     }
 
+    /// Even an entry-empty batch may purge aged numeric claim markers.
+    pub(crate) fn has_housekeeping_scope(&self) -> bool {
+        !self.batches.is_empty()
+    }
+
     pub(crate) fn len(&self) -> usize {
         batch_entry_count(&self.batches)
     }
@@ -57,6 +62,11 @@ impl TrashPurgePlan {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Even an entry-empty batch may purge aged numeric claim markers.
+    pub(crate) fn has_housekeeping_scope(&self) -> bool {
+        !self.batches.is_empty()
     }
 
     pub(crate) fn len(&self) -> usize {

@@ -4,6 +4,8 @@
 //! types keep content policy, writer risk, OS capability, evidence freshness,
 //! identity, and transaction state separate before later work expands cleanup.
 
+pub mod local_mode;
+
 use serde::Serialize;
 use serde::ser::{SerializeSeq, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
@@ -433,7 +435,7 @@ pub struct CapabilityEvidence {
 }
 
 impl CapabilityEvidence {
-    pub fn new(backend: AuthorityBackend) -> Option<Self> {
+    fn new(backend: AuthorityBackend) -> Option<Self> {
         backend.is_known().then_some(Self { backend })
     }
 

@@ -6,7 +6,6 @@
 
 mod accounting;
 mod fstype;
-pub mod local_backend;
 mod metadata;
 pub mod mount;
 mod mutation_guard;

@@ -9,11 +9,11 @@
 //! validation plus fail-closed ACL absence prevents a foreign UID from gaining
 //! namespace authority and detaching the durable WAL.
 
-use crate::seal_wal::{ExclusiveFileLock, RecoveryLockError, RecoverySession};
-use degu_walk::local_backend::{
+use crate::local_backend::{
     CertifiedLocalBackend, HeldLocalBackendEvidence, certify_held_fd, certify_held_fd_backend,
     require_held_fd_acl_absent,
 };
+use crate::seal_wal::{ExclusiveFileLock, RecoveryLockError, RecoverySession};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{FileType, Mode, OFlags};
 use std::ffi::OsString;

@@ -1,11 +1,11 @@
 use super::{MountInfo, ProbeError};
-use crate::commands::quota::model::QuotaReport;
+use crate::quota::model::QuotaSnapshot;
 use std::ffi::CString;
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-pub(super) fn probe(path: &Path) -> Result<QuotaReport, ProbeError> {
+pub(super) fn probe(path: &Path) -> Result<QuotaSnapshot, ProbeError> {
     let mount = inspect_mount(path)?;
     Err(ProbeError::Unsupported {
         filesystem: mount.filesystem,

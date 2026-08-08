@@ -1,6 +1,6 @@
-use super::model::{QuotaDimension, QuotaGrace, QuotaGraceState, QuotaReport};
 use crate::output::stdoutln;
 use crate::presentation::{escape_terminal_text, human_bytes, ratio_bar};
+use crate::quota::model::{QuotaDimension, QuotaGrace, QuotaGraceState, QuotaSnapshot};
 use crate::runtime::{Glyphs, Ui};
 use anyhow::Result;
 use std::cmp::Ordering;
@@ -10,7 +10,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const PERCENT_SCALE: f64 = 100.0;
 const DETAIL_INDENT: usize = 11;
 
-pub(super) fn print(report: &QuotaReport, json: bool, ui: Ui) -> Result<()> {
+pub(super) fn print(report: &QuotaSnapshot, json: bool, ui: Ui) -> Result<()> {
     if json {
         stdoutln!("{}", serde_json::to_string_pretty(report)?)?;
     } else {
@@ -19,7 +19,7 @@ pub(super) fn print(report: &QuotaReport, json: bool, ui: Ui) -> Result<()> {
     Ok(())
 }
 
-fn render_human(report: &QuotaReport, ui: Ui) -> String {
+fn render_human(report: &QuotaSnapshot, ui: Ui) -> String {
     let glyphs = ui.glyphs;
     let separator = glyphs.separator;
     let target = escape_terminal_text(&report.scope.path.display().to_string());

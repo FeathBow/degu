@@ -18,8 +18,8 @@
 //! a number it could not verify.
 
 use super::{MountInfo, ProbeError};
-use crate::commands::quota::model::{
-    ActiveQuota, QuotaDimension, QuotaGrace, QuotaGraceState, QuotaLimits, QuotaReport,
+use crate::quota::model::{
+    ActiveQuota, QuotaDimension, QuotaGrace, QuotaGraceState, QuotaLimits, QuotaSnapshot,
 };
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
@@ -116,7 +116,7 @@ pub(super) fn probe(
     mount: MountInfo,
     path: &Path,
     subject_id: u32,
-) -> Result<QuotaReport, ProbeError> {
+) -> Result<QuotaSnapshot, ProbeError> {
     require_rooted_mount_point(&mount)?;
     verify_statfs_is_lustre(&mount)?;
     let execution = capture(Path::new(LFS_BINARY), &mount, subject_id, LFS_TIMEOUT)?;
@@ -128,7 +128,7 @@ pub(super) fn probe(
     let parsed = parse(&stdout, &mount.mount_point, subject_id, observed_at_unix)
         .map_err(|reason| super::incomplete(&mount, reason))?;
     let scope = mount.scope(path);
-    Ok(QuotaReport::active(
+    Ok(QuotaSnapshot::active(
         scope,
         subject_id,
         ActiveQuota {

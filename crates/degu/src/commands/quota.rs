@@ -1,6 +1,4 @@
-mod model;
 mod output;
-mod platform;
 
 use crate::cli::QuotaArgs;
 use crate::commands::next_action::{self, OutputMode, Request, Workflow};
@@ -15,7 +13,7 @@ pub(crate) fn run(args: QuotaArgs, ui: Ui) -> Result<()> {
     let target_text = escape_terminal_text(&target.display().to_string());
     let canonical = std::fs::canonicalize(&target)
         .with_context(|| format!("quota target is unavailable: {target_text}"))?;
-    let report = platform::probe(&canonical)?;
+    let report = crate::quota::probe(&canonical)?;
     output::print(&report, json, ui)?;
     next_action::print(Request {
         output: output_mode(json, ui),

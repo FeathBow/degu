@@ -16,6 +16,7 @@ mod findings_table;
 mod lifecycle;
 mod output;
 mod presentation;
+mod quota;
 mod runtime;
 mod source_selection;
 mod value_parser;

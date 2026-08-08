@@ -281,6 +281,7 @@ name = "degu-core"
 version = "0.1.4"
 dependencies = [
  "degu-walk",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

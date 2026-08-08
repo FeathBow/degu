@@ -286,16 +286,14 @@ fn applied_sync_failure_is_reported_after_mutation_and_poisoned() {
 fn torn_final_frame_is_truncated_under_recovery_lock() {
     let temp = tempfile::tempdir().unwrap();
     let wal_path = temp.path().join("seal.wal");
-    let lock_path = temp.path().join("recovery.lock");
     let first = frame(&state(tx(7), TransactionState::Prepared));
     let second = frame(&state(tx(7), TransactionState::ParentSealIntent));
     let mut bytes = first.clone();
     bytes.extend_from_slice(&second[..second.len() - 3]);
     std::fs::write(&wal_path, bytes).unwrap();
 
-    let recovery = RecoverySession::try_acquire(open_rw(&lock_path)).unwrap();
-    let mut wal_file = open_rw(&wal_path);
-    let replay = recovery.replay_and_repair(&mut wal_file).unwrap();
+    let mut recovery = RecoverySession::try_acquire(open_rw(&wal_path)).unwrap();
+    let replay = recovery.replay_and_repair().unwrap();
     assert_eq!(
         replay.tail_repair,
         Some(TailRepair {
@@ -319,21 +317,19 @@ fn torn_tail_repair_positions_plain_file_for_resume_append_and_replay() {
     torn.extend_from_slice(&second[..second.len() - 2]);
     std::fs::write(&wal_path, torn).unwrap();
 
-    let recovery = RecoverySession::try_acquire(open_rw(&temp.path().join("lock"))).unwrap();
-    let mut file = open_rw(&wal_path); // deliberately not opened with O_APPEND
-    let replay = recovery.replay_and_repair(&mut file).unwrap();
+    let mut recovery = RecoverySession::try_acquire(open_rw(&wal_path)).unwrap();
+    let replay = recovery.replay_and_repair().unwrap();
     assert!(replay.tail_repair.is_some());
-    drop(file);
 
-    // A distinct ordinary descriptor starts at offset zero; resume must
-    // validate its length and position it at EOF before appending.
-    let file = open_rw(&wal_path);
-    let mut resumed = SealWal::resume(file, &replay).unwrap();
+    // Resume consumes the exact locked descriptor and retains its lease until
+    // the writer is dropped.
+    let mut resumed = recovery.resume().unwrap();
     resumed
         .transition(tx(20), TransactionState::ParentSealIntent)
         .unwrap();
-    let mut file = resumed.into_inner();
-    let replay = recovery.replay_and_repair(&mut file).unwrap();
+    drop(resumed);
+    let mut recovery = RecoverySession::try_acquire(open_rw(&wal_path)).unwrap();
+    let replay = recovery.replay_and_repair().unwrap();
     assert_eq!(
         replay.transactions[&tx(20)].state,
         TransactionState::ParentSealIntent
@@ -348,17 +344,18 @@ fn torn_tail_repair_positions_plain_file_for_resume_append_and_replay() {
 #[test]
 fn checksum_unknown_version_and_malformed_interior_fail_closed() {
     let temp = tempfile::tempdir().unwrap();
-    let lock = RecoverySession::try_acquire(open_rw(&temp.path().join("lock"))).unwrap();
     let good = frame(&state(tx(8), TransactionState::Prepared));
 
     let checksum_path = temp.path().join("checksum.wal");
     let mut checksum = good.clone();
     *checksum.last_mut().unwrap() ^= 1;
     std::fs::write(&checksum_path, &checksum).unwrap();
+    let mut lock = RecoverySession::try_acquire(open_rw(&checksum_path)).unwrap();
     assert!(matches!(
-        lock.replay_and_repair(&mut open_rw(&checksum_path)),
+        lock.replay_and_repair(),
         Err(ReplayError::Checksum { .. })
     ));
+    drop(lock);
     assert_eq!(std::fs::read(&checksum_path).unwrap(), checksum);
 
     let version_path = temp.path().join("version.wal");
@@ -367,18 +364,21 @@ fn checksum_unknown_version_and_malformed_interior_fail_closed() {
     let version_header_crc = crc32(&version[4..12]);
     version[12..16].copy_from_slice(&version_header_crc.to_le_bytes());
     std::fs::write(&version_path, &version).unwrap();
+    let mut lock = RecoverySession::try_acquire(open_rw(&version_path)).unwrap();
     assert!(matches!(
-        lock.replay_and_repair(&mut open_rw(&version_path)),
+        lock.replay_and_repair(),
         Err(ReplayError::UnknownVersion { version: 2, .. })
     ));
+    drop(lock);
 
     let interior_path = temp.path().join("interior.wal");
     let mut interior = good;
     interior.extend_from_slice(b"BAD!committed-looking-interior");
     interior.extend_from_slice(&frame(&state(tx(9), TransactionState::Prepared)));
     std::fs::write(&interior_path, &interior).unwrap();
+    let mut lock = RecoverySession::try_acquire(open_rw(&interior_path)).unwrap();
     assert!(matches!(
-        lock.replay_and_repair(&mut open_rw(&interior_path)),
+        lock.replay_and_repair(),
         Err(ReplayError::Malformed { .. })
     ));
     assert_eq!(std::fs::read(&interior_path).unwrap(), interior);
@@ -387,7 +387,6 @@ fn checksum_unknown_version_and_malformed_interior_fail_closed() {
 #[test]
 fn checksummed_frame_with_out_of_schema_mode_fails_closed() {
     let temp = tempfile::tempdir().unwrap();
-    let lock = RecoverySession::try_acquire(open_rw(&temp.path().join("lock"))).unwrap();
     let path = temp.path().join("high-mode.wal");
     let frame = frame(&SealRecord::PermissionIntent {
         transaction: tx(19),
@@ -398,9 +397,9 @@ fn checksummed_frame_with_out_of_schema_mode_fails_closed() {
         reverses_mutation_id: None,
     });
     std::fs::write(&path, &frame).unwrap();
-    let mut wal = open_rw(&path);
+    let mut lock = RecoverySession::try_acquire(open_rw(&path)).unwrap();
     assert!(matches!(
-        lock.replay_and_repair(&mut wal),
+        lock.replay_and_repair(),
         Err(ReplayError::Malformed {
             reason: "permission mode exceeds the supported mode-bit schema",
             ..
@@ -420,6 +419,20 @@ fn recovery_lock_is_exclusive_and_nonblocking() {
     ));
     drop(first);
     RecoverySession::try_acquire(open_rw(&path)).unwrap();
+}
+
+#[test]
+fn recovery_drop_unlocks_a_fork_inherited_file_description() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("inherited-lock");
+    let file = open_rw(&path);
+    let inherited = file.try_clone().unwrap();
+    let session = RecoverySession::try_acquire(file).unwrap();
+
+    drop(session);
+    RecoverySession::try_acquire(open_rw(&path)).unwrap();
+
+    drop(inherited);
 }
 
 fn replayed(state: TransactionState) -> ReplayedTransaction {
@@ -740,15 +753,16 @@ fn inverse_binding_rejects_changed_stable_identity_and_cross_transaction_matches
 #[test]
 fn oversized_wal_fails_closed_without_allocating_its_claimed_size() {
     let temp = tempfile::tempdir().unwrap();
-    let lock = RecoverySession::try_acquire(open_rw(&temp.path().join("lock"))).unwrap();
     let path = temp.path().join("oversized.wal");
-    let mut wal = open_rw(&path);
+    let wal = open_rw(&path);
     wal.set_len(MAX_WAL_LEN + 1).unwrap();
+    drop(wal);
+    let mut lock = RecoverySession::try_acquire(open_rw(&path)).unwrap();
     assert!(matches!(
-        lock.replay_and_repair(&mut wal),
+        lock.replay_and_repair(),
         Err(ReplayError::TooLarge { limit: MAX_WAL_LEN })
     ));
-    assert_eq!(wal.metadata().unwrap().len(), MAX_WAL_LEN + 1);
+    assert_eq!(std::fs::metadata(path).unwrap().len(), MAX_WAL_LEN + 1);
 }
 
 #[test]
@@ -1072,13 +1086,13 @@ fn unknown_intent_only_produces_resolution_work_and_can_stop_recovery() {
 #[test]
 fn protected_header_length_corruption_fails_closed_without_truncation() {
     let temp = tempfile::tempdir().unwrap();
-    let lock = RecoverySession::try_acquire(open_rw(&temp.path().join("lock"))).unwrap();
     let path = temp.path().join("length.wal");
     let mut corrupted = frame(&state(tx(24), TransactionState::Prepared));
     corrupted[8] ^= 0x40;
     std::fs::write(&path, &corrupted).unwrap();
+    let mut lock = RecoverySession::try_acquire(open_rw(&path)).unwrap();
     assert!(matches!(
-        lock.replay_and_repair(&mut open_rw(&path)),
+        lock.replay_and_repair(),
         Err(ReplayError::HeaderChecksum { .. })
     ));
     assert_eq!(std::fs::read(path).unwrap(), corrupted);

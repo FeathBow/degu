@@ -5,7 +5,7 @@
 //! statx mount-id, `/proc/self/mountinfo` filesystem type, and fstatfs magic all
 //! agree; macOS accepts APFS only. No chmod or cleanup operation lives here.
 
-use rustix::fd::OwnedFd;
+use rustix::fd::{AsFd, OwnedFd};
 use std::collections::BTreeSet;
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -172,6 +172,48 @@ impl HeldLocalBackendEvidence {
     }
 }
 
+/// Certifies only the local filesystem backend of an already-held object. This
+/// does not certify type, ownership, mode, or ACL absence.
+#[cfg(target_os = "linux")]
+pub fn certify_held_fd_backend<Fd: AsFd>(
+    fd: Fd,
+) -> Result<CertifiedLocalBackend, CertificationError> {
+    use rustix::fs::{AtFlags, StatxFlags};
+
+    let statx = rustix::fs::statx(fd.as_fd(), c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)
+        .map_err(|_| CertificationError::MountIdentityUnavailable)?;
+    if !StatxFlags::from_bits_retain(statx.stx_mask).contains(StatxFlags::MNT_ID) {
+        return Err(CertificationError::MountIdentityUnavailable);
+    }
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|_| CertificationError::MountInfoUnreadable)?;
+    let statfs =
+        rustix::fs::fstatfs(fd.as_fd()).map_err(|_| CertificationError::InspectionFailed)?;
+    certify_linux_mount(statx.stx_mnt_id, &mountinfo, statfs.f_type as u64)
+}
+
+#[cfg(target_os = "macos")]
+pub fn certify_held_fd_backend<Fd: AsFd>(
+    fd: Fd,
+) -> Result<CertifiedLocalBackend, CertificationError> {
+    let statfs =
+        rustix::fs::fstatfs(fd.as_fd()).map_err(|_| CertificationError::InspectionFailed)?;
+    let filesystem_name = statfs
+        .f_fstypename
+        .iter()
+        .map(|byte| *byte as u8)
+        .take_while(|byte| *byte != 0)
+        .collect::<Vec<_>>();
+    certify_macos_filesystem_name(&filesystem_name)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn certify_held_fd_backend<Fd: AsFd>(
+    _fd: Fd,
+) -> Result<CertifiedLocalBackend, CertificationError> {
+    Err(CertificationError::UnsupportedPlatform)
+}
+
 /// Certify an already-held descriptor. Path-level filesystem classification is
 /// never accepted as a substitute for this object-relative probe.
 #[cfg(target_os = "linux")]
@@ -220,7 +262,7 @@ fn finish_certification(
     if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
         return Err(CertificationError::NotDirectory);
     }
-    require_acl_absent(probe_acl(fd.as_raw_fd()))?;
+    require_held_fd_acl_absent(&fd)?;
     let effective_uid = rustix::process::geteuid().as_raw();
     let mut effective_groups = rustix::process::getgroups()
         .map_err(|_| CertificationError::ProcessCredentialsUnavailable)?
@@ -251,6 +293,13 @@ enum AclProbe {
     Unknown,
 }
 
+/// Requires that an already-held object have no access/default POSIX ACL on
+/// Linux and no extended ACL on macOS. Probe errors and unsupported platforms
+/// are uncertainty and therefore fail closed.
+pub fn require_held_fd_acl_absent<Fd: AsFd>(fd: Fd) -> Result<(), CertificationError> {
+    require_acl_absent(probe_acl(fd.as_fd().as_raw_fd()))
+}
+
 fn require_acl_absent(probe: AclProbe) -> Result<(), CertificationError> {
     match probe {
         AclProbe::Absent => Ok(()),
@@ -259,12 +308,8 @@ fn require_acl_absent(probe: AclProbe) -> Result<(), CertificationError> {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn probe_acl(fd: RawFd) -> AclProbe {
-    let probes = [
-        probe_linux_xattr(fd, c"system.posix_acl_access"),
-        probe_linux_xattr(fd, c"system.posix_acl_default"),
-    ];
+#[cfg(any(target_os = "linux", test))]
+fn combine_acl_probes(probes: &[AclProbe]) -> AclProbe {
     if probes.contains(&AclProbe::Present) {
         AclProbe::Present
     } else if probes.contains(&AclProbe::Unknown) {
@@ -272,6 +317,14 @@ fn probe_acl(fd: RawFd) -> AclProbe {
     } else {
         AclProbe::Absent
     }
+}
+
+#[cfg(target_os = "linux")]
+fn probe_acl(fd: RawFd) -> AclProbe {
+    combine_acl_probes(&[
+        probe_linux_xattr(fd, c"system.posix_acl_access"),
+        probe_linux_xattr(fd, c"system.posix_acl_default"),
+    ])
 }
 
 #[cfg(target_os = "linux")]
@@ -388,6 +441,19 @@ mod tests {
                 "filesystem {name}"
             );
         }
+    }
+
+    #[test]
+    fn acl_probe_combination_is_hermetic_and_fail_closed() {
+        assert_eq!(combine_acl_probes(&[AclProbe::Absent]), AclProbe::Absent);
+        assert_eq!(
+            combine_acl_probes(&[AclProbe::Absent, AclProbe::Unknown]),
+            AclProbe::Unknown
+        );
+        assert_eq!(
+            combine_acl_probes(&[AclProbe::Unknown, AclProbe::Present]),
+            AclProbe::Present
+        );
     }
 
     #[test]

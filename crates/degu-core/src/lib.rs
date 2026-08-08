@@ -15,3 +15,4 @@ pub mod finding;
 pub mod oplog;
 pub mod plan;
 pub mod safety;
+pub mod seal_wal;

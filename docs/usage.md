@@ -124,4 +124,19 @@ cat "$relocate_script"
 
 Add the reviewed export lines to your shell profile to direct future logins to the same cache paths. Existing data stays in place.
 
+By default, `degu relocate TARGET` performs no filesystem mutation. To initialize the proposed cache roots before receiving the script, opt in with `--init`:
+
+```sh
+relocate_script=$(mktemp "${TMPDIR:-/tmp}/degu-relocate.XXXXXX")
+degu relocate --init "/scratch/$USER/degu-cache" > "$relocate_script"
+```
+
+`--init` creates only the exact cache roots named by cache-specific relocation exports, with mode `0700`, and writes a standard `CACHEDIR.TAG` with mode `0600` in each root. It does not tag the target base, initialize mixed-state homes such as `HF_HOME` or `CARGO_HOME`, move existing cache contents, or edit shell profiles. A pre-existing cache root is accepted only when it is already safely owned and carries a valid, safely owned `CACHEDIR.TAG`; an untagged pre-existing directory is rejected even when empty.
+
+The target's parent must already exist; `--init` does not create missing ancestor directories, so create the parent yourself first (for example `mkdir -m 700 -p /scratch/$USER`). degu resolves the target one component at a time and requires every directory it descends into — each lexical ancestor and each directory a followed symlink resolves through — to be a namespace that grants no foreign mutation authority, so no other user can rename a component or re-point a symlink to redirect the target. A namespace qualifies when it is owned by you or root and is not group- or other-writable unless it is sticky (as `/tmp` is); under a sticky parent each traversed entry must additionally be owned by you or root. Intermediate symlinks are permitted only when degu can authenticate both the symlink's own binding and its complete resolved target chain this way, which admits root-managed system links (`/var`, `/tmp`) and admin- or user-managed scratch links while refusing anything reachable through a group-writable, non-sticky directory.
+
+`--init` guarantees ownership and modes only at initialization time. Cache tools you run later create their own descendants under your ambient umask, so with `umask 002` or `007` a tool that requests broad permissions typically leaves group-writable descendants (`0775`/`0770`). degu's scan and clean stay conservative about group-writable trees, so such a populated cache is reported but not eligible for cleaning until a scoped cooperative-group trust policy lands. `--init` does not by itself make a group-writable relocated cache cleanable.
+
+Initialization is transactional over the filesystem: degu validates the full relocation plan before creating anything, and on any failure through the final target-binding re-check it prints no sourceable exports and removes only entries created by that invocation whose recorded identities still match — a rollback failure is reported with every known residual path. Once every root is initialized and the target still resolves to the initialized directory, the transaction commits; if writing the report or script then fails, the completed roots are left in place, since they already form a valid, idempotent state that a re-run reports as already initialized. With `--init --json`, the otherwise unchanged relocation report also includes an `initialization` object listing the newly created and already initialized cache-root paths.
+
 Use `degu <command> --help`, `degu man <command>`, or the corresponding shipped page for the complete command-line reference. Nested pages use the full command path, such as `degu man trash purge`.

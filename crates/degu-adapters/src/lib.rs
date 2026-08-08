@@ -105,7 +105,10 @@ pub(crate) fn first_present(
 pub const ARTIFACT_SOURCE_ID: &str = artifacts::SOURCE_ID;
 pub const CHECKPOINT_SOURCE_ID: &str = checkpoints::SOURCE_ID;
 pub const PROJECT_SOURCE_IDS: [&str; 2] = [ARTIFACT_SOURCE_ID, CHECKPOINT_SOURCE_ID];
-pub use cachedir_tag::{Probe as CachedirTagProbe, has_valid_cachedir_tag, probe_for_scheduling};
+pub use cachedir_tag::{
+    Probe as CachedirTagProbe, SIGNATURE_PROBE_LEN, has_valid_cachedir_tag, prefix_has_signature,
+    probe_for_scheduling,
+};
 
 pub(crate) use roots::{resolve_existing_roots, validate_root_path};
 

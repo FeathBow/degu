@@ -2,7 +2,7 @@
 //!
 //! This module is intentionally disconnected from planning, staging, cleanup,
 //! and purge. Its output is descriptive evidence only and can never construct
-//! `MutationUnitAuthority` or `PurgeAuthority`.
+//! `MutationUnitAuthority` or object-bound purge authority.
 
 use super::{
     AuthorityBackend, AuthorityControlRights, AuthorityControllerExposure, CapabilityAcquisition,

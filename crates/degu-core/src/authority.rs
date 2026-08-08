@@ -516,6 +516,8 @@ pub enum TransactionState {
     TreeSealed,
     RenameIntent,
     StagedUnverified,
+    SourceParentRestoreIntent,
+    SourceParentRestored,
     StagedSealed,
     VerifiedCommitted,
     Purgeable,
@@ -534,21 +536,6 @@ impl TransactionState {
             self,
             Self::VerifiedCommitted | Self::Purgeable | Self::Purged
         )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PurgeAuthority(());
-
-impl TryFrom<TransactionState> for PurgeAuthority {
-    type Error = TransactionState;
-
-    fn try_from(state: TransactionState) -> Result<Self, Self::Error> {
-        if state == TransactionState::Purgeable {
-            Ok(Self(()))
-        } else {
-            Err(state)
-        }
     }
 }
 
@@ -729,18 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn purge_and_writer_acceptance_follow_committed_state() {
-        for state in [
-            TransactionState::Prepared,
-            TransactionState::TreeSealed,
-            TransactionState::StagedSealed,
-            TransactionState::VerifiedCommitted,
-            TransactionState::Purged,
-            TransactionState::RecoveryRequired,
-        ] {
-            assert_eq!(PurgeAuthority::try_from(state), Err(state));
-        }
-        assert!(PurgeAuthority::try_from(TransactionState::Purgeable).is_ok());
+    fn writer_acceptance_expires_only_after_commit() {
         assert!(TransactionState::VerifiedCommitted.writer_acceptance_expired());
         assert!(!TransactionState::StagedSealed.writer_acceptance_expired());
     }

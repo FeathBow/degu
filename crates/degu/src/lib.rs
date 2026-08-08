@@ -3,6 +3,9 @@
 //!
 //! Output discipline: stdout carries command data only; diagnostics and logs go to stderr so machine-readable output remains pipe-safe.
 
+#[allow(dead_code)]
+// Contract types only; the cleanup lifecycle and quota-observation wiring land separately.
+mod action_result;
 mod cli;
 mod collection;
 mod commands;

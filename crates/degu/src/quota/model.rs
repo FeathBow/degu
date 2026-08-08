@@ -2,19 +2,19 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize)]
-pub(super) struct QuotaReport {
-    pub(super) scope: QuotaScope,
-    pub(super) subject: QuotaSubject,
-    pub(super) provider: &'static str,
-    pub(super) data_source: &'static str,
-    pub(super) state: &'static str,
-    pub(super) space: QuotaDimension,
-    pub(super) inodes: QuotaDimension,
+pub(crate) struct QuotaSnapshot {
+    pub(crate) scope: QuotaScope,
+    pub(crate) subject: QuotaSubject,
+    pub(crate) provider: &'static str,
+    pub(crate) data_source: &'static str,
+    pub(crate) state: &'static str,
+    pub(crate) space: QuotaDimension,
+    pub(crate) inodes: QuotaDimension,
 }
 
 #[cfg(any(target_os = "linux", test))]
-impl QuotaReport {
-    pub(super) fn active(scope: QuotaScope, subject_id: u32, quota: ActiveQuota) -> Self {
+impl QuotaSnapshot {
+    pub(crate) fn active(scope: QuotaScope, subject_id: u32, quota: ActiveQuota) -> Self {
         Self {
             scope,
             subject: QuotaSubject::user(subject_id),
@@ -28,23 +28,23 @@ impl QuotaReport {
 }
 
 #[cfg(any(target_os = "linux", test))]
-pub(super) struct ActiveQuota {
-    pub(super) provider: &'static str,
-    pub(super) data_source: &'static str,
-    pub(super) space: QuotaDimension,
-    pub(super) inodes: QuotaDimension,
+pub(crate) struct ActiveQuota {
+    pub(crate) provider: &'static str,
+    pub(crate) data_source: &'static str,
+    pub(crate) space: QuotaDimension,
+    pub(crate) inodes: QuotaDimension,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct QuotaScope {
-    pub(super) path: PathBuf,
-    pub(super) mount_point: PathBuf,
-    pub(super) filesystem: String,
+pub(crate) struct QuotaScope {
+    pub(crate) path: PathBuf,
+    pub(crate) mount_point: PathBuf,
+    pub(crate) filesystem: String,
 }
 
 #[cfg(any(target_os = "linux", test))]
 impl QuotaScope {
-    pub(super) fn new(path: PathBuf, mount_point: PathBuf, filesystem: String) -> Self {
+    pub(crate) fn new(path: PathBuf, mount_point: PathBuf, filesystem: String) -> Self {
         Self {
             path,
             mount_point,
@@ -54,9 +54,9 @@ impl QuotaScope {
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct QuotaSubject {
-    pub(super) kind: &'static str,
-    pub(super) id: u32,
+pub(crate) struct QuotaSubject {
+    pub(crate) kind: &'static str,
+    pub(crate) id: u32,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -67,18 +67,18 @@ impl QuotaSubject {
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct QuotaDimension {
-    pub(super) used: u64,
-    pub(super) soft_limit: Option<u64>,
-    pub(super) hard_limit: Option<u64>,
-    pub(super) headroom_to_soft_limit: Option<u64>,
-    pub(super) headroom_to_hard_limit: Option<u64>,
-    pub(super) grace: Option<QuotaGrace>,
+pub(crate) struct QuotaDimension {
+    pub(crate) used: u64,
+    pub(crate) soft_limit: Option<u64>,
+    pub(crate) hard_limit: Option<u64>,
+    pub(crate) headroom_to_soft_limit: Option<u64>,
+    pub(crate) headroom_to_hard_limit: Option<u64>,
+    pub(crate) grace: Option<QuotaGrace>,
 }
 
 #[cfg(any(target_os = "linux", test))]
 impl QuotaDimension {
-    pub(super) fn new(used: u64, limits: QuotaLimits, grace: Option<QuotaGrace>) -> Self {
+    pub(crate) fn new(used: u64, limits: QuotaLimits, grace: Option<QuotaGrace>) -> Self {
         let soft_limit = nonzero_limit(limits.soft);
         let hard_limit = nonzero_limit(limits.hard);
         Self {
@@ -93,18 +93,18 @@ impl QuotaDimension {
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct QuotaGrace {
-    pub(super) state: QuotaGraceState,
+pub(crate) struct QuotaGrace {
+    pub(crate) state: QuotaGraceState,
     /// `None` means the provider reported an expired grace period without a
     /// deadline (Lustre prints `none` or `expired`); degu never synthesizes
     /// one. Serialized as an explicit `null`: the key is part of the frozen
     /// JSON contract and must never be omitted.
-    pub(super) expires_at_unix: Option<u64>,
+    pub(crate) expires_at_unix: Option<u64>,
 }
 
 #[cfg(any(target_os = "linux", test))]
 impl QuotaGrace {
-    pub(super) fn from_kernel_deadline(deadline: u64, observed_at_unix: u64) -> Option<Self> {
+    pub(crate) fn from_kernel_deadline(deadline: u64, observed_at_unix: u64) -> Option<Self> {
         nonzero_limit(deadline).map(|expires_at_unix| Self {
             state: if expires_at_unix > observed_at_unix {
                 QuotaGraceState::Active
@@ -118,7 +118,7 @@ impl QuotaGrace {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum QuotaGraceState {
+pub(crate) enum QuotaGraceState {
     #[cfg_attr(all(not(target_os = "linux"), not(test)), allow(dead_code))]
     Active,
     #[cfg_attr(all(not(target_os = "linux"), not(test)), allow(dead_code))]
@@ -126,14 +126,14 @@ pub(super) enum QuotaGraceState {
 }
 
 #[cfg(any(target_os = "linux", test))]
-pub(super) struct QuotaLimits {
-    pub(super) soft: u64,
-    pub(super) hard: u64,
+pub(crate) struct QuotaLimits {
+    pub(crate) soft: u64,
+    pub(crate) hard: u64,
 }
 
 #[cfg(any(target_os = "linux", test))]
 impl QuotaLimits {
-    pub(super) fn new(soft: u64, hard: u64) -> Self {
+    pub(crate) fn new(soft: u64, hard: u64) -> Self {
         Self { soft, hard }
     }
 }
@@ -151,8 +151,8 @@ fn headroom(limit: Option<u64>, used: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveQuota, QuotaDimension, QuotaGrace, QuotaGraceState, QuotaLimits, QuotaReport,
-        QuotaScope,
+        ActiveQuota, QuotaDimension, QuotaGrace, QuotaGraceState, QuotaLimits, QuotaScope,
+        QuotaSnapshot,
     };
     use std::path::PathBuf;
 
@@ -235,7 +235,7 @@ mod tests {
             PathBuf::from("/home"),
             "ext4".to_owned(),
         );
-        let report = QuotaReport::active(
+        let report = QuotaSnapshot::active(
             scope,
             1000,
             ActiveQuota {

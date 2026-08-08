@@ -1,9 +1,7 @@
 mod lustre;
 
 use super::{MountInfo, ProbeError};
-use crate::commands::quota::model::{
-    ActiveQuota, QuotaDimension, QuotaGrace, QuotaLimits, QuotaReport,
-};
+use crate::quota::model::{ActiveQuota, QuotaDimension, QuotaGrace, QuotaLimits, QuotaSnapshot};
 use std::ffi::{CString, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -25,7 +23,7 @@ struct QueryResult {
     inodes: QuotaDimension,
 }
 
-pub(super) fn probe(path: &Path) -> Result<QuotaReport, ProbeError> {
+pub(super) fn probe(path: &Path) -> Result<QuotaSnapshot, ProbeError> {
     let mount = inspect_mount(path)?;
     // SAFETY: geteuid has no preconditions and does not mutate process state.
     let subject_id = unsafe { libc::geteuid() };
@@ -36,10 +34,10 @@ pub(super) fn probe(path: &Path) -> Result<QuotaReport, ProbeError> {
     }
 }
 
-fn probe_vfs(mount: MountInfo, path: &Path, subject_id: u32) -> Result<QuotaReport, ProbeError> {
+fn probe_vfs(mount: MountInfo, path: &Path, subject_id: u32) -> Result<QuotaSnapshot, ProbeError> {
     let result = query_current_user(&mount, subject_id)?;
     let scope = mount.scope(path);
-    Ok(QuotaReport::active(
+    Ok(QuotaSnapshot::active(
         scope,
         subject_id,
         ActiveQuota {
@@ -225,7 +223,7 @@ mod tests {
     use super::{
         MountInfo, ProbeError, QueryResult, classify_error, incomplete, normalize, parse_mountinfo,
     };
-    use crate::commands::quota::model::QuotaGraceState;
+    use crate::quota::model::QuotaGraceState;
     use std::path::{Path, PathBuf};
 
     #[test]

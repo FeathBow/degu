@@ -3,9 +3,9 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
-use super::model::QuotaReport;
 #[cfg(target_os = "linux")]
 use super::model::QuotaScope;
+use super::model::QuotaSnapshot;
 use crate::presentation::escape_terminal_text as escaped;
 use std::fmt;
 use std::path::Path;
@@ -29,7 +29,7 @@ impl MountInfo {
 }
 
 #[derive(Debug)]
-pub(super) enum ProbeError {
+pub(crate) enum ProbeError {
     #[cfg(target_os = "linux")]
     NotConfigured {
         filesystem: String,
@@ -161,17 +161,17 @@ fn failure_fields(error: &ProbeError) -> (&'static str, &str, &str, &str) {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn probe(path: &Path) -> Result<QuotaReport, ProbeError> {
+pub(super) fn probe(path: &Path) -> Result<QuotaSnapshot, ProbeError> {
     linux::probe(path)
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn probe(path: &Path) -> Result<QuotaReport, ProbeError> {
+pub(super) fn probe(path: &Path) -> Result<QuotaSnapshot, ProbeError> {
     macos::probe(path)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(super) fn probe(path: &Path) -> Result<QuotaReport, ProbeError> {
+pub(super) fn probe(path: &Path) -> Result<QuotaSnapshot, ProbeError> {
     Err(ProbeError::Unsupported {
         filesystem: "unknown".to_owned(),
         mount_point: path.display().to_string(),

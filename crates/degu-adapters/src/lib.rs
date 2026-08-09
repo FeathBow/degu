@@ -19,6 +19,7 @@ mod huggingface;
 mod inductor;
 mod jax;
 mod modelscope;
+pub mod native;
 mod npm;
 mod ollama;
 mod orbstack;
@@ -225,6 +226,7 @@ pub enum AdapterScope {
 pub struct RegisteredAdapter {
     ecosystem: Box<dyn Ecosystem>,
     scope: AdapterScope,
+    native_cleanup: Option<Box<dyn native::NativeCleanupCapability>>,
 }
 
 impl RegisteredAdapter {
@@ -232,6 +234,20 @@ impl RegisteredAdapter {
         Self {
             ecosystem: Box::new(ecosystem),
             scope,
+            native_cleanup: None,
+        }
+    }
+
+    #[allow(dead_code)] // no adapter registers a native capability yet; only tests construct one
+    fn with_native_cleanup(
+        ecosystem: impl Ecosystem + 'static,
+        scope: AdapterScope,
+        native_cleanup: impl native::NativeCleanupCapability + 'static,
+    ) -> Self {
+        Self {
+            ecosystem: Box::new(ecosystem),
+            scope,
+            native_cleanup: Some(Box::new(native_cleanup)),
         }
     }
 
@@ -245,6 +261,26 @@ impl RegisteredAdapter {
 
     pub fn ecosystem(&self) -> &dyn Ecosystem {
         self.ecosystem.as_ref()
+    }
+
+    /// Invokes the separately registered native declaration capability once
+    /// over one frozen context/root snapshot. Discovery alone never supplies it.
+    pub fn declare_native_cleanup(
+        &self,
+        ctx: &DetectCtx,
+        frozen_roots: &[Root],
+    ) -> Result<Option<native::NativeActionRequest>, native::NativeCapabilityError> {
+        let Some(capability) = &self.native_cleanup else {
+            return Ok(None);
+        };
+        let request = capability.declare(ctx, frozen_roots)?;
+        if request.identity().adapter_id() != self.id() {
+            return Err(native::NativeCapabilityError::AdapterIdentityMismatch {
+                expected: self.id(),
+                actual: request.identity().adapter_id().to_owned(),
+            });
+        }
+        Ok(Some(request))
     }
 }
 
@@ -293,6 +329,124 @@ mod tests {
         let mut ctx = DetectCtx::from_process().unwrap();
         ctx.home = home.to_path_buf();
         ctx
+    }
+
+    struct FakeEcosystem;
+
+    impl Ecosystem for FakeEcosystem {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        fn roots(&self, _ctx: &DetectCtx) -> RootOutcome {
+            RootOutcome::default()
+        }
+
+        fn scan(&self, _root: &Root, _ctx: &DetectCtx) -> ScanOutcome {
+            ScanOutcome::default()
+        }
+
+        fn stated_facts(&self, _root: &Root) -> FindingFacts {
+            (
+                degu_core::finding::Recovery::Regenerable {
+                    cost: degu_core::finding::RegenCost::Cheap,
+                },
+                degu_core::finding::Ownership::Standalone,
+                None,
+            )
+        }
+    }
+
+    struct FakeNative {
+        adapter_id: &'static str,
+    }
+
+    impl native::NativeCleanupCapability for FakeNative {
+        fn declare(
+            &self,
+            _ctx: &DetectCtx,
+            frozen_roots: &[Root],
+        ) -> Result<native::NativeActionRequest, native::NativeCapabilityError> {
+            Ok(native::NativeActionRequest::new(
+                native::NativeActionIdentity::new(self.adapter_id, "prune")?,
+                std::path::PathBuf::from("/usr/bin/fake"),
+                [std::ffi::OsString::from("prune")],
+                native::NativeEnvironmentRequest::clear(),
+                native::NativeProcessContract::AuditedCooperativeProcessGroup,
+                Duration::from_secs(1),
+                16,
+                16,
+                frozen_roots.iter().map(|root| root.path.clone()),
+            )?)
+        }
+    }
+
+    #[test]
+    fn production_registry_is_discovery_only_by_default() {
+        let ctx = DetectCtx::for_test(
+            std::path::PathBuf::from("/missing-home"),
+            [] as [(&str, &str); 0],
+        );
+        let adapters = all();
+        assert!(
+            !adapters.is_empty(),
+            "an empty registry would pass vacuously"
+        );
+        assert!(adapters.iter().all(|adapter| {
+            adapter
+                .declare_native_cleanup(&ctx, &[])
+                .expect("absence is not an error")
+                .is_none()
+        }));
+    }
+
+    #[test]
+    fn separate_capability_declares_from_the_exact_frozen_roots_handed_in() {
+        let adapter = RegisteredAdapter::with_native_cleanup(
+            FakeEcosystem,
+            AdapterScope::Cache,
+            FakeNative { adapter_id: "fake" },
+        );
+        let ctx = DetectCtx::for_test(
+            std::path::PathBuf::from("/missing-home"),
+            [] as [(&str, &str); 0],
+        );
+        let roots = [
+            Root::well_known(std::path::PathBuf::from("/frozen/one")),
+            Root::well_known(std::path::PathBuf::from("/frozen/two")),
+        ];
+        let request = adapter
+            .declare_native_cleanup(&ctx, &roots)
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.identity().adapter_id(), "fake");
+        assert_eq!(request.identity().action_id(), "prune");
+        assert_eq!(
+            request.observation_requests(),
+            &[
+                std::path::PathBuf::from("/frozen/one"),
+                std::path::PathBuf::from("/frozen/two"),
+            ]
+        );
+    }
+
+    #[test]
+    fn registration_rejects_capability_identity_mismatch() {
+        let adapter = RegisteredAdapter::with_native_cleanup(
+            FakeEcosystem,
+            AdapterScope::Cache,
+            FakeNative {
+                adapter_id: "other",
+            },
+        );
+        let ctx = DetectCtx::for_test(
+            std::path::PathBuf::from("/missing-home"),
+            [] as [(&str, &str); 0],
+        );
+        assert!(matches!(
+            adapter.declare_native_cleanup(&ctx, &[]),
+            Err(native::NativeCapabilityError::AdapterIdentityMismatch { .. })
+        ));
     }
 
     #[cfg(target_os = "macos")]

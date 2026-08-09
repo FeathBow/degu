@@ -269,15 +269,22 @@ impl RegisteredAdapter {
         &self,
         ctx: &DetectCtx,
         frozen_roots: &[Root],
+        executable: &native::NativeExecutableSelection,
     ) -> Result<Option<native::NativeActionRequest>, native::NativeCapabilityError> {
         let Some(capability) = &self.native_cleanup else {
             return Ok(None);
         };
-        let request = capability.declare(ctx, frozen_roots)?;
+        let request = capability.declare(ctx, frozen_roots, executable)?;
         if request.identity().adapter_id() != self.id() {
             return Err(native::NativeCapabilityError::AdapterIdentityMismatch {
                 expected: self.id(),
                 actual: request.identity().adapter_id().to_owned(),
+            });
+        }
+        if request.executable() != executable.as_path() {
+            return Err(native::NativeCapabilityError::ExecutableSelectionMismatch {
+                expected: executable.as_path().to_path_buf(),
+                actual: request.executable().to_path_buf(),
             });
         }
         Ok(Some(request))
@@ -361,15 +368,21 @@ mod tests {
         adapter_id: &'static str,
     }
 
+    fn fake_executable() -> native::NativeExecutableSelection {
+        native::NativeExecutableSelection::explicit(std::path::PathBuf::from("/usr/bin/fake"))
+            .unwrap()
+    }
+
     impl native::NativeCleanupCapability for FakeNative {
         fn declare(
             &self,
             _ctx: &DetectCtx,
             frozen_roots: &[Root],
+            executable: &native::NativeExecutableSelection,
         ) -> Result<native::NativeActionRequest, native::NativeCapabilityError> {
             Ok(native::NativeActionRequest::new(
                 native::NativeActionIdentity::new(self.adapter_id, "prune")?,
-                std::path::PathBuf::from("/usr/bin/fake"),
+                executable.clone(),
                 [std::ffi::OsString::from("prune")],
                 native::NativeEnvironmentRequest::clear(),
                 native::NativeProcessContract::AuditedCooperativeProcessGroup,
@@ -377,6 +390,31 @@ mod tests {
                 16,
                 16,
                 frozen_roots.iter().map(|root| root.path.clone()),
+            )?)
+        }
+    }
+
+    struct SubstitutingNative;
+
+    impl native::NativeCleanupCapability for SubstitutingNative {
+        fn declare(
+            &self,
+            _ctx: &DetectCtx,
+            _frozen_roots: &[Root],
+            _executable: &native::NativeExecutableSelection,
+        ) -> Result<native::NativeActionRequest, native::NativeCapabilityError> {
+            Ok(native::NativeActionRequest::new(
+                native::NativeActionIdentity::new("fake", "prune")?,
+                native::NativeExecutableSelection::explicit(std::path::PathBuf::from(
+                    "/usr/bin/substitute",
+                ))?,
+                [std::ffi::OsString::from("prune")],
+                native::NativeEnvironmentRequest::clear(),
+                native::NativeProcessContract::AuditedCooperativeProcessGroup,
+                Duration::from_secs(1),
+                16,
+                16,
+                [],
             )?)
         }
     }
@@ -394,7 +432,7 @@ mod tests {
         );
         assert!(adapters.iter().all(|adapter| {
             adapter
-                .declare_native_cleanup(&ctx, &[])
+                .declare_native_cleanup(&ctx, &[], &fake_executable())
                 .expect("absence is not an error")
                 .is_none()
         }));
@@ -416,7 +454,7 @@ mod tests {
             Root::well_known(std::path::PathBuf::from("/frozen/two")),
         ];
         let request = adapter
-            .declare_native_cleanup(&ctx, &roots)
+            .declare_native_cleanup(&ctx, &roots, &fake_executable())
             .unwrap()
             .unwrap();
         assert_eq!(request.identity().adapter_id(), "fake");
@@ -444,9 +482,32 @@ mod tests {
             [] as [(&str, &str); 0],
         );
         assert!(matches!(
-            adapter.declare_native_cleanup(&ctx, &[]),
+            adapter.declare_native_cleanup(&ctx, &[], &fake_executable()),
             Err(native::NativeCapabilityError::AdapterIdentityMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn registration_rejects_capability_executable_substitution() {
+        let adapter = RegisteredAdapter::with_native_cleanup(
+            FakeEcosystem,
+            AdapterScope::Cache,
+            SubstitutingNative,
+        );
+        let ctx = DetectCtx::for_test(
+            std::path::PathBuf::from("/missing-home"),
+            [] as [(&str, &str); 0],
+        );
+        match adapter.declare_native_cleanup(&ctx, &[], &fake_executable()) {
+            Err(native::NativeCapabilityError::ExecutableSelectionMismatch {
+                expected,
+                actual,
+            }) => {
+                assert_eq!(expected, std::path::PathBuf::from("/usr/bin/fake"));
+                assert_eq!(actual, std::path::PathBuf::from("/usr/bin/substitute"));
+            }
+            other => panic!("expected ExecutableSelectionMismatch, got {other:?}"),
+        }
     }
 
     #[cfg(target_os = "macos")]

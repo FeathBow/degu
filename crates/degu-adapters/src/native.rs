@@ -262,6 +262,8 @@ pub enum NativeRequestError {
 pub enum NativeCapabilityError {
     #[error("native declaration failed: {0}")]
     Declaration(#[from] NativeRequestError),
+    #[error("native capability rejected the frozen root set: {0}")]
+    InvalidFrozenRoots(&'static str),
     #[error("native capability returned adapter id {actual:?}, expected {expected:?}")]
     AdapterIdentityMismatch {
         expected: &'static str,

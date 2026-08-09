@@ -14,8 +14,49 @@ fn run(args: &[&str]) -> Output {
         .unwrap()
 }
 
+#[cfg(unix)]
 #[test]
-fn mutating_reclaim_is_structurally_unavailable() {
+fn closed_json_stdout_stops_before_version_probe_or_mutation_transition() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+
+    let home = tempfile::tempdir().unwrap();
+    let (reader, writer) = UnixStream::pair().unwrap();
+    drop(reader);
+    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("degu"))
+        .env_clear()
+        .env("HOME", home.path())
+        .env("LOGNAME", "degu-test")
+        .env("DEGU_ALLOW_ROOT", "1")
+        .args([
+            "reclaim",
+            "uv",
+            "--executable",
+            "/definitely/missing/uv",
+            "--cache-dir",
+            "/definitely/missing/cache",
+            "--yes",
+            "--json",
+        ])
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("failed to inspect selected uv executable"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn mutating_reclaim_with_yes_enters_only_the_bounded_preflight_for_a_missing_binary() {
     let output = run(&[
         "reclaim",
         "uv",
@@ -29,10 +70,14 @@ fn mutating_reclaim_is_structurally_unavailable() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("execution is not available in this build"),
+        stderr.contains("failed to inspect selected uv executable"),
         "{stderr}"
     );
-    assert!(!stderr.contains("Proceed?"), "{stderr}");
+    assert!(
+        !stderr.contains("execution is not available in this build"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Type 'prune'"), "{stderr}");
 }
 
 #[test]
@@ -49,10 +94,10 @@ fn non_dry_run_without_yes_still_fails_before_any_prompt_or_probe() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("execution is not available in this build"),
+        stderr.contains("requires --yes when stdin is not a terminal"),
         "{stderr}"
     );
-    assert!(!stderr.contains("Proceed?"), "{stderr}");
+    assert!(!stderr.contains("Type 'prune'"), "{stderr}");
     assert!(
         !stderr.contains("failed to inspect selected uv executable"),
         "{stderr}"
@@ -60,7 +105,7 @@ fn non_dry_run_without_yes_still_fails_before_any_prompt_or_probe() {
 }
 
 #[test]
-fn json_mutation_requires_yes_before_reporting_unavailability() {
+fn json_mutation_requires_yes_before_any_preflight() {
     let output = run(&[
         "reclaim",
         "uv",
@@ -77,7 +122,11 @@ fn json_mutation_requires_yes_before_reporting_unavailability() {
         stderr.contains("--json requires --yes or --dry-run"),
         "{stderr}"
     );
-    assert!(!stderr.contains("Proceed?"), "{stderr}");
+    assert!(!stderr.contains("Type 'prune'"), "{stderr}");
+    assert!(
+        !stderr.contains("failed to inspect selected uv executable"),
+        "{stderr}"
+    );
 }
 
 #[test]

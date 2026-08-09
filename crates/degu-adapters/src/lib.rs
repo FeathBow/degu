@@ -238,7 +238,6 @@ impl RegisteredAdapter {
         }
     }
 
-    #[allow(dead_code)] // no adapter registers a native capability yet; only tests construct one
     fn with_native_cleanup(
         ecosystem: impl Ecosystem + 'static,
         scope: AdapterScope,
@@ -301,7 +300,7 @@ pub fn all() -> Vec<RegisteredAdapter> {
         RegisteredAdapter::new(apptainer::Apptainer, Cache),
         RegisteredAdapter::new(npm::Npm, Cache),
         RegisteredAdapter::new(pip::Pip, Cache),
-        RegisteredAdapter::new(uv::Uv, Cache),
+        RegisteredAdapter::with_native_cleanup(uv::Uv, Cache, uv::NativePrune),
         RegisteredAdapter::new(pixi::Pixi, Cache),
         RegisteredAdapter::new(vscode::Vscode, Cache),
         RegisteredAdapter::new(huggingface::Huggingface, Cache),
@@ -331,6 +330,7 @@ pub fn all() -> Vec<RegisteredAdapter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn fake_ctx(home: &Path) -> DetectCtx {
         let mut ctx = DetectCtx::from_process().unwrap();
@@ -420,22 +420,30 @@ mod tests {
     }
 
     #[test]
-    fn production_registry_is_discovery_only_by_default() {
+    fn production_registry_exposes_only_the_fixed_uv_native_capability() {
         let ctx = DetectCtx::for_test(
             std::path::PathBuf::from("/missing-home"),
             [] as [(&str, &str); 0],
         );
+        let roots = [Root::well_known(PathBuf::from("/scratch/alice/uv"))];
         let adapters = all();
-        assert!(
-            !adapters.is_empty(),
-            "an empty registry would pass vacuously"
+        let mut native = Vec::new();
+        for adapter in &adapters {
+            match adapter.declare_native_cleanup(&ctx, &roots, &fake_executable()) {
+                Ok(Some(request)) => native.push((adapter.id(), request)),
+                Ok(None) => {}
+                Err(error) => panic!("{} declaration failed: {error}", adapter.id()),
+            }
+        }
+        assert_eq!(native.len(), 1);
+        let (adapter, request) = &native[0];
+        assert_eq!(*adapter, "uv");
+        assert_eq!(request.identity().action_id(), "cache-prune");
+        assert_eq!(request.executable(), Path::new("/usr/bin/fake"));
+        assert_eq!(
+            request.observation_requests(),
+            &[PathBuf::from("/scratch/alice/uv")]
         );
-        assert!(adapters.iter().all(|adapter| {
-            adapter
-                .declare_native_cleanup(&ctx, &[], &fake_executable())
-                .expect("absence is not an error")
-                .is_none()
-        }));
     }
 
     #[test]

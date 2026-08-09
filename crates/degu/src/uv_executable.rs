@@ -11,7 +11,8 @@
 
 use crate::native_runner::{
     HeldNativeExecutable, NativePreparationError, NativeRunOutcome, NativeRunnerError,
-    cleanup_executable_snapshot, prepare_native_action_from_held,
+    PreparedNativeAction, cleanup_executable_snapshot, prepare_native_action_from_held,
+    prepare_native_action_from_held_with_binding,
 };
 use degu_adapters::native::{
     NativeActionIdentity, NativeActionRequest, NativeEnvironmentRequest, NativeExecutableSelection,
@@ -29,8 +30,10 @@ use std::time::Duration;
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const VERSION_OUTPUT_LIMIT: usize = 128;
 const MINIMUM_UV_VERSION: UvVersion = UvVersion::new(0, 8, 19);
-/// The only uv version whose exact cache-prune traversal and mutation contract
-/// this build audits; a newer probed binary is still refused prune authority.
+/// The only cache-prune layout whose exact traversal and mutation contract is
+/// audited. A newer binary may pass the minimum-version probe, but native
+/// authority must remain unavailable until that version's prune implementation
+/// is separately audited.
 pub(crate) const AUDITED_UV_PRUNE_VERSION: UvVersion = UvVersion::new(0, 12, 3);
 const SHARED_WRITE_MASK: u32 = 0o022;
 const EXECUTE_MASK: u32 = 0o111;
@@ -100,8 +103,15 @@ impl ProbedUvExecutable {
         Ok(())
     }
 
-    pub(crate) fn into_parts(self) -> (NativeExecutableSelection, HeldNativeExecutable) {
-        (self.selection, self.executable)
+    /// Consume the exact snapshot that answered the version probe into one
+    /// runner action. No held descriptor or reusable split capability escapes
+    /// this module.
+    pub(crate) fn into_native_action_with_binding(
+        self,
+        request: NativeActionRequest,
+        mutation_binding: impl FnOnce() -> Result<(), String> + Send + 'static,
+    ) -> Result<PreparedNativeAction, NativePreparationError> {
+        prepare_native_action_from_held_with_binding(request, self.executable, mutation_binding)
     }
 }
 
@@ -717,29 +727,17 @@ fn reject_extended_acl(fd: &impl AsFd, path: &Path) -> Result<(), UvExecutablePr
 
 #[cfg(target_os = "macos")]
 fn reject_extended_acl(fd: &impl AsFd, path: &Path) -> Result<(), UvExecutableProbeError> {
-    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
-    unsafe extern "C" {
-        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
-        fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
-    }
-    // SAFETY: the borrowed descriptor stays live; the constant is the macOS
-    // ACL_TYPE_EXTENDED ABI value from <sys/acl.h>.
-    let acl = unsafe { acl_get_fd_np(fd.as_fd().as_raw_fd(), ACL_TYPE_EXTENDED) };
-    if acl.is_null() {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::NotFound {
-            return Ok(());
-        }
-        return Err(UvExecutableProbeError::AclInspection {
+    match crate::macos_acl::grants_mutation(fd) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(unsafe_path(
+            path,
+            "extended ACL grants mutation authority or has an unknown tag",
+        )),
+        Err(source) => Err(UvExecutableProbeError::AclInspection {
             path: path.to_path_buf(),
-            source: error,
-        });
+            source,
+        }),
     }
-    // SAFETY: `acl` is the owned allocation returned by acl_get_fd_np.
-    unsafe {
-        acl_free(acl);
-    }
-    Err(unsafe_path(path, "extended ACL is present"))
 }
 
 fn reject_unpreserved_xattrs(fd: &impl AsFd, path: &Path) -> Result<(), UvExecutableProbeError> {

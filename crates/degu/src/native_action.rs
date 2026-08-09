@@ -11,32 +11,16 @@ use crate::action_result::{
 #[cfg(test)]
 use crate::native_runner::prepare_native_action;
 use crate::native_runner::{
-    HeldNativeExecutable, NativePreparationError, NativeRunReport, NativeRunnerError,
-    PreparedNativeAction, prepare_native_action_from_held,
+    NativePreparationError, NativeRunReport, NativeRunnerError, PreparedNativeAction,
 };
 use crate::quota::{ProbeError, QuotaSnapshot};
-use crate::quota_observation::{self, CompletedQuotaAction};
-use crate::uv_cache_root::{SealedUvCacheRoot, UvCacheRootSealError};
-use crate::uv_executable::{ProbedUvExecutable, UvExecutableProbeError};
-use degu_adapters::RegisteredAdapter;
-use degu_adapters::native::{
-    NativeActionRequest, NativeCapabilityError, NativeInheritedEnvironment,
-};
-use degu_core::ecosystem::{DetectCtx, Root};
+use crate::quota_observation::{self, CompletedQuotaAction, PostObservationPolicy};
+#[cfg(test)]
+use degu_adapters::native::NativeActionRequest;
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum NativeActionPlanError {
-    #[error("native capability declaration failed: {0}")]
-    Capability(#[from] NativeCapabilityError),
-    #[error("native executable proof failed revalidation: {0}")]
-    Executable(#[from] UvExecutableProbeError),
-    #[error("uv cache-root proof failed revalidation: {0}")]
-    CacheRoot(#[from] UvCacheRootSealError),
-    #[error("uv executable/root proofs cannot prepare native adapter {0:?}")]
-    NonUvAdapter(&'static str),
-    #[error("native declaration is not bound to the exact sealed `--cache-dir`")]
-    CacheRootArgumentMismatch,
     #[error("native action preparation failed: {0}")]
     Preparation(#[from] NativePreparationError),
     #[error("native action identity is invalid: {0:?}")]
@@ -48,9 +32,6 @@ pub(crate) enum NativeActionPlanError {
 pub(crate) struct PreparedNativeQuotaAction {
     action: PreparedNativeAction,
     batch: PlannedActionBatch,
-    /// Production uv work must retain and revalidate the non-cloneable root
-    /// proof. Controlled generic runner tests deliberately carry no root.
-    cache_root: Option<SealedUvCacheRoot>,
 }
 
 /// Runner diagnostics are retained even when observation also fails.
@@ -60,110 +41,34 @@ pub(crate) struct CompletedNativeQuotaAction<Parsed, ParseError> {
 }
 
 impl<Parsed, ParseError> CompletedNativeQuotaAction<Parsed, ParseError> {
+    #[cfg(test)]
     pub(crate) fn execution(
         &self,
     ) -> &Result<NativeRunReport<Parsed, ParseError>, NativeRunnerError> {
         &self.execution
     }
 
+    #[cfg(test)]
     pub(crate) fn observation(&self) -> &CompletedQuotaAction {
         &self.observation
     }
-}
 
-/// The only production entry: discovery-only adapters return `None`; a native
-/// request must come through the separately registered capability, including
-/// its adapter-identity check, before runner preflight and batch construction.
-pub(crate) fn prepare_registered_native_action(
-    registration: &RegisteredAdapter,
-    ctx: &DetectCtx,
-    executable: ProbedUvExecutable,
-    cache_root: SealedUvCacheRoot,
-) -> Result<Option<PreparedNativeQuotaAction>, NativeActionPlanError> {
-    if registration.id() != "uv" {
-        return Err(NativeActionPlanError::NonUvAdapter(registration.id()));
-    }
-    executable.revalidate_path()?;
-    cache_root.revalidate_for_executable(&executable)?;
-    // The adapter receives exactly one data-only root derived from the sealed
-    // authority. A discovery Root or quota path can never construct the proof
-    // consumed by this production seam.
-    let frozen_roots = [Root::well_known(cache_root.canonical_path().to_path_buf())];
-    let request =
-        registration.declare_native_cleanup(ctx, &frozen_roots, executable.selection())?;
-    let Some(request) = request else {
-        return Ok(None);
-    };
-    require_exact_uv_prune_contract(&request, cache_root.canonical_path())?;
-    let (_selection, held_executable) = executable.into_parts();
-    prepare_request_from_held(request, held_executable, cache_root).map(Some)
-}
-
-fn require_exact_uv_prune_contract(
-    request: &NativeActionRequest,
-    cache_root: &Path,
-) -> Result<(), NativeActionPlanError> {
-    if request.identity().adapter_id() != "uv" || request.identity().action_id() != "cache-prune" {
-        return Err(NativeActionPlanError::CacheRootArgumentMismatch);
-    }
-    if !matches!(
-        request.environment().inherited(),
-        NativeInheritedEnvironment::Clear
-    ) || request.environment().fixed()
-        != [(
-            std::ffi::OsString::from("UV_LOCK_TIMEOUT"),
-            std::ffi::OsString::from("240"),
-        )]
-    {
-        return Err(NativeActionPlanError::CacheRootArgumentMismatch);
-    }
-    let expected = [
-        std::ffi::OsStr::new("--no-config"),
-        std::ffi::OsStr::new("--color"),
-        std::ffi::OsStr::new("never"),
-        std::ffi::OsStr::new("--no-progress"),
-        std::ffi::OsStr::new("--offline"),
-        std::ffi::OsStr::new("--cache-dir"),
-        cache_root.as_os_str(),
-        std::ffi::OsStr::new("cache"),
-        std::ffi::OsStr::new("prune"),
-    ];
-    let arguments = request.arguments();
-    if arguments.len() == expected.len()
-        && arguments
-            .iter()
-            .zip(expected)
-            .all(|(actual, expected)| actual.as_os_str() == expected)
-    {
-        Ok(())
-    } else {
-        Err(NativeActionPlanError::CacheRootArgumentMismatch)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Result<NativeRunReport<Parsed, ParseError>, NativeRunnerError>,
+        CompletedQuotaAction,
+    ) {
+        (self.execution, self.observation)
     }
 }
 
-#[cfg(test)]
-fn prepare_request(
-    request: NativeActionRequest,
-) -> Result<PreparedNativeQuotaAction, NativeActionPlanError> {
-    // All declaration, inherited-environment, and other pre-start validation
-    // finishes before a batch exists. A failure therefore performs no probe.
-    prepare_preflighted(prepare_native_action(request)?, None)
-}
-
-fn prepare_request_from_held(
-    request: NativeActionRequest,
-    held_executable: HeldNativeExecutable,
-    cache_root: SealedUvCacheRoot,
-) -> Result<PreparedNativeQuotaAction, NativeActionPlanError> {
-    prepare_preflighted(
-        prepare_native_action_from_held(request, held_executable)?,
-        Some(cache_root),
-    )
-}
-
-fn prepare_preflighted(
+/// Attach the immutable quota-observation batch to an already preflighted native
+/// action. The caller must first consume adapter-specific authority and compare
+/// the production registry declaration against its frozen request; quota code
+/// receives only the resulting runner capability and reporting targets.
+pub(crate) fn attach_quota_observation(
     action: PreparedNativeAction,
-    cache_root: Option<SealedUvCacheRoot>,
 ) -> Result<PreparedNativeQuotaAction, NativeActionPlanError> {
     let adapter_id =
         ActionId::new(action.adapter_id().to_owned()).map_err(NativeActionPlanError::Contract)?;
@@ -183,45 +88,59 @@ fn prepare_preflighted(
         action_id,
         targets,
     );
-    Ok(PreparedNativeQuotaAction {
-        action,
-        batch,
-        cache_root,
-    })
+    Ok(PreparedNativeQuotaAction { action, batch })
 }
 
 impl PreparedNativeQuotaAction {
     /// Coordinates the strict pre -> execute-once -> post sequence. Consuming the
     /// prepared executor is the start boundary. Every error returned after that
     /// point is a real started failure and still receives post observation.
+    #[cfg(test)]
     pub(crate) fn execute<Parsed, ParseError>(
         self,
         probe: &mut impl FnMut(&Path) -> Result<QuotaSnapshot, ProbeError>,
         parse: impl FnOnce(&[u8]) -> Result<Parsed, ParseError>,
     ) -> CompletedNativeQuotaAction<Parsed, ParseError> {
-        let Self {
-            action,
-            batch,
-            cache_root,
-        } = self;
-        let (execution, observation) = quota_observation::coordinate(batch, probe, move || {
-            let execution = match cache_root {
-                Some(cache_root) => cache_root
-                    .revalidate()
-                    .map_err(|error| NativeRunnerError::MutationBinding(error.to_string()))
-                    .and_then(|()| action.execute(parse).result()),
-                None => action.execute(parse).result(),
-            };
-            let outcome = execution
-                .as_ref()
-                .map(|report| report.outcome().action_outcome())
-                .unwrap_or(StartedActionOutcome::Failure);
-            (execution, outcome)
-        });
+        self.execute_output(probe, move |stdout, _stderr| parse(stdout))
+    }
+
+    pub(crate) fn execute_output<Parsed, ParseError>(
+        self,
+        probe: &mut impl FnMut(&Path) -> Result<QuotaSnapshot, ProbeError>,
+        parse: impl FnOnce(&[u8], &[u8]) -> Result<Parsed, ParseError>,
+    ) -> CompletedNativeQuotaAction<Parsed, ParseError> {
+        let Self { action, batch } = self;
+        let (execution, observation) =
+            quota_observation::coordinate_with_post_policy(batch, probe, move || {
+                let execution = action.execute_output(parse).result();
+                let outcome = execution
+                    .as_ref()
+                    .map(|report| report.outcome().action_outcome())
+                    .unwrap_or(StartedActionOutcome::Failure);
+                let post_policy = native_post_policy(&execution);
+                (execution, outcome, post_policy)
+            });
         CompletedNativeQuotaAction {
             execution,
             observation,
         }
+    }
+}
+
+fn native_post_policy<Parsed, ParseError>(
+    execution: &Result<NativeRunReport<Parsed, ParseError>, NativeRunnerError>,
+) -> PostObservationPolicy {
+    if execution
+        .as_ref()
+        .is_err_and(NativeRunnerError::termination_unconfirmed)
+    {
+        PostObservationPolicy::Unavailable {
+            category: "action_not_terminal",
+            message: "native action termination is unconfirmed; post-action quota observation was not attempted"
+                .to_owned(),
+        }
+    } else {
+        PostObservationPolicy::Probe
     }
 }
 
@@ -245,14 +164,10 @@ mod tests {
     const HELPER_TEST: &str = "native_action::tests::controlled_helper_process";
     const HELPER_MODE: &str = "DEGU_NATIVE_ACTION_HELPER_MODE";
 
-    fn selection(path: PathBuf) -> NativeExecutableSelection {
-        NativeExecutableSelection::explicit(path).unwrap()
-    }
-
     fn request(paths: impl IntoIterator<Item = PathBuf>, mode: &str) -> NativeActionRequest {
         NativeActionRequest::new(
             NativeActionIdentity::new("fake", "prune").unwrap(),
-            selection(std::env::current_exe().unwrap()),
+            NativeExecutableSelection::explicit(std::env::current_exe().unwrap()).unwrap(),
             [
                 OsString::from("--exact"),
                 OsString::from(HELPER_TEST),
@@ -287,108 +202,27 @@ mod tests {
         )
     }
 
-    #[test]
-    fn production_registry_has_no_native_entry() {
-        let home = tempfile::tempdir().unwrap();
-        let ctx = DetectCtx::for_test(home.path().to_path_buf(), [] as [(OsString, OsString); 0]);
-        for registration in degu_adapters::all() {
-            assert!(
-                registration
-                    .declare_native_cleanup(
-                        &ctx,
-                        &[],
-                        &selection(PathBuf::from("/usr/bin/unused")),
-                    )
-                    .unwrap()
-                    .is_none(),
-                "{} unexpectedly declared native work",
-                registration.id()
-            );
-        }
+    fn prepare_request(
+        request: NativeActionRequest,
+    ) -> Result<PreparedNativeQuotaAction, NativeActionPlanError> {
+        // Test-only path-based preparation exercises the generic observation envelope.
+        // Production uv preparation enters with a held executable and root binding.
+        attach_quota_observation(prepare_native_action(request)?)
     }
 
     #[test]
-    fn sealed_cache_root_requires_the_complete_ordinary_prune_contract() {
-        let root = Path::new("/sealed/cache");
-        let exact_arguments = || {
-            vec![
-                OsString::from("--no-config"),
-                OsString::from("--color"),
-                OsString::from("never"),
-                OsString::from("--no-progress"),
-                OsString::from("--offline"),
-                OsString::from("--cache-dir"),
-                root.as_os_str().to_os_string(),
-                OsString::from("cache"),
-                OsString::from("prune"),
-            ]
-        };
-        let exact_environment = || {
-            NativeEnvironmentRequest::clear()
-                .with_fixed([(OsString::from("UV_LOCK_TIMEOUT"), OsString::from("240"))])
-        };
-        let declared =
-            |action: &str, arguments: Vec<OsString>, environment: NativeEnvironmentRequest| {
-                NativeActionRequest::new(
-                    NativeActionIdentity::new("uv", action).unwrap(),
-                    selection(PathBuf::from("/usr/bin/uv")),
-                    arguments,
-                    environment,
-                    NativeProcessContract::AuditedCooperativeProcessGroup,
-                    Duration::from_secs(1),
-                    16,
-                    16,
-                    [],
-                )
-                .unwrap()
-            };
-
-        assert!(
-            require_exact_uv_prune_contract(
-                &declared("cache-prune", exact_arguments(), exact_environment()),
-                root,
-            )
-            .is_ok()
-        );
-
-        let mut clean = exact_arguments();
-        *clean.last_mut().unwrap() = OsString::from("clean");
-        let mut force = exact_arguments();
-        force.push(OsString::from("--force"));
-        let mut ci = exact_arguments();
-        ci.push(OsString::from("--ci"));
-        let mut other_root = exact_arguments();
-        other_root[6] = OsString::from("/other");
-        for (action, arguments) in [
-            ("prune", exact_arguments()),
-            ("cache-prune", clean),
-            ("cache-prune", force),
-            ("cache-prune", ci),
-            ("cache-prune", other_root),
-        ] {
-            assert!(matches!(
-                require_exact_uv_prune_contract(
-                    &declared(action, arguments, exact_environment()),
-                    root,
-                ),
-                Err(NativeActionPlanError::CacheRootArgumentMismatch)
-            ));
-        }
-
-        for environment in [
-            NativeEnvironmentRequest::clear(),
-            NativeEnvironmentRequest::allowlist([OsString::from("HOME")]),
-            NativeEnvironmentRequest::clear()
-                .with_fixed([(OsString::from("UV_NO_CACHE"), OsString::from("1"))]),
-        ] {
-            assert!(matches!(
-                require_exact_uv_prune_contract(
-                    &declared("cache-prune", exact_arguments(), environment),
-                    root,
-                ),
-                Err(NativeActionPlanError::CacheRootArgumentMismatch)
-            ));
-        }
+    fn unconfirmed_child_termination_disables_post_observation() {
+        let execution: Result<NativeRunReport<(), ()>, _> =
+            Err(NativeRunnerError::TerminationUnconfirmed {
+                stage: "controlled test",
+            });
+        assert!(matches!(
+            native_post_policy(&execution),
+            PostObservationPolicy::Unavailable {
+                category: "action_not_terminal",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -459,7 +293,10 @@ mod tests {
         // Rebuild with a valid absolute, normalized path that cannot spawn.
         bad = NativeActionRequest::new(
             bad.identity().clone(),
-            selection(PathBuf::from("/definitely/missing/degu-native-test")),
+            NativeExecutableSelection::explicit(PathBuf::from(
+                "/definitely/missing/degu-native-test",
+            ))
+            .unwrap(),
             bad.arguments().iter().cloned(),
             bad.environment().clone(),
             bad.process_contract(),
@@ -491,51 +328,6 @@ mod tests {
             completed.observation().observations().quota_scopes()[0].state(),
             QuotaObservationState::Observed(_)
         ));
-    }
-
-    #[test]
-    fn cache_root_revalidation_failure_is_started_and_keeps_post_observation() {
-        use std::os::unix::fs::PermissionsExt;
-        // CI runs under umask 002; pin the fixture to a private tree so the seal
-        // sees a non-shared-writable root regardless of the ambient umask.
-        let private = |path: &Path, mode: u32| {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
-        };
-        let root = tempfile::tempdir().unwrap();
-        let canonical = std::fs::canonicalize(root.path()).unwrap();
-        private(&canonical, 0o700);
-        std::fs::write(
-            canonical.join("CACHEDIR.TAG"),
-            b"Signature: 8a477f597d28d172789f06886806bc55\n",
-        )
-        .unwrap();
-        private(&canonical.join("CACHEDIR.TAG"), 0o600);
-        std::fs::create_dir(canonical.join("sdists-v9")).unwrap();
-        private(&canonical.join("sdists-v9"), 0o700);
-        let cache_root = crate::uv_cache_root::seal_uv_cache_root_for_test(canonical.clone())
-            .expect("private empty root seals");
-        let action = prepare_preflighted(
-            prepare_native_action(request([canonical.clone()], "success")).unwrap(),
-            Some(cache_root),
-        )
-        .unwrap();
-
-        // A current bucket was sealed missing; attaching it before the start
-        // boundary must refuse spawn rather than execute against changed scope.
-        std::fs::create_dir(canonical.join("archive-v0")).unwrap();
-        let mut replies =
-            VecDeque::from([Ok(snapshot(&canonical, 10)), Ok(snapshot(&canonical, 10))]);
-        let completed = action.execute(&mut |_| replies.pop_front().unwrap(), |_| Ok::<_, ()>(()));
-
-        assert!(matches!(
-            completed.execution(),
-            Err(NativeRunnerError::MutationBinding(_))
-        ));
-        assert_eq!(completed.observation().outcome(), ActionOutcome::Failure);
-        assert!(
-            replies.is_empty(),
-            "failure still receives post observation"
-        );
     }
 
     #[test]

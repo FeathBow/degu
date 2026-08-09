@@ -21,6 +21,7 @@ const MAX_VERIFIED_ENTRIES: usize = 1_000_000;
 const MAX_TRAVERSAL_DEPTH: usize = 256;
 const SHARED_WRITE_MASK: u32 = 0o022;
 const REQUIRED_DIRECTORY_MODE: u32 = 0o700;
+#[cfg(target_os = "linux")]
 const MAX_ACL_XATTR_LIST_BYTES: usize = 64 * 1024;
 
 /// Exact `CacheBucket::to_str` values at uv commit
@@ -362,16 +363,6 @@ fn seal_uv_cache_root_for_version(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn seal_uv_cache_root_for_test(
-    path: PathBuf,
-) -> Result<SealedUvCacheRoot, UvCacheRootSealError> {
-    seal_uv_cache_root_for_version(
-        UvCacheRootSelection::explicit(path)?,
-        AUDITED_UV_PRUNE_VERSION,
-    )
-}
-
 fn open_selected_root(
     selection: &UvCacheRootSelection,
 ) -> Result<OpenedRoot, UvCacheRootSealError> {
@@ -642,7 +633,7 @@ fn revalidate_entry(
 /// Verify every real directory ordinary prune may walk or recursively remove.
 /// Descriptor-relative, no-follow traversal ensures an untrusted directory is
 /// rejected before any child pathname is dereferenced. All directories must be
-/// EUID-owned and non-shared-writable with no extended ACL, and every directory
+/// EUID-owned and non-shared-writable with no ACL granting foreign mutation authority, and every directory
 /// must remain on the root mount (including Linux bind mounts via statx MNT_ID).
 fn verify_prune_namespace(
     root: &OwnedFd,
@@ -976,30 +967,17 @@ fn has_posix_acl_name(names: &[u8]) -> bool {
 
 #[cfg(target_os = "macos")]
 fn reject_extended_acl(fd: &OwnedFd, path: &Path) -> Result<(), UvCacheRootSealError> {
-    use rustix::fd::{AsFd, AsRawFd};
-    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
-    unsafe extern "C" {
-        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
-        fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
-    }
-    // SAFETY: the borrowed descriptor remains live and the constant is the
-    // macOS ACL_TYPE_EXTENDED ABI value from <sys/acl.h>.
-    let acl = unsafe { acl_get_fd_np(fd.as_fd().as_raw_fd(), ACL_TYPE_EXTENDED) };
-    if acl.is_null() {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::NotFound {
-            return Ok(());
-        }
-        return Err(UvCacheRootSealError::AclInspection {
+    match crate::macos_acl::grants_mutation(fd) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(unsafe_path(
+            path,
+            "extended ACL grants mutation authority or has an unknown tag",
+        )),
+        Err(source) => Err(UvCacheRootSealError::AclInspection {
             path: path.to_path_buf(),
-            source: error,
-        });
+            source,
+        }),
     }
-    // SAFETY: `acl` is the owned allocation returned by acl_get_fd_np.
-    unsafe {
-        acl_free(acl);
-    }
-    Err(unsafe_path(path, "extended ACL is present"))
 }
 
 #[cfg(target_os = "linux")]

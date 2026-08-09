@@ -148,22 +148,6 @@ impl NativeActionDeclaration {
             stderr_limit,
         })
     }
-
-    pub(crate) fn executable(&self) -> &Path {
-        &self.executable
-    }
-
-    pub(crate) fn arguments(&self) -> &[OsString] {
-        &self.arguments
-    }
-
-    pub(crate) fn environment(&self) -> &NativeEnvironment {
-        &self.environment
-    }
-
-    pub(crate) fn process_contract(&self) -> NativeProcessContract {
-        self.process_contract
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -218,8 +202,14 @@ pub(crate) enum NativeRunnerError {
     Wait(#[source] io::Error),
     #[error("failed to drain native action output: {0}")]
     Drain(#[source] io::Error),
-    #[error("native action did not become reapable within the kill grace period")]
-    ReapTimedOut,
+    #[error("native action termination is unconfirmed after {stage}")]
+    TerminationUnconfirmed { stage: &'static str },
+}
+
+impl NativeRunnerError {
+    pub(crate) fn termination_unconfirmed(&self) -> bool {
+        matches!(self, Self::TerminationUnconfirmed { .. })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -236,6 +226,15 @@ impl CapturedOutput {
 
     pub(crate) fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(bytes: Vec<u8>, truncated: bool, limit: usize) -> Self {
+        Self {
+            bytes,
+            truncated,
+            limit,
+        }
     }
 }
 
@@ -275,7 +274,13 @@ pub(crate) struct PreparedNativeAction {
     /// Keeps the private executable snapshot and its cleanup lease alive through
     /// execution. Its descriptor is CLOEXEC and never enters the tool.
     held_executable: Option<HeldNativeExecutable>,
+    /// Adapter-specific mutation authority retained through quota pre-observation
+    /// and consumed for one final fail-closed attachment check immediately before
+    /// spawn. Reporting paths cannot construct this closure.
+    mutation_binding: Option<MutationBinding>,
 }
+
+type MutationBinding = Box<dyn FnOnce() -> Result<(), String> + Send>;
 
 /// One private executable snapshot. Its stable path works with `exec` on both
 /// Linux and macOS, while the open descriptor pins identity. The shared cleanup
@@ -441,19 +446,29 @@ impl PreparedNativeAction {
         self,
         parse: impl FnOnce(&[u8]) -> Result<Parsed, ParseError>,
     ) -> StartedNativeExecution<Parsed, ParseError> {
-        self.execute_with_descriptor_limit(parse, descriptor_scan_limit)
+        self.execute_output(move |stdout, _stderr| parse(stdout))
     }
 
-    fn execute_with_descriptor_limit<Parsed, ParseError>(
+    /// Variant for audited tools, including uv, whose stable machine-disabled
+    /// summary is written to stderr. Both streams remain independently bounded.
+    pub(crate) fn execute_output<Parsed, ParseError>(
         self,
-        parse: impl FnOnce(&[u8]) -> Result<Parsed, ParseError>,
+        parse: impl FnOnce(&[u8], &[u8]) -> Result<Parsed, ParseError>,
+    ) -> StartedNativeExecution<Parsed, ParseError> {
+        self.execute_output_with_descriptor_limit(parse, descriptor_scan_limit)
+    }
+
+    fn execute_output_with_descriptor_limit<Parsed, ParseError>(
+        self,
+        parse: impl FnOnce(&[u8], &[u8]) -> Result<Parsed, ParseError>,
         refresh_descriptor_limit: impl FnOnce() -> io::Result<i32>,
     ) -> StartedNativeExecution<Parsed, ParseError> {
         StartedNativeExecution {
-            result: run_preflighted(
+            result: run_preflighted_output(
                 self.declaration,
                 self.resolved_environment,
                 self.held_executable,
+                self.mutation_binding,
                 refresh_descriptor_limit,
                 parse,
             ),
@@ -475,7 +490,7 @@ impl<Parsed, ParseError> StartedNativeExecution<Parsed, ParseError> {
 pub(crate) fn prepare_native_action(
     request: NativeActionRequest,
 ) -> Result<PreparedNativeAction, NativePreparationError> {
-    prepare_native_action_with(request, None, resolve_environment)
+    prepare_native_action_with(request, None, None, resolve_environment)
 }
 
 /// Prepare a request to execute the exact private snapshot paired with a held
@@ -486,12 +501,29 @@ pub(crate) fn prepare_native_action_from_held(
     request: NativeActionRequest,
     held_executable: HeldNativeExecutable,
 ) -> Result<PreparedNativeAction, NativePreparationError> {
-    prepare_native_action_with(request, Some(held_executable), resolve_environment)
+    prepare_native_action_with(request, Some(held_executable), None, resolve_environment)
+}
+
+/// The only production preparation seam that retains adapter-specific mutation
+/// authority through the quota pre-observation and into the runner's final pre-spawn
+/// check. The binding is one-shot and cannot be cloned or recovered as a path.
+pub(crate) fn prepare_native_action_from_held_with_binding(
+    request: NativeActionRequest,
+    held_executable: HeldNativeExecutable,
+    mutation_binding: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Result<PreparedNativeAction, NativePreparationError> {
+    prepare_native_action_with(
+        request,
+        Some(held_executable),
+        Some(Box::new(mutation_binding)),
+        resolve_environment,
+    )
 }
 
 fn prepare_native_action_with(
     request: NativeActionRequest,
     held_executable: Option<HeldNativeExecutable>,
+    mutation_binding: Option<MutationBinding>,
     resolve: impl FnOnce(&NativeEnvironment) -> Result<Vec<(OsString, OsString)>, NativeRunnerError>,
 ) -> Result<PreparedNativeAction, NativePreparationError> {
     let mut declaration = NativeActionDeclaration::from_request(&request)?;
@@ -507,6 +539,7 @@ fn prepare_native_action_with(
         observation_requests: request.observation_requests().to_vec(),
         resolved_environment,
         held_executable,
+        mutation_binding,
     })
 }
 
@@ -529,6 +562,19 @@ impl<Parsed, ParseError> NativeRunReport<Parsed, ParseError> {
     pub(crate) fn stderr(&self) -> &CapturedOutput {
         &self.stderr
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        outcome: NativeRunOutcome<Parsed, ParseError>,
+        stdout: CapturedOutput,
+        stderr: CapturedOutput,
+    ) -> Self {
+        Self {
+            outcome,
+            stdout,
+            stderr,
+        }
+    }
 }
 
 /// Test-only entry point that resolves the environment inline; production paths
@@ -548,6 +594,7 @@ fn run_native_action<Parsed, ParseError>(
     )
 }
 
+#[cfg(test)]
 fn run_preflighted<Parsed, ParseError>(
     declaration: NativeActionDeclaration,
     resolved_environment: Vec<(OsString, OsString)>,
@@ -555,11 +602,24 @@ fn run_preflighted<Parsed, ParseError>(
     refresh_descriptor_limit: impl FnOnce() -> io::Result<i32>,
     parse: impl FnOnce(&[u8]) -> Result<Parsed, ParseError>,
 ) -> Result<NativeRunReport<Parsed, ParseError>, NativeRunnerError> {
-    if let Some(executable) = &held_executable {
-        executable
-            .revalidate()
-            .map_err(NativeRunnerError::ExecutableBinding)?;
-    }
+    run_preflighted_output(
+        declaration,
+        resolved_environment,
+        held_executable,
+        None,
+        refresh_descriptor_limit,
+        move |stdout, _stderr| parse(stdout),
+    )
+}
+
+fn run_preflighted_output<Parsed, ParseError>(
+    declaration: NativeActionDeclaration,
+    resolved_environment: Vec<(OsString, OsString)>,
+    held_executable: Option<HeldNativeExecutable>,
+    mutation_binding: Option<MutationBinding>,
+    refresh_descriptor_limit: impl FnOnce() -> io::Result<i32>,
+    parse: impl FnOnce(&[u8], &[u8]) -> Result<Parsed, ParseError>,
+) -> Result<NativeRunReport<Parsed, ParseError>, NativeRunnerError> {
     let mut command = Command::new(&declaration.executable);
     command
         .args(&declaration.arguments)
@@ -578,15 +638,28 @@ fn run_preflighted<Parsed, ParseError>(
     let scan_limit = refresh_descriptor_limit().map_err(NativeRunnerError::DescriptorPolicy)?;
     install_descriptor_policy(&mut command, scan_limit);
 
+    // These are the final fallible attachment checks before `spawn`. They live
+    // inside the consuming started boundary and after the quota pre-observation.
+    if let Some(executable) = &held_executable {
+        executable
+            .revalidate()
+            .map_err(NativeRunnerError::ExecutableBinding)?;
+    }
+    if let Some(binding) = mutation_binding {
+        binding().map_err(NativeRunnerError::MutationBinding)?;
+    }
+
     let mut child = command.spawn().map_err(NativeRunnerError::Spawn)?;
     let process_group = child.id();
     let mut stdout_pipe = child.stdout.take().expect("piped stdout is present");
     let mut stderr_pipe = child.stderr.take().expect("piped stderr is present");
     if let Err(error) = set_nonblocking(&stdout_pipe).and_then(|()| set_nonblocking(&stderr_pipe)) {
-        terminate_process_group(process_group);
-        let _ = child.kill();
-        defer_reap(child);
-        return Err(NativeRunnerError::OutputSetup(error));
+        return Err(terminate_reap_or_defer(
+            child,
+            process_group,
+            "output setup failure",
+            NativeRunnerError::OutputSetup(error),
+        ));
     }
 
     let mut stdout = CapturedOutput::empty(declaration.stdout_limit);
@@ -604,10 +677,12 @@ fn run_preflighted<Parsed, ParseError>(
             match drain_available(&mut stdout_pipe, &mut stdout) {
                 Ok(eof) => stdout_eof = eof,
                 Err(error) => {
-                    terminate_process_group(process_group);
-                    let _ = child.kill();
-                    defer_reap(child);
-                    return Err(NativeRunnerError::Drain(error));
+                    return Err(terminate_reap_or_defer(
+                        child,
+                        process_group,
+                        "stdout drain failure",
+                        NativeRunnerError::Drain(error),
+                    ));
                 }
             }
         }
@@ -615,10 +690,12 @@ fn run_preflighted<Parsed, ParseError>(
             match drain_available(&mut stderr_pipe, &mut stderr) {
                 Ok(eof) => stderr_eof = eof,
                 Err(error) => {
-                    terminate_process_group(process_group);
-                    let _ = child.kill();
-                    defer_reap(child);
-                    return Err(NativeRunnerError::Drain(error));
+                    return Err(terminate_reap_or_defer(
+                        child,
+                        process_group,
+                        "stderr drain failure",
+                        NativeRunnerError::Drain(error),
+                    ));
                 }
             }
         }
@@ -636,10 +713,12 @@ fn run_preflighted<Parsed, ParseError>(
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    terminate_process_group(process_group);
-                    let _ = child.kill();
-                    defer_reap(child);
-                    return Err(NativeRunnerError::Wait(error));
+                    return Err(terminate_reap_or_defer(
+                        child,
+                        process_group,
+                        "wait failure",
+                        NativeRunnerError::Wait(error),
+                    ));
                 }
             }
         }
@@ -654,7 +733,9 @@ fn run_preflighted<Parsed, ParseError>(
 
         if status.is_none() && kill_deadline.is_some_and(|deadline| now >= deadline) {
             defer_reap(child);
-            return Err(NativeRunnerError::ReapTimedOut);
+            return Err(NativeRunnerError::TerminationUnconfirmed {
+                stage: "timeout kill grace",
+            });
         }
 
         if let Some(observed) = status {
@@ -690,7 +771,7 @@ fn normalize_outcome<Parsed, ParseError>(
     timed_out: bool,
     stdout: &CapturedOutput,
     stderr: &CapturedOutput,
-    parse: impl FnOnce(&[u8]) -> Result<Parsed, ParseError>,
+    parse: impl FnOnce(&[u8], &[u8]) -> Result<Parsed, ParseError>,
 ) -> NativeRunOutcome<Parsed, ParseError> {
     if timed_out {
         return NativeRunOutcome::Timeout;
@@ -708,7 +789,7 @@ fn normalize_outcome<Parsed, ParseError>(
     if stdout.truncated || stderr.truncated {
         return NativeRunOutcome::OutputTruncated;
     }
-    match parse(&stdout.bytes) {
+    match parse(&stdout.bytes, &stderr.bytes) {
         Ok(parsed) => NativeRunOutcome::Success(parsed),
         Err(error) => NativeRunOutcome::OutputParseFailure(error),
     }
@@ -765,6 +846,33 @@ fn retain_bytes(captured: &mut CapturedOutput, bytes: &[u8]) {
     let retained = bytes.len().min(remaining);
     captured.bytes.extend_from_slice(&bytes[..retained]);
     captured.truncated |= retained != bytes.len();
+}
+
+fn terminate_reap_or_defer(
+    mut child: std::process::Child,
+    process_group: u32,
+    stage: &'static str,
+    confirmed_error: NativeRunnerError,
+) -> NativeRunnerError {
+    terminate_process_group(process_group);
+    let _ = child.kill();
+    if reap_within_grace(&mut child) {
+        confirmed_error
+    } else {
+        defer_reap(child);
+        NativeRunnerError::TerminationUnconfirmed { stage }
+    }
+}
+
+fn reap_within_grace(child: &mut std::process::Child) -> bool {
+    let deadline = Instant::now() + KILL_REAP_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(WAIT_POLL_INTERVAL),
+            Ok(None) | Err(_) => return false,
+        }
+    }
 }
 
 /// A SIGKILLed task may remain uninterruptible and unreapable. Move the child
@@ -1109,6 +1217,7 @@ mod tests {
         let error = prepare_native_action_with(
             native_request(PathBuf::from("/usr/bin/fake"), Vec::new()),
             None,
+            None,
             |_| {
                 Err(NativeRunnerError::InheritedEnvironmentTooLarge(
                     OsString::from("HUGE"),
@@ -1130,13 +1239,55 @@ mod tests {
             Vec::new(),
         ))
         .unwrap();
-        let started = prepared.execute_with_descriptor_limit(
-            |_| Ok::<(), ()>(()),
+        let started = prepared.execute_output_with_descriptor_limit(
+            |_, _| Ok::<(), ()>(()),
             || Err(io::Error::other("controlled descriptor refresh failure")),
         );
         assert!(matches!(
             started.result(),
             Err(NativeRunnerError::DescriptorPolicy(_))
+        ));
+    }
+
+    #[test]
+    fn post_spawn_error_returns_only_after_killed_child_is_reaped() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", HELPER_TEST, "--nocapture"])
+            .env_clear()
+            .env(HELPER_MODE, "timeout")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let child = command.spawn().unwrap();
+        let process_group = child.id();
+        let error = terminate_reap_or_defer(
+            child,
+            process_group,
+            "controlled drain failure",
+            NativeRunnerError::Drain(io::Error::other("controlled")),
+        );
+        assert!(matches!(error, NativeRunnerError::Drain(_)));
+    }
+
+    #[test]
+    fn mutation_binding_is_consumed_inside_started_boundary_before_spawn() {
+        let prepared = prepare_native_action_with(
+            native_request(
+                PathBuf::from("/definitely/missing/degu-native-tool"),
+                Vec::new(),
+            ),
+            None,
+            Some(Box::new(|| Err("sealed uv root changed".to_owned()))),
+            resolve_environment,
+        )
+        .unwrap();
+        let result = prepared.execute(|_| Ok::<(), ()>(())).result();
+        assert!(matches!(
+            result,
+            Err(NativeRunnerError::MutationBinding(message))
+                if message == "sealed uv root changed"
         ));
     }
 

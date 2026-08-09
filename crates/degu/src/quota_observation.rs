@@ -244,6 +244,15 @@ fn canonicalize_before(anchor: &Path) -> Result<PathBuf, UnavailableObservation>
     })
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PostObservationPolicy {
+    Probe,
+    Unavailable {
+        category: &'static str,
+        message: String,
+    },
+}
+
 /// The only injectable quota-probe seam. Canonicalization is deliberately part
 /// of this best-effort phase: neither it nor a provider failure can prevent the
 /// execution closure. A successful pre probe binds post probing to that exact
@@ -253,6 +262,20 @@ pub(crate) fn coordinate<R>(
     planned: PlannedActionBatch,
     probe: &mut impl FnMut(&Path) -> Result<QuotaSnapshot, ProbeError>,
     execute: impl FnOnce() -> (R, StartedActionOutcome),
+) -> (R, CompletedQuotaAction) {
+    coordinate_with_post_policy(planned, probe, || {
+        let (result, outcome) = execute();
+        (result, outcome, PostObservationPolicy::Probe)
+    })
+}
+
+/// Native runners use this variant when child termination cannot be confirmed.
+/// It completes the started action but refuses to label a concurrent snapshot
+/// as post-action data while the first action may still be mutating.
+pub(crate) fn coordinate_with_post_policy<R>(
+    planned: PlannedActionBatch,
+    probe: &mut impl FnMut(&Path) -> Result<QuotaSnapshot, ProbeError>,
+    execute: impl FnOnce() -> (R, StartedActionOutcome, PostObservationPolicy),
 ) -> (R, CompletedQuotaAction) {
     let anchors = planned
         .observation_targets()
@@ -293,7 +316,7 @@ pub(crate) fn coordinate<R>(
     }
 
     let started = planned.start();
-    let (result, outcome) = execute();
+    let (result, outcome, post_policy) = execute();
     let mut pending = started.finish_execution(outcome);
 
     let mut resolved = Vec::with_capacity(pre.len());
@@ -305,24 +328,33 @@ pub(crate) fn coordinate<R>(
                 before,
                 ..
             } => {
-                let state = match probe(&canonical) {
-                    Err(error) => QuotaObservationState::Unavailable(
-                        UnavailableObservation::from_error(ProbePhase::After, error),
-                    ),
-                    Ok(after) => match compare(&canonical, &before, &after) {
-                        Ok(delta) => match serde_json::to_value(&delta) {
-                            Ok(_) => QuotaObservationState::Observed(delta),
-                            Err(error) => {
-                                QuotaObservationState::Unavailable(UnavailableObservation {
-                                    phase: ProbePhase::After,
-                                    category: "output_unrepresentable",
-                                    message: format!(
-                                        "quota observation cannot be represented in JSON: {error}"
-                                    ),
-                                })
-                            }
+                let state = match &post_policy {
+                    PostObservationPolicy::Unavailable { category, message } => {
+                        QuotaObservationState::Unavailable(UnavailableObservation {
+                            phase: ProbePhase::After,
+                            category,
+                            message: message.clone(),
+                        })
+                    }
+                    PostObservationPolicy::Probe => match probe(&canonical) {
+                        Err(error) => QuotaObservationState::Unavailable(
+                            UnavailableObservation::from_error(ProbePhase::After, error),
+                        ),
+                        Ok(after) => match compare(&canonical, &before, &after) {
+                            Ok(delta) => match serde_json::to_value(&delta) {
+                                Ok(_) => QuotaObservationState::Observed(delta),
+                                Err(error) => {
+                                    QuotaObservationState::Unavailable(UnavailableObservation {
+                                        phase: ProbePhase::After,
+                                        category: "output_unrepresentable",
+                                        message: format!(
+                                            "quota observation cannot be represented in JSON: {error}"
+                                        ),
+                                    })
+                                }
+                            },
+                            Err(dimension) => QuotaObservationState::Incomparable(dimension),
                         },
-                        Err(dimension) => QuotaObservationState::Incomparable(dimension),
                     },
                 };
                 resolved.push(ResolvedQuotaObservation::new(anchors, state));
@@ -749,6 +781,38 @@ mod tests {
         assert!(matches!(
             completed.observations().quota_scopes()[0].state(),
             QuotaObservationState::Observed(delta) if delta.space_used_delta_bytes == -3
+        ));
+    }
+
+    #[test]
+    fn unconfirmed_termination_suppresses_post_probe_and_marks_after_unavailable() {
+        let mut replies = VecDeque::from([Ok(snapshot("/", 10, 2))]);
+        let mut calls = 0;
+        let (_, completed) = coordinate_with_post_policy(
+            planned(&["/"]),
+            &mut |_| {
+                calls += 1;
+                replies.pop_front().unwrap()
+            },
+            || {
+                (
+                    (),
+                    StartedActionOutcome::Failure,
+                    PostObservationPolicy::Unavailable {
+                        category: "action_not_terminal",
+                        message: "termination unconfirmed".to_owned(),
+                    },
+                )
+            },
+        );
+        assert_eq!(calls, 1, "only the pre-action probe may run");
+        assert!(matches!(
+            completed.observations().quota_scopes()[0].state(),
+            QuotaObservationState::Unavailable(UnavailableObservation {
+                phase: ProbePhase::After,
+                category: "action_not_terminal",
+                message,
+            }) if message == "termination unconfirmed"
         ));
     }
 

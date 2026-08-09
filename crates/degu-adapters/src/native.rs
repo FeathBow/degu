@@ -9,7 +9,7 @@ use degu_core::ecosystem::{DetectCtx, Root};
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 pub const MAX_ID_BYTES: usize = 128;
@@ -101,6 +101,40 @@ pub enum NativeProcessContract {
     AuditedCooperativeProcessGroup,
 }
 
+/// One executable path selected by the command owner, never by an adapter.
+///
+/// This is deliberately only lexical policy data, not executable provenance:
+/// it performs no filesystem I/O and proves no file identity or version.
+/// Keeping the selection separate lets the registry reject a capability that
+/// tries to substitute a different executable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeExecutableSelection(PathBuf);
+
+impl NativeExecutableSelection {
+    pub fn explicit(path: PathBuf) -> Result<Self, NativeRequestError> {
+        if path.as_os_str().as_bytes().len() > MAX_EXECUTABLE_BYTES {
+            return Err(NativeRequestError::ExecutableTooLarge);
+        }
+        let mut components = path.components();
+        if !matches!(components.next(), Some(Component::RootDir)) {
+            return Err(NativeRequestError::ExecutableNotAbsolute);
+        }
+        let Some(Component::Normal(_)) = components.next() else {
+            return Err(NativeRequestError::ExecutableNotLexicallyNormalized);
+        };
+        if !components.all(|component| matches!(component, Component::Normal(_)))
+            || path.as_os_str().as_bytes().contains(&0)
+        {
+            return Err(NativeRequestError::ExecutableNotLexicallyNormalized);
+        }
+        Ok(Self(path))
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeActionRequest {
     identity: NativeActionIdentity,
@@ -118,7 +152,7 @@ impl NativeActionRequest {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         identity: NativeActionIdentity,
-        executable: PathBuf,
+        executable: NativeExecutableSelection,
         arguments: impl IntoIterator<Item = OsString>,
         environment: NativeEnvironmentRequest,
         process_contract: NativeProcessContract,
@@ -129,9 +163,6 @@ impl NativeActionRequest {
     ) -> Result<Self, NativeRequestError> {
         let arguments = arguments.into_iter().collect::<Vec<_>>();
         let observation_requests = observation_requests.into_iter().collect::<Vec<_>>();
-        if executable.as_os_str().as_bytes().len() > MAX_EXECUTABLE_BYTES {
-            return Err(NativeRequestError::ExecutableTooLarge);
-        }
         validate_arguments(&arguments)?;
         validate_environment(&environment)?;
         if timeout.is_zero() || timeout > MAX_TIMEOUT {
@@ -151,7 +182,7 @@ impl NativeActionRequest {
         }
         Ok(Self {
             identity,
-            executable,
+            executable: executable.0,
             arguments,
             environment,
             process_contract,
@@ -199,6 +230,10 @@ pub enum NativeRequestError {
     InvalidActionId,
     #[error("native executable path exceeds the byte limit")]
     ExecutableTooLarge,
+    #[error("native executable selection is not absolute")]
+    ExecutableNotAbsolute,
+    #[error("native executable selection is not lexically normalized")]
+    ExecutableNotLexicallyNormalized,
     #[error("native argument contains an invalid byte")]
     InvalidArgument,
     #[error("native declaration has too many arguments")]
@@ -232,6 +267,10 @@ pub enum NativeCapabilityError {
         expected: &'static str,
         actual: String,
     },
+    #[error(
+        "native capability substituted executable {actual:?}, expected explicit selection {expected:?}"
+    )]
+    ExecutableSelectionMismatch { expected: PathBuf, actual: PathBuf },
 }
 
 /// Separate optional mutation declaration capability. Discovery remains on
@@ -241,6 +280,7 @@ pub trait NativeCleanupCapability: Send + Sync {
         &self,
         ctx: &DetectCtx,
         frozen_roots: &[Root],
+        executable: &NativeExecutableSelection,
     ) -> Result<NativeActionRequest, NativeCapabilityError>;
 }
 
@@ -319,12 +359,16 @@ mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
 
+    fn executable(path: impl Into<PathBuf>) -> NativeExecutableSelection {
+        NativeExecutableSelection::explicit(path.into()).unwrap()
+    }
+
     fn request(
         paths: impl IntoIterator<Item = PathBuf>,
     ) -> Result<NativeActionRequest, NativeRequestError> {
         NativeActionRequest::new(
             NativeActionIdentity::new("fake", "prune").unwrap(),
-            PathBuf::from("/usr/bin/fake"),
+            executable("/usr/bin/fake"),
             [OsString::from("prune")],
             NativeEnvironmentRequest::clear(),
             NativeProcessContract::AuditedCooperativeProcessGroup,
@@ -359,21 +403,7 @@ mod tests {
         assert!(matches!(
             NativeActionRequest::new(
                 NativeActionIdentity::new("fake", "prune").unwrap(),
-                PathBuf::from(format!("/{}", "x".repeat(MAX_EXECUTABLE_BYTES))),
-                [],
-                NativeEnvironmentRequest::clear(),
-                NativeProcessContract::AuditedCooperativeProcessGroup,
-                Duration::from_secs(1),
-                0,
-                0,
-                []
-            ),
-            Err(NativeRequestError::ExecutableTooLarge)
-        ));
-        assert!(matches!(
-            NativeActionRequest::new(
-                NativeActionIdentity::new("fake", "prune").unwrap(),
-                PathBuf::from("/x"),
+                executable("/x"),
                 [OsString::from_vec(b"bad\0arg".to_vec())],
                 NativeEnvironmentRequest::clear(),
                 NativeProcessContract::AuditedCooperativeProcessGroup,
@@ -400,7 +430,7 @@ mod tests {
         assert!(matches!(
             NativeActionRequest::new(
                 NativeActionIdentity::new("fake", "prune").unwrap(),
-                PathBuf::from("/x"),
+                executable("/x"),
                 [],
                 duplicate,
                 NativeProcessContract::AuditedCooperativeProcessGroup,
@@ -414,12 +444,45 @@ mod tests {
     }
 
     #[test]
+    fn native_executable_selection_rejects_unsafe_paths() {
+        use NativeRequestError::{
+            ExecutableNotAbsolute, ExecutableNotLexicallyNormalized, ExecutableTooLarge,
+        };
+        let cases = [
+            (PathBuf::from(""), ExecutableNotAbsolute),
+            (PathBuf::from("."), ExecutableNotAbsolute),
+            (PathBuf::from(".."), ExecutableNotAbsolute),
+            (PathBuf::from("relative/tool"), ExecutableNotAbsolute),
+            (PathBuf::from("/"), ExecutableNotLexicallyNormalized),
+            (
+                PathBuf::from("/tool/../other"),
+                ExecutableNotLexicallyNormalized,
+            ),
+            (
+                PathBuf::from(OsString::from_vec(b"/tool\0other".to_vec())),
+                ExecutableNotLexicallyNormalized,
+            ),
+            (
+                PathBuf::from(format!("/{}", "x".repeat(MAX_EXECUTABLE_BYTES))),
+                ExecutableTooLarge,
+            ),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                NativeExecutableSelection::explicit(path.clone()),
+                Err(expected),
+                "explicit({path:?}) must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn request_owns_a_frozen_copy_of_every_input() {
         let mut argument = OsString::from("before");
         let mut path = PathBuf::from("/before");
         let declared = NativeActionRequest::new(
             NativeActionIdentity::new("fake", "prune").unwrap(),
-            PathBuf::from("/usr/bin/fake"),
+            executable("/usr/bin/fake"),
             [argument.clone()],
             NativeEnvironmentRequest::clear(),
             NativeProcessContract::AuditedCooperativeProcessGroup,

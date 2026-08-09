@@ -836,7 +836,7 @@ mod tests {
     fn native_request(executable: PathBuf, paths: Vec<PathBuf>) -> NativeActionRequest {
         NativeActionRequest::new(
             degu_adapters::native::NativeActionIdentity::new("fake", "prune").unwrap(),
-            executable,
+            degu_adapters::native::NativeExecutableSelection::explicit(executable).unwrap(),
             [OsString::from("prune")],
             degu_adapters::native::NativeEnvironmentRequest::clear(),
             RequestedProcessContract::AuditedCooperativeProcessGroup,
@@ -893,7 +893,10 @@ mod tests {
     fn from_request_carries_every_declared_field_and_substitutes_nothing() {
         let request = NativeActionRequest::new(
             degu_adapters::native::NativeActionIdentity::new("fake", "prune").unwrap(),
-            PathBuf::from("/usr/bin/prune-tool"),
+            degu_adapters::native::NativeExecutableSelection::explicit(PathBuf::from(
+                "/usr/bin/prune-tool",
+            ))
+            .unwrap(),
             [OsString::from("cache"), OsString::from("--prune")],
             degu_adapters::native::NativeEnvironmentRequest::allowlist([OsString::from("HOME")])
                 .with_fixed([(OsString::from("TOOL_MODE"), OsString::from("prune"))]),
@@ -957,18 +960,6 @@ mod tests {
         assert!(matches!(
             started.result(),
             Err(NativeRunnerError::DescriptorPolicy(_))
-        ));
-    }
-
-    #[test]
-    fn adapter_request_still_passes_executable_validation() {
-        let error =
-            prepare_native_action(native_request(PathBuf::from("relative/tool"), Vec::new()))
-                .err()
-                .expect("relative executable must fail");
-        assert!(matches!(
-            error,
-            NativePreparationError::Declaration(NativeDeclarationError::ExecutableNotAbsolute)
         ));
     }
 
@@ -1190,7 +1181,10 @@ mod tests {
         let target_fd = descriptor_scan_limit().unwrap().checked_add(100).unwrap();
         let request = NativeActionRequest::new(
             degu_adapters::native::NativeActionIdentity::new("fake", "descriptor-check").unwrap(),
-            std::env::current_exe().unwrap(),
+            degu_adapters::native::NativeExecutableSelection::explicit(
+                std::env::current_exe().unwrap(),
+            )
+            .unwrap(),
             [
                 OsString::from("--exact"),
                 OsString::from(HELPER_TEST),

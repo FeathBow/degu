@@ -15,7 +15,9 @@ use crate::native_runner::{
 use crate::quota::{ProbeError, QuotaSnapshot};
 use crate::quota_observation::{self, CompletedQuotaAction};
 use degu_adapters::RegisteredAdapter;
-use degu_adapters::native::{NativeActionRequest, NativeCapabilityError};
+use degu_adapters::native::{
+    NativeActionRequest, NativeCapabilityError, NativeExecutableSelection,
+};
 use degu_core::ecosystem::{DetectCtx, Root};
 use std::path::Path;
 
@@ -61,9 +63,10 @@ pub(crate) fn prepare_registered_native_action(
     registration: &RegisteredAdapter,
     ctx: &DetectCtx,
     frozen_roots: &[Root],
+    executable: &NativeExecutableSelection,
 ) -> Result<Option<PreparedNativeQuotaAction>, NativeActionPlanError> {
     registration
-        .declare_native_cleanup(ctx, frozen_roots)?
+        .declare_native_cleanup(ctx, frozen_roots, executable)?
         .map(prepare_request)
         .transpose()
 }
@@ -139,10 +142,14 @@ mod tests {
     const HELPER_TEST: &str = "native_action::tests::controlled_helper_process";
     const HELPER_MODE: &str = "DEGU_NATIVE_ACTION_HELPER_MODE";
 
+    fn selection(path: PathBuf) -> NativeExecutableSelection {
+        NativeExecutableSelection::explicit(path).unwrap()
+    }
+
     fn request(paths: impl IntoIterator<Item = PathBuf>, mode: &str) -> NativeActionRequest {
         NativeActionRequest::new(
             NativeActionIdentity::new("fake", "prune").unwrap(),
-            std::env::current_exe().unwrap(),
+            selection(std::env::current_exe().unwrap()),
             [
                 OsString::from("--exact"),
                 OsString::from(HELPER_TEST),
@@ -183,9 +190,14 @@ mod tests {
         let ctx = DetectCtx::for_test(home.path().to_path_buf(), [] as [(OsString, OsString); 0]);
         for registration in degu_adapters::all() {
             assert!(
-                prepare_registered_native_action(&registration, &ctx, &[])
-                    .unwrap()
-                    .is_none(),
+                prepare_registered_native_action(
+                    &registration,
+                    &ctx,
+                    &[],
+                    &selection(PathBuf::from("/usr/bin/unused")),
+                )
+                .unwrap()
+                .is_none(),
                 "{} unexpectedly declared native work",
                 registration.id()
             );
@@ -253,28 +265,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_declaration_fails_before_a_batch_or_probe_can_exist() {
-        let invalid = NativeActionRequest::new(
-            NativeActionIdentity::new("fake", "prune").unwrap(),
-            PathBuf::from("relative/executable"),
-            [],
-            NativeEnvironmentRequest::clear(),
-            NativeProcessContract::AuditedCooperativeProcessGroup,
-            Duration::from_secs(1),
-            0,
-            0,
-            [PathBuf::from("/would-have-been-probed")],
-        )
-        .unwrap();
-        assert!(matches!(
-            prepare_request(invalid),
-            Err(NativeActionPlanError::Preparation(
-                NativePreparationError::Declaration(_)
-            ))
-        ));
-    }
-
-    #[test]
     fn started_spawn_failure_keeps_post_observation_and_diagnostic() {
         let root = tempfile::tempdir().unwrap();
         let canonical = std::fs::canonicalize(root.path()).unwrap();
@@ -282,7 +272,7 @@ mod tests {
         // Rebuild with a valid absolute, normalized path that cannot spawn.
         bad = NativeActionRequest::new(
             bad.identity().clone(),
-            PathBuf::from("/definitely/missing/degu-native-test"),
+            selection(PathBuf::from("/definitely/missing/degu-native-test")),
             bad.arguments().iter().cloned(),
             bad.environment().clone(),
             bad.process_contract(),

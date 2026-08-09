@@ -32,6 +32,9 @@ mod uv_cache_root;
 #[allow(dead_code)]
 // Descriptor-bound uv executable/version proof; no caller wired up yet.
 mod uv_executable;
+#[allow(dead_code)]
+// Exact uv prune proof bundle; no caller wired up yet.
+mod uv_prune_plan;
 mod value_parser;
 
 use anyhow::Result;

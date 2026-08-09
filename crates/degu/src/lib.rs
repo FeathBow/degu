@@ -15,6 +15,9 @@ mod finding_filter;
 mod findings_table;
 mod lifecycle;
 #[allow(dead_code)]
+// Native capability execution and its quota-observation bridge; no caller wired up yet.
+mod native_action;
+#[allow(dead_code)]
 // Native execution foundation; no caller wired up yet.
 mod native_runner;
 mod output;

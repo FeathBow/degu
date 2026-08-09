@@ -206,6 +206,8 @@ pub(crate) enum NativeRunnerError {
     InheritedEnvironmentTooLarge(OsString),
     #[error("private native executable snapshot failed attachment revalidation: {0}")]
     ExecutableBinding(#[source] io::Error),
+    #[error("native mutation scope failed attachment revalidation: {0}")]
+    MutationBinding(String),
     #[error("failed to establish the native child descriptor policy: {0}")]
     DescriptorPolicy(#[source] io::Error),
     #[error("failed to spawn native action: {0}")]

@@ -11,6 +11,13 @@ use crate::seal_wal::{
     SealWal, StagingTransactionMetadata, TransactionId, decide_recovery,
     quarantined_transaction_retains_active_permission_seals,
 };
+use crate::staging_recovery::{
+    RecoveryAnchors, RecoveryRebindError, StartupRecoveryCapability, prepare_startup_recovery,
+    recovery_transaction,
+};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_RECOVERY_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum StagingEngineError {
@@ -29,11 +36,24 @@ pub enum StagingEngineError {
 pub struct SealedStagingEngine {
     wal: SealWal<RecoverySession>,
     startup_blocked: bool,
+    recovery_generation: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
+pub struct StartupRecoveryCandidate {
+    transaction: TransactionId,
+    generation: u64,
+}
+
+impl StartupRecoveryCandidate {
+    pub fn transaction(&self) -> TransactionId {
+        self.transaction
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct StartupRecoveryReport {
-    pub work: Vec<RecoveryWork>,
+    pub candidates: Vec<StartupRecoveryCandidate>,
 }
 
 impl SealedStagingEngine {
@@ -52,12 +72,33 @@ impl SealedStagingEngine {
                 "transaction has no atomic staging metadata",
             ));
         }
+        // Enumerate candidate recovery ordering without granting authority. Every
+        // item is subsequently required to pass staging_recovery's fresh held-FD
+        // rebind; this callback cannot itself authorize chmod or namespace work.
+        let recovery_generation = NEXT_RECOVERY_GENERATION.fetch_add(1, Ordering::Relaxed);
         let work = replay
             .transactions
             .values()
-            .map(|transaction| decide_recovery(transaction, |_| RecoveryIdentity::Insufficient))
-            .filter(|work| *work != RecoveryWork::Nothing)
+            .map(|transaction| decide_recovery(transaction, |_| RecoveryIdentity::Reestablished))
+            .filter(|work| {
+                matches!(
+                    work,
+                    RecoveryWork::RestoreBeforeRename { .. }
+                        | RecoveryWork::VerifyOrQuarantineAfterRename { .. }
+                        | RecoveryWork::RestoreSourceParentAfterRename { .. }
+                        | RecoveryWork::RestoreQuarantinedSeals { .. }
+                        | RecoveryWork::ResolveUncertainPermissions { .. }
+                        | RecoveryWork::RecoveryRequired { .. }
+                )
+            })
             .collect::<Vec<_>>();
+        let candidates = work
+            .iter()
+            .map(|work| StartupRecoveryCandidate {
+                transaction: recovery_transaction(work),
+                generation: recovery_generation,
+            })
+            .collect();
         let startup_blocked = replay
             .transactions
             .values()
@@ -74,8 +115,9 @@ impl SealedStagingEngine {
             Self {
                 wal,
                 startup_blocked,
+                recovery_generation,
             },
-            StartupRecoveryReport { work },
+            StartupRecoveryReport { candidates },
         ))
     }
 
@@ -101,6 +143,34 @@ impl SealedStagingEngine {
 
     pub fn state(&self, transaction: TransactionId) -> Option<TransactionState> {
         self.wal.transaction_state(transaction)
+    }
+
+    /// Rebinds one startup item while retaining this engine's exact WAL lease.
+    /// The returned capability borrows the engine, so another transaction cannot
+    /// reuse the lease while recovery FDs authorize work.
+    #[allow(dead_code)] // consumed by the lifecycle startup coordinator
+    pub(crate) fn prepare_startup_recovery(
+        &mut self,
+        candidate: StartupRecoveryCandidate,
+        anchors: RecoveryAnchors,
+    ) -> Result<StartupRecoveryCapability<'_>, RecoveryRebindError> {
+        let transaction = self.validate_recovery_candidate(&candidate)?;
+        prepare_startup_recovery(
+            &mut self.wal,
+            &mut self.startup_blocked,
+            transaction,
+            anchors,
+        )
+    }
+
+    fn validate_recovery_candidate(
+        &self,
+        candidate: &StartupRecoveryCandidate,
+    ) -> Result<TransactionId, RecoveryRebindError> {
+        if candidate.generation != self.recovery_generation {
+            return Err(RecoveryRebindError::CandidateFromAnotherEngine);
+        }
+        Ok(candidate.transaction)
     }
 
     #[allow(dead_code)] // future held-tree integration seam

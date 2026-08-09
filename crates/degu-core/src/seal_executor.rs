@@ -79,6 +79,25 @@ pub(crate) fn execute_local_mode_mutation<W: DurableWrite>(
     held: &mut HeldLocalBackendEvidence,
     request: LocalModeMutationRequest,
 ) -> Result<LocalModeMutationResult, LocalModeExecutionError> {
+    execute_local_mode_mutation_inner(wal, held, request, false)
+}
+
+/// Staging-bound entry: unlike the authority-neutral executor this may append
+/// only to an exact staging transaction owned by the high-level engine.
+pub(crate) fn execute_staging_local_mode_mutation<W: DurableWrite>(
+    wal: &mut SealWal<W>,
+    held: &mut HeldLocalBackendEvidence,
+    request: LocalModeMutationRequest,
+) -> Result<LocalModeMutationResult, LocalModeExecutionError> {
+    execute_local_mode_mutation_inner(wal, held, request, true)
+}
+
+fn execute_local_mode_mutation_inner<W: DurableWrite>(
+    wal: &mut SealWal<W>,
+    held: &mut HeldLocalBackendEvidence,
+    request: LocalModeMutationRequest,
+    staging: bool,
+) -> Result<LocalModeMutationResult, LocalModeExecutionError> {
     let (prepared, reverses_mutation_id, restore_original) = match &request.transform {
         LocalModeTransform::Seal {
             acquire_owner_write_search,
@@ -145,7 +164,7 @@ pub(crate) fn execute_local_mode_mutation<W: DurableWrite>(
     };
 
     let mut held_outcome = None;
-    let wal_result = wal.apply_permission_mutation(intent, || {
+    let mutate = || {
         // A1 invokes this closure only after synchronizing the exact permission
         // intent constructed from `prepared` above.
         let outcome = held.apply_wal_bound_mode_change(prepared);
@@ -156,7 +175,12 @@ pub(crate) fn execute_local_mode_mutation<W: DurableWrite>(
         } else {
             Err(io::Error::other("held mode mutation was not verified"))
         }
-    });
+    };
+    let wal_result = if staging {
+        wal.apply_staging_permission_mutation(intent, mutate)
+    } else {
+        wal.apply_permission_mutation(intent, mutate)
+    };
 
     match (wal_result, held_outcome) {
         (Ok(()), Some(HeldModeChangeOutcome::AppliedVerified { .. })) => {
@@ -191,11 +215,16 @@ pub(crate) fn execute_local_mode_mutation<W: DurableWrite>(
                 | HeldModeChangeOutcome::NotAppliedVerified { .. },
             ),
         ) => {
-            if let Err(error) =
+            let resolution = if staging {
+                wal.resolve_staging_permission(request.transaction, request.mutation_id, |_| {
+                    Ok(PermissionResolution::ConfirmedNotApplied)
+                })
+            } else {
                 wal.resolve_unresolved_permission(request.transaction, request.mutation_id, |_| {
                     Ok(PermissionResolution::ConfirmedNotApplied)
                 })
-            {
+            };
+            if let Err(error) = resolution {
                 // The physical state is known not applied, but the durable WAL
                 // outcome is still unknown. Do not let this token or a restored
                 // seal lineage authorize a second transaction.
@@ -210,8 +239,7 @@ pub(crate) fn execute_local_mode_mutation<W: DurableWrite>(
             Err(MutationAppendError::Mutation(_)),
             Some(HeldModeChangeOutcome::AppliedButUnverified { reason, .. }),
         ) => {
-            let recovery_required =
-                wal.transition(request.transaction, TransactionState::RecoveryRequired);
+            let recovery_required = wal.transition_recovery_required(request.transaction);
             Err(LocalModeExecutionError::AppliedButUnverified {
                 reason,
                 recovery_required,
@@ -224,8 +252,7 @@ pub(crate) fn execute_local_mode_mutation<W: DurableWrite>(
                 post_failure,
             }),
         ) => {
-            let recovery_required =
-                wal.transition(request.transaction, TransactionState::RecoveryRequired);
+            let recovery_required = wal.transition_recovery_required(request.transaction);
             Err(LocalModeExecutionError::OutcomeUnknown {
                 syscall,
                 post_failure,

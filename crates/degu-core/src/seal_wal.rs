@@ -14,7 +14,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
 const MAGIC: &[u8; 4] = b"DSWL";
-const VERSION: u16 = 3;
+const VERSION: u16 = 4;
 const HEADER_LEN: usize = 20;
 const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 const MAX_WAL_LEN: u64 = 64 * 1024 * 1024;
@@ -41,14 +41,26 @@ pub struct StrongObjectIdentity {
     device: u64,
     inode: u64,
     incarnation: ObjectIncarnation,
+    mount_id: u64,
 }
 
 impl StrongObjectIdentity {
+    /// A zero mount id is insufficient for live startup recovery.
     pub fn new(device: u64, inode: u64, incarnation: ObjectIncarnation) -> Self {
+        Self::new_with_mount(device, inode, incarnation, 0)
+    }
+
+    pub fn new_with_mount(
+        device: u64,
+        inode: u64,
+        incarnation: ObjectIncarnation,
+        mount_id: u64,
+    ) -> Self {
         Self {
             device,
             inode,
             incarnation,
+            mount_id,
         }
     }
 
@@ -62,6 +74,10 @@ impl StrongObjectIdentity {
 
     pub fn incarnation(self) -> ObjectIncarnation {
         self.incarnation
+    }
+
+    pub fn mount_id(self) -> u64 {
+        self.mount_id
     }
 }
 
@@ -223,6 +239,9 @@ impl StagingTransactionMetadata {
         locator_is_valid(&self.source_parent)
             && locator_is_valid(&self.destination_parent)
             && self.source_parent.filesystem_id == self.destination_parent.filesystem_id
+            && self.source_parent_identity.mount_id != 0
+            && self.source_parent_identity.mount_id == self.root_identity.mount_id
+            && self.root_identity.mount_id == self.destination_parent_identity.mount_id
             && normal_name(&self.source_basename)
             && normal_name(&self.destination_basename)
             && (self.source_parent.relative_path != self.destination_parent.relative_path
@@ -258,6 +277,7 @@ pub enum DurableRenameOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // durable schema favors explicit, allocation-free records
 pub enum SealRecord {
     State {
         transaction: TransactionId,
@@ -350,6 +370,7 @@ pub struct SealWal<W> {
     writer: W,
     poisoned: bool,
     states: HashMap<TransactionId, TransactionState>,
+    staging_schema_versions: HashMap<TransactionId, u16>,
     used_mutations: HashSet<(TransactionId, u64)>,
     permissions: HashMap<(TransactionId, u64), DurablePermission>,
     unresolved_mutations: HashMap<(TransactionId, u64), DurablePermission>,
@@ -377,6 +398,7 @@ impl<W: DurableWrite> SealWal<W> {
             writer,
             poisoned: false,
             states: HashMap::new(),
+            staging_schema_versions: HashMap::new(),
             used_mutations: HashSet::new(),
             permissions: HashMap::new(),
             unresolved_mutations: HashMap::new(),
@@ -440,6 +462,9 @@ impl<W: DurableWrite> SealWal<W> {
         let mut wal = Self::from_validated(writer, actual_len, MAX_WAL_LEN);
         for transaction in replay.transactions.values() {
             wal.states.insert(transaction.id, transaction.state);
+            if let Some(version) = transaction.staging_schema_version {
+                wal.staging_schema_versions.insert(transaction.id, version);
+            }
             if let Some(metadata) = &transaction.staging {
                 wal.staging.insert(transaction.id, metadata.clone());
             }
@@ -494,6 +519,7 @@ impl<W: DurableWrite> SealWal<W> {
         })?;
         self.states.insert(transaction, TransactionState::Prepared);
         self.staging.insert(transaction, metadata);
+        self.staging_schema_versions.insert(transaction, VERSION);
         Ok(())
     }
 
@@ -506,6 +532,44 @@ impl<W: DurableWrite> SealWal<W> {
 
     pub(crate) fn transaction_state(&self, transaction: TransactionId) -> Option<TransactionState> {
         self.states.get(&transaction).copied()
+    }
+
+    /// Exact in-memory projection of the transaction held by this leased WAL.
+    /// Recovery must derive work from this snapshot rather than caller-provided
+    /// permission subsets or durable-path guesses.
+    pub(crate) fn recovery_snapshot(
+        &self,
+        transaction: TransactionId,
+    ) -> Option<ReplayedTransaction> {
+        let state = self.states.get(&transaction).copied()?;
+        let mut permissions = self
+            .permissions
+            .iter()
+            .filter_map(|((owner, _), permission)| {
+                (*owner == transaction).then_some(permission.clone())
+            })
+            .collect::<Vec<_>>();
+        permissions.sort_by_key(|permission| permission.mutation_id);
+        Some(ReplayedTransaction {
+            id: transaction,
+            state,
+            staging_schema_version: self.staging_schema_versions.get(&transaction).copied(),
+            permissions,
+            staging: self.staging.get(&transaction).cloned(),
+            tree_manifest: self.manifests.get(&transaction).copied(),
+            rename_outcome: self.rename_outcomes.get(&transaction).copied(),
+        })
+    }
+
+    /// Allocates the next transaction-local mutation id for startup recovery.
+    /// IDs are never reused across original seals, failed intents, or inverses.
+    #[allow(dead_code)] // consumed by the startup recovery execution seam
+    pub(crate) fn next_recovery_mutation_id(&self, transaction: TransactionId) -> Option<u64> {
+        self.used_mutations
+            .iter()
+            .filter_map(|(owner, id)| (*owner == transaction).then_some(*id))
+            .max()
+            .map_or(Some(0), |id| id.checked_add(1))
     }
 
     pub(crate) fn can_begin_staging_transaction(&self) -> bool {
@@ -556,6 +620,14 @@ impl<W: DurableWrite> SealWal<W> {
             ));
         }
         self.transition_inner(transaction, next)
+    }
+
+    /// Fail-closed transition shared by authority-neutral and staging executors.
+    pub(crate) fn transition_recovery_required(
+        &mut self,
+        transaction: TransactionId,
+    ) -> Result<(), AppendError> {
+        self.transition_inner(transaction, TransactionState::RecoveryRequired)
     }
 
     fn transition_inner(
@@ -807,6 +879,7 @@ impl<W: DurableWrite> SealWal<W> {
                     | TransactionState::RestoreIntent
                     | TransactionState::SourceParentRestoreIntent
                     | TransactionState::RollbackIntent
+                    | TransactionState::Quarantined
             )
         ) {
             return Err(MutationAppendError::IntentWal(AppendError::InvalidState(
@@ -853,7 +926,8 @@ impl<W: DurableWrite> SealWal<W> {
             (
                 TransactionState::RestoreIntent
                 | TransactionState::SourceParentRestoreIntent
-                | TransactionState::RollbackIntent,
+                | TransactionState::RollbackIntent
+                | TransactionState::Quarantined,
                 Some(original),
             ) => {
                 let Some(original) = self.permissions.get(&(transaction, original)) else {
@@ -1086,6 +1160,9 @@ pub struct DurablePermission {
 pub struct ReplayedTransaction {
     pub id: TransactionId,
     pub state: TransactionState,
+    /// Schema version of the transaction's atomic `StagingBegin` frame.
+    /// Later legacy-version state fixtures do not weaken v4 staging metadata.
+    pub staging_schema_version: Option<u16>,
     pub permissions: Vec<DurablePermission>,
     pub staging: Option<StagingTransactionMetadata>,
     pub tree_manifest: Option<DurableTreeManifest>,
@@ -1110,8 +1187,10 @@ pub enum ReplayError {
     Io(#[from] io::Error),
     #[error("malformed committed WAL frame at byte {offset}: {reason}")]
     Malformed { offset: u64, reason: &'static str },
-    #[error("unsupported WAL version {version} at byte {offset}")]
-    UnknownVersion { offset: u64, version: u16 },
+    #[error(
+        "unsupported legacy WAL version {version} at byte {offset}; supported legacy versions are 1 and 3"
+    )]
+    UnsupportedLegacyVersion { offset: u64, version: u16 },
     #[error("WAL header checksum mismatch at byte {offset}")]
     HeaderChecksum { offset: u64 },
     #[error("WAL payload checksum mismatch at byte {offset}")]
@@ -1277,6 +1356,10 @@ pub enum RecoveryWork {
         transaction: TransactionId,
         permissions: Vec<DurablePermission>,
     },
+    RestoreQuarantinedSeals {
+        transaction: TransactionId,
+        permissions: Vec<DurablePermission>,
+    },
     ResolveUncertainPermissions {
         transaction: TransactionId,
         permissions: Vec<DurablePermission>,
@@ -1299,6 +1382,7 @@ pub enum RecoveryRequiredReason {
     InsufficientPersistentIdentity,
     RenameOutcomeUnknown,
     RecordedRecoveryRequired,
+    LegacySchemaMissingMountIdentity { version: u16 },
 }
 
 pub(crate) fn quarantined_transaction_retains_active_permission_seals(
@@ -1308,21 +1392,39 @@ pub(crate) fn quarantined_transaction_retains_active_permission_seals(
         && retains_active_permission_seals(transaction.permissions.iter())
 }
 
+fn staging_recovery_needs_mount_authority(transaction: &ReplayedTransaction) -> bool {
+    match transaction.state {
+        TransactionState::VerifiedCommitted
+        | TransactionState::Restored
+        | TransactionState::RolledBack
+        | TransactionState::Purged
+        | TransactionState::Purgeable
+        | TransactionState::RecoveryRequired => false,
+        TransactionState::Quarantined => {
+            quarantined_transaction_retains_active_permission_seals(transaction)
+        }
+        _ => true,
+    }
+}
+
 /// Converts durable state into work only. The caller must independently obtain
 /// live, authority-bearing handles before any chmod/rename/quarantine action.
 pub fn decide_recovery<F>(transaction: &ReplayedTransaction, identity: F) -> RecoveryWork
 where
     F: Fn(&PersistentRecoveryEvidence) -> RecoveryIdentity,
 {
+    if let Some(version @ 0..=3) = transaction.staging_schema_version
+        && staging_recovery_needs_mount_authority(transaction)
+    {
+        return RecoveryWork::RecoveryRequired {
+            transaction: transaction.id,
+            reason: RecoveryRequiredReason::LegacySchemaMissingMountIdentity { version },
+        };
+    }
     if transaction.state == TransactionState::RecoveryRequired {
         return RecoveryWork::RecoveryRequired {
             transaction: transaction.id,
             reason: RecoveryRequiredReason::RecordedRecoveryRequired,
-        };
-    }
-    if transaction.state == TransactionState::Quarantined {
-        return RecoveryWork::PreserveQuarantine {
-            transaction: transaction.id,
         };
     }
     if matches!(
@@ -1371,6 +1473,19 @@ where
             .cloned()
             .collect::<Vec<_>>()
     };
+    if transaction.state == TransactionState::Quarantined {
+        let mut permissions = active_permissions();
+        if permissions.is_empty() {
+            return RecoveryWork::PreserveQuarantine {
+                transaction: transaction.id,
+            };
+        }
+        sort_permissions_deepest_first(&mut permissions);
+        return RecoveryWork::RestoreQuarantinedSeals {
+            transaction: transaction.id,
+            permissions,
+        };
+    }
     if transaction.state == TransactionState::RenameIntent && transaction.rename_outcome.is_none() {
         // No durable outcome exists from which to choose a side of the rename.
         // The WAL has no filesystem authority with which to infer the location.
@@ -1461,8 +1576,33 @@ fn sort_permissions_deepest_first(permissions: &mut [DurablePermission]) {
     });
 }
 
+#[derive(Debug)]
+struct VersionedRecord {
+    version: u16,
+    record: SealRecord,
+}
+
+trait IntoVersionedRecord {
+    fn into_versioned(self) -> VersionedRecord;
+}
+
+impl IntoVersionedRecord for VersionedRecord {
+    fn into_versioned(self) -> VersionedRecord {
+        self
+    }
+}
+
+impl IntoVersionedRecord for SealRecord {
+    fn into_versioned(self) -> VersionedRecord {
+        VersionedRecord {
+            version: VERSION,
+            record: self,
+        }
+    }
+}
+
 struct ParsedFrames {
-    records: Vec<SealRecord>,
+    records: Vec<VersionedRecord>,
     committed_len: usize,
 }
 
@@ -1487,8 +1627,8 @@ fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
             });
         }
         let version = u16::from_le_bytes([header[4], header[5]]);
-        if version != VERSION {
-            return Err(ReplayError::UnknownVersion {
+        if !matches!(version, 1 | 3 | VERSION) {
+            return Err(ReplayError::UnsupportedLegacyVersion {
                 offset: offset as u64,
                 version,
             });
@@ -1517,7 +1657,10 @@ fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
                 offset: offset as u64,
             });
         }
-        records.push(decode_record(payload, offset as u64)?);
+        records.push(VersionedRecord {
+            version,
+            record: decode_record(payload, offset as u64, version)?,
+        });
         offset += frame_len;
     }
     Ok(ParsedFrames {
@@ -1529,6 +1672,7 @@ fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
 #[derive(Default)]
 struct ReplayBuilding {
     state: Option<TransactionState>,
+    staging_schema_version: Option<u16>,
     permissions: Vec<DurablePermission>,
     indices: HashMap<u64, (usize, TransactionState)>,
     staging: Option<StagingTransactionMetadata>,
@@ -1536,13 +1680,16 @@ struct ReplayBuilding {
     rename_outcome: Option<DurableRenameOutcome>,
 }
 
-fn replay_records(records: Vec<SealRecord>) -> Result<Replay, ReplayError> {
+fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, ReplayError> {
     let mut transactions: BTreeMap<TransactionId, ReplayBuilding> = BTreeMap::new();
     for record in records {
+        let versioned = record.into_versioned();
+        let record = versioned.record;
         let id = record.transaction();
         let tx = transactions.entry(id).or_default();
         match record {
             SealRecord::StagingBegin { metadata, .. } => {
+                tx.staging_schema_version = Some(versioned.version);
                 if tx.state.is_some() || tx.staging.is_some() {
                     return Err(ReplayError::InvalidHistory(
                         "staging transaction has a duplicate or noninitial begin",
@@ -1708,6 +1855,7 @@ fn replay_records(records: Vec<SealRecord>) -> Result<Replay, ReplayError> {
                         | TransactionState::RestoreIntent
                         | TransactionState::SourceParentRestoreIntent
                         | TransactionState::RollbackIntent
+                        | TransactionState::Quarantined
                 ) {
                     return Err(ReplayError::InvalidHistory(
                         "permission intent is outside a permission-intent phase",
@@ -1783,6 +1931,7 @@ fn replay_records(records: Vec<SealRecord>) -> Result<Replay, ReplayError> {
                 ReplayedTransaction {
                     id,
                     state,
+                    staging_schema_version: tx.staging_schema_version,
                     permissions: tx.permissions,
                     staging: tx.staging,
                     tree_manifest: tx.tree_manifest,
@@ -1814,7 +1963,8 @@ fn validate_replayed_inverse(
         (
             TransactionState::RestoreIntent
             | TransactionState::SourceParentRestoreIntent
-            | TransactionState::RollbackIntent,
+            | TransactionState::RollbackIntent
+            | TransactionState::Quarantined,
             Some(original_id),
         ) => {
             let original = permissions
@@ -2038,7 +2188,8 @@ fn valid_transition(from: TransactionState, to: TransactionState) -> bool {
                     | S::SourceParentRestoreIntent
                     | S::SourceParentRestored
                     | S::RollbackIntent
-                    | S::RestoreIntent,
+                    | S::RestoreIntent
+                    | S::Quarantined,
                 S::RecoveryRequired
             )
     )
@@ -2161,7 +2312,7 @@ fn encode_record(record: &SealRecord) -> Result<Vec<u8>, FrameError> {
     Ok(bytes)
 }
 
-fn decode_record(payload: &[u8], offset: u64) -> Result<SealRecord, ReplayError> {
+fn decode_record(payload: &[u8], offset: u64, version: u16) -> Result<SealRecord, ReplayError> {
     let mut cursor = Cursor::new(payload, offset);
     let tag = cursor.u8()?;
     let transaction = TransactionId(cursor.array_16()?);
@@ -2229,21 +2380,21 @@ fn decode_record(payload: &[u8], offset: u64) -> Result<SealRecord, ReplayError>
             transaction,
             mutation_id: cursor.u64()?,
         },
-        5 => SealRecord::StagingBegin {
+        5 if version >= 3 => SealRecord::StagingBegin {
             transaction,
-            metadata: decode_staging_metadata(&mut cursor, offset)?,
+            metadata: decode_staging_metadata(&mut cursor, offset, version)?,
         },
-        6 => SealRecord::TreeManifestComplete {
+        6 if version >= 3 => SealRecord::TreeManifestComplete {
             transaction,
             manifest: DurableTreeManifest {
                 entry_count: cursor.u64()?,
                 sha256: cursor.array_32()?,
             },
         },
-        7 => SealRecord::RenameIntent { transaction },
-        8 => {
+        7 if version >= 3 => SealRecord::RenameIntent { transaction },
+        8 if version >= 3 => {
             let kind = cursor.u8()?;
-            let identity = decode_strong_identity(&mut cursor)?;
+            let identity = decode_strong_identity(&mut cursor, version)?;
             let outcome = match kind {
                 1 => DurableRenameOutcome::AppliedAndParentsSynced(identity),
                 2 => DurableRenameOutcome::ConfirmedNotAppliedAtSource(identity),
@@ -2275,11 +2426,15 @@ fn decode_record(payload: &[u8], offset: u64) -> Result<SealRecord, ReplayError>
     Ok(record)
 }
 
-fn decode_strong_identity(cursor: &mut Cursor<'_>) -> Result<StrongObjectIdentity, ReplayError> {
+fn decode_strong_identity(
+    cursor: &mut Cursor<'_>,
+    version: u16,
+) -> Result<StrongObjectIdentity, ReplayError> {
     Ok(StrongObjectIdentity {
         device: cursor.u64()?,
         inode: cursor.u64()?,
         incarnation: ObjectIncarnation::new(cursor.u64()?),
+        mount_id: if version >= 4 { cursor.u64()? } else { 0 },
     })
 }
 
@@ -2298,13 +2453,14 @@ fn decode_locator(cursor: &mut Cursor<'_>, offset: u64) -> Result<StagingLocator
 fn decode_staging_metadata(
     cursor: &mut Cursor<'_>,
     offset: u64,
+    version: u16,
 ) -> Result<StagingTransactionMetadata, ReplayError> {
     let source_parent = decode_locator(cursor, offset)?;
-    let source_parent_identity = decode_strong_identity(cursor)?;
+    let source_parent_identity = decode_strong_identity(cursor, version)?;
     let source_basename = std::ffi::OsString::from_vec(cursor.bytes()?);
-    let root_identity = decode_strong_identity(cursor)?;
+    let root_identity = decode_strong_identity(cursor, version)?;
     let destination_parent = decode_locator(cursor, offset)?;
-    let destination_parent_identity = decode_strong_identity(cursor)?;
+    let destination_parent_identity = decode_strong_identity(cursor, version)?;
     let destination_basename = std::ffi::OsString::from_vec(cursor.bytes()?);
     let backend = match cursor.u8()? {
         1 => CertifiedLocalBackend::Ext4,
@@ -2321,7 +2477,7 @@ fn decode_staging_metadata(
         1 => DurableSourceParentStrategy::PermissionSeal,
         2 => DurableSourceParentStrategy::AlreadyExclusive(DurableAlreadyExclusiveParent {
             source_parent: decode_locator(cursor, offset)?,
-            source_parent_identity: decode_strong_identity(cursor)?,
+            source_parent_identity: decode_strong_identity(cursor, version)?,
             observed_mode: cursor.u32()?,
         }),
         _ => {
@@ -2331,7 +2487,7 @@ fn decode_staging_metadata(
             });
         }
     };
-    StagingTransactionMetadata::new(
+    let metadata = StagingTransactionMetadata {
         source_parent,
         source_parent_identity,
         source_basename,
@@ -2341,8 +2497,29 @@ fn decode_staging_metadata(
         destination_basename,
         backend,
         source_parent_strategy,
-    )
-    .ok_or(ReplayError::Malformed {
+    };
+    let valid = if version >= 4 {
+        metadata.invariants_hold()
+    } else if metadata.source_parent_identity.mount_id != 0
+        || metadata.root_identity.mount_id != 0
+        || metadata.destination_parent_identity.mount_id != 0
+    {
+        false
+    } else {
+        // Validate every non-mount invariant without inventing mount authority in
+        // the replayed value. The promoted clone is discarded immediately.
+        let mut promoted = metadata.clone();
+        promoted.source_parent_identity.mount_id = 1;
+        promoted.root_identity.mount_id = 1;
+        promoted.destination_parent_identity.mount_id = 1;
+        if let DurableSourceParentStrategy::AlreadyExclusive(proof) =
+            &mut promoted.source_parent_strategy
+        {
+            proof.source_parent_identity.mount_id = 1;
+        }
+        promoted.invariants_hold()
+    };
+    valid.then_some(metadata).ok_or(ReplayError::Malformed {
         offset,
         reason: "staging metadata is inconsistent",
     })
@@ -2352,6 +2529,7 @@ fn encode_strong_identity(output: &mut Vec<u8>, identity: StrongObjectIdentity) 
     output.extend_from_slice(&identity.device.to_le_bytes());
     output.extend_from_slice(&identity.inode.to_le_bytes());
     output.extend_from_slice(&identity.incarnation.get().to_le_bytes());
+    output.extend_from_slice(&identity.mount_id.to_le_bytes());
 }
 
 fn encode_locator(output: &mut Vec<u8>, locator: &StagingLocator) -> Result<(), FrameError> {

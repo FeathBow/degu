@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 fn identity(inode: u64) -> StrongObjectIdentity {
-    StrongObjectIdentity::new(1, inode, ObjectIncarnation::new(inode + 1000))
+    StrongObjectIdentity::new_with_mount(1, inode, ObjectIncarnation::new(inode + 1000), 7)
 }
 
 fn metadata() -> StagingTransactionMetadata {
@@ -28,12 +28,32 @@ fn metadata() -> StagingTransactionMetadata {
 }
 
 #[test]
+fn bare_transaction_without_staging_provenance_is_rejected() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let store =
+        SealWalStore::open_or_create(&temp.path().canonicalize().unwrap().join("wal-store"))
+            .unwrap();
+    {
+        let mut lease = store.try_lease().unwrap();
+        lease.replay_and_repair().unwrap();
+        let mut wal = lease.resume().unwrap();
+        wal.begin(TransactionId([0x80; 16])).unwrap();
+    }
+    assert!(matches!(
+        SealedStagingEngine::open(&store),
+        Err(StagingEngineError::InsufficientRecoveryIdentity(
+            "transaction has no atomic staging metadata"
+        ))
+    ));
+}
+
+#[test]
 fn high_level_open_owns_staging_begin_and_blocks_parallel_transaction() {
     let temp = crate::secure_test_tempdir().unwrap();
     let store_path = temp.path().canonicalize().unwrap().join("wal-store");
     let store = SealWalStore::open_or_create(&store_path).unwrap();
     let (mut engine, report) = SealedStagingEngine::open(&store).unwrap();
-    assert!(report.work.is_empty());
+    assert!(report.candidates.is_empty());
     let first = TransactionId([81; 16]);
     engine.begin_transaction(first, metadata()).unwrap();
     assert_eq!(engine.state(first), Some(TransactionState::Prepared));
@@ -52,7 +72,7 @@ fn invalid_metadata_is_rejected_without_poisoning_runtime_or_reopen() {
     let invalid_transaction = TransactionId([86; 16]);
     {
         let (mut engine, report) = SealedStagingEngine::open(&store).unwrap();
-        assert!(report.work.is_empty());
+        assert!(report.candidates.is_empty());
         let mut invalid = metadata();
         invalid.invalidate_for_test();
         assert!(matches!(
@@ -65,7 +85,7 @@ fn invalid_metadata_is_rejected_without_poisoning_runtime_or_reopen() {
     }
 
     let (mut reopened, report) = SealedStagingEngine::open(&store).unwrap();
-    assert!(report.work.is_empty());
+    assert!(report.candidates.is_empty());
     let valid_transaction = TransactionId([87; 16]);
     reopened
         .begin_transaction(valid_transaction, metadata())
@@ -88,15 +108,38 @@ fn reopen_blocks_new_mutation_when_staging_recovery_is_incomplete() {
             .unwrap();
     }
     let (mut engine, report) = SealedStagingEngine::open(&store).unwrap();
-    assert!(matches!(
-        report.work.as_slice(),
-        [RecoveryWork::RestoreBeforeRename { .. }]
-    ));
+    assert_eq!(report.candidates.len(), 1);
+    assert_eq!(report.candidates[0].transaction(), TransactionId([83; 16]));
     assert!(
         engine
             .begin_transaction(TransactionId([84; 16]), metadata())
             .is_err()
     );
+}
+
+#[test]
+fn recovery_candidate_cannot_cross_engine_generation() {
+    let first_temp = crate::secure_test_tempdir().unwrap();
+    let first_store =
+        SealWalStore::open_or_create(&first_temp.path().canonicalize().unwrap().join("wal-store"))
+            .unwrap();
+    let transaction = TransactionId([0x91; 16]);
+    {
+        let (mut engine, _) = SealedStagingEngine::open(&first_store).unwrap();
+        engine.begin_transaction(transaction, metadata()).unwrap();
+    }
+    let (_first_engine, mut first_report) = SealedStagingEngine::open(&first_store).unwrap();
+    let candidate = first_report.candidates.pop().unwrap();
+
+    let second_temp = crate::secure_test_tempdir().unwrap();
+    let second_store =
+        SealWalStore::open_or_create(&second_temp.path().canonicalize().unwrap().join("wal-store"))
+            .unwrap();
+    let (second_engine, _) = SealedStagingEngine::open(&second_store).unwrap();
+    assert!(matches!(
+        second_engine.validate_recovery_candidate(&candidate),
+        Err(RecoveryRebindError::CandidateFromAnotherEngine)
+    ));
 }
 
 #[test]
@@ -205,10 +248,8 @@ fn active_seals_in_quarantine_block_runtime_and_reopen() {
     }
 
     let (mut reopened, report) = SealedStagingEngine::open(&store).unwrap();
-    assert!(matches!(
-        report.work.as_slice(),
-        [RecoveryWork::PreserveQuarantine { transaction: id }] if *id == transaction
-    ));
+    assert_eq!(report.candidates.len(), 1);
+    assert_eq!(report.candidates[0].transaction(), transaction);
     assert!(
         reopened
             .begin_transaction(TransactionId([90; 16]), metadata())

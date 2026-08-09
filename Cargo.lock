@@ -255,6 +255,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "terminal_size",
+ "thiserror",
  "tracing",
  "tracing-subscriber",
  "unicode-width",

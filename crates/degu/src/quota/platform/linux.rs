@@ -12,7 +12,6 @@ const DATA_SOURCE: &str = "linux_quotactl";
 const QUOTA_BLOCK_BYTES: u64 = 1024;
 const SUPPORTED_FILESYSTEM: &str = "ext4";
 const SUBCOMMAND_SHIFT: u32 = 8;
-const MOUNT_POINT_FIELD: usize = 4;
 const OCTAL_DIGIT_COUNT: usize = 3;
 const OCTAL_RADIX: u32 = 8;
 const REQUIRED_VALID_FIELDS: u32 = libc::QIF_LIMITS | libc::QIF_USAGE | libc::QIF_TIMES;
@@ -27,11 +26,22 @@ pub(super) fn probe(path: &Path) -> Result<QuotaSnapshot, ProbeError> {
     let mount = inspect_mount(path)?;
     // SAFETY: geteuid has no preconditions and does not mutate process state.
     let subject_id = unsafe { libc::geteuid() };
-    match mount.filesystem.as_str() {
-        SUPPORTED_FILESYSTEM => probe_vfs(mount, path, subject_id),
-        lustre::FILESYSTEM => lustre::probe(mount, path, subject_id),
+    let snapshot = match mount.filesystem.as_str() {
+        SUPPORTED_FILESYSTEM => probe_vfs(mount.clone(), path, subject_id),
+        lustre::FILESYSTEM => lustre::probe(mount.clone(), path, subject_id),
         _ => Err(unsupported(&mount)),
+    }?;
+    // Detect ordinary concurrent replacement. A privileged mount controller can
+    // still arrange A -> B -> the same A; that hostile-root ABA is outside this
+    // reporting-only provider's threat boundary (see the Lustre module notes).
+    let rebound = inspect_mount(path)?;
+    if rebound != mount {
+        return Err(incomplete(
+            &mount,
+            "mount identity changed during quota probe",
+        ));
     }
+    Ok(snapshot)
 }
 
 fn probe_vfs(mount: MountInfo, path: &Path, subject_id: u32) -> Result<QuotaSnapshot, ProbeError> {
@@ -72,7 +82,15 @@ fn parse_mountinfo(input: &str, path: &Path) -> Option<MountInfo> {
 
 fn parse_mount_line(line: &str) -> Option<MountInfo> {
     let (mount, filesystem) = line.split_once(" - ")?;
-    let mount_point = mount.split_whitespace().nth(MOUNT_POINT_FIELD)?;
+    let mut mount_fields = mount.split_whitespace();
+    let mount_id = mount_fields.next()?.parse().ok()?;
+    let _parent_id = mount_fields.next()?;
+    let device = mount_fields.next()?;
+    let (device_major, device_minor) = device.split_once(':')?;
+    let device_major = device_major.parse().ok()?;
+    let device_minor = device_minor.parse().ok()?;
+    let _root = mount_fields.next()?;
+    let mount_point = mount_fields.next()?;
     let mut fields = filesystem.split_whitespace();
     let filesystem = fields.next()?.to_owned();
     let source = fields.next()?;
@@ -80,6 +98,9 @@ fn parse_mount_line(line: &str) -> Option<MountInfo> {
         mount_point: decode_path(mount_point),
         filesystem,
         source: decode_path(source),
+        mount_id,
+        device_major,
+        device_minor,
     })
 }
 
@@ -232,6 +253,25 @@ mod tests {
         let mount = parse_mountinfo(input, Path::new("/home/me/My Data/project")).unwrap();
         assert_eq!(mount.mount_point, Path::new("/home/me/My Data"));
         assert_eq!(mount.source, Path::new("/dev/loop0"));
+        assert_eq!(mount.mount_id, 40);
+        assert_eq!((mount.device_major, mount.device_minor), (7, 1));
+
+        let replacement = parse_mountinfo(
+            "41 36 7:2 / /home/me/My\\040Data rw - ext4 /dev/loop1 rw",
+            Path::new("/home/me/My Data/project"),
+        )
+        .unwrap();
+        assert_ne!(mount, replacement);
+    }
+
+    #[test]
+    fn quota_mount_parser_rejects_missing_or_invalid_identity() {
+        let missing_device = "40 36 / /home rw - ext4 /dev/loop0 rw";
+        let invalid_mount_id = "x 36 7:1 / /home rw - ext4 /dev/loop0 rw";
+        let invalid_device = "40 36 7:x / /home rw - ext4 /dev/loop0 rw";
+        for input in [missing_device, invalid_mount_id, invalid_device] {
+            assert!(parse_mountinfo(input, Path::new("/home/project")).is_none());
+        }
     }
 
     #[test]
@@ -279,6 +319,9 @@ mod tests {
             mount_point: PathBuf::from("/home"),
             filesystem: "ext4".to_owned(),
             source: PathBuf::from("/dev/root"),
+            mount_id: 36,
+            device_major: 8,
+            device_minor: 1,
         };
 
         let not_configured = classify_error(&mount, std::io::Error::from_raw_os_error(libc::ESRCH));

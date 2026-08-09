@@ -1,7 +1,7 @@
 use super::{format_count, render_dimension, render_human};
 use crate::quota::model::{
     ActiveQuota, QuotaDimension, QuotaGrace, QuotaGraceState, QuotaLimits, QuotaScope,
-    QuotaSnapshot,
+    QuotaScopeIdentity, QuotaSnapshot,
 };
 use crate::runtime::{Glyphs, Ui};
 use std::path::PathBuf;
@@ -12,6 +12,7 @@ fn quota_human_escapes_scope_and_provider_terminal_controls() {
         PathBuf::from("/tmp/target\nrow"),
         PathBuf::from("/mnt/\tdata"),
         "ext4\x1b[31m".to_owned(),
+        QuotaScopeIdentity::new(36, 8, 1, PathBuf::from("/dev/root")),
     );
     let report = QuotaSnapshot::active(
         scope,
@@ -43,6 +44,7 @@ fn quota_human_reflows_fields_for_a_narrow_terminal() {
         PathBuf::from("/home/user/a-very-long-quota-target"),
         PathBuf::from("/home/user/a-very-long-mount-point"),
         "ext4".to_owned(),
+        QuotaScopeIdentity::new(36, 8, 1, PathBuf::from("/dev/root")),
     );
     let report = QuotaSnapshot::active(
         scope,

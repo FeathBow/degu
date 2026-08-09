@@ -52,6 +52,7 @@ pub(super) const CLEAN_REPORT_KEYS: &[&str] = &[
     "omitted",
     "opt_in",
     "planned",
+    "quota_observations",
 ];
 pub(super) const CLEAN_EXPIRY_KEYS: &[&str] =
     &["attempted", "failed", "planned", "purged", "retention_days"];
@@ -102,7 +103,15 @@ pub(super) const TRASH_LIST_ROW_KEYS: &[&str] = &[
     "lower_bound",
     "original",
 ];
-pub(super) const TRASH_PURGE_REPORT_KEYS: &[&str] = &["failed", "purged"];
+pub(super) const TRASH_PURGE_REPORT_KEYS: &[&str] = &["failed", "purged", "quota_observations"];
+pub(super) const QUOTA_ACTION_KEYS: &[&str] = &[
+    "id",
+    "kind",
+    "observation_state",
+    "owner",
+    "quota_observations",
+];
+pub(super) const QUOTA_SCOPE_KEYS: &[&str] = &["anchors", "quota_observed_usage_delta"];
 pub(super) const OP_RECORD_KEYS_LEGACY: &[&str] = &[
     "action",
     "bytes_allocated",
@@ -129,6 +138,7 @@ pub(super) fn fake_huggingface_cache(home: &tempfile::TempDir) -> PathBuf {
     let repo = hf_home.join("hub/models--org--name");
     std::fs::create_dir_all(repo.join("snapshots/main")).unwrap();
     std::fs::write(repo.join("snapshots/main/model.bin"), [0u8; 8192]).unwrap();
+    crate::common::make_tree_non_shared_writable(&hf_home).unwrap();
     hf_home
 }
 

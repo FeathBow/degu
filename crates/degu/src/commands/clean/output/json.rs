@@ -1,4 +1,4 @@
-use super::super::execution::ExpiryExecution;
+use super::super::execution::{CleanQuotaObservations, ExpiryExecution};
 use super::super::preparation::PreparedClean;
 use crate::lifecycle::{CleanExecution, ExpiryPlan, Lifecycle, TRASH_RETENTION_DAYS};
 use crate::output::stdoutln;
@@ -9,6 +9,7 @@ pub(crate) fn print(
     prepared: &PreparedClean,
     executed: &[CleanExecution],
     expiry: &ExpiryExecution,
+    observations: &CleanQuotaObservations,
 ) -> Result<()> {
     let (planned, excluded, omitted) = prepared_findings_json(prepared)?;
     let executed = executed
@@ -23,6 +24,10 @@ pub(crate) fn print(
         "executed": executed,
         "opt_in": prepared.scope.include_review(),
         "expiry": expiry_json(expiry)?,
+        "quota_observations": {
+            "direct_purge": crate::quota_observation::json(&observations.direct_purge),
+            "expiry_purge": crate::quota_observation::json(&expiry.observation),
+        },
     });
     stdoutln!("{}", serde_json::to_string_pretty(&report)?)
 }

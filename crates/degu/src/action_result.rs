@@ -6,7 +6,7 @@
 //! converted into a lifecycle capability.
 
 use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Stable identity of one action within the result owner's namespace.
@@ -109,24 +109,18 @@ pub(crate) enum CompletionBoundary {
     Completed,
 }
 
-/// Canonical absolute path selected solely for read-only post-action observation.
+/// Uninterpreted path requested solely for read-only action observation.
 ///
-/// The caller must obtain the path from canonicalization and choose an anchor
-/// expected to survive the action (normally a mount point or persistent parent).
-/// Lexical validation here prevents accidentally recording a relative or
-/// parent-traversing path, but does not assert filesystem identity or authority.
+/// It is intentionally an infallible data wrapper: lexical `.`/`..` and symlink
+/// traversal retain filesystem meaning until the observation pass canonicalizes
+/// inside the non-authoritative probe phase. Relative requests are also captured
+/// and later reported as unavailable rather than becoming setup failures.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct CanonicalObservationAnchor(PathBuf);
+pub(crate) struct ObservationRequestPath(PathBuf);
 
-impl CanonicalObservationAnchor {
-    pub(crate) fn from_canonicalized(path: PathBuf) -> Result<Self, ContractError> {
-        let mut components = path.components();
-        if !matches!(components.next(), Some(Component::RootDir))
-            || !components.all(|component| matches!(component, Component::Normal(_)))
-        {
-            return Err(ContractError::InvalidObservationAnchor);
-        }
-        Ok(Self(path))
+impl ObservationRequestPath {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self(path)
     }
 
     /// Read-only quota probe input. Possessing this path grants no permission to
@@ -136,21 +130,21 @@ impl CanonicalObservationAnchor {
     }
 }
 
-/// One prospective quota scope, addressed by a canonical persistent anchor.
-/// The quota-observation pass probes it and decides whether two anchors identify
-/// the same scope and subject; this module intentionally does not duplicate the
-/// quota identity vocabulary.
+/// One prospective quota scope, addressed by an uninterpreted path request.
+/// The quota-observation pass canonicalizes and probes it, then decides whether
+/// requests identify the same provider scope and subject; this module intentionally
+/// does not duplicate the quota identity vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct QuotaObservationTarget {
-    anchor: CanonicalObservationAnchor,
+    anchor: ObservationRequestPath,
 }
 
 impl QuotaObservationTarget {
-    pub(crate) fn new(anchor: CanonicalObservationAnchor) -> Self {
+    pub(crate) fn new(anchor: ObservationRequestPath) -> Self {
         Self { anchor }
     }
 
-    pub(crate) fn anchor(&self) -> &CanonicalObservationAnchor {
+    pub(crate) fn anchor(&self) -> &ObservationRequestPath {
         &self.anchor
     }
 }
@@ -177,7 +171,7 @@ impl ActionObservationTargets {
         &self.quota_scopes
     }
 
-    fn anchors(&self) -> HashSet<CanonicalObservationAnchor> {
+    fn anchors(&self) -> HashSet<ObservationRequestPath> {
         self.quota_scopes
             .iter()
             .map(|target| target.anchor.clone())
@@ -200,7 +194,7 @@ pub(crate) enum QuotaObservationState<Unavailable, Incomparable, Observed> {
 /// after the observation pass proves they address the same provider scope and subject.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedQuotaObservation<Unavailable, Incomparable, Observed> {
-    anchors: Vec<CanonicalObservationAnchor>,
+    anchors: Vec<ObservationRequestPath>,
     state: QuotaObservationState<Unavailable, Incomparable, Observed>,
 }
 
@@ -208,7 +202,7 @@ impl<Unavailable, Incomparable, Observed>
     ResolvedQuotaObservation<Unavailable, Incomparable, Observed>
 {
     pub(crate) fn new(
-        anchors: impl IntoIterator<Item = CanonicalObservationAnchor>,
+        anchors: impl IntoIterator<Item = ObservationRequestPath>,
         state: QuotaObservationState<Unavailable, Incomparable, Observed>,
     ) -> Result<Self, ContractError> {
         let mut seen = HashSet::new();
@@ -228,7 +222,7 @@ impl<Unavailable, Incomparable, Observed>
         })
     }
 
-    pub(crate) fn anchors(&self) -> &[CanonicalObservationAnchor] {
+    pub(crate) fn anchors(&self) -> &[ObservationRequestPath] {
         &self.anchors
     }
 
@@ -482,6 +476,48 @@ impl BatchPostObservationPending {
             .ok_or(ContractError::ObservationTicketAlreadyTaken)
     }
 
+    /// Completes with the supplied resolution, or seals every exact target as
+    /// unavailable if an internal observation contract check fails. This keeps
+    /// reporting defects from discarding an already-produced mutation result.
+    pub(crate) fn complete_or_all_unavailable<Unavailable: Clone, Incomparable, Observed>(
+        self,
+        observations: Result<
+            ActionObservations<Unavailable, Incomparable, Observed>,
+            ContractError,
+        >,
+        unavailable: Unavailable,
+    ) -> CompletedActionBatchResult<Unavailable, Incomparable, Observed> {
+        let observations = match observations {
+            Ok(observations)
+                if observations.belongs_to(&self.descriptor.correlation)
+                    && observations.covers(&self.descriptor.targets)
+                    && !observations.any_not_attempted() =>
+            {
+                observations
+            }
+            Ok(_) | Err(_) => ActionObservations {
+                correlation: self.descriptor.correlation.clone(),
+                quota_scopes: self
+                    .descriptor
+                    .targets
+                    .quota_scopes()
+                    .iter()
+                    .map(|target| ResolvedQuotaObservation {
+                        anchors: vec![target.anchor.clone()],
+                        state: QuotaObservationState::Unavailable(unavailable.clone()),
+                    })
+                    .collect(),
+            },
+        };
+        CompletedActionBatchResult {
+            descriptor: self.descriptor,
+            start: StartBoundary::Started,
+            completion: CompletionBoundary::Completed,
+            outcome: self.outcome,
+            observations,
+        }
+    }
+
     /// Crosses the completion boundary only with an observation resolution that
     /// covers the exact targets carried across the start/execution boundaries.
     pub(crate) fn complete<Unavailable, Incomparable, Observed>(
@@ -558,7 +594,6 @@ impl<Unavailable, Incomparable, Observed>
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ContractError {
     InvalidActionId,
-    InvalidObservationAnchor,
     EmptyObservationScope,
     DuplicateObservationAnchor,
     ObservationTargetMismatch,
@@ -575,8 +610,8 @@ mod tests {
         ActionId::new(value).unwrap()
     }
 
-    fn anchor(path: &str) -> CanonicalObservationAnchor {
-        CanonicalObservationAnchor::from_canonicalized(PathBuf::from(path)).unwrap()
+    fn anchor(path: &str) -> ObservationRequestPath {
+        ObservationRequestPath::new(PathBuf::from(path))
     }
 
     fn planned(targets: ActionObservationTargets) -> PlannedActionBatch {
@@ -597,17 +632,9 @@ mod tests {
     }
 
     #[test]
-    fn observation_anchor_is_absolute_and_lexically_confined() {
-        assert_eq!(anchor("/").as_path(), Path::new("/"));
-        assert_eq!(
-            anchor("/home/cache-parent").as_path(),
-            Path::new("/home/cache-parent")
-        );
-        for invalid in ["relative", "../escape", "/home/../escape"] {
-            assert_eq!(
-                CanonicalObservationAnchor::from_canonicalized(PathBuf::from(invalid)),
-                Err(ContractError::InvalidObservationAnchor)
-            );
+    fn observation_request_preserves_alias_components_without_validation() {
+        for request in ["relative", "../escape", "/home/./cache", "/alias/../real"] {
+            assert_eq!(anchor(request).as_path(), Path::new(request));
         }
     }
 

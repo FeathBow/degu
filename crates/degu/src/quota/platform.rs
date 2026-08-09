@@ -3,28 +3,40 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
-#[cfg(target_os = "linux")]
-use super::model::QuotaScope;
 use super::model::QuotaSnapshot;
+#[cfg(target_os = "linux")]
+use super::model::{QuotaScope, QuotaScopeIdentity};
 use crate::presentation::escape_terminal_text as escaped;
 use std::fmt;
 use std::path::Path;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) struct MountInfo {
     pub(super) mount_point: PathBuf,
     pub(super) filesystem: String,
     #[cfg(target_os = "linux")]
     pub(super) source: PathBuf,
+    #[cfg(target_os = "linux")]
+    pub(super) mount_id: u64,
+    #[cfg(target_os = "linux")]
+    pub(super) device_major: u32,
+    #[cfg(target_os = "linux")]
+    pub(super) device_minor: u32,
 }
 
 #[cfg(target_os = "linux")]
 impl MountInfo {
     pub(super) fn scope(self, path: &Path) -> QuotaScope {
-        QuotaScope::new(path.to_owned(), self.mount_point, self.filesystem)
+        let identity = QuotaScopeIdentity::new(
+            self.mount_id,
+            self.device_major,
+            self.device_minor,
+            self.source,
+        );
+        QuotaScope::new(path.to_owned(), self.mount_point, self.filesystem, identity)
     }
 }
 
@@ -86,6 +98,44 @@ impl fmt::Display for ProbeError {
                 escaped(&source.to_string())
             ),
             _ => write_failure(formatter, self),
+        }
+    }
+}
+
+impl ProbeError {
+    pub(crate) fn category(&self) -> &'static str {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::NotConfigured { .. } => "not_configured",
+            Self::Unsupported { .. } => "unsupported",
+            #[cfg(any(target_os = "linux", test))]
+            Self::Unavailable { .. } => "unavailable",
+            #[cfg(target_os = "linux")]
+            Self::PermissionDenied { .. } => "permission_denied",
+            #[cfg(target_os = "linux")]
+            Self::Incomplete { .. } => "incomplete",
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Io { .. } => "io",
+        }
+    }
+
+    /// Raw diagnostic for structured JSON. Terminal escaping belongs only to
+    /// human presentation and must never be persisted in machine output.
+    pub(crate) fn raw_message(&self) -> String {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::NotConfigured {
+                filesystem,
+                mount_point,
+            } => format!("quota not configured for {filesystem} mounted at {mount_point}"),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Io { path, source } => {
+                format!("quota probe failed for {path}: {source}")
+            }
+            _ => {
+                let (label, filesystem, mount_point, reason) = failure_fields(self);
+                format!("{label} for {filesystem} mounted at {mount_point}: {reason}")
+            }
         }
     }
 }

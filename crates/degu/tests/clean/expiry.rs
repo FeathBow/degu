@@ -1,6 +1,16 @@
 use super::support::*;
 use std::os::unix::fs::PermissionsExt;
 
+fn seed_aged_numeric_marker(state: &tempfile::TempDir) -> std::path::PathBuf {
+    let claims = private_trash_root(state).join(".claims");
+    std::fs::create_dir_all(&claims).unwrap();
+    std::fs::set_permissions(&claims, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = claims.join("12345");
+    let file = std::fs::File::create(&marker).unwrap();
+    file.set_modified(expired_time()).unwrap();
+    marker
+}
+
 fn seed_expired_interrupted_claim(state: &tempfile::TempDir) -> std::path::PathBuf {
     let trash = private_trash_root(state);
     let claims = trash.join(".claims");
@@ -24,6 +34,67 @@ fn seed_expired_interrupted_claim(state: &tempfile::TempDir) -> std::path::PathB
 }
 
 #[test]
+fn xdg_state_parent_alias_does_not_block_direct_or_expiry_mutation() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let alias = state.path().join("alias");
+    let real = state.path().join("real");
+    std::fs::create_dir(&alias).unwrap();
+    std::fs::create_dir(&real).unwrap();
+    let request = alias.join("..").join("real");
+    let cache = crate::common::platform_cache_dir(home.path(), "pip");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("wheel.whl"), b"cache").unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+
+    let out = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", &request)
+        .args(["clean", "--purge", "--yes", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!cache.exists());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["quota_observations"]["direct_purge"]["observation_state"],
+        "resolved"
+    );
+    assert_eq!(
+        report["quota_observations"]["expiry_purge"]["observation_state"],
+        "resolved"
+    );
+}
+
+#[test]
+fn clean_empty_entries_still_runs_observed_claim_housekeeping() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let marker = seed_aged_numeric_marker(&state);
+
+    let out = run_clean(&home, &state, &["clean", "--yes", "--json"]);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!marker.exists());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(report["expiry"]["planned"].as_array().unwrap().is_empty());
+    assert_eq!(report["expiry"]["attempted"], true);
+    assert_eq!(
+        report["quota_observations"]["expiry_purge"]["observation_state"],
+        "resolved"
+    );
+}
+
+#[test]
 fn clean_purges_expired_trash_entries_after_report() {
     assert_json_expiry_after_report();
     assert_human_expiry_after_report();
@@ -44,6 +115,17 @@ fn assert_json_expiry_after_report() {
     assert_eq!(report["expiry"]["planned"].as_array().unwrap().len(), 1);
     assert_eq!(report["expiry"]["purged"].as_array().unwrap().len(), 1);
     assert!(report["expiry"]["failed"].as_array().unwrap().is_empty());
+    assert_eq!(
+        report["quota_observations"]["expiry_purge"]["kind"],
+        "expiry_purge"
+    );
+    assert_eq!(
+        report["quota_observations"]["expiry_purge"]["quota_observations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     assert!(!expired.exists());
     assert_eq!(
         visible_trash_entries(&state.path().join("degu/trash")).len(),
@@ -99,6 +181,10 @@ fn clean_empty_plan_json_still_purges_expired_trash() {
     assert_eq!(report["expiry"]["attempted"], true);
     assert_eq!(report["expiry"]["planned"].as_array().unwrap().len(), 1);
     assert_eq!(report["expiry"]["purged"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        report["quota_observations"]["expiry_purge"]["kind"],
+        "expiry_purge"
+    );
     assert!(!expired.exists());
     assert!(visible_trash_entries(&state.path().join("degu/trash")).is_empty());
 }
@@ -142,6 +228,14 @@ fn clean_dry_run_previews_and_never_purges_expired_trash() {
     assert_eq!(report["expiry"]["attempted"], false);
     assert_eq!(report["expiry"]["planned"].as_array().unwrap().len(), 1);
     assert!(report["expiry"]["purged"].as_array().unwrap().is_empty());
+    assert_eq!(
+        report["quota_observations"]["direct_purge"]["observation_state"],
+        "not_attempted"
+    );
+    assert_eq!(
+        report["quota_observations"]["expiry_purge"]["observation_state"],
+        "not_attempted"
+    );
     assert_eq!(oplog_records(&state).len(), 1);
     assert_eq!(
         visible_trash_entries(&state.path().join("degu/trash")).len(),

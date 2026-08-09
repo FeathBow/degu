@@ -11,6 +11,7 @@ pub(crate) mod next_action;
 pub(crate) mod ops;
 pub(crate) mod prompt;
 pub(crate) mod quota;
+pub(crate) mod reclaim;
 mod regions;
 pub(crate) mod relocate;
 pub(crate) mod scan;

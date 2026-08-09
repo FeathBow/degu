@@ -6,6 +6,7 @@ Inspect:
   quota        Report authoritative filesystem quota for one path
 
 Clean and recover:
+  reclaim      Preview an explicitly selected tool-native cache action
   clean        Preview or execute a cleanup plan
   undo         Restore the latest staged clean operation
   trash        Inspect or permanently purge trash entries

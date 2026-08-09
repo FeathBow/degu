@@ -7,6 +7,10 @@
 //! cooperative descendants; it is not a cross-platform containment sandbox.
 
 use crate::action_result::StartedActionOutcome;
+use degu_adapters::native::{
+    NativeActionRequest, NativeInheritedEnvironment,
+    NativeProcessContract as RequestedProcessContract,
+};
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
@@ -88,6 +92,32 @@ pub(crate) struct NativeActionDeclaration {
 }
 
 impl NativeActionDeclaration {
+    pub(crate) fn from_request(
+        request: &NativeActionRequest,
+    ) -> Result<Self, NativeDeclarationError> {
+        let environment = match request.environment().inherited() {
+            NativeInheritedEnvironment::Clear => NativeEnvironment::clear(),
+            NativeInheritedEnvironment::Allowlist(names) => {
+                NativeEnvironment::allowlist(names.iter().cloned())
+            }
+        }
+        .with_fixed(request.environment().fixed().iter().cloned());
+        let process_contract = match request.process_contract() {
+            RequestedProcessContract::AuditedCooperativeProcessGroup => {
+                NativeProcessContract::AuditedCooperativeProcessGroup
+            }
+        };
+        Self::new(
+            request.executable().to_path_buf(),
+            request.arguments().iter().cloned(),
+            environment,
+            process_contract,
+            request.timeout(),
+            request.stdout_limit(),
+            request.stderr_limit(),
+        )
+    }
+
     pub(crate) fn new(
         executable: PathBuf,
         arguments: impl IntoIterator<Item = OsString>,
@@ -162,6 +192,14 @@ pub(crate) enum NativeDeclarationError {
 }
 
 #[derive(Debug, thiserror::Error)]
+pub(crate) enum NativePreparationError {
+    #[error("native declaration validation failed: {0}")]
+    Declaration(#[from] NativeDeclarationError),
+    #[error("native preflight failed before spawn: {0}")]
+    Preflight(#[source] NativeRunnerError),
+}
+
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum NativeRunnerError {
     #[error("inherited native environment exceeds its bound at {0:?}")]
     InheritedEnvironmentTooLarge(OsString),
@@ -221,6 +259,88 @@ impl<Parsed, ParseError> NativeRunOutcome<Parsed, ParseError> {
     }
 }
 
+/// One-use, fully preflighted native invocation. It deliberately is neither
+/// `Clone` nor reusable. Calling `execute` is the exact spawn-attempt boundary.
+pub(crate) struct PreparedNativeAction {
+    declaration: NativeActionDeclaration,
+    adapter_id: String,
+    action_id: String,
+    observation_requests: Vec<PathBuf>,
+    resolved_environment: Vec<(OsString, OsString)>,
+}
+
+impl PreparedNativeAction {
+    pub(crate) fn adapter_id(&self) -> &str {
+        &self.adapter_id
+    }
+
+    pub(crate) fn action_id(&self) -> &str {
+        &self.action_id
+    }
+
+    pub(crate) fn observation_requests(&self) -> &[PathBuf] {
+        &self.observation_requests
+    }
+
+    /// Consuming this value crosses the start boundary. The descriptor-table
+    /// bound is deliberately refreshed here, not at preparation, so an FD
+    /// opened between preparation and execution is still covered by fallback.
+    /// Refresh or spawn failure is therefore a started execution error.
+    pub(crate) fn execute<Parsed, ParseError>(
+        self,
+        parse: impl FnOnce(&[u8]) -> Result<Parsed, ParseError>,
+    ) -> StartedNativeExecution<Parsed, ParseError> {
+        self.execute_with_descriptor_limit(parse, descriptor_scan_limit)
+    }
+
+    fn execute_with_descriptor_limit<Parsed, ParseError>(
+        self,
+        parse: impl FnOnce(&[u8]) -> Result<Parsed, ParseError>,
+        refresh_descriptor_limit: impl FnOnce() -> io::Result<i32>,
+    ) -> StartedNativeExecution<Parsed, ParseError> {
+        StartedNativeExecution {
+            result: run_preflighted(
+                self.declaration,
+                self.resolved_environment,
+                refresh_descriptor_limit,
+                parse,
+            ),
+        }
+    }
+}
+
+pub(crate) struct StartedNativeExecution<Parsed, ParseError> {
+    result: Result<NativeRunReport<Parsed, ParseError>, NativeRunnerError>,
+}
+
+impl<Parsed, ParseError> StartedNativeExecution<Parsed, ParseError> {
+    pub(crate) fn result(self) -> Result<NativeRunReport<Parsed, ParseError>, NativeRunnerError> {
+        self.result
+    }
+}
+
+pub(crate) fn prepare_native_action(
+    request: NativeActionRequest,
+) -> Result<PreparedNativeAction, NativePreparationError> {
+    prepare_native_action_with(request, resolve_environment)
+}
+
+fn prepare_native_action_with(
+    request: NativeActionRequest,
+    resolve: impl FnOnce(&NativeEnvironment) -> Result<Vec<(OsString, OsString)>, NativeRunnerError>,
+) -> Result<PreparedNativeAction, NativePreparationError> {
+    let declaration = NativeActionDeclaration::from_request(&request)?;
+    let resolved_environment =
+        resolve(&declaration.environment).map_err(NativePreparationError::Preflight)?;
+    Ok(PreparedNativeAction {
+        declaration,
+        adapter_id: request.identity().adapter_id().to_owned(),
+        action_id: request.identity().action_id().to_owned(),
+        observation_requests: request.observation_requests().to_vec(),
+        resolved_environment,
+    })
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct NativeRunReport<Parsed, ParseError> {
     outcome: NativeRunOutcome<Parsed, ParseError>,
@@ -242,10 +362,26 @@ impl<Parsed, ParseError> NativeRunReport<Parsed, ParseError> {
     }
 }
 
-/// Runs one declaration. The parser is consulted only after a successful exit
-/// with complete output; it receives stdout and cannot authorize any mutation.
-pub(crate) fn run_native_action<Parsed, ParseError>(
+/// Test-only entry point that resolves the environment inline; production paths
+/// go through `PreparedNativeAction`.
+#[cfg(test)]
+fn run_native_action<Parsed, ParseError>(
     declaration: &NativeActionDeclaration,
+    parse: impl FnOnce(&[u8]) -> Result<Parsed, ParseError>,
+) -> Result<NativeRunReport<Parsed, ParseError>, NativeRunnerError> {
+    let resolved_environment = resolve_environment(&declaration.environment)?;
+    run_preflighted(
+        declaration.clone(),
+        resolved_environment,
+        descriptor_scan_limit,
+        parse,
+    )
+}
+
+fn run_preflighted<Parsed, ParseError>(
+    declaration: NativeActionDeclaration,
+    resolved_environment: Vec<(OsString, OsString)>,
+    refresh_descriptor_limit: impl FnOnce() -> io::Result<i32>,
     parse: impl FnOnce(&[u8]) -> Result<Parsed, ParseError>,
 ) -> Result<NativeRunReport<Parsed, ParseError>, NativeRunnerError> {
     let mut command = Command::new(&declaration.executable);
@@ -259,8 +395,12 @@ pub(crate) fn run_native_action<Parsed, ParseError>(
         // A private process group provides cleanup for the explicitly audited
         // cooperative topology; it does not contain setsid/namespace escape.
         .process_group(0);
-    apply_environment(&mut command, &declaration.environment)?;
-    install_descriptor_policy(&mut command)?;
+    apply_resolved_environment(&mut command, &resolved_environment);
+    // Refresh after command construction and immediately before installing the
+    // pre-exec policy/spawning. This is intentionally inside the consuming
+    // started boundary, not frozen with declaration preparation.
+    let scan_limit = refresh_descriptor_limit().map_err(NativeRunnerError::DescriptorPolicy)?;
+    install_descriptor_policy(&mut command, scan_limit);
 
     let mut child = command.spawn().map_err(NativeRunnerError::Spawn)?;
     let process_group = child.id();
@@ -472,8 +612,7 @@ fn terminate_process_group(process_group: u32) {
     }
 }
 
-fn install_descriptor_policy(command: &mut Command) -> Result<(), NativeRunnerError> {
-    let scan_limit = descriptor_scan_limit().map_err(NativeRunnerError::DescriptorPolicy)?;
+fn install_descriptor_policy(command: &mut Command, scan_limit: i32) {
     // SAFETY: the closure performs only async-signal-safe syscalls after fork.
     // It marks every non-stdio descriptor CLOEXEC in the child only. Rust's
     // exec-error pipe remains usable if exec fails because CLOEXEC takes effect
@@ -481,7 +620,6 @@ fn install_descriptor_policy(command: &mut Command) -> Result<(), NativeRunnerEr
     unsafe {
         command.pre_exec(move || mark_nonstdio_cloexec(scan_limit));
     }
-    Ok(())
 }
 
 fn descriptor_scan_limit() -> io::Result<i32> {
@@ -530,6 +668,10 @@ fn mark_nonstdio_cloexec(scan_limit: i32) -> io::Result<()> {
         }
     }
 
+    mark_nonstdio_cloexec_fallback(scan_limit)
+}
+
+fn mark_nonstdio_cloexec_fallback(scan_limit: i32) -> io::Result<()> {
     for fd in 3..scan_limit {
         loop {
             // SAFETY: fcntl operates on the numeric descriptor in the forked
@@ -559,10 +701,9 @@ fn mark_nonstdio_cloexec(scan_limit: i32) -> io::Result<()> {
     Ok(())
 }
 
-fn apply_environment(
-    command: &mut Command,
+fn resolve_environment(
     environment: &NativeEnvironment,
-) -> Result<(), NativeRunnerError> {
+) -> Result<Vec<(OsString, OsString)>, NativeRunnerError> {
     let mut bytes = environment
         .fixed
         .iter()
@@ -571,6 +712,7 @@ fn apply_environment(
                 .saturating_add(os_len(name))
                 .saturating_add(os_len(value))
         });
+    let mut resolved = Vec::new();
     if let InheritedEnvironment::Allowlist(names) = &environment.inherited {
         for name in names {
             if let Some(value) = std::env::var_os(name) {
@@ -582,14 +724,18 @@ fn apply_environment(
                         name.clone(),
                     ));
                 }
-                command.env(name, value);
+                resolved.push((name.clone(), value));
             }
         }
     }
-    for (name, value) in &environment.fixed {
+    resolved.extend(environment.fixed.iter().cloned());
+    Ok(resolved)
+}
+
+fn apply_resolved_environment(command: &mut Command, environment: &[(OsString, OsString)]) {
+    for (name, value) in environment {
         command.env(name, value);
     }
-    Ok(())
 }
 
 fn validate_executable(path: &Path) -> Result<(), NativeDeclarationError> {
@@ -687,6 +833,21 @@ mod tests {
     const HELPER_MODE: &str = "DEGU_NATIVE_RUNNER_HELPER_MODE";
     const HELPER_FD: &str = "DEGU_NATIVE_RUNNER_HELPER_FD";
 
+    fn native_request(executable: PathBuf, paths: Vec<PathBuf>) -> NativeActionRequest {
+        NativeActionRequest::new(
+            degu_adapters::native::NativeActionIdentity::new("fake", "prune").unwrap(),
+            executable,
+            [OsString::from("prune")],
+            degu_adapters::native::NativeEnvironmentRequest::clear(),
+            RequestedProcessContract::AuditedCooperativeProcessGroup,
+            Duration::from_secs(1),
+            64,
+            64,
+            paths,
+        )
+        .unwrap()
+    }
+
     fn declaration(
         mode: &str,
         timeout: Duration,
@@ -708,6 +869,107 @@ mod tests {
             stderr_limit,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn prepared_action_freezes_identity_paths_and_is_consumed_at_spawn_boundary() {
+        let paths = vec![PathBuf::from("/persistent"), PathBuf::from("relative-data")];
+        let prepared = prepare_native_action(native_request(
+            PathBuf::from("/definitely/missing/degu-native-tool"),
+            paths.clone(),
+        ))
+        .unwrap();
+        assert_eq!(prepared.adapter_id(), "fake");
+        assert_eq!(prepared.action_id(), "prune");
+        assert_eq!(prepared.observation_requests(), paths);
+
+        // `execute(self, ..)` consumes the only prepared capability. A missing
+        // executable is a spawn-attempt failure, not a preflight failure.
+        let started = prepared.execute(|_| Ok::<(), ()>(()));
+        assert!(matches!(started.result(), Err(NativeRunnerError::Spawn(_))));
+    }
+
+    #[test]
+    fn from_request_carries_every_declared_field_and_substitutes_nothing() {
+        let request = NativeActionRequest::new(
+            degu_adapters::native::NativeActionIdentity::new("fake", "prune").unwrap(),
+            PathBuf::from("/usr/bin/prune-tool"),
+            [OsString::from("cache"), OsString::from("--prune")],
+            degu_adapters::native::NativeEnvironmentRequest::allowlist([OsString::from("HOME")])
+                .with_fixed([(OsString::from("TOOL_MODE"), OsString::from("prune"))]),
+            RequestedProcessContract::AuditedCooperativeProcessGroup,
+            Duration::from_secs(42),
+            111,
+            222,
+            [PathBuf::from("/observed/root")],
+        )
+        .unwrap();
+
+        let declaration = NativeActionDeclaration::from_request(&request).unwrap();
+
+        assert_eq!(declaration.executable, PathBuf::from("/usr/bin/prune-tool"));
+        assert_eq!(
+            declaration.arguments,
+            vec![OsString::from("cache"), OsString::from("--prune")]
+        );
+        assert_eq!(
+            declaration.environment.inherited,
+            InheritedEnvironment::Allowlist(vec![OsString::from("HOME")])
+        );
+        assert_eq!(
+            declaration.environment.fixed,
+            vec![(OsString::from("TOOL_MODE"), OsString::from("prune"))]
+        );
+        assert_eq!(declaration.timeout, Duration::from_secs(42));
+        assert_eq!(declaration.stdout_limit, 111);
+        assert_eq!(declaration.stderr_limit, 222);
+    }
+
+    #[test]
+    fn preflight_failure_never_produces_a_started_capability() {
+        let error = prepare_native_action_with(
+            native_request(PathBuf::from("/usr/bin/fake"), Vec::new()),
+            |_| {
+                Err(NativeRunnerError::InheritedEnvironmentTooLarge(
+                    OsString::from("HUGE"),
+                ))
+            },
+        )
+        .err()
+        .expect("preflight must fail");
+        assert!(matches!(
+            error,
+            NativePreparationError::Preflight(NativeRunnerError::InheritedEnvironmentTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn descriptor_refresh_failure_is_a_started_execution_error() {
+        let prepared = prepare_native_action(native_request(
+            PathBuf::from("/definitely/missing/degu-native-tool"),
+            Vec::new(),
+        ))
+        .unwrap();
+        let started = prepared.execute_with_descriptor_limit(
+            |_| Ok::<(), ()>(()),
+            || Err(io::Error::other("controlled descriptor refresh failure")),
+        );
+        assert!(matches!(
+            started.result(),
+            Err(NativeRunnerError::DescriptorPolicy(_))
+        ));
+    }
+
+    #[test]
+    fn adapter_request_still_passes_executable_validation() {
+        let error =
+            prepare_native_action(native_request(PathBuf::from("relative/tool"), Vec::new()))
+                .err()
+                .expect("relative executable must fail");
+        assert!(matches!(
+            error,
+            NativePreparationError::Declaration(NativeDeclarationError::ExecutableNotAbsolute)
+        ));
     }
 
     #[test]
@@ -919,6 +1181,90 @@ mod tests {
         // injected-looking argument is passed literally to the test harness.
         let _report = run_native_action(&declaration, |_| Ok::<_, ()>(())).unwrap();
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn prepared_execution_refreshes_descriptor_bound_after_prepare() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let target_fd = descriptor_scan_limit().unwrap().checked_add(100).unwrap();
+        let request = NativeActionRequest::new(
+            degu_adapters::native::NativeActionIdentity::new("fake", "descriptor-check").unwrap(),
+            std::env::current_exe().unwrap(),
+            [
+                OsString::from("--exact"),
+                OsString::from(HELPER_TEST),
+                OsString::from("--nocapture"),
+            ],
+            degu_adapters::native::NativeEnvironmentRequest::clear().with_fixed([
+                (
+                    OsString::from(HELPER_MODE),
+                    OsString::from("descriptor-policy"),
+                ),
+                (
+                    OsString::from(HELPER_FD),
+                    OsString::from(target_fd.to_string()),
+                ),
+            ]),
+            RequestedProcessContract::AuditedCooperativeProcessGroup,
+            Duration::from_secs(5),
+            4096,
+            4096,
+            [],
+        )
+        .unwrap();
+        let prepared = prepare_native_action(request).unwrap();
+
+        let temp = tempfile::tempfile().unwrap();
+        // Open the non-CLOEXEC descriptor only after preparation. Since the
+        // requested slot is above the then-current table, F_DUPFD returns it.
+        // SAFETY: temp is live and the successful result is immediately owned.
+        let raw = unsafe { libc::fcntl(temp.as_raw_fd(), libc::F_DUPFD, target_fd) };
+        assert_eq!(
+            raw, target_fd,
+            "failed to create controlled high descriptor"
+        );
+        // SAFETY: raw is a fresh successful F_DUPFD result.
+        let high_fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: high_fd remains live through child execution.
+        assert_eq!(
+            unsafe { libc::fcntl(high_fd.as_raw_fd(), libc::F_GETFD) },
+            0
+        );
+
+        let report = prepared
+            .execute(|bytes| {
+                Ok::<_, ()>(String::from_utf8_lossy(bytes).contains("DESCRIPTORS_CLOSED"))
+            })
+            .result()
+            .unwrap();
+        assert_eq!(report.outcome(), &NativeRunOutcome::Success(true));
+    }
+
+    #[test]
+    fn fallback_refresh_covers_a_descriptor_opened_after_a_stale_bound() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let stale_limit = descriptor_scan_limit().unwrap();
+        let target_fd = stale_limit.checked_add(50).unwrap();
+        let temp = tempfile::tempfile().unwrap();
+        // SAFETY: temp is live and the successful result is immediately owned.
+        let raw = unsafe { libc::fcntl(temp.as_raw_fd(), libc::F_DUPFD, target_fd) };
+        assert_eq!(raw, target_fd);
+        // SAFETY: raw is a fresh successful F_DUPFD result.
+        let high_fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        assert!(
+            raw >= stale_limit,
+            "the stale bound must miss this descriptor"
+        );
+
+        let refreshed_limit = descriptor_scan_limit().unwrap();
+        assert!(refreshed_limit > raw);
+        mark_nonstdio_cloexec_fallback(refreshed_limit).unwrap();
+        // SAFETY: high_fd remains live for the query.
+        let flags = unsafe { libc::fcntl(high_fd.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
     }
 
     #[test]

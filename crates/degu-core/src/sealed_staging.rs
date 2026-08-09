@@ -1,19 +1,23 @@
-//! High-level boundary for the sealed-staging WAL foundation.
+//! High-level boundary for the sealed-staging transaction stack.
 //!
-//! Namespace mutation is deliberately absent until the held-tree engine can
-//! supply verified rename and staged-object authority. Paths and durable
-//! identities in this module are evidence only.
+//! The only namespace mutation is the core-private, unwired A3c2 operation that
+//! consumes exact held parents and returns `StagedUnverified`. Paths and durable
+//! identities remain evidence only; no restore, commit, purge, or deletion seam
+//! is exposed here.
 
 use crate::authority::TransactionState;
 use crate::seal_store::{SealWalStore, StoreError};
 use crate::seal_wal::{
-    AppendError, DurableTreeManifest, RecoveryIdentity, RecoverySession, RecoveryWork, ReplayError,
-    SealWal, StagingTransactionMetadata, TransactionId, decide_recovery,
+    AppendError, RecoveryIdentity, RecoverySession, RecoveryWork, ReplayError, SealWal,
+    StagingTransactionMetadata, TransactionId, decide_recovery,
     quarantined_transaction_retains_active_permission_seals,
 };
 use crate::staging_recovery::{
     RecoveryAnchors, RecoveryRebindError, StartupRecoveryCapability, prepare_startup_recovery,
     recovery_transaction,
+};
+use crate::staging_rename::{
+    PreparedRootBinding, StagedUnverifiedTree, StagingRenameError, execute_prepared_rename,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -173,39 +177,30 @@ impl SealedStagingEngine {
         Ok(candidate.transaction)
     }
 
-    #[allow(dead_code)] // future held-tree integration seam
-    pub(crate) fn complete_tree_manifest(
+    /// Consumes one descriptor-derived root binding and performs the complete
+    /// unwired A3c2 seal/rename sequence. Success reaches only
+    /// `StagedUnverified` and retains this engine's exact WAL lease.
+    #[allow(dead_code)] // consumed only by the future forward lifecycle coordinator
+    pub(crate) fn stage_prepared_root(
         &mut self,
         transaction: TransactionId,
-        manifest: DurableTreeManifest,
-    ) -> Result<(), StagingEngineError> {
-        self.wal.complete_tree_manifest(transaction, manifest)?;
-        Ok(())
-    }
-
-    #[allow(dead_code)] // future held-tree integration seam
-    pub(crate) fn begin_rename(
-        &mut self,
-        transaction: TransactionId,
-    ) -> Result<(), StagingEngineError> {
-        self.wal.record_rename_intent(transaction)?;
-        Ok(())
-    }
-
-    #[allow(dead_code)] // future held-tree integration seam
-    pub(crate) fn transition(
-        &mut self,
-        transaction: TransactionId,
-        next: TransactionState,
-    ) -> Result<(), StagingEngineError> {
-        self.wal.transition_staging(transaction, next)?;
-        Ok(())
+        binding: PreparedRootBinding,
+    ) -> Result<StagedUnverifiedTree<'_>, StagingRenameError> {
+        if self.startup_blocked || !self.wal.can_begin_staging_transaction() {
+            return Err(StagingRenameError::StartupBlocked);
+        }
+        execute_prepared_rename(
+            &mut self.wal,
+            &mut self.startup_blocked,
+            transaction,
+            binding,
+        )
     }
 }
 
-// Rename completion and purge authorization deliberately have no callable seam.
-// The future held-tree executor must introduce core-private, non-forgeable values
-// that retain both rename-parent capabilities or the staged object capability.
+// Restore, commit, purge, unlink, and deletion authorization deliberately have
+// no callable engine seam. A3c2 success retains both parent capabilities and the
+// staged object under the exact WAL lease, but stops at `StagedUnverified`.
 
 #[cfg(test)]
 mod tests;

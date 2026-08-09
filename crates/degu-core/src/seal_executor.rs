@@ -18,8 +18,45 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryLocator {
-    pub relative_path: PathBuf,
-    pub filesystem_id: Option<String>,
+    relative_path: PathBuf,
+    filesystem_id: Option<String>,
+    incarnation: Option<u64>,
+}
+
+impl RecoveryLocator {
+    /// Authority-neutral A1/A3 locator. It carries no strong incarnation and
+    /// cannot satisfy the staging WAL's stronger evidence checks.
+    pub fn authority_neutral(relative_path: PathBuf, filesystem_id: Option<String>) -> Self {
+        Self {
+            relative_path,
+            filesystem_id,
+            incarnation: None,
+        }
+    }
+
+    /// Descriptor-derived forward-staging locator. Only degu-core's held-tree
+    /// coordinator can attach the strong kernel incarnation.
+    pub(crate) fn held_staging(
+        relative_path: PathBuf,
+        filesystem_id: String,
+        incarnation: u64,
+    ) -> Self {
+        Self {
+            relative_path,
+            filesystem_id: Some(filesystem_id),
+            incarnation: Some(incarnation),
+        }
+    }
+
+    /// Exact durable restore locator; the executor inherits incarnation from
+    /// the original applied seal and refuses any caller override.
+    pub(crate) fn durable_restore(relative_path: PathBuf, filesystem_id: Option<String>) -> Self {
+        Self {
+            relative_path,
+            filesystem_id,
+            incarnation: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,12 +178,24 @@ fn execute_local_mode_mutation_inner<W: DurableWrite>(
             "held restore target does not match the original seal",
         ));
     }
+    let incarnation = match restore_original {
+        Some(original) => {
+            let durable = original.evidence.generation_or_btime();
+            if request.locator.incarnation.is_some() && request.locator.incarnation != durable {
+                return Err(LocalModeExecutionError::InvalidRequest(
+                    "restore locator incarnation differs from its original seal",
+                ));
+            }
+            durable
+        }
+        None => request.locator.incarnation,
+    };
     let evidence = PersistentRecoveryEvidence::new(
         request.locator.relative_path,
         request.locator.filesystem_id,
         prepared.device(),
         prepared.inode(),
-        restore_original.and_then(|original| original.evidence.generation_or_btime()),
+        incarnation,
         prepared.target_mode(),
     )
     .ok_or(LocalModeExecutionError::InvalidRequest(
@@ -380,10 +429,7 @@ mod tests {
                 LocalModeMutationRequest {
                     transaction,
                     mutation_id: 1,
-                    locator: RecoveryLocator {
-                        relative_path: PathBuf::from("directory"),
-                        filesystem_id: None,
-                    },
+                    locator: RecoveryLocator::authority_neutral(PathBuf::from("directory"), None),
                     transform: LocalModeTransform::Seal {
                         acquire_owner_write_search: false,
                     },
@@ -436,10 +482,10 @@ mod tests {
                 LocalModeMutationRequest {
                     transaction,
                     mutation_id: 1,
-                    locator: RecoveryLocator {
-                        relative_path: PathBuf::from("source/directory"),
-                        filesystem_id: None,
-                    },
+                    locator: RecoveryLocator::authority_neutral(
+                        PathBuf::from("source/directory"),
+                        None,
+                    ),
                     transform: LocalModeTransform::Seal {
                         acquire_owner_write_search: false,
                     },
@@ -483,10 +529,10 @@ mod tests {
                 LocalModeMutationRequest {
                     transaction,
                     mutation_id: 2,
-                    locator: RecoveryLocator {
-                        relative_path: PathBuf::from("restored/directory"),
-                        filesystem_id: None,
-                    },
+                    locator: RecoveryLocator::authority_neutral(
+                        PathBuf::from("restored/directory"),
+                        None,
+                    ),
                     transform: LocalModeTransform::Restore {
                         original: original.clone(),
                     },
@@ -504,10 +550,10 @@ mod tests {
                 LocalModeMutationRequest {
                     transaction,
                     mutation_id: 2,
-                    locator: RecoveryLocator {
-                        relative_path: PathBuf::from("restored/directory"),
-                        filesystem_id: None,
-                    },
+                    locator: RecoveryLocator::authority_neutral(
+                        PathBuf::from("restored/directory"),
+                        None,
+                    ),
                     transform: LocalModeTransform::Restore { original },
                 },
             )

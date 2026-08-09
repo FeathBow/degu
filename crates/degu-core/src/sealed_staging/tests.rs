@@ -2,8 +2,8 @@ use super::*;
 use crate::authority::PersistentRecoveryEvidence;
 use crate::local_backend::CertifiedLocalBackend;
 use crate::seal_wal::{
-    DurableSourceParentStrategy, ObjectIncarnation, PermissionIntent, StagingLocator,
-    StrongObjectIdentity,
+    DurableSourceParentStrategy, DurableTreeManifest, ObjectIncarnation, PermissionIntent,
+    StagingLocator, StrongObjectIdentity,
 };
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -158,7 +158,7 @@ fn active_seals_in_quarantine_block_runtime_and_reopen() {
             .unwrap();
         engine
             .wal
-            .transition_staging(transaction, TransactionState::ParentSealIntent)
+            .transition_staging_for_test(transaction, TransactionState::ParentSealIntent)
             .unwrap();
         engine
             .wal
@@ -184,11 +184,11 @@ fn active_seals_in_quarantine_block_runtime_and_reopen() {
             .unwrap();
         engine
             .wal
-            .transition_staging(transaction, TransactionState::ParentSealed)
+            .transition_staging_for_test(transaction, TransactionState::ParentSealed)
             .unwrap();
         engine
             .wal
-            .transition_staging(transaction, TransactionState::TreeSealIntent)
+            .transition_staging_for_test(transaction, TransactionState::TreeSealIntent)
             .unwrap();
         engine
             .wal
@@ -224,7 +224,7 @@ fn active_seals_in_quarantine_block_runtime_and_reopen() {
             .unwrap();
         engine
             .wal
-            .transition_staging(transaction, TransactionState::TreeSealed)
+            .transition_staging_for_test(transaction, TransactionState::TreeSealed)
             .unwrap();
         engine.wal.record_rename_intent(transaction).unwrap();
         engine
@@ -233,11 +233,11 @@ fn active_seals_in_quarantine_block_runtime_and_reopen() {
             .unwrap();
         engine
             .wal
-            .transition_staging(transaction, TransactionState::StagedUnverified)
+            .transition_staging_for_test(transaction, TransactionState::StagedUnverified)
             .unwrap();
         engine
             .wal
-            .transition_staging(transaction, TransactionState::Quarantined)
+            .transition_staging_for_test(transaction, TransactionState::Quarantined)
             .unwrap();
 
         assert!(
@@ -266,7 +266,12 @@ fn purge_states_are_unreachable_without_future_held_object_capability() {
     let transaction = TransactionId([85; 16]);
     engine.begin_transaction(transaction, metadata()).unwrap();
     for state in [TransactionState::Purgeable, TransactionState::Purged] {
-        assert!(engine.transition(transaction, state).is_err());
+        assert!(
+            engine
+                .wal
+                .transition_staging_for_test(transaction, state)
+                .is_err()
+        );
     }
     assert_eq!(engine.state(transaction), Some(TransactionState::Prepared));
 }

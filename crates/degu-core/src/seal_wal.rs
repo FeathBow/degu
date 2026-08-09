@@ -7,6 +7,8 @@
 
 use crate::authority::{PersistentRecoveryEvidence, TransactionState};
 use crate::local_backend::CertifiedLocalBackend;
+use crate::staging_recovery::ExactStagedVerification;
+use crate::staging_rename::{FreshlyConfirmedSourceResident, ParentsSyncedAppliedRename};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -606,7 +608,7 @@ impl<W: DurableWrite> SealWal<W> {
         self.transition_inner(transaction, next)
     }
 
-    pub(crate) fn transition_staging(
+    fn transition_staging(
         &mut self,
         transaction: TransactionId,
         next: TransactionState,
@@ -614,12 +616,49 @@ impl<W: DurableWrite> SealWal<W> {
         if !self.staging.contains_key(&transaction) {
             return Err(AppendError::InvalidState("transaction is not staged"));
         }
-        if matches!(next, TransactionState::Purgeable | TransactionState::Purged) {
+        self.transition_inner(transaction, next)
+    }
+
+    /// Narrow A3 foundation transitions. Verification, source-parent commit,
+    /// verified commit, and purge states require separate unforgeable proofs.
+    pub(crate) fn transition_staging_foundation(
+        &mut self,
+        transaction: TransactionId,
+        next: TransactionState,
+    ) -> Result<(), AppendError> {
+        if !matches!(
+            next,
+            TransactionState::ParentSealIntent
+                | TransactionState::ParentSealed
+                | TransactionState::TreeSealIntent
+                | TransactionState::TreeSealed
+                | TransactionState::StagedUnverified
+                | TransactionState::RestoreIntent
+                | TransactionState::Restored
+                | TransactionState::Quarantined
+                | TransactionState::RecoveryRequired
+        ) {
             return Err(AppendError::InvalidState(
-                "purge state requires an unavailable held-object capability",
+                "staging state requires an unavailable authority proof",
             ));
         }
-        self.transition_inner(transaction, next)
+        self.transition_staging(transaction, next)
+    }
+
+    pub(crate) fn record_staged_sealed(
+        &mut self,
+        proof: ExactStagedVerification,
+    ) -> Result<(), AppendError> {
+        self.transition_staging(proof.transaction(), TransactionState::StagedSealed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transition_staging_for_test(
+        &mut self,
+        transaction: TransactionId,
+        next: TransactionState,
+    ) -> Result<(), AppendError> {
+        self.transition_staging(transaction, next)
     }
 
     /// Fail-closed transition shared by authority-neutral and staging executors.
@@ -799,16 +838,39 @@ impl<W: DurableWrite> SealWal<W> {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_applied_rename_for_test(
+    pub(crate) fn record_applied_synced_rename(
         &mut self,
         transaction: TransactionId,
+        proof: ParentsSyncedAppliedRename,
+    ) -> Result<(), AppendError> {
+        self.record_rename_outcome(
+            transaction,
+            DurableRenameOutcome::AppliedAndParentsSynced(proof.identity()),
+        )
+    }
+
+    pub(crate) fn record_confirmed_not_applied_rename(
+        &mut self,
+        transaction: TransactionId,
+        proof: FreshlyConfirmedSourceResident,
+    ) -> Result<(), AppendError> {
+        self.record_rename_outcome(
+            transaction,
+            DurableRenameOutcome::ConfirmedNotAppliedAtSource(proof.identity()),
+        )
+    }
+
+    /// Private codec/state validation behind the two proof-consuming writers.
+    fn record_rename_outcome(
+        &mut self,
+        transaction: TransactionId,
+        outcome: DurableRenameOutcome,
     ) -> Result<(), AppendError> {
         if self.states.get(&transaction).copied() != Some(TransactionState::RenameIntent)
             || self.rename_outcomes.contains_key(&transaction)
         {
             return Err(AppendError::InvalidState(
-                "test rename outcome is outside rename intent",
+                "rename outcome is outside a unique rename intent",
             ));
         }
         let identity = self
@@ -816,13 +878,37 @@ impl<W: DurableWrite> SealWal<W> {
             .get(&transaction)
             .ok_or(AppendError::InvalidState("transaction is not staged"))?
             .root_identity;
-        let outcome = DurableRenameOutcome::AppliedAndParentsSynced(identity);
+        let outcome_identity = match outcome {
+            DurableRenameOutcome::AppliedAndParentsSynced(identity)
+            | DurableRenameOutcome::ConfirmedNotAppliedAtSource(identity) => identity,
+        };
+        if outcome_identity != identity {
+            return Err(AppendError::InvalidState(
+                "rename outcome does not bind the staged root identity",
+            ));
+        }
         self.append_synced(&SealRecord::RenameOutcome {
             transaction,
             outcome,
         })?;
         self.rename_outcomes.insert(transaction, outcome);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_applied_rename_for_test(
+        &mut self,
+        transaction: TransactionId,
+    ) -> Result<(), AppendError> {
+        let identity = self
+            .staging
+            .get(&transaction)
+            .ok_or(AppendError::InvalidState("transaction is not staged"))?
+            .root_identity;
+        self.record_rename_outcome(
+            transaction,
+            DurableRenameOutcome::AppliedAndParentsSynced(identity),
+        )
     }
 
     /// Durably records intent before invoking `mutate`, then durably records

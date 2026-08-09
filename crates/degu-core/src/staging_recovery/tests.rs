@@ -203,6 +203,55 @@ fn capability_rechecks_name_immediately_before_use() {
 }
 
 #[test]
+fn recovery_capability_rechecks_final_namespace_controller_exclusivity() {
+    let Some(fixture) = fixture(true) else {
+        return;
+    };
+    let rebound = rebind_work(
+        &fixture.metadata,
+        None,
+        RecoveryWork::VerifyOrQuarantineAfterRename {
+            transaction: TransactionId([0xbc; 16]),
+            permissions: vec![],
+        },
+        &anchors(&fixture),
+    )
+    .unwrap();
+    let ReboundWork::VerifyStaged(staged) = rebound else {
+        panic!("expected staged capability");
+    };
+    fs::set_permissions(
+        fixture._temp.path().join("destination"),
+        fs::Permissions::from_mode(0o770),
+    )
+    .unwrap();
+    assert!(matches!(
+        staged.root.verify_fresh_binding(),
+        Err(RecoveryRebindError::LocatorControllerNotExclusive)
+    ));
+}
+
+#[test]
+fn recovery_rebind_rejects_writable_anchor_controller() {
+    let Some(fixture) = fixture(true) else {
+        return;
+    };
+    fs::set_permissions(fixture._temp.path(), fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(matches!(
+        rebind_work(
+            &fixture.metadata,
+            None,
+            RecoveryWork::VerifyOrQuarantineAfterRename {
+                transaction: TransactionId([0xbd; 16]),
+                permissions: vec![],
+            },
+            &anchors(&fixture),
+        ),
+        Err(RecoveryRebindError::LocatorControllerNotExclusive)
+    ));
+}
+
+#[test]
 fn caller_supplied_filesystem_label_cannot_replace_kernel_fsid() {
     let Some(fixture) = fixture(false) else {
         return;
@@ -266,7 +315,7 @@ fn uncertain_staging_intent_resolves_before_after_and_at_fresh_resolution() {
         let mut wal = lease.resume().unwrap();
         wal.begin_staging(transaction, fixture.metadata.clone())
             .unwrap();
-        wal.transition_staging(transaction, TransactionState::ParentSealIntent)
+        wal.transition_staging_for_test(transaction, TransactionState::ParentSealIntent)
             .unwrap();
         let fd = open_dir(&source_path);
         let result = wal.apply_staging_permission_mutation(
@@ -399,7 +448,7 @@ fn uncertain_inverse_intents_resolve_before_and_after_fchmod_in_every_restore_ph
             let mut wal = lease.resume().unwrap();
             wal.begin_staging(transaction, fixture.metadata.clone())
                 .unwrap();
-            wal.transition_staging(transaction, TransactionState::ParentSealIntent)
+            wal.transition_staging_for_test(transaction, TransactionState::ParentSealIntent)
                 .unwrap();
             let source_fd = open_dir(&source_path);
             wal.apply_staging_permission_mutation(
@@ -431,9 +480,9 @@ fn uncertain_inverse_intents_resolve_before_and_after_fchmod_in_every_restore_ph
                 },
             )
             .unwrap();
-            wal.transition_staging(transaction, TransactionState::ParentSealed)
+            wal.transition_staging_for_test(transaction, TransactionState::ParentSealed)
                 .unwrap();
-            wal.transition_staging(transaction, TransactionState::TreeSealIntent)
+            wal.transition_staging_for_test(transaction, TransactionState::TreeSealIntent)
                 .unwrap();
             let needs_tree = matches!(case, Case::RestoreTree | Case::QuarantinedTree);
             if needs_tree {
@@ -470,7 +519,7 @@ fn uncertain_inverse_intents_resolve_before_and_after_fchmod_in_every_restore_ph
                 },
             )
             .unwrap();
-            wal.transition_staging(transaction, TransactionState::TreeSealed)
+            wal.transition_staging_for_test(transaction, TransactionState::TreeSealed)
                 .unwrap();
             let (phase, original_id, inverse_path, inverse_identity) = match case {
                 Case::RestoreTree => (
@@ -483,13 +532,19 @@ fn uncertain_inverse_intents_resolve_before_and_after_fchmod_in_every_restore_ph
                     wal.record_rename_intent(transaction).unwrap();
                     fs::rename(&root_path, &staged_path).unwrap();
                     wal.record_applied_rename_for_test(transaction).unwrap();
-                    wal.transition_staging(transaction, TransactionState::StagedUnverified)
-                        .unwrap();
+                    wal.transition_staging_for_test(
+                        transaction,
+                        TransactionState::StagedUnverified,
+                    )
+                    .unwrap();
                     match case {
                         Case::SourceParentRestore => {
-                            wal.transition_staging(transaction, TransactionState::StagedSealed)
-                                .unwrap();
-                            wal.transition_staging(
+                            wal.transition_staging_for_test(
+                                transaction,
+                                TransactionState::StagedSealed,
+                            )
+                            .unwrap();
+                            wal.transition_staging_for_test(
                                 transaction,
                                 TransactionState::SourceParentRestoreIntent,
                             )
@@ -502,8 +557,11 @@ fn uncertain_inverse_intents_resolve_before_and_after_fchmod_in_every_restore_ph
                             )
                         }
                         Case::QuarantinedParent => {
-                            wal.transition_staging(transaction, TransactionState::Quarantined)
-                                .unwrap();
+                            wal.transition_staging_for_test(
+                                transaction,
+                                TransactionState::Quarantined,
+                            )
+                            .unwrap();
                             (
                                 TransactionState::Quarantined,
                                 1,
@@ -512,8 +570,11 @@ fn uncertain_inverse_intents_resolve_before_and_after_fchmod_in_every_restore_ph
                             )
                         }
                         Case::QuarantinedTree => {
-                            wal.transition_staging(transaction, TransactionState::Quarantined)
-                                .unwrap();
+                            wal.transition_staging_for_test(
+                                transaction,
+                                TransactionState::Quarantined,
+                            )
+                            .unwrap();
                             (
                                 TransactionState::Quarantined,
                                 2,
@@ -526,7 +587,7 @@ fn uncertain_inverse_intents_resolve_before_and_after_fchmod_in_every_restore_ph
                 }
             };
             if phase == TransactionState::RestoreIntent {
-                wal.transition_staging(transaction, phase).unwrap();
+                wal.transition_staging_for_test(transaction, phase).unwrap();
             }
             let inverse_relative = if matches!(case, Case::QuarantinedTree) {
                 PathBuf::from("destination/staged")
@@ -655,7 +716,7 @@ fn exact_staging_snapshot_restores_all_applied_permissions_and_reaches_restored(
                           path: &Path,
                           relative_path: &str,
                           identity: StrongObjectIdentity| {
-        wal.transition_staging(transaction, phase).unwrap();
+        wal.transition_staging_for_test(transaction, phase).unwrap();
         let fd = open_dir(path);
         wal.apply_staging_permission_mutation(
             PermissionIntent {
@@ -686,7 +747,7 @@ fn exact_staging_snapshot_restores_all_applied_permissions_and_reaches_restored(
         "source",
         fixture.metadata.source_parent_identity(),
     );
-    wal.transition_staging(transaction, TransactionState::ParentSealed)
+    wal.transition_staging_for_test(transaction, TransactionState::ParentSealed)
         .unwrap();
     apply_original(
         &mut wal,
@@ -704,7 +765,7 @@ fn exact_staging_snapshot_restores_all_applied_permissions_and_reaches_restored(
         },
     )
     .unwrap();
-    wal.transition_staging(transaction, TransactionState::TreeSealed)
+    wal.transition_staging_for_test(transaction, TransactionState::TreeSealed)
         .unwrap();
 
     // Simulate process death: discard every live seal token and rebuild the
@@ -784,10 +845,10 @@ fn quarantined_active_seals_restore_in_place_and_unblock_without_unquarantining(
         ),
     ] {
         if phase == TransactionState::TreeSealIntent {
-            wal.transition_staging(transaction, TransactionState::ParentSealed)
+            wal.transition_staging_for_test(transaction, TransactionState::ParentSealed)
                 .unwrap();
         }
-        wal.transition_staging(transaction, phase).unwrap();
+        wal.transition_staging_for_test(transaction, phase).unwrap();
         let fd = open_dir(path);
         wal.apply_staging_permission_mutation(
             PermissionIntent {
@@ -818,13 +879,13 @@ fn quarantined_active_seals_restore_in_place_and_unblock_without_unquarantining(
         },
     )
     .unwrap();
-    wal.transition_staging(transaction, TransactionState::TreeSealed)
+    wal.transition_staging_for_test(transaction, TransactionState::TreeSealed)
         .unwrap();
     wal.record_rename_intent(transaction).unwrap();
     wal.record_applied_rename_for_test(transaction).unwrap();
-    wal.transition_staging(transaction, TransactionState::StagedUnverified)
+    wal.transition_staging_for_test(transaction, TransactionState::StagedUnverified)
         .unwrap();
-    wal.transition_staging(transaction, TransactionState::Quarantined)
+    wal.transition_staging_for_test(transaction, TransactionState::Quarantined)
         .unwrap();
 
     let mut startup_blocked = true;
@@ -868,7 +929,7 @@ fn repeated_unknown_rename_attempts_never_lookup_or_erase_typed_ambiguity() {
     let mut wal = lease.resume().unwrap();
     wal.begin_staging(transaction, fixture.metadata.clone())
         .unwrap();
-    wal.transition_staging(transaction, TransactionState::ParentSealIntent)
+    wal.transition_staging_for_test(transaction, TransactionState::ParentSealIntent)
         .unwrap();
     wal.apply_staging_permission_mutation(
         PermissionIntent {
@@ -896,9 +957,9 @@ fn repeated_unknown_rename_attempts_never_lookup_or_erase_typed_ambiguity() {
         || Ok(()),
     )
     .unwrap();
-    wal.transition_staging(transaction, TransactionState::ParentSealed)
+    wal.transition_staging_for_test(transaction, TransactionState::ParentSealed)
         .unwrap();
-    wal.transition_staging(transaction, TransactionState::TreeSealIntent)
+    wal.transition_staging_for_test(transaction, TransactionState::TreeSealIntent)
         .unwrap();
     wal.complete_tree_manifest(
         transaction,
@@ -908,7 +969,7 @@ fn repeated_unknown_rename_attempts_never_lookup_or_erase_typed_ambiguity() {
         },
     )
     .unwrap();
-    wal.transition_staging(transaction, TransactionState::TreeSealed)
+    wal.transition_staging_for_test(transaction, TransactionState::TreeSealed)
         .unwrap();
     wal.record_rename_intent(transaction).unwrap();
 
@@ -949,7 +1010,7 @@ fn staged_pending(
     fs::set_permissions(&source, fs::Permissions::from_mode(0o770)).ok()?;
     let source_identity = fixture.metadata.source_parent_identity();
     let source_fd = open_dir(&source);
-    wal.transition_staging(transaction, TransactionState::ParentSealIntent)
+    wal.transition_staging_for_test(transaction, TransactionState::ParentSealIntent)
         .ok()?;
     wal.apply_staging_permission_mutation(
         PermissionIntent {
@@ -970,9 +1031,9 @@ fn staged_pending(
         || rustix::fs::fchmod(&source_fd, Mode::from_raw_mode(0o750)).map_err(io::Error::from),
     )
     .ok()?;
-    wal.transition_staging(transaction, TransactionState::ParentSealed)
+    wal.transition_staging_for_test(transaction, TransactionState::ParentSealed)
         .ok()?;
-    wal.transition_staging(transaction, TransactionState::TreeSealIntent)
+    wal.transition_staging_for_test(transaction, TransactionState::TreeSealIntent)
         .ok()?;
 
     let destination = fixture._temp.path().join("destination");
@@ -1044,11 +1105,11 @@ fn staged_pending(
         },
     };
     wal.complete_tree_manifest(transaction, manifest).ok()?;
-    wal.transition_staging(transaction, TransactionState::TreeSealed)
+    wal.transition_staging_for_test(transaction, TransactionState::TreeSealed)
         .ok()?;
     wal.record_rename_intent(transaction).ok()?;
     wal.record_applied_rename_for_test(transaction).ok()?;
-    wal.transition_staging(transaction, TransactionState::StagedUnverified)
+    wal.transition_staging_for_test(transaction, TransactionState::StagedUnverified)
         .ok()?;
     Some((fixture, wal, true, transaction))
 }

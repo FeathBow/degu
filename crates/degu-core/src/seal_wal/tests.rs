@@ -2066,7 +2066,7 @@ fn already_exclusive_strategy_is_explicit_exact_and_non_vacuous() {
         .unwrap();
 }
 
-fn wal_at_staged_unverified(transaction: TransactionId) -> SealWal<FaultWriter> {
+fn wal_at_rename_intent(transaction: TransactionId) -> SealWal<FaultWriter> {
     let mut wal = SealWal::new(FaultWriter::default()).unwrap();
     wal.begin_staging(transaction, staging_metadata()).unwrap();
     advance_to_tree_intent(&mut wal, transaction);
@@ -2081,10 +2081,92 @@ fn wal_at_staged_unverified(transaction: TransactionId) -> SealWal<FaultWriter> 
     wal.transition_staging(transaction, TransactionState::TreeSealed)
         .unwrap();
     wal.record_rename_intent(transaction).unwrap();
+    wal
+}
+
+fn wal_at_staged_unverified(transaction: TransactionId) -> SealWal<FaultWriter> {
+    let mut wal = wal_at_rename_intent(transaction);
     wal.record_applied_rename_for_test(transaction).unwrap();
     wal.transition_staging(transaction, TransactionState::StagedUnverified)
         .unwrap();
     wal
+}
+
+#[test]
+fn rename_outcome_and_staged_state_real_writer_failures_poison_without_success() {
+    // Partial outcome frame: replay sees only the durable RenameIntent prefix.
+    let transaction = tx(0xb2);
+    let mut partial = wal_at_rename_intent(transaction);
+    partial.writer.write_error_after = Some((partial.writer.bytes.len() + 7, libc::EIO));
+    assert!(partial.record_applied_rename_for_test(transaction).is_err());
+    assert_eq!(
+        partial.transaction_state(transaction),
+        Some(TransactionState::RenameIntent)
+    );
+    assert_eq!(
+        partial
+            .recovery_snapshot(transaction)
+            .unwrap()
+            .rename_outcome,
+        None
+    );
+    assert!(matches!(
+        partial.append_synced(&state(transaction, TransactionState::RecoveryRequired)),
+        Err(AppendError::Poisoned)
+    ));
+    let replay = replay_bytes(&partial.into_inner().bytes);
+    assert_eq!(replay.transactions[&transaction].rename_outcome, None);
+
+    // Outcome sync failure may leave the complete frame physically visible, but
+    // the live writer is poisoned and publishes no in-memory transition token.
+    let transaction = tx(0xb3);
+    let mut outcome_sync = wal_at_rename_intent(transaction);
+    outcome_sync.writer.fail_sync_at = Some((outcome_sync.writer.sync_count, libc::EIO));
+    assert!(
+        outcome_sync
+            .record_applied_rename_for_test(transaction)
+            .is_err()
+    );
+    assert_eq!(
+        outcome_sync.transaction_state(transaction),
+        Some(TransactionState::RenameIntent)
+    );
+    assert_eq!(
+        outcome_sync
+            .recovery_snapshot(transaction)
+            .unwrap()
+            .rename_outcome,
+        None
+    );
+
+    // The applied outcome is durable, but the following state sync fails. The
+    // outcome remains the only published in-memory fact and the writer poisons.
+    let transaction = tx(0xb4);
+    let mut state_sync = wal_at_rename_intent(transaction);
+    state_sync
+        .record_applied_rename_for_test(transaction)
+        .unwrap();
+    state_sync.writer.fail_sync_at = Some((state_sync.writer.sync_count, libc::EIO));
+    assert!(
+        state_sync
+            .transition_staging(transaction, TransactionState::StagedUnverified)
+            .is_err()
+    );
+    assert_eq!(
+        state_sync.transaction_state(transaction),
+        Some(TransactionState::RenameIntent)
+    );
+    assert!(matches!(
+        state_sync
+            .recovery_snapshot(transaction)
+            .unwrap()
+            .rename_outcome,
+        Some(DurableRenameOutcome::AppliedAndParentsSynced(_))
+    ));
+    assert!(matches!(
+        state_sync.transition_staging(transaction, TransactionState::StagedUnverified),
+        Err(AppendError::Poisoned)
+    ));
 }
 
 #[test]
@@ -2101,6 +2183,33 @@ fn staged_verification_state_sync_failure_never_publishes_success_or_quarantine(
         let mut wal = wal_at_staged_unverified(transaction);
         wal.writer.fail_sync_at = Some((wal.writer.sync_count, libc::EIO));
         assert!(wal.transition_staging(transaction, next).is_err());
+        assert_eq!(
+            wal.transaction_state(transaction),
+            Some(TransactionState::StagedUnverified)
+        );
+    }
+}
+
+#[test]
+fn foundation_transition_seam_cannot_bypass_verification_commit_or_purge_proofs() {
+    let transaction = tx(0xaf);
+    let mut wal = wal_at_staged_unverified(transaction);
+    for forbidden in [
+        TransactionState::StagedSealed,
+        TransactionState::RollbackIntent,
+        TransactionState::RolledBack,
+        TransactionState::SourceParentRestoreIntent,
+        TransactionState::SourceParentRestored,
+        TransactionState::VerifiedCommitted,
+        TransactionState::Purgeable,
+        TransactionState::Purged,
+    ] {
+        assert!(matches!(
+            wal.transition_staging_foundation(transaction, forbidden),
+            Err(AppendError::InvalidState(
+                "staging state requires an unavailable authority proof"
+            ))
+        ));
         assert_eq!(
             wal.transaction_state(transaction),
             Some(TransactionState::StagedUnverified)

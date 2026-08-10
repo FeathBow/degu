@@ -8,7 +8,7 @@ use degu_core::ecosystem::DetectCtx;
 
 use super::claims::interrupted_purge_claims;
 use super::expiry::{SECONDS_PER_DAY, fallback_age};
-use super::operation_log::OperationLog;
+use super::journal::OperationLog;
 use super::reconcile::{TrashOplogInfo, reconciled_trash_info};
 use super::storage::trash_roots;
 

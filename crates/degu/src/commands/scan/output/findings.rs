@@ -1,6 +1,6 @@
 use super::{ScanReport, print_hidden_summary};
-use crate::commands::{next_action, regions};
-use crate::findings_table::{FindingsTableOptions, print as print_findings_table};
+use crate::commands::{guidance, regions};
+use crate::findings::{FindingsTableOptions, print as print_findings_table};
 use crate::output::stdoutln;
 use crate::presentation::semantic::Tone;
 use crate::presentation::{
@@ -278,7 +278,7 @@ pub(super) fn print_review_command(report: &ScanReport) -> Result<()> {
         Tone::AccentHeading,
         report.ui.colors.stdout,
     );
-    match next_action::review_preview_from_scan(&report.scope, finding.path(), &report.ctx.home) {
+    match guidance::review_preview_from_scan(&report.scope, finding.path(), &report.ctx.home) {
         Some(line) => {
             stdoutln!(
                 "\n{}",
@@ -292,7 +292,7 @@ pub(super) fn print_review_command(report: &ScanReport) -> Result<()> {
                 semantic::paint(
                     report
                         .ui
-                        .prose(next_action::review_followup(report.ui.stdout_is_terminal)),
+                        .prose(guidance::review_followup(report.ui.stdout_is_terminal)),
                     Tone::Secondary,
                     report.ui.colors.stdout
                 )
@@ -303,7 +303,7 @@ pub(super) fn print_review_command(report: &ScanReport) -> Result<()> {
             stdoutln!(
                 "{}",
                 semantic::paint(
-                    report.ui.indented_prose(2, next_action::UNSAFE_PATH_REASON),
+                    report.ui.indented_prose(2, guidance::UNSAFE_PATH_REASON),
                     Tone::Review,
                     report.ui.colors.stdout
                 )

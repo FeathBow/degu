@@ -6,11 +6,11 @@ use crate::collection::{
 use crate::commands::regions::{self, DisjointnessFailure};
 use crate::commands::scope::CleanScope;
 use crate::configuration::{deadline_from_budget, load_config, resolve_max_concurrency};
-use crate::filters::Filters;
-use crate::finding_filter::{FilterReason, FilteredFinding, PreparedFindingFilter};
+use crate::findings::Filters;
+use crate::findings::{FilterReason, FilteredFinding, PreparedFindingFilter};
 use crate::lifecycle::{CapturedCleanPlan, Lifecycle, MutationSession};
 use crate::runtime::Ui;
-use crate::source_selection::SourceSelection;
+use crate::selection::SourceSelection;
 use anyhow::Result;
 use degu_core::config::Config;
 use degu_core::ecosystem::{DetectCtx, IncompleteRegion, IncompleteRegions, RegionCause};

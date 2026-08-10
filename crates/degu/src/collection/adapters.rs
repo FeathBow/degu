@@ -1,6 +1,6 @@
 mod claims;
 
-use crate::source_selection::SourceSelection;
+use crate::selection::SourceSelection;
 use anyhow::{Context, Result};
 use degu_adapters::{AdapterScope, RegisteredAdapter};
 use degu_core::ecosystem::{DetectCtx, Root, RootOutcome};

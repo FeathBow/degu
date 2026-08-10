@@ -1,4 +1,4 @@
-use crate::value_parser::{parse_duration, parse_max_concurrency, parse_size};
+use crate::cli::parsers::{parse_duration, parse_max_concurrency, parse_size};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -6,6 +6,7 @@ use std::time::Duration;
 
 mod color;
 mod help;
+mod parsers;
 pub(crate) use color::{ColorPolicy, ColorWhen};
 use help::TOP_LEVEL_HELP_TEMPLATE;
 

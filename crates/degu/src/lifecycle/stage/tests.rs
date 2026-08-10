@@ -11,7 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use super::execution::{CleanFailure, StageOutcome, record_clean_failure};
 use super::{CleanExecution, StageRequest, cleaned_resources, stage_finding_with_log};
 use crate::lifecycle::EntryIdentity;
-use crate::lifecycle::operation_log::OperationLog;
+use crate::lifecycle::journal::OperationLog;
 
 #[path = "tests/purge.rs"]
 mod purge;

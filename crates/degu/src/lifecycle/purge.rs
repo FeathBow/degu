@@ -6,7 +6,7 @@ use degu_core::ecosystem::DetectCtx;
 
 use super::claims::interrupted_purge_claims;
 use super::expiry::{ExpiryContext, should_purge_expired_entry};
-use super::operation_log::OperationLog;
+use super::journal::OperationLog;
 use super::reconcile::reconciled_trash_info;
 use super::storage::trash_roots;
 

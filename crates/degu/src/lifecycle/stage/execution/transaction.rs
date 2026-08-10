@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use super::{CleanExecution, CleanSubject, StagedFailure};
 use crate::lifecycle::identity::{EntryIdentity, RenameFailure};
-use crate::lifecycle::operation_log::{OperationLog, TrashRecord, trash_record};
+use crate::lifecycle::journal::{OperationLog, TrashRecord, trash_record};
 
 pub(crate) struct StageRequest<'a> {
     pub(crate) trash: &'a Trash,

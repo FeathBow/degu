@@ -9,7 +9,7 @@
 //! probed executable for a different cleanup executable. Snapshot cleanup is
 //! restricted to fixed names below exact held directory descriptors.
 
-use crate::native_runner::{
+use crate::native::{
     HeldNativeExecutable, NativePreparationError, NativeRunOutcome, NativeRunnerError,
     PreparedNativeAction, cleanup_executable_snapshot, prepare_native_action_from_held,
     prepare_native_action_from_held_with_binding,
@@ -727,7 +727,7 @@ fn reject_extended_acl(fd: &impl AsFd, path: &Path) -> Result<(), UvExecutablePr
 
 #[cfg(target_os = "macos")]
 fn reject_extended_acl(fd: &impl AsFd, path: &Path) -> Result<(), UvExecutableProbeError> {
-    match crate::macos_acl::grants_mutation(fd) {
+    match crate::uv::grants_mutation(fd) {
         Ok(false) => Ok(()),
         Ok(true) => Err(unsafe_path(
             path,

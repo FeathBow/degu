@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use super::EntryIdentity;
 use super::claims::prepare_claims_dir;
-use super::operation_log::OperationLog;
+use super::journal::OperationLog;
 use super::storage::{
     ensure_managed_trash_root, register_trash_root, resolve_trash_dir, trash_dir_state,
 };

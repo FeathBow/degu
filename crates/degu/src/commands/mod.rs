@@ -6,8 +6,8 @@ use std::time::Duration;
 pub(crate) mod adapters;
 pub(crate) mod clean;
 pub(crate) mod completions;
+pub(crate) mod guidance;
 pub(crate) mod man;
-pub(crate) mod next_action;
 pub(crate) mod ops;
 pub(crate) mod prompt;
 pub(crate) mod quota;
@@ -39,8 +39,8 @@ impl CollectionRunOptions {
 
 pub(crate) fn purge_outcome(
     report: &crate::lifecycle::PurgeReport,
-) -> crate::action_result::StartedActionOutcome {
-    use crate::action_result::StartedActionOutcome;
+) -> crate::native::StartedActionOutcome {
+    use crate::native::StartedActionOutcome;
     if report.failed.is_empty() {
         StartedActionOutcome::Success
     } else if report.purged.is_empty() {

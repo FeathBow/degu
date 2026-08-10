@@ -2,11 +2,11 @@ mod claims;
 mod entries;
 mod expiry;
 mod identity;
-mod operation_log;
+mod journal;
 mod purge;
 mod reconcile;
+mod records;
 mod stage;
-mod state_read;
 mod storage;
 mod summary;
 mod trash;
@@ -57,7 +57,7 @@ impl Lifecycle {
     }
 
     pub(crate) fn operations(&self) -> Result<Vec<degu_core::oplog::OpRecord>> {
-        operation_log::OperationLog::new(&self.ctx).read()
+        journal::OperationLog::new(&self.ctx).read()
     }
 
     pub(crate) fn lock(self) -> Result<MutationSession> {

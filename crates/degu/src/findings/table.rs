@@ -1,4 +1,4 @@
-mod default_view;
+mod view;
 
 use crate::output::stdoutln;
 use crate::presentation::{
@@ -72,7 +72,7 @@ pub(crate) fn render(findings: &[Finding], options: FindingsTableOptions<'_>) ->
     if options.details {
         render_details(findings, options)
     } else {
-        default_view::render(findings, options)
+        view::render(findings, options)
     }
 }
 

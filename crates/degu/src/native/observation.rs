@@ -3,7 +3,7 @@
 //! This module is reporting-only. Canonical anchors are probe inputs and never
 //! mutation authority.
 
-use crate::action_result::{
+use crate::native::{
     ActionId, ActionKind, ActionObservationTargets, ActionObservations, ActionResultOwner,
     CompletedActionBatchResult, ContractError, NotStartedReason, ObservationRequestPath,
     PlannedActionBatch, QuotaObservationState, QuotaObservationTarget, ResolvedQuotaObservation,
@@ -562,7 +562,7 @@ pub(crate) fn print_human(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::action_result::{
+    use crate::native::{
         ActionId, ActionKind, ActionObservationTargets, ActionOutcome, ActionResultOwner,
         QuotaObservationTarget,
     };

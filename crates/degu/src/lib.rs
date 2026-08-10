@@ -3,36 +3,19 @@
 //!
 //! Output discipline: stdout carries command data only; diagnostics and logs go to stderr so machine-readable output remains pipe-safe.
 
-#[allow(dead_code)]
-// Contract types only; the cleanup lifecycle and quota-observation wiring land separately.
-mod action_result;
 mod cli;
 mod collection;
 mod commands;
 mod configuration;
-mod filters;
-mod finding_filter;
-mod findings_table;
+mod findings;
 mod lifecycle;
-#[cfg(target_os = "macos")]
-mod macos_acl;
-// Native capability execution and its quota-observation bridge.
-mod native_action;
-// Bounded native execution foundation.
-mod native_runner;
+mod native;
 mod output;
 mod presentation;
 mod quota;
-mod quota_observation;
 mod runtime;
-mod source_selection;
-// Descriptor-bound uv cache-root mutation authority.
-mod uv_cache_root;
-// Descriptor-bound uv executable/version proof.
-mod uv_executable;
-// Exact uv prune proof bundle and consuming production transition.
-mod uv_prune_plan;
-mod value_parser;
+mod selection;
+mod uv;
 
 use anyhow::Result;
 use cli::{Cli, ColorPolicy, Command};

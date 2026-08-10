@@ -1,6 +1,6 @@
 use crate::cli::{CleanArgs, ScanArgs};
-use crate::filters::Filters;
-use crate::source_selection::{clean_only_ids, project_sources_selected};
+use crate::findings::Filters;
+use crate::selection::{clean_only_ids, project_sources_selected};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]

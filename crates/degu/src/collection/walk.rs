@@ -1,13 +1,13 @@
-mod root_scan;
+mod scan;
 
-use self::root_scan::RootScan;
+use self::scan::RootScan;
 use super::adapters::{
     ExclusionClaims, PreparedAdapter, PreparedAdapters, RootResolutionPolicy, prepare_adapters,
 };
 use super::progress::ScanRootProgress;
 use super::roots::artifact_roots;
 use super::{Collection, CollectionRequest, CollectionSection};
-use crate::source_selection::SourceSelection;
+use crate::selection::SourceSelection;
 use anyhow::Result;
 use degu_adapters::discovery::{ProjectSources, ValidatedProjectRoot};
 use degu_adapters::{AdapterScope, CachedirTagProbe, RegisteredAdapter};

@@ -1,4 +1,4 @@
-use crate::commands::next_action::{self, OutputMode, Request, UndoState, Workflow};
+use crate::commands::guidance::{self, OutputMode, Request, UndoState, Workflow};
 use crate::lifecycle::{
     Lifecycle, UndoAmbiguousEntry, UndoEntry, UndoFailedEntry, UndoLogFailure, UndoReport,
 };
@@ -56,7 +56,7 @@ pub(crate) fn run(json: bool, ui: crate::runtime::Ui) -> Result<()> {
         return Ok(());
     };
     let output_result = print_report(json, &report).and_then(|()| {
-        next_action::print(Request {
+        guidance::print(Request {
             output: if json {
                 OutputMode::Json
             } else {

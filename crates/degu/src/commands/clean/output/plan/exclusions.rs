@@ -1,7 +1,7 @@
 use super::{PreparedClean, table_options};
-use crate::commands::next_action;
-use crate::finding_filter::rank_findings;
-use crate::findings_table::print as print_findings_table;
+use crate::commands::guidance;
+use crate::findings::print as print_findings_table;
+use crate::findings::rank_findings;
 use crate::output::stdoutln;
 use crate::presentation::semantic::Tone;
 use crate::presentation::{cleanup, escape_terminal_text, semantic};
@@ -83,7 +83,7 @@ fn print_details_hint(prepared: &PreparedClean) -> Result<()> {
     } else {
         "Excluded details"
     };
-    match next_action::details_preview_from_clean(&prepared.scope, &prepared.ctx.home) {
+    match guidance::details_preview_from_clean(&prepared.scope, &prepared.ctx.home) {
         Some(line) => stdoutln!(
             "{}",
             prepared.settings.ui.command_block(
@@ -104,7 +104,7 @@ fn print_details_hint(prepared: &PreparedClean) -> Result<()> {
             prepared
                 .settings
                 .ui
-                .prose(&format!("{label} {}", next_action::UNSAFE_SCOPE_REASON))
+                .prose(&format!("{label} {}", guidance::UNSAFE_SCOPE_REASON))
         ),
     }
 }
@@ -180,14 +180,14 @@ fn print_review_focus(prepared: &PreparedClean) -> Result<()> {
 
 fn print_review_preview(prepared: &PreparedClean, finding: &Finding) -> Result<()> {
     let Some(line) =
-        next_action::review_preview_from_clean(&prepared.scope, finding.path(), &prepared.ctx.home)
+        guidance::review_preview_from_clean(&prepared.scope, finding.path(), &prepared.ctx.home)
     else {
         stdoutln!(
             "{}",
             prepared
                 .settings
                 .ui
-                .indented_prose(2, next_action::UNSAFE_PATH_REASON)
+                .indented_prose(2, guidance::UNSAFE_PATH_REASON)
         )?;
         return Ok(());
     };
@@ -210,7 +210,7 @@ fn print_review_preview(prepared: &PreparedClean, finding: &Finding) -> Result<(
     stdoutln!(
         "{}",
         semantic::paint(
-            prepared.settings.ui.prose(next_action::review_followup(
+            prepared.settings.ui.prose(guidance::review_followup(
                 prepared.settings.ui.stdout_is_terminal
             )),
             Tone::Secondary,

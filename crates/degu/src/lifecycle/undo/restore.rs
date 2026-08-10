@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use degu_core::oplog::{ObjectIdentity, OpOutcome, OpRecord};
 
 use super::super::EntryIdentity;
-use super::super::operation_log::{OperationLog, RestoreRecord, restore_record};
+use super::super::journal::{OperationLog, RestoreRecord, restore_record};
 use super::report::{UndoAmbiguousEntry, UndoEntry, UndoFailedEntry, UndoLogFailure, UndoReport};
 use super::selection::UndoSelection;
 use failure::RestoreFailure;

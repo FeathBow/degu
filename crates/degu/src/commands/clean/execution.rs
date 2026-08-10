@@ -1,13 +1,13 @@
 use super::output;
 use super::preparation::PreparedClean;
-use crate::action_result::{ActionKind, ActionResultOwner, NotStartedReason, StartedActionOutcome};
-use crate::commands::next_action::{
+use crate::commands::guidance::{
     self, CleanPreviewState, CleanResultState, OutputMode, Request, Workflow,
 };
 use crate::commands::prompt::{confirm_permanent_delete, confirm_required};
 use crate::lifecycle::{CleanExecution, ExpiryPlan, Lifecycle, MutationSession, PurgeReport};
-use crate::quota_observation::{
-    QuotaActionReport, coordinate, not_attempted_action, planned_action,
+use crate::native::{
+    ActionKind, ActionResultOwner, NotStartedReason, QuotaActionReport, StartedActionOutcome,
+    coordinate, not_attempted_action, planned_action,
 };
 use anyhow::Result;
 use degu_core::finding::Finding;
@@ -106,11 +106,8 @@ fn run_json(prepared: PreparedClean) -> Result<()> {
         .map_err(|error| anyhow::anyhow!("invalid direct observation contract: {error:?}"))?,
     };
     let observations = CleanQuotaObservations { direct_purge };
-    crate::quota_observation::print_warnings(
-        &observations.direct_purge,
-        prepared.settings.ui.colors,
-    );
-    crate::quota_observation::print_warnings(&expiry.observation, prepared.settings.ui.colors);
+    crate::native::print_warnings(&observations.direct_purge, prepared.settings.ui.colors);
+    crate::native::print_warnings(&expiry.observation, prepared.settings.ui.colors);
     let output_result = output::print_json(&prepared, &executed, &expiry, &observations);
     ensure_clean_success(clean_failed)?;
     ensure_expiry_success(&expiry)?;
@@ -155,7 +152,7 @@ fn run_human_preview(prepared: &PreparedClean) -> Result<()> {
 }
 
 fn print_preview_next(prepared: &PreparedClean) -> Result<()> {
-    next_action::print(Request {
+    guidance::print(Request {
         output: OutputMode::Human(prepared.settings.ui),
         workflow: Workflow::CleanPreview(CleanPreviewState {
             scope: &prepared.scope,
@@ -201,16 +198,13 @@ fn execute_human_plan(
     let output_result = output::print_execution(&prepared, &executed, Some(elapsed))
         .and_then(|()| {
             if let Some(observation) = &direct_purge {
-                crate::quota_observation::print_human(observation, prepared.settings.ui.colors)?;
+                crate::native::print_human(observation, prepared.settings.ui.colors)?;
             }
             if failed {
                 Ok(())
             } else {
                 output::print_expiry(&expiry, prepared.settings.ui.colors)?;
-                crate::quota_observation::print_human(
-                    &expiry.observation,
-                    prepared.settings.ui.colors,
-                )?;
+                crate::native::print_human(&expiry.observation, prepared.settings.ui.colors)?;
                 Ok(())
             }
         })
@@ -343,7 +337,7 @@ fn print_result_next(
         .iter()
         .filter(|item| item.has_trash_location())
         .count();
-    next_action::print(Request {
+    guidance::print(Request {
         output: OutputMode::Human(prepared.settings.ui),
         workflow: Workflow::CleanResult(CleanResultState { trash_locations }),
         home: None,

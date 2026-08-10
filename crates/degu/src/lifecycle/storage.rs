@@ -19,7 +19,7 @@ mod validation;
 pub(crate) use validation::ensure_managed_trash_root;
 use validation::{ensure_state_parent, validate_existing_trash_root};
 
-use super::operation_log::isolate_partial_tail;
+use super::journal::isolate_partial_tail;
 
 pub(crate) fn trash_dir_state(ctx: &DetectCtx) -> PathBuf {
     ctx.xdg_state().join("degu/trash")
@@ -207,8 +207,8 @@ pub(crate) fn trash_roots(ctx: &DetectCtx) -> Result<Vec<PathBuf>> {
 fn read_registered_trash_roots(registry: &Path) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
     let limits =
-        super::state_read::StateReadLimits::new(TRASHROOTS_MAX_BYTES, TRASHROOT_RECORD_MAX_BYTES);
-    super::state_read::visit_bounded_state_lines(registry, limits, |line_no, line| {
+        super::records::StateReadLimits::new(TRASHROOTS_MAX_BYTES, TRASHROOT_RECORD_MAX_BYTES);
+    super::records::visit_bounded_state_lines(registry, limits, |line_no, line| {
         let line = std::str::from_utf8(line).with_context(|| {
             format!(
                 "failed to read {}: trash registry line {line_no} is not valid UTF-8",

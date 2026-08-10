@@ -25,8 +25,8 @@ pub(crate) fn print(
         "opt_in": prepared.scope.include_review(),
         "expiry": expiry_json(expiry)?,
         "quota_observations": {
-            "direct_purge": crate::quota_observation::json(&observations.direct_purge),
-            "expiry_purge": crate::quota_observation::json(&expiry.observation),
+            "direct_purge": crate::native::json(&observations.direct_purge),
+            "expiry_purge": crate::native::json(&expiry.observation),
         },
     });
     stdoutln!("{}", serde_json::to_string_pretty(&report)?)

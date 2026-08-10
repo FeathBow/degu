@@ -1,5 +1,5 @@
 use super::super::preparation::PreparedClean;
-use crate::findings_table::{FindingsTableOptions, print as print_findings_table};
+use crate::findings::{FindingsTableOptions, print as print_findings_table};
 use crate::output::stdoutln;
 use crate::presentation::semantic::Tone;
 use crate::presentation::{

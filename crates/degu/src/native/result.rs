@@ -53,7 +53,6 @@ pub(crate) enum ActionKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NotStartedReason {
     DryRun,
-    Cancelled,
     Empty,
     PrerequisiteFailed,
 }
@@ -464,6 +463,7 @@ pub(crate) struct BatchPostObservationPending {
 }
 
 impl BatchPostObservationPending {
+    #[cfg(test)]
     pub(crate) fn observation_targets(&self) -> &ActionObservationTargets {
         &self.descriptor.targets
     }
@@ -517,31 +517,6 @@ impl BatchPostObservationPending {
             observations,
         }
     }
-
-    /// Crosses the completion boundary only with an observation resolution that
-    /// covers the exact targets carried across the start/execution boundaries.
-    pub(crate) fn complete<Unavailable, Incomparable, Observed>(
-        self,
-        observations: ActionObservations<Unavailable, Incomparable, Observed>,
-    ) -> Result<CompletedActionBatchResult<Unavailable, Incomparable, Observed>, ContractError>
-    {
-        if !observations.belongs_to(&self.descriptor.correlation) {
-            return Err(ContractError::ObservationBatchMismatch);
-        }
-        if !observations.covers(&self.descriptor.targets) {
-            return Err(ContractError::ObservationTargetMismatch);
-        }
-        if observations.any_not_attempted() {
-            return Err(ContractError::StartedObservationNotResolved);
-        }
-        Ok(CompletedActionBatchResult {
-            descriptor: self.descriptor,
-            start: StartBoundary::Started,
-            completion: CompletionBoundary::Completed,
-            outcome: self.outcome,
-            observations,
-        })
-    }
 }
 
 /// Stable internal envelope. It is intentionally not `Serialize` and is not
@@ -570,18 +545,22 @@ impl<Unavailable, Incomparable, Observed>
         &self.descriptor.id
     }
 
+    #[cfg(test)]
     pub(crate) fn observation_targets(&self) -> &ActionObservationTargets {
         &self.descriptor.targets
     }
 
+    #[cfg(test)]
     pub(crate) fn start_boundary(&self) -> StartBoundary {
         self.start
     }
 
+    #[cfg(test)]
     pub(crate) fn completion_boundary(&self) -> CompletionBoundary {
         self.completion
     }
 
+    #[cfg(test)]
     pub(crate) fn outcome(&self) -> ActionOutcome {
         self.outcome
     }
@@ -597,9 +576,7 @@ pub(crate) enum ContractError {
     EmptyObservationScope,
     DuplicateObservationAnchor,
     ObservationTargetMismatch,
-    ObservationBatchMismatch,
     ObservationTicketAlreadyTaken,
-    StartedObservationNotResolved,
 }
 
 #[cfg(test)]
@@ -677,7 +654,6 @@ mod tests {
     fn not_started_actions_internally_seal_not_attempted_observations() {
         for reason in [
             NotStartedReason::DryRun,
-            NotStartedReason::Cancelled,
             NotStartedReason::Empty,
             NotStartedReason::PrerequisiteFailed,
         ] {
@@ -721,7 +697,7 @@ mod tests {
             .unwrap()],
         )
         .unwrap();
-        let result = pending.complete(observations).unwrap();
+        let result = pending.complete_or_all_unavailable(Ok(observations), "unused");
         assert_eq!(
             result.owner(),
             &ActionResultOwner::NativeAdapter {
@@ -767,7 +743,7 @@ mod tests {
                 .unwrap()],
             )
             .unwrap();
-            let result = pending.complete(observations).unwrap();
+            let result = pending.complete_or_all_unavailable(Ok(observations), "unused");
             assert_eq!(result.start_boundary(), StartBoundary::Started);
             assert_eq!(result.completion_boundary(), CompletionBoundary::Completed);
             assert_eq!(result.outcome(), ActionOutcome::from(outcome));
@@ -816,7 +792,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = pending.complete(observations).unwrap();
+        let result = pending.complete_or_all_unavailable(Ok(observations), "unused");
         assert_eq!(result.observations().quota_scopes().len(), 4);
         assert_eq!(result.observations().quota_scopes()[3].anchors().len(), 2);
         assert!(matches!(
@@ -854,10 +830,11 @@ mod tests {
         .start()
         .finish_execution(StartedActionOutcome::Success);
 
-        assert_eq!(
-            pending.complete(observations),
-            Err(ContractError::ObservationBatchMismatch)
-        );
+        let result = pending.complete_or_all_unavailable(Ok(observations), ());
+        assert!(matches!(
+            result.observations().quota_scopes()[0].state(),
+            QuotaObservationState::Unavailable(())
+        ));
     }
 
     #[test]
@@ -884,10 +861,11 @@ mod tests {
             .start()
             .finish_execution(StartedActionOutcome::Success);
 
-        assert_eq!(
-            second.complete(observations),
-            Err(ContractError::ObservationBatchMismatch)
-        );
+        let result = second.complete_or_all_unavailable(Ok(observations), ());
+        assert!(matches!(
+            result.observations().quota_scopes()[0].state(),
+            QuotaObservationState::Unavailable(())
+        ));
         // `PlannedActionBatch` is intentionally not `Clone`; consuming `start`
         // is the only transition and therefore cannot be repeated.
     }
@@ -902,10 +880,11 @@ mod tests {
             &started.descriptor.correlation,
             &started.descriptor.targets,
         );
-        assert_eq!(
-            started.complete(not_attempted),
-            Err(ContractError::StartedObservationNotResolved)
-        );
+        let result = started.complete_or_all_unavailable(Ok(not_attempted), ());
+        assert!(matches!(
+            result.observations().quota_scopes()[0].state(),
+            QuotaObservationState::Unavailable(())
+        ));
     }
 
     #[test]
@@ -971,7 +950,7 @@ mod tests {
                 .finish_execution(StartedActionOutcome::Success);
             let ticket = pending.take_observation_ticket().unwrap();
             let observations = ActionObservations::<(), (), ()>::resolve(ticket, []).unwrap();
-            let result = pending.complete(observations).unwrap();
+            let result = pending.complete_or_all_unavailable(Ok(observations), ());
             assert_eq!(result.owner(), &owner);
             assert_eq!(result.kind(), kind);
         }

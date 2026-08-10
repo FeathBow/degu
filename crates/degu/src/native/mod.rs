@@ -4,8 +4,6 @@
 
 mod action;
 mod observation;
-#[allow(dead_code)]
-// Part of the action-result contract has no production caller yet.
 mod result;
 mod runner;
 

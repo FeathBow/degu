@@ -14,11 +14,12 @@ use degu_adapters::native::{
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MAX_ARGUMENTS: usize = 128;
@@ -203,6 +204,8 @@ pub(crate) enum NativePreparationError {
 pub(crate) enum NativeRunnerError {
     #[error("inherited native environment exceeds its bound at {0:?}")]
     InheritedEnvironmentTooLarge(OsString),
+    #[error("private native executable snapshot failed attachment revalidation: {0}")]
+    ExecutableBinding(#[source] io::Error),
     #[error("failed to establish the native child descriptor policy: {0}")]
     DescriptorPolicy(#[source] io::Error),
     #[error("failed to spawn native action: {0}")]
@@ -267,6 +270,152 @@ pub(crate) struct PreparedNativeAction {
     action_id: String,
     observation_requests: Vec<PathBuf>,
     resolved_environment: Vec<(OsString, OsString)>,
+    /// Keeps the private executable snapshot and its cleanup lease alive through
+    /// execution. Its descriptor is CLOEXEC and never enters the tool.
+    held_executable: Option<HeldNativeExecutable>,
+}
+
+/// One private executable snapshot. Its stable path works with `exec` on both
+/// Linux and macOS, while the open descriptor pins identity. The shared cleanup
+/// lease removes the snapshot only after all prepared uses finish.
+pub(crate) struct HeldNativeExecutable {
+    executable: OwnedFd,
+    execution_path: PathBuf,
+    identity: rustix::fs::Stat,
+    cleanup: Arc<ExecutableSnapshotCleanup>,
+}
+
+struct ExecutableSnapshotCleanup {
+    parent: OwnedFd,
+    directory: OwnedFd,
+    directory_name: OsString,
+}
+
+impl HeldNativeExecutable {
+    pub(crate) fn new(
+        executable: OwnedFd,
+        execution_path: PathBuf,
+        parent: OwnedFd,
+        directory: OwnedFd,
+        directory_name: OsString,
+    ) -> io::Result<Self> {
+        let identity = rustix::fs::fstat(&executable).map_err(io::Error::from)?;
+        Ok(Self {
+            executable,
+            execution_path,
+            identity,
+            cleanup: Arc::new(ExecutableSnapshotCleanup {
+                parent,
+                directory,
+                directory_name,
+            }),
+        })
+    }
+
+    pub(crate) fn duplicate(&self) -> io::Result<Self> {
+        Ok(Self {
+            executable: rustix::io::dup(&self.executable).map_err(io::Error::from)?,
+            execution_path: self.execution_path.clone(),
+            identity: self.identity,
+            cleanup: Arc::clone(&self.cleanup),
+        })
+    }
+
+    fn revalidate(&self) -> io::Result<()> {
+        let held = rustix::fs::fstat(&self.executable).map_err(io::Error::from)?;
+        let attached = rustix::fs::statat(
+            &self.cleanup.directory,
+            "uv",
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(io::Error::from)?;
+        let path = rustix::fs::statat(
+            rustix::fs::CWD,
+            &self.execution_path,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(io::Error::from)?;
+        let execution_parent = self
+            .execution_path
+            .parent()
+            .ok_or_else(|| io::Error::other("native snapshot path has no parent"))?;
+        let parent = rustix::fs::openat(
+            rustix::fs::CWD,
+            execution_parent,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        let parent = rustix::fs::fstat(&parent).map_err(io::Error::from)?;
+        let held_parent = rustix::fs::fstat(&self.cleanup.directory).map_err(io::Error::from)?;
+        if !same_snapshot_identity(&self.identity, &held)
+            || !same_snapshot_identity(&self.identity, &attached)
+            || !same_snapshot_identity(&self.identity, &path)
+            || parent.st_dev != held_parent.st_dev
+            || parent.st_ino != held_parent.st_ino
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "private native executable snapshot changed identity or path attachment",
+            ));
+        }
+        Ok(())
+    }
+
+    fn execution_path(&self) -> &Path {
+        &self.execution_path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_path(&self) -> &Path {
+        &self.execution_path
+    }
+}
+
+fn same_snapshot_identity(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
+    left.st_dev == right.st_dev
+        && left.st_ino == right.st_ino
+        && left.st_mode == right.st_mode
+        && left.st_uid == right.st_uid
+        && left.st_gid == right.st_gid
+        && left.st_size == right.st_size
+        && left.st_ctime == right.st_ctime
+        && left.st_ctime_nsec == right.st_ctime_nsec
+}
+
+impl Drop for ExecutableSnapshotCleanup {
+    fn drop(&mut self) {
+        cleanup_executable_snapshot(&self.parent, &self.directory, &self.directory_name);
+    }
+}
+
+/// Best-effort cleanup of the exact private snapshot namespace held by FDs.
+/// This intentionally does not use path-based removal or the general lifecycle.
+pub(crate) fn cleanup_executable_snapshot(
+    parent: &OwnedFd,
+    directory: &OwnedFd,
+    directory_name: &OsStr,
+) {
+    raw_unlinkat(directory, OsStr::new("uv"), 0);
+    raw_unlinkat(parent, directory_name, libc::AT_REMOVEDIR);
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "removes only fixed names created in a random private snapshot directory, through held exact parent FDs"
+)]
+fn raw_unlinkat(parent: &OwnedFd, name: &OsStr, flags: libc::c_int) {
+    let Ok(name) = std::ffi::CString::new(name.as_bytes()) else {
+        return;
+    };
+    // SAFETY: `parent` stays live; `name` is a NUL-terminated single relative
+    // component created by this module; flags are either zero or AT_REMOVEDIR.
+    unsafe {
+        libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags);
+    }
 }
 
 impl PreparedNativeAction {
@@ -302,6 +451,7 @@ impl PreparedNativeAction {
             result: run_preflighted(
                 self.declaration,
                 self.resolved_environment,
+                self.held_executable,
                 refresh_descriptor_limit,
                 parse,
             ),
@@ -319,17 +469,33 @@ impl<Parsed, ParseError> StartedNativeExecution<Parsed, ParseError> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_native_action(
     request: NativeActionRequest,
 ) -> Result<PreparedNativeAction, NativePreparationError> {
-    prepare_native_action_with(request, resolve_environment)
+    prepare_native_action_with(request, None, resolve_environment)
+}
+
+/// Prepare a request to execute the exact private snapshot paired with a held
+/// descriptor and cleanup lease, rather than resolving the caller-selected
+/// pathname again at spawn. The request retains that reviewed lexical selection
+/// for identity and adapter-substitution checks.
+pub(crate) fn prepare_native_action_from_held(
+    request: NativeActionRequest,
+    held_executable: HeldNativeExecutable,
+) -> Result<PreparedNativeAction, NativePreparationError> {
+    prepare_native_action_with(request, Some(held_executable), resolve_environment)
 }
 
 fn prepare_native_action_with(
     request: NativeActionRequest,
+    held_executable: Option<HeldNativeExecutable>,
     resolve: impl FnOnce(&NativeEnvironment) -> Result<Vec<(OsString, OsString)>, NativeRunnerError>,
 ) -> Result<PreparedNativeAction, NativePreparationError> {
-    let declaration = NativeActionDeclaration::from_request(&request)?;
+    let mut declaration = NativeActionDeclaration::from_request(&request)?;
+    if let Some(executable) = &held_executable {
+        declaration.executable = executable.execution_path().to_path_buf();
+    }
     let resolved_environment =
         resolve(&declaration.environment).map_err(NativePreparationError::Preflight)?;
     Ok(PreparedNativeAction {
@@ -338,6 +504,7 @@ fn prepare_native_action_with(
         action_id: request.identity().action_id().to_owned(),
         observation_requests: request.observation_requests().to_vec(),
         resolved_environment,
+        held_executable,
     })
 }
 
@@ -373,6 +540,7 @@ fn run_native_action<Parsed, ParseError>(
     run_preflighted(
         declaration.clone(),
         resolved_environment,
+        None,
         descriptor_scan_limit,
         parse,
     )
@@ -381,9 +549,15 @@ fn run_native_action<Parsed, ParseError>(
 fn run_preflighted<Parsed, ParseError>(
     declaration: NativeActionDeclaration,
     resolved_environment: Vec<(OsString, OsString)>,
+    held_executable: Option<HeldNativeExecutable>,
     refresh_descriptor_limit: impl FnOnce() -> io::Result<i32>,
     parse: impl FnOnce(&[u8]) -> Result<Parsed, ParseError>,
 ) -> Result<NativeRunReport<Parsed, ParseError>, NativeRunnerError> {
+    if let Some(executable) = &held_executable {
+        executable
+            .revalidate()
+            .map_err(NativeRunnerError::ExecutableBinding)?;
+    }
     let mut command = Command::new(&declaration.executable);
     command
         .args(&declaration.arguments)
@@ -932,6 +1106,7 @@ mod tests {
     fn preflight_failure_never_produces_a_started_capability() {
         let error = prepare_native_action_with(
             native_request(PathBuf::from("/usr/bin/fake"), Vec::new()),
+            None,
             |_| {
                 Err(NativeRunnerError::InheritedEnvironmentTooLarge(
                     OsString::from("HUGE"),

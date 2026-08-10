@@ -26,6 +26,9 @@ mod quota;
 mod quota_observation;
 mod runtime;
 mod source_selection;
+#[allow(dead_code)]
+// Descriptor-bound uv executable/version proof; no caller wired up yet.
+mod uv_executable;
 mod value_parser;
 
 use anyhow::Result;

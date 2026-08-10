@@ -8,16 +8,17 @@ use crate::action_result::{
     ActionId, ActionKind, ActionObservationTargets, ActionResultOwner, ContractError,
     ObservationRequestPath, PlannedActionBatch, QuotaObservationTarget, StartedActionOutcome,
 };
+#[cfg(test)]
+use crate::native_runner::prepare_native_action;
 use crate::native_runner::{
-    NativePreparationError, NativeRunReport, NativeRunnerError, PreparedNativeAction,
-    prepare_native_action,
+    HeldNativeExecutable, NativePreparationError, NativeRunReport, NativeRunnerError,
+    PreparedNativeAction, prepare_native_action_from_held,
 };
 use crate::quota::{ProbeError, QuotaSnapshot};
 use crate::quota_observation::{self, CompletedQuotaAction};
+use crate::uv_executable::{ProbedUvExecutable, UvExecutableProbeError};
 use degu_adapters::RegisteredAdapter;
-use degu_adapters::native::{
-    NativeActionRequest, NativeCapabilityError, NativeExecutableSelection,
-};
+use degu_adapters::native::{NativeActionRequest, NativeCapabilityError};
 use degu_core::ecosystem::{DetectCtx, Root};
 use std::path::Path;
 
@@ -25,6 +26,8 @@ use std::path::Path;
 pub(crate) enum NativeActionPlanError {
     #[error("native capability declaration failed: {0}")]
     Capability(#[from] NativeCapabilityError),
+    #[error("native executable proof failed revalidation: {0}")]
+    Executable(#[from] UvExecutableProbeError),
     #[error("native action preparation failed: {0}")]
     Preparation(#[from] NativePreparationError),
     #[error("native action identity is invalid: {0:?}")]
@@ -63,20 +66,36 @@ pub(crate) fn prepare_registered_native_action(
     registration: &RegisteredAdapter,
     ctx: &DetectCtx,
     frozen_roots: &[Root],
-    executable: &NativeExecutableSelection,
+    executable: ProbedUvExecutable,
 ) -> Result<Option<PreparedNativeQuotaAction>, NativeActionPlanError> {
-    registration
-        .declare_native_cleanup(ctx, frozen_roots, executable)?
-        .map(prepare_request)
-        .transpose()
+    executable.revalidate_path()?;
+    let request = registration.declare_native_cleanup(ctx, frozen_roots, executable.selection())?;
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    let (_selection, held_executable) = executable.into_parts();
+    prepare_request_from_held(request, held_executable).map(Some)
 }
 
+#[cfg(test)]
 fn prepare_request(
     request: NativeActionRequest,
 ) -> Result<PreparedNativeQuotaAction, NativeActionPlanError> {
     // All declaration, inherited-environment, and other pre-start validation
     // finishes before a batch exists. A failure therefore performs no probe.
-    let action = prepare_native_action(request)?;
+    prepare_preflighted(prepare_native_action(request)?)
+}
+
+fn prepare_request_from_held(
+    request: NativeActionRequest,
+    held_executable: HeldNativeExecutable,
+) -> Result<PreparedNativeQuotaAction, NativeActionPlanError> {
+    prepare_preflighted(prepare_native_action_from_held(request, held_executable)?)
+}
+
+fn prepare_preflighted(
+    action: PreparedNativeAction,
+) -> Result<PreparedNativeQuotaAction, NativeActionPlanError> {
     let adapter_id =
         ActionId::new(action.adapter_id().to_owned()).map_err(NativeActionPlanError::Contract)?;
     let action_id =
@@ -132,7 +151,8 @@ mod tests {
     };
     use crate::quota_observation::{ProbePhase, UnavailableObservation};
     use degu_adapters::native::{
-        NativeActionIdentity, NativeEnvironmentRequest, NativeProcessContract,
+        NativeActionIdentity, NativeEnvironmentRequest, NativeExecutableSelection,
+        NativeProcessContract,
     };
     use std::collections::VecDeque;
     use std::ffi::OsString;
@@ -190,14 +210,14 @@ mod tests {
         let ctx = DetectCtx::for_test(home.path().to_path_buf(), [] as [(OsString, OsString); 0]);
         for registration in degu_adapters::all() {
             assert!(
-                prepare_registered_native_action(
-                    &registration,
-                    &ctx,
-                    &[],
-                    &selection(PathBuf::from("/usr/bin/unused")),
-                )
-                .unwrap()
-                .is_none(),
+                registration
+                    .declare_native_cleanup(
+                        &ctx,
+                        &[],
+                        &selection(PathBuf::from("/usr/bin/unused")),
+                    )
+                    .unwrap()
+                    .is_none(),
                 "{} unexpectedly declared native work",
                 registration.id()
             );

@@ -594,11 +594,11 @@ fn tox_entry_probe(
 }
 
 fn valid_cachedir_tag(path: &Path, ctx: &DetectCtx) -> Probe {
-    match crate::cachedir_tag::probe(path, Some(ctx)) {
-        crate::cachedir_tag::Probe::Match => Probe::Match,
-        crate::cachedir_tag::Probe::Miss => Probe::Miss,
-        crate::cachedir_tag::Probe::Incomplete => Probe::Incomplete,
-        crate::cachedir_tag::Probe::Truncated => Probe::Truncated { incomplete: false },
+    match crate::cachedir::probe(path, Some(ctx)) {
+        crate::cachedir::Probe::Match => Probe::Match,
+        crate::cachedir::Probe::Miss => Probe::Miss,
+        crate::cachedir::Probe::Incomplete => Probe::Incomplete,
+        crate::cachedir::Probe::Truncated => Probe::Truncated { incomplete: false },
     }
 }
 

@@ -1,6 +1,6 @@
 use super::output;
 use super::preparation::PreparedClean;
-use crate::commands::next_action::{
+use crate::commands::guidance::{
     self, CleanPreviewState, CleanResultState, OutputMode, Request, Workflow,
 };
 use crate::commands::prompt::{confirm_permanent_delete, confirm_required};
@@ -152,7 +152,7 @@ fn run_human_preview(prepared: &PreparedClean) -> Result<()> {
 }
 
 fn print_preview_next(prepared: &PreparedClean) -> Result<()> {
-    next_action::print(Request {
+    guidance::print(Request {
         output: OutputMode::Human(prepared.settings.ui),
         workflow: Workflow::CleanPreview(CleanPreviewState {
             scope: &prepared.scope,
@@ -337,7 +337,7 @@ fn print_result_next(
         .iter()
         .filter(|item| item.has_trash_location())
         .count();
-    next_action::print(Request {
+    guidance::print(Request {
         output: OutputMode::Human(prepared.settings.ui),
         workflow: Workflow::CleanResult(CleanResultState { trash_locations }),
         home: None,

@@ -261,5 +261,4 @@ pub(crate) fn cleaned_resources(executed: &[CleanExecution], purge: bool) -> (u6
 }
 
 #[cfg(test)]
-#[path = "execution_tests.rs"]
 mod tests;

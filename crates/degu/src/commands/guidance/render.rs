@@ -1,6 +1,6 @@
 use super::Action;
 use crate::commands::scope::{CleanScope, ScanScope};
-use crate::filters::Filters;
+use crate::findings::Filters;
 use crate::presentation::shell::{command_path, quote_path, quote_word};
 use std::path::{Path, PathBuf};
 

@@ -1,7 +1,6 @@
 use super::ScanReport;
-use crate::commands::next_action::{self, OutputMode, Request, ScanState, Workflow};
-use crate::finding_filter::FilteredFinding;
-use crate::findings_table::{self, print as print_findings_table};
+use crate::commands::guidance::{self, OutputMode, Request, ScanState, Workflow};
+use crate::findings::{FilteredFinding, print as print_findings_table};
 use crate::lifecycle::Lifecycle;
 use crate::output::stdoutln;
 use crate::presentation::semantic::Tone;
@@ -37,7 +36,7 @@ pub(super) fn print(report: &ScanReport) -> Result<()> {
         print_human(report)?;
     }
     let trash_entries = print_trash_summary(&report.ctx, report.ui)?;
-    let guidance = next_action::resolve(Request {
+    let guidance = guidance::resolve(Request {
         output: OutputMode::Human(report.ui),
         workflow: Workflow::Scan(ScanState {
             scope: &report.scope,
@@ -96,7 +95,7 @@ fn has_unmanaged_artifacts_to_explain(report: &ScanReport) -> bool {
         })
 }
 
-fn print_project_scope_note(report: &ScanReport, guidance: &next_action::Guidance) -> Result<()> {
+fn print_project_scope_note(report: &ScanReport, guidance: &guidance::Guidance) -> Result<()> {
     if report.truncated()
         || report.has_effective_project_roots
         || !report.scope.includes_project_sources()
@@ -294,7 +293,7 @@ fn print_runtime(section: RuntimeSection<'_>) -> Result<()> {
     print_runtime_heading(&section)?;
     print_findings_table(
         section.findings,
-        findings_table::FindingsTableOptions::new(section.ui, section.details, section.home)
+        crate::findings::FindingsTableOptions::new(section.ui, section.details, section.home)
             .for_disposition(DispositionMode::ReportOnly),
     )?;
     print_runtime_total(&section)?;

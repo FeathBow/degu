@@ -5,7 +5,7 @@
 
 mod apptainer;
 mod artifacts;
-mod cachedir_tag;
+mod cachedir;
 mod cargo;
 mod ccache;
 mod checkpoints;
@@ -106,7 +106,7 @@ pub(crate) fn first_present(
 pub const ARTIFACT_SOURCE_ID: &str = artifacts::SOURCE_ID;
 pub const CHECKPOINT_SOURCE_ID: &str = checkpoints::SOURCE_ID;
 pub const PROJECT_SOURCE_IDS: [&str; 2] = [ARTIFACT_SOURCE_ID, CHECKPOINT_SOURCE_ID];
-pub use cachedir_tag::{
+pub use cachedir::{
     Probe as CachedirTagProbe, SIGNATURE_PROBE_LEN, has_valid_cachedir_tag, prefix_has_signature,
     probe_for_scheduling,
 };

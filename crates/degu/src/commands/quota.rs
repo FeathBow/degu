@@ -1,7 +1,7 @@
 mod output;
 
 use crate::cli::QuotaArgs;
-use crate::commands::next_action::{self, OutputMode, Request, Workflow};
+use crate::commands::guidance::{self, OutputMode, Request, Workflow};
 use crate::presentation::escape_terminal_text;
 use crate::runtime::Ui;
 use anyhow::{Context, Result, anyhow};
@@ -15,7 +15,7 @@ pub(crate) fn run(args: QuotaArgs, ui: Ui) -> Result<()> {
         .with_context(|| format!("quota target is unavailable: {target_text}"))?;
     let report = crate::quota::probe(&canonical)?;
     output::print(&report, json, ui)?;
-    next_action::print(Request {
+    guidance::print(Request {
         output: output_mode(json, ui),
         workflow: Workflow::Quota,
         home: None,

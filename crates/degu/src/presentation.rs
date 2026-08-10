@@ -8,9 +8,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub(crate) mod cleanup;
 pub(crate) mod semantic;
 pub(crate) mod shell;
-mod terminal_text;
+mod terminal;
 
-pub(crate) use terminal_text::{escape_terminal_controls, escape_terminal_text};
+pub(crate) use terminal::{escape_terminal_controls, escape_terminal_text};
 
 const BYTE_BASE: f64 = 1024.0;
 /// Human layout ceiling: wider terminals keep prose and table rows readable

@@ -6,7 +6,7 @@ mod roots;
 mod section;
 mod walk;
 
-use crate::source_selection::SourceSelection;
+use crate::selection::SourceSelection;
 use anyhow::Result;
 use degu_core::config::Config;
 use degu_core::ecosystem::DetectCtx;

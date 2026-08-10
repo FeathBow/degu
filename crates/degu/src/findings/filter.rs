@@ -1,4 +1,4 @@
-use crate::filters::Filters;
+use crate::findings::Filters;
 use anyhow::{Context, Result};
 use degu_core::finding::Finding;
 use std::collections::{HashMap, hash_map::Entry};

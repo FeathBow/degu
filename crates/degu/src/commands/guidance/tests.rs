@@ -1,5 +1,5 @@
 use super::*;
-use crate::filters::Filters;
+use crate::findings::Filters;
 use crate::runtime::Ui;
 use std::path::PathBuf;
 

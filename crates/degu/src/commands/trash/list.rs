@@ -1,4 +1,4 @@
-use crate::commands::next_action::{self, OutputMode, Request, TrashListState, Workflow};
+use crate::commands::guidance::{self, OutputMode, Request, TrashListState, Workflow};
 use crate::lifecycle::Lifecycle;
 use anyhow::Result;
 use degu_core::ecosystem::DetectCtx;
@@ -15,7 +15,7 @@ pub(super) fn run(json: bool, ui: crate::runtime::Ui) -> Result<()> {
         if should_print_outcomes(&rows, ui.stdout_is_terminal) {
             output::print_outcomes(&rows, ui)?;
         }
-        next_action::print(Request {
+        guidance::print(Request {
             output: OutputMode::Human(ui),
             workflow: Workflow::TrashList(TrashListState {
                 ambiguous: rows.iter().any(|row| row.ambiguous),

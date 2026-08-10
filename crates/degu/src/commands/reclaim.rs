@@ -9,7 +9,7 @@ use crate::native::{
 use crate::output::{flush_stdout, stdout_closed_error, stdout_consumer_gone, stdoutln};
 use crate::presentation::{Severity, escape_terminal_text, print_stderr_note};
 use crate::runtime::Ui;
-use crate::source_selection::SourceSelection;
+use crate::selection::SourceSelection;
 use crate::uv::{
     ACTION_ID, PreparedUvPrunePlan, UvCacheRootSelection, UvPruneOutputError, UvPruneSummary,
     prepare_uv_prune_plan,

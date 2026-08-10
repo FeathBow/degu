@@ -40,6 +40,17 @@ const RELOCATE_EXAMPLES: &str = "Examples:
   degu relocate /scratch/$USER
       Print shell exports for future cache writes";
 
+const RECLAIM_EXAMPLES: &str = "Examples:
+  degu reclaim uv --executable /usr/local/bin/uv --cache-dir /scratch/$USER/uv --dry-run
+      Validate the selected uv binary and cache namespace, then preview the fixed prune action
+  degu reclaim uv --executable /usr/local/bin/uv --cache-dir /scratch/$USER/uv --dry-run --json
+      Emit the validated preview as one JSON document
+
+Dry-run note:
+  Validation creates a private temporary snapshot and starts the selected binary
+  with only -V. It never starts uv cache prune, but the selected binary is not
+  sandboxed.";
+
 const MAN_EXAMPLES: &str = "Examples:
   degu man
       Print the top-level page
@@ -127,6 +138,12 @@ pub(crate) enum Command {
     /// Report the current user's authoritative filesystem quota for one path
     #[command(after_help = QUOTA_EXAMPLES)]
     Quota(QuotaArgs),
+    /// Preview an explicitly selected tool-native cache reclaim action
+    #[command(after_help = RECLAIM_EXAMPLES)]
+    Reclaim {
+        #[command(subcommand)]
+        command: ReclaimCommand,
+    },
     /// Preview or execute a cleanup plan
     #[command(after_help = CLEAN_HELP)]
     Clean(CleanArgs),
@@ -240,6 +257,31 @@ pub(crate) struct CleanArgs {
     /// Keep only findings at or under this path; repeatable
     #[arg(long)]
     pub(crate) path: Vec<PathBuf>,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ReclaimCommand {
+    /// Validate and preview uv's fixed ordinary cache-prune action
+    #[command(after_help = RECLAIM_EXAMPLES)]
+    Uv(ReclaimUvArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct ReclaimUvArgs {
+    #[command(flatten)]
+    pub(crate) output: JsonArgs,
+    /// Absolute, lexically normalized path to the exact uv native binary to probe
+    #[arg(long, value_name = "ABSOLUTE_UV")]
+    pub(crate) executable: PathBuf,
+    /// Absolute, lexically normalized path to the active uv cache root
+    #[arg(long, value_name = "ABSOLUTE_CACHE_DIR")]
+    pub(crate) cache_dir: PathBuf,
+    /// Validate and preview without running prune; creates a private snapshot and starts the selected binary with -V
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+    /// Execution confirmation; has no effect in a dry run
+    #[arg(long)]
+    pub(crate) yes: bool,
 }
 
 #[derive(Args)]

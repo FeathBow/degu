@@ -30,6 +30,7 @@ const HELP_CASES: &[HelpCase] = &[
     HelpCase::new(&["man", "--help"], false, false),
     HelpCase::new(&["scan", "--help"], true, true),
     HelpCase::new(&["quota", "--help"], true, false),
+    HelpCase::new(&["reclaim", "uv", "--help"], true, false),
     HelpCase::new(&["clean", "--help"], true, true),
     HelpCase::new(&["trash", "--help"], false, false),
     HelpCase::new(&["trash", "list", "--help"], true, false),
@@ -51,6 +52,17 @@ const SUPPORTED_CASES: &[&[&str]] = &[
         "1",
     ],
     &["quota", JSON, "--help"],
+    &[
+        "reclaim",
+        "uv",
+        "--executable",
+        "/opt/uv/bin/uv",
+        "--cache-dir",
+        "/scratch/user/uv",
+        "--dry-run",
+        JSON,
+        "--help",
+    ],
     &[
         "clean",
         JSON,
@@ -76,6 +88,8 @@ const UNSUPPORTED_CASES: &[(&[&str], &str)] = &[
     (&[MAX_CONCURRENCY, "1", "scan"], MAX_CONCURRENCY),
     (&["quota", BUDGET, "1s"], BUDGET),
     (&["quota", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
+    (&["reclaim", "uv", BUDGET, "1s"], BUDGET),
+    (&["reclaim", "uv", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
     (&["completions", "bash", JSON], JSON),
     (&["completions", "bash", BUDGET, "1s"], BUDGET),
     (
@@ -123,6 +137,11 @@ const COMPLETION_CASES: &[CompletionCase] = &[
     CompletionCase::new("__fish_degu_using_subcommand man", false, false),
     CompletionCase::new("__fish_degu_using_subcommand scan", true, true),
     CompletionCase::new("__fish_degu_using_subcommand quota", true, false),
+    CompletionCase::new(
+        "__fish_degu_using_subcommand reclaim; and __fish_seen_subcommand_from uv",
+        true,
+        false,
+    ),
     CompletionCase::new("__fish_degu_using_subcommand clean", true, true),
     CompletionCase::new(
         "__fish_degu_using_subcommand trash; and not __fish_seen_subcommand_from list purge help",

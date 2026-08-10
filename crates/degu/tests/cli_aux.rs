@@ -3,6 +3,7 @@ use assert_cmd::Command;
 const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[
     &["scan"],
     &["quota"],
+    &["reclaim"],
     &["clean"],
     &["undo"],
     &["trash"],
@@ -13,6 +14,7 @@ const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[
     &["man"],
 ];
 const NESTED_MAN_COMMANDS: &[&[&str]] = &[&["trash", "list"], &["trash", "purge"]];
+const RECLAIM_MAN_COMMANDS: &[&[&str]] = &[&["reclaim", "uv"]];
 
 fn degu() -> Command {
     let mut command = Command::cargo_bin("degu").unwrap();
@@ -91,7 +93,11 @@ fn generated_surfaces_prioritize_the_progressive_workflow() {
 
 #[test]
 fn man_renders_every_shipped_command_page() {
-    for path in TOP_LEVEL_MAN_COMMANDS.iter().chain(NESTED_MAN_COMMANDS) {
+    for path in TOP_LEVEL_MAN_COMMANDS
+        .iter()
+        .chain(NESTED_MAN_COMMANDS)
+        .chain(RECLAIM_MAN_COMMANDS)
+    {
         let output = generated_man(path);
         let title = format!(".TH degu{} 1", page_suffix(path));
         assert!(output.contains(&title), "missing {title:?}");
@@ -102,6 +108,9 @@ fn man_renders_every_shipped_command_page() {
     }
     assert!(generated_man(&["scan"]).contains("\\-\\-summary"));
     assert!(generated_man(&["quota"]).contains("quota data as JSON"));
+    let reclaim = generated_man(&["reclaim"]);
+    assert!(reclaim.contains("degu\\-reclaim\\-uv(1)"));
+    assert!(generated_man(&["reclaim", "uv"]).contains("selected binary is not"));
     let trash = generated_man(&["trash"]);
     assert!(trash.contains("degu\\-trash\\-list(1)"));
     assert!(trash.contains("degu\\-trash\\-purge(1)"));
@@ -117,6 +126,10 @@ fn man_references_only_pages_in_the_release_contract() {
     assert_eq!(
         man_references(&generated_man(&["trash"])),
         expected_man_references(NESTED_MAN_COMMANDS)
+    );
+    assert_eq!(
+        man_references(&generated_man(&["reclaim"])),
+        expected_man_references(RECLAIM_MAN_COMMANDS)
     );
 }
 
@@ -148,6 +161,7 @@ fn assert_top_help_order() {
         &[
             "\n  scan",
             "\n  quota",
+            "\n  reclaim",
             "\n  clean",
             "\n  undo",
             "\n  trash",
@@ -169,6 +183,7 @@ fn assert_man_order() {
         &[
             "degu\\-scan(1)",
             "degu\\-quota(1)",
+            "degu\\-reclaim(1)",
             "degu\\-clean(1)",
             "degu\\-undo(1)",
             "degu\\-trash(1)",
@@ -188,10 +203,9 @@ fn assert_completion_order(shell: &str) {
     assert!(!output.is_empty());
     if shell == "bash" {
         assert!(output.contains("complete -F") || output.contains("_degu"));
-        assert!(
-            output
-                .contains("scan quota clean undo trash relocate ops adapters completions man help")
-        );
+        assert!(output.contains(
+            "scan quota reclaim clean undo trash relocate ops adapters completions man help"
+        ));
         assert!(!output.contains("degu,usage)"));
         return;
     }
@@ -201,6 +215,7 @@ fn assert_completion_order(shell: &str) {
             &[
                 "(scan)",
                 "(quota)",
+                "(reclaim)",
                 "(clean)",
                 "(undo)",
                 "(trash)",
@@ -216,6 +231,7 @@ fn assert_completion_order(shell: &str) {
             &[
                 "-a \"scan\"",
                 "-a \"quota\"",
+                "-a \"reclaim\"",
                 "-a \"clean\"",
                 "-a \"undo\"",
                 "-a \"trash\"",

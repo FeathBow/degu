@@ -18,7 +18,7 @@ mod lifecycle;
 // Native capability execution and its quota-observation bridge; no caller wired up yet.
 mod native_action;
 #[allow(dead_code)]
-// Native execution foundation; no caller wired up yet.
+// Native execution foundation; some execution helpers are not exercised until a native action runs.
 mod native_runner;
 mod output;
 mod presentation;
@@ -27,13 +27,9 @@ mod quota_observation;
 mod runtime;
 mod source_selection;
 #[allow(dead_code)]
-// Descriptor-bound uv cache-root authority; no caller wired up yet.
+// Descriptor-bound uv cache-root authority; one safety bound is not exercised until execution lands.
 mod uv_cache_root;
-#[allow(dead_code)]
-// Descriptor-bound uv executable/version proof; no caller wired up yet.
 mod uv_executable;
-#[allow(dead_code)]
-// Exact uv prune proof bundle; no caller wired up yet.
 mod uv_prune_plan;
 mod value_parser;
 
@@ -97,6 +93,7 @@ fn dispatch(command: Command, ui: runtime::Ui) -> Result<()> {
     match command {
         Command::Scan(args) => commands::scan::run(args, ui),
         Command::Quota(args) => commands::quota::run(args, ui),
+        Command::Reclaim { command } => commands::reclaim::run(command, ui),
         Command::Clean(args) => commands::clean::run(args, ui),
         Command::Trash { command } => commands::trash::run(command, ui),
         Command::Ops { output } => commands::ops::run(output.json, ui),

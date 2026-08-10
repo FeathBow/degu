@@ -28,11 +28,10 @@ use std::time::Duration;
 
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const VERSION_OUTPUT_LIMIT: usize = 128;
-const MINIMUM_UV_VERSION: UvVersion = UvVersion {
-    major: 0,
-    minor: 8,
-    patch: 19,
-};
+const MINIMUM_UV_VERSION: UvVersion = UvVersion::new(0, 8, 19);
+/// The only uv version whose exact cache-prune traversal and mutation contract
+/// this build audits; a newer probed binary is still refused prune authority.
+pub(crate) const AUDITED_UV_PRUNE_VERSION: UvVersion = UvVersion::new(0, 12, 3);
 const SHARED_WRITE_MASK: u32 = 0o022;
 const EXECUTE_MASK: u32 = 0o111;
 const MAX_XATTR_LIST_BYTES: usize = 64 * 1024;
@@ -43,6 +42,16 @@ pub(crate) struct UvVersion {
     major: u64,
     minor: u64,
     patch: u64,
+}
+
+impl UvVersion {
+    pub(crate) const fn new(major: u64, minor: u64, patch: u64) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
 }
 
 impl fmt::Display for UvVersion {

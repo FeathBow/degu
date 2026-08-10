@@ -14,11 +14,11 @@ mod filters;
 mod finding_filter;
 mod findings_table;
 mod lifecycle;
-#[allow(dead_code)]
-// Native capability execution and its quota-observation bridge; no caller wired up yet.
+#[cfg(target_os = "macos")]
+mod macos_acl;
+// Native capability execution and its quota-observation bridge.
 mod native_action;
-#[allow(dead_code)]
-// Native execution foundation; some execution helpers are not exercised until a native action runs.
+// Bounded native execution foundation.
 mod native_runner;
 mod output;
 mod presentation;
@@ -26,10 +26,11 @@ mod quota;
 mod quota_observation;
 mod runtime;
 mod source_selection;
-#[allow(dead_code)]
-// Descriptor-bound uv cache-root authority; one safety bound is not exercised until execution lands.
+// Descriptor-bound uv cache-root mutation authority.
 mod uv_cache_root;
+// Descriptor-bound uv executable/version proof.
 mod uv_executable;
+// Exact uv prune proof bundle and consuming production transition.
 mod uv_prune_plan;
 mod value_parser;
 

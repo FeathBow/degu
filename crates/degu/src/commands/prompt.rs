@@ -27,6 +27,21 @@ pub(crate) fn confirm_permanent_delete(colors: OutputColors) -> Result<bool> {
     })
 }
 
+pub(crate) fn confirm_native_reclaim(colors: OutputColors) -> Result<bool> {
+    crossterm::style::force_color_output(colors.stderr);
+    let prompt = semantic::paint(
+        "Type 'prune' to run irreversible uv cache prune: ",
+        Tone::Destructive,
+        colors.stderr,
+    );
+    crossterm::style::force_color_output(colors.stdout);
+    confirm(Confirmation {
+        non_tty_error: "uv cache prune requires --yes when stdin is not a terminal",
+        prompt: &prompt,
+        accepted: Accepted::Prune,
+    })
+}
+
 struct Confirmation<'a> {
     non_tty_error: &'a str,
     prompt: &'a str,
@@ -36,6 +51,7 @@ struct Confirmation<'a> {
 enum Accepted {
     Yes,
     Purge,
+    Prune,
 }
 
 impl Accepted {
@@ -43,6 +59,7 @@ impl Accepted {
         match self {
             Self::Yes => matches!(input, "y" | "Y"),
             Self::Purge => input == "purge",
+            Self::Prune => input == "prune",
         }
     }
 }
@@ -57,4 +74,18 @@ fn confirm(request: Confirmation<'_>) -> Result<bool> {
     let mut input = String::new();
     stdin.read_line(&mut input)?;
     Ok(request.accepted.matches(input.trim()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn irreversible_tokens_are_exact_and_not_interchangeable() {
+        assert!(Accepted::Prune.matches("prune"));
+        assert!(!Accepted::Prune.matches("Prune"));
+        assert!(!Accepted::Prune.matches("purge"));
+        assert!(Accepted::Purge.matches("purge"));
+        assert!(!Accepted::Purge.matches("prune"));
+    }
 }

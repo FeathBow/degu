@@ -42,14 +42,16 @@ const RELOCATE_EXAMPLES: &str = "Examples:
 
 const RECLAIM_EXAMPLES: &str = "Examples:
   degu reclaim uv --executable /usr/local/bin/uv --cache-dir /scratch/$USER/uv --dry-run
-      Validate the selected uv binary and cache namespace, then preview the fixed prune action
-  degu reclaim uv --executable /usr/local/bin/uv --cache-dir /scratch/$USER/uv --dry-run --json
-      Emit the validated preview as one JSON document
+      Validate exact uv 0.12.3 and the selected cache namespace, then preview the fixed prune action
+  degu reclaim uv --executable /usr/local/bin/uv --cache-dir /scratch/$USER/uv
+      Show the irreversible plan, then require typing 'prune' on a terminal
+  degu reclaim uv --executable /usr/local/bin/uv --cache-dir /scratch/$USER/uv --yes --json
+      Execute without prompting and emit one final JSON result
 
-Dry-run note:
+Safety note:
   Validation creates a private temporary snapshot and starts the selected binary
-  with only -V. It never starts uv cache prune, but the selected binary is not
-  sandboxed.";
+  with only -V. The fixed ordinary prune bypasses degu trash and cannot be undone.
+  The selected binary is not sandboxed.";
 
 const MAN_EXAMPLES: &str = "Examples:
   degu man
@@ -138,7 +140,7 @@ pub(crate) enum Command {
     /// Report the current user's authoritative filesystem quota for one path
     #[command(after_help = QUOTA_EXAMPLES)]
     Quota(QuotaArgs),
-    /// Preview an explicitly selected tool-native cache reclaim action
+    /// Preview or execute an explicitly selected tool-native cache reclaim action
     #[command(after_help = RECLAIM_EXAMPLES)]
     Reclaim {
         #[command(subcommand)]
@@ -261,7 +263,7 @@ pub(crate) struct CleanArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum ReclaimCommand {
-    /// Validate and preview uv's fixed ordinary cache-prune action
+    /// Validate, preview, or execute uv 0.12.3's fixed ordinary cache-prune action
     #[command(after_help = RECLAIM_EXAMPLES)]
     Uv(ReclaimUvArgs),
 }
@@ -279,7 +281,7 @@ pub(crate) struct ReclaimUvArgs {
     /// Validate and preview without running prune; creates a private snapshot and starts the selected binary with -V
     #[arg(long)]
     pub(crate) dry_run: bool,
-    /// Execution confirmation; has no effect in a dry run
+    /// Execute the irreversible fixed prune action without prompting; has no effect in a dry run
     #[arg(long)]
     pub(crate) yes: bool,
 }

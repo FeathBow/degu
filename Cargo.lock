@@ -282,6 +282,7 @@ version = "0.1.4"
 dependencies = [
  "degu-walk",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "toml",

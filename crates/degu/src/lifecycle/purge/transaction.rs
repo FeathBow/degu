@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use degu_core::oplog::OpOutcome;
 
-use super::super::operation_log::{OperationLog, PurgeRecord, purge_record};
+use super::super::journal::{OperationLog, PurgeRecord, purge_record};
 use super::PurgeReport;
 use super::claim::{ClaimFailure, ClaimedTrashEntry, FailureLocation, LocatedFailure};
 

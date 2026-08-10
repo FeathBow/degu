@@ -158,8 +158,8 @@ fn stamped_record(fields: RecordFields) -> OpRecord {
 
 fn read_records(log_path: &Path) -> Result<Vec<OpRecord>> {
     let mut records = Vec::new();
-    let limits = super::state_read::StateReadLimits::new(OPS_LOG_MAX_BYTES, OPS_RECORD_MAX_BYTES);
-    super::state_read::visit_bounded_state_lines(log_path, limits, |line_no, line| {
+    let limits = super::records::StateReadLimits::new(OPS_LOG_MAX_BYTES, OPS_RECORD_MAX_BYTES);
+    super::records::visit_bounded_state_lines(log_path, limits, |line_no, line| {
         let line = match std::str::from_utf8(line) {
             Ok(line) => line,
             Err(_) => {

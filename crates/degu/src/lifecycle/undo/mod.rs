@@ -5,7 +5,7 @@ mod selection;
 use anyhow::Result;
 use degu_core::ecosystem::DetectCtx;
 
-use super::operation_log::OperationLog;
+use super::journal::OperationLog;
 use restore::restore_selection;
 use selection::select_actionable_undo_group;
 

@@ -309,6 +309,7 @@ name = "degu-core"
 version = "0.1.4"
 dependencies = [
  "degu-walk",
+ "getrandom",
  "libc",
  "rustix",
  "serde",

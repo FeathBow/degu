@@ -52,6 +52,18 @@ pub enum StoreError {
     UnsafeDirectory { path: PathBuf, reason: &'static str },
     #[error("unsafe seal WAL entry at {path}: {reason}")]
     UnsafeWal { path: PathBuf, reason: &'static str },
+    #[error("seal WAL store parent backend could not be certified at {path}: {reason:?}")]
+    ParentBackend {
+        path: PathBuf,
+        reason: crate::local_backend::CertificationError,
+    },
+    #[error("seal WAL store backend inspection was uncertain at {path}: {reason:?}")]
+    BackendInspection {
+        path: PathBuf,
+        reason: crate::local_backend::CertificationError,
+    },
+    #[error("activated seal WAL store is missing at {path}")]
+    MissingStore { path: PathBuf },
     #[error("existing seal WAL store is missing its durable WAL entry at {path}")]
     MissingWal { path: PathBuf },
     #[error(transparent)]
@@ -78,7 +90,32 @@ impl SealWalStore {
         Self::open_or_create_with_sync(path, |fd| rustix::fs::fsync(fd).map_err(io::Error::from))
     }
 
-    fn open_or_create_with_sync<F>(path: &Path, mut sync: F) -> Result<Self, StoreError>
+    /// Opens already-published store authority without ever recreating it.
+    /// This is the only safe discovery operation after whole-store activation.
+    pub fn open_existing(path: &Path) -> Result<Self, StoreError> {
+        Self::open_with_sync(path, false, |fd| {
+            rustix::fs::fsync(fd).map_err(io::Error::from)
+        })
+        .map_err(|error| match error {
+            // Any absent component makes the exact recorded whole-store locator
+            // absent. Normalize it before activation classifies state.
+            StoreError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
+                StoreError::MissingStore {
+                    path: path.to_path_buf(),
+                }
+            }
+            error => error,
+        })
+    }
+
+    fn open_or_create_with_sync<F>(path: &Path, sync: F) -> Result<Self, StoreError>
+    where
+        F: FnMut(&OwnedFd) -> io::Result<()>,
+    {
+        Self::open_with_sync(path, true, sync)
+    }
+
+    fn open_with_sync<F>(path: &Path, create: bool, mut sync: F) -> Result<Self, StoreError>
     where
         F: FnMut(&OwnedFd) -> io::Result<()>,
     {
@@ -90,8 +127,13 @@ impl SealWalStore {
         let parent_lock = try_lock_directory(&parent)?;
         let directory = match rustix::fs::openat(&parent, &name, OPEN_DIRECTORY, Mode::empty()) {
             Ok(directory) => directory,
-            Err(rustix::io::Errno::NOENT) => {
+            Err(rustix::io::Errno::NOENT) if create => {
                 initialize_unpublished_store(&parent, &name, path, &mut sync)?
+            }
+            Err(rustix::io::Errno::NOENT) => {
+                return Err(StoreError::MissingStore {
+                    path: path.to_path_buf(),
+                });
             }
             Err(error) => return Err(io_error(path, error.into())),
         };
@@ -138,6 +180,29 @@ impl SealWalStore {
             device,
             path: path.to_path_buf(),
         })
+    }
+
+    /// Internal descriptor seam for the reciprocal activation marker. It grants
+    /// no authority outside this crate and remains bound by `revalidate_binding`.
+    pub(crate) fn directory_fd(&self) -> &OwnedFd {
+        &self.directory
+    }
+
+    pub(crate) fn certified_backend(&self) -> CertifiedLocalBackend {
+        self.backend
+    }
+
+    pub(crate) fn revalidate_binding(&self) -> Result<(), StoreError> {
+        let parent_path = self.path.parent().unwrap_or_else(|| Path::new("/"));
+        validate_store_binding(
+            &self.parent,
+            &self.name,
+            &self.directory,
+            self.backend,
+            self.device,
+            &self.path,
+            parent_path,
+        )
     }
 
     /// Opens the mandatory exact WAL entry and acquires a nonblocking exclusive
@@ -306,7 +371,117 @@ fn try_lock_directory(directory: &OwnedFd) -> Result<ExclusiveFileLock, StoreErr
     Ok(ExclusiveFileLock::try_acquire(File::from(lock_fd))?)
 }
 
-fn open_authenticated_parent(path: &Path) -> Result<(OwnedFd, OsString, PathBuf), StoreError> {
+pub(crate) fn probe_store_parent_backend(path: &Path) -> Result<CertifiedLocalBackend, StoreError> {
+    let (parent, _, parent_path) = open_authenticated_parent(path)?;
+    validate_parent_for_creation(&parent, &parent_path)?;
+    require_directory_acl_absent(&parent, &parent_path)?;
+    let duplicate = rustix::io::fcntl_dupfd_cloexec(&parent, 0)
+        .map_err(|error| io_error(&parent_path, error.into()))?;
+    certify_held_fd(duplicate)
+        .map(|evidence| evidence.backend())
+        .map_err(|reason| StoreError::ParentBackend {
+            path: parent_path,
+            reason,
+        })
+}
+
+/// Support-only probe used after the activation authority entry has been
+/// observed absent. It first classifies the exact held parent backend without
+/// asking every ancestor to satisfy the certified mutation contract. This
+/// keeps a real NFS/FUSE parent reachable as an explicit unsupported result.
+/// A supported exact parent still goes through the normal full certification.
+pub(crate) fn probe_store_parent_backend_after_authority_absence(
+    path: &Path,
+) -> Result<CertifiedLocalBackend, StoreError> {
+    let (parent, _, parent_path) = open_structurally_authenticated_parent(path)?;
+    validate_parent_structure(&parent, &parent_path)?;
+    match certify_held_fd_backend(&parent) {
+        Err(
+            reason @ (crate::local_backend::CertificationError::UnsupportedPlatform
+            | crate::local_backend::CertificationError::UnsupportedFilesystem),
+        ) => Err(StoreError::ParentBackend {
+            path: parent_path,
+            reason,
+        }),
+        Err(reason) => Err(StoreError::BackendInspection {
+            path: parent_path,
+            reason,
+        }),
+        Ok(_) => probe_store_parent_backend(path),
+    }
+}
+
+pub(crate) fn open_authenticated_parent(
+    path: &Path,
+) -> Result<(OwnedFd, OsString, PathBuf), StoreError> {
+    open_parent(path, true)
+}
+
+/// Structure-only observation of an exact entry beneath an EUID-owned,
+/// namespace-exclusive directory. Neither variant carries mutation authority.
+pub(crate) enum StructuralEntryProbe {
+    Present,
+    Absent(StructuralAbsenceProof),
+}
+
+/// Opaque held-parent proof used only to repeat an absence observation after a
+/// support probe. It deliberately exposes no descriptor or creation method.
+pub(crate) struct StructuralAbsenceProof {
+    parent: OwnedFd,
+    name: OsString,
+    path: PathBuf,
+}
+
+impl StructuralAbsenceProof {
+    pub(crate) fn is_still_absent(&self) -> Result<bool, StoreError> {
+        match rustix::fs::statat(
+            &self.parent,
+            &self.name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Err(rustix::io::Errno::NOENT) => Ok(true),
+            Ok(_) => Ok(false),
+            Err(error) => Err(io_error(&self.path, error.into())),
+        }
+    }
+}
+
+/// Safely establishes only whether `path` is absent. Ancestor and parent
+/// traversal is no-follow and binding-checked, but intentionally performs no
+/// backend/ACL certification so unsupported filesystems remain observable.
+pub(crate) fn probe_private_parent_entry(path: &Path) -> Result<StructuralEntryProbe, StoreError> {
+    let (parent, name, parent_path) = open_structurally_authenticated_parent(path)?;
+    validate_parent_structure(&parent, &parent_path)?;
+    let stat = rustix::fs::fstat(&parent).map_err(|error| io_error(&parent_path, error.into()))?;
+    if stat.st_uid != rustix::process::geteuid().as_raw()
+        || nonowner_write_and_search(raw_mode_u32(stat.st_mode))
+    {
+        return Err(StoreError::UnsafeDirectory {
+            path: parent_path,
+            reason: "absence parent is not EUID-owned and namespace-exclusive",
+        });
+    }
+    match rustix::fs::statat(&parent, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => Ok(StructuralEntryProbe::Present),
+        Err(rustix::io::Errno::NOENT) => Ok(StructuralEntryProbe::Absent(StructuralAbsenceProof {
+            parent,
+            name,
+            path: path.to_path_buf(),
+        })),
+        Err(error) => Err(io_error(path, error.into())),
+    }
+}
+
+fn open_structurally_authenticated_parent(
+    path: &Path,
+) -> Result<(OwnedFd, OsString, PathBuf), StoreError> {
+    open_parent(path, false)
+}
+
+fn open_parent(
+    path: &Path,
+    certify_ancestors: bool,
+) -> Result<(OwnedFd, OsString, PathBuf), StoreError> {
     if !path.is_absolute() {
         return Err(StoreError::InvalidPath(
             "an absolute dedicated store path is required",
@@ -333,7 +508,11 @@ fn open_authenticated_parent(path: &Path) -> Result<(OwnedFd, OsString, PathBuf)
     let mut current_path = PathBuf::from("/");
     let mut current = rustix::fs::open("/", OPEN_DIRECTORY, Mode::empty())
         .map_err(|error| io_error(Path::new("/"), error.into()))?;
-    validate_directory_controller(&current, &current_path)?;
+    if certify_ancestors {
+        validate_directory_controller(&current, &current_path)?;
+    } else {
+        validate_directory_controller_structure(&current, &current_path)?;
+    }
 
     for component in names {
         let child_path = current_path.join(&component);
@@ -358,7 +537,11 @@ fn open_authenticated_parent(path: &Path) -> Result<(OwnedFd, OsString, PathBuf)
             &child_path,
             "ancestor binding changed",
         )?;
-        validate_directory_controller(&opened, &child_path)?;
+        if certify_ancestors {
+            validate_directory_controller(&opened, &child_path)?;
+        } else {
+            validate_directory_controller_structure(&opened, &child_path)?;
+        }
         current = opened;
         current_path = child_path;
     }
@@ -366,8 +549,13 @@ fn open_authenticated_parent(path: &Path) -> Result<(OwnedFd, OsString, PathBuf)
 }
 
 fn validate_parent_for_creation(fd: &OwnedFd, path: &Path) -> Result<(), StoreError> {
-    let stat = rustix::fs::fstat(fd).map_err(|error| io_error(path, error.into()))?;
     validate_directory_controller(fd, path)?;
+    validate_parent_structure(fd, path)
+}
+
+fn validate_parent_structure(fd: &OwnedFd, path: &Path) -> Result<(), StoreError> {
+    let stat = rustix::fs::fstat(fd).map_err(|error| io_error(path, error.into()))?;
+    validate_directory_controller_structure(fd, path)?;
     if nonowner_write_and_search(raw_mode_u32(stat.st_mode))
         && raw_mode_u32(stat.st_mode) & 0o1000 == 0
     {
@@ -380,8 +568,18 @@ fn validate_parent_for_creation(fd: &OwnedFd, path: &Path) -> Result<(), StoreEr
 }
 
 fn validate_directory_controller(fd: &OwnedFd, path: &Path) -> Result<(), StoreError> {
-    let stat = rustix::fs::fstat(fd).map_err(|error| io_error(path, error.into()))?;
     certify_directory(fd, path)?;
+    validate_directory_controller_structure(fd, path)
+}
+
+fn validate_directory_controller_structure(fd: &OwnedFd, path: &Path) -> Result<(), StoreError> {
+    let stat = rustix::fs::fstat(fd).map_err(|error| io_error(path, error.into()))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+        return Err(StoreError::UnsafeDirectory {
+            path: path.to_path_buf(),
+            reason: "ancestor is not a directory",
+        });
+    }
     let euid = rustix::process::geteuid().as_raw();
     if stat.st_uid != euid && stat.st_uid != 0 {
         return Err(StoreError::UnsafeDirectory {
@@ -483,23 +681,51 @@ fn require_same_entry(
 }
 
 fn require_directory_acl_absent(fd: &OwnedFd, path: &Path) -> Result<(), StoreError> {
-    require_held_fd_acl_absent(fd).map_err(|_| StoreError::UnsafeDirectory {
-        path: path.to_path_buf(),
-        reason: "directory ACL is present or could not be verified absent",
-    })
+    match require_held_fd_acl_absent(fd) {
+        Ok(()) => Ok(()),
+        Err(crate::local_backend::CertificationError::AclPresent) => {
+            Err(StoreError::UnsafeDirectory {
+                path: path.to_path_buf(),
+                reason: "directory ACL is present or could not be verified absent",
+            })
+        }
+        Err(reason) => Err(StoreError::BackendInspection {
+            path: path.to_path_buf(),
+            reason,
+        }),
+    }
 }
 
 fn certify_directory(fd: &OwnedFd, path: &Path) -> Result<HeldLocalBackendEvidence, StoreError> {
     require_directory_acl_absent(fd, path)?;
     let duplicate =
         rustix::io::fcntl_dupfd_cloexec(fd, 0).map_err(|error| io_error(path, error.into()))?;
-    certify_held_fd(duplicate).map_err(|_| StoreError::UnsafeDirectory {
-        path: path.to_path_buf(),
-        reason: "directory is not on a certified ACL-free local backend",
+    certify_held_fd(duplicate).map_err(|reason| {
+        if backend_failure_is_definite(&reason) {
+            StoreError::UnsafeDirectory {
+                path: path.to_path_buf(),
+                reason: "directory backend definitively mismatches the certified contract",
+            }
+        } else {
+            StoreError::BackendInspection {
+                path: path.to_path_buf(),
+                reason,
+            }
+        }
     })
 }
 
-fn validate_directory(fd: &OwnedFd, path: &Path) -> Result<(), StoreError> {
+fn backend_failure_is_definite(reason: &crate::local_backend::CertificationError) -> bool {
+    matches!(
+        reason,
+        crate::local_backend::CertificationError::UnsupportedFilesystem
+            | crate::local_backend::CertificationError::FilesystemMagicMismatch
+            | crate::local_backend::CertificationError::NotDirectory
+            | crate::local_backend::CertificationError::AclPresent
+    )
+}
+
+pub(crate) fn validate_directory(fd: &OwnedFd, path: &Path) -> Result<(), StoreError> {
     let stat = rustix::fs::fstat(fd).map_err(|error| io_error(path, error.into()))?;
     require_directory_acl_absent(fd, path)?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
@@ -554,13 +780,33 @@ fn validate_wal<Fd: AsFd>(
     path: &Path,
 ) -> Result<(), StoreError> {
     let stat = rustix::fs::fstat(&fd).map_err(|error| io_error(path, error.into()))?;
-    require_held_fd_acl_absent(&fd).map_err(|_| StoreError::UnsafeWal {
-        path: path.to_path_buf(),
-        reason: "WAL ACL is present or could not be verified absent",
-    })?;
-    let backend = certify_held_fd_backend(&fd).map_err(|_| StoreError::UnsafeWal {
-        path: path.to_path_buf(),
-        reason: "WAL backend could not be certified",
+    match require_held_fd_acl_absent(&fd) {
+        Ok(()) => {}
+        Err(crate::local_backend::CertificationError::AclPresent) => {
+            return Err(StoreError::UnsafeWal {
+                path: path.to_path_buf(),
+                reason: "WAL ACL is present or could not be verified absent",
+            });
+        }
+        Err(reason) => {
+            return Err(StoreError::BackendInspection {
+                path: path.to_path_buf(),
+                reason,
+            });
+        }
+    }
+    let backend = certify_held_fd_backend(&fd).map_err(|reason| {
+        if backend_failure_is_definite(&reason) {
+            StoreError::UnsafeWal {
+                path: path.to_path_buf(),
+                reason: "WAL backend definitively mismatches the certified contract",
+            }
+        } else {
+            StoreError::BackendInspection {
+                path: path.to_path_buf(),
+                reason,
+            }
+        }
     })?;
     if backend != expected_backend {
         return Err(StoreError::UnsafeWal {

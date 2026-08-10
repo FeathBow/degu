@@ -5,7 +5,7 @@
 //! supply one lexical root selection; discovery roots and quota-observation
 //! paths cannot construct this proof.
 
-use crate::uv_executable::{AUDITED_UV_PRUNE_VERSION, ProbedUvExecutable, UvVersion};
+use crate::uv::{AUDITED_UV_PRUNE_VERSION, ProbedUvExecutable, UvVersion};
 use degu_adapters::RegisteredAdapter;
 use degu_core::ecosystem::DetectCtx;
 use rustix::fd::OwnedFd;
@@ -967,7 +967,7 @@ fn has_posix_acl_name(names: &[u8]) -> bool {
 
 #[cfg(target_os = "macos")]
 fn reject_extended_acl(fd: &OwnedFd, path: &Path) -> Result<(), UvCacheRootSealError> {
-    match crate::macos_acl::grants_mutation(fd) {
+    match crate::uv::grants_mutation(fd) {
         Ok(false) => Ok(()),
         Ok(true) => Err(unsafe_path(
             path,

@@ -5,17 +5,14 @@
 //! the registered capability to reproduce the request exactly, and retains the
 //! root seal as a one-shot pre-spawn mutation binding through quota observation.
 
-use crate::native_action::{
-    CompletedNativeQuotaAction, NativeActionPlanError, PreparedNativeQuotaAction,
-    attach_quota_observation,
+use crate::native::{
+    CompletedNativeQuotaAction, NativeActionPlanError, NativePreparationError,
+    PreparedNativeQuotaAction, attach_quota_observation,
 };
-use crate::native_runner::NativePreparationError;
 use crate::quota;
-use crate::uv_cache_root::{
-    SealedUvCacheRoot, UvCacheRootSealError, UvCacheRootSelection, seal_uv_cache_root,
-};
-use crate::uv_executable::{
-    ProbedUvExecutable, UvExecutableProbeError, UvVersion, probe_uv_executable,
+use crate::uv::{
+    ProbedUvExecutable, SealedUvCacheRoot, UvCacheRootSealError, UvCacheRootSelection,
+    UvExecutableProbeError, UvVersion, probe_uv_executable, seal_uv_cache_root,
 };
 use degu_adapters::RegisteredAdapter;
 use degu_adapters::native::{
@@ -345,8 +342,8 @@ fn canonical_unsigned(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_action::attach_quota_observation;
-    use crate::native_runner::{NativeRunOutcome, prepare_native_action};
+    use crate::native::attach_quota_observation;
+    use crate::native::{NativeRunOutcome, prepare_native_action};
     use std::ffi::OsStr;
     use std::path::PathBuf;
 
@@ -520,7 +517,7 @@ mod tests {
         ));
         assert_eq!(
             completed.observation().outcome(),
-            crate::action_result::ActionOutcome::Success
+            crate::native::ActionOutcome::Success
         );
     }
 
@@ -574,7 +571,7 @@ mod tests {
         ));
         assert_eq!(
             completed.observation().outcome(),
-            crate::action_result::ActionOutcome::OutputParseFailure
+            crate::native::ActionOutcome::OutputParseFailure
         );
     }
 
@@ -596,7 +593,7 @@ mod tests {
         ));
         assert_eq!(
             completed.observation().outcome(),
-            crate::action_result::ActionOutcome::OutputTruncated
+            crate::native::ActionOutcome::OutputTruncated
         );
     }
 

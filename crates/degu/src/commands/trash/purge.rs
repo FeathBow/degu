@@ -2,15 +2,15 @@ use anyhow::Result;
 use degu_core::ecosystem::DetectCtx;
 use std::path::Path;
 
-use crate::action_result::{ActionKind, ActionResultOwner, NotStartedReason};
 use crate::commands::prompt::confirm_permanent_delete;
 use crate::lifecycle::{Lifecycle, TrashPurgePlan};
+use crate::native::{
+    ActionKind, ActionResultOwner, NotStartedReason, QuotaActionReport, coordinate,
+    not_attempted_action, planned_action,
+};
 use crate::output::{flush_stdout, stdoutln};
 use crate::presentation::semantic::Tone;
 use crate::presentation::{display_path, escape_terminal_text, semantic};
-use crate::quota_observation::{
-    QuotaActionReport, coordinate, not_attempted_action, planned_action,
-};
 use crate::runtime::Ui;
 use serde::Serialize;
 
@@ -64,11 +64,11 @@ pub(super) fn run(json: bool, yes: bool, ui: Ui) -> Result<()> {
         (report, QuotaActionReport::Attempted(completed))
     };
     let output_result = if json {
-        crate::quota_observation::print_warnings(&observation, ui.colors);
+        crate::native::print_warnings(&observation, ui.colors);
         print_json_report(&report, &observation)
     } else {
         print_human_report(&report.purged, &report.failed, ui.colors)
-            .and_then(|()| crate::quota_observation::print_human(&observation, ui.colors))
+            .and_then(|()| crate::native::print_human(&observation, ui.colors))
     };
     if !report.failed.is_empty() {
         anyhow::bail!("one or more trash entries failed to purge")
@@ -122,7 +122,7 @@ fn json_report<'a>(
     PurgeJsonReport {
         purged: &report.purged,
         failed,
-        quota_observations: crate::quota_observation::json(observation),
+        quota_observations: crate::native::json(observation),
     }
 }
 
@@ -202,12 +202,12 @@ mod tests {
                 "changed".to_owned(),
             )],
         };
-        let observation = crate::quota_observation::not_attempted_action(
-            crate::action_result::ActionResultOwner::TrashPurgeCommand,
-            crate::action_result::ActionKind::TrashPurge,
+        let observation = crate::native::not_attempted_action(
+            crate::native::ActionResultOwner::TrashPurgeCommand,
+            crate::native::ActionKind::TrashPurge,
             "trash:test",
             [],
-            crate::action_result::NotStartedReason::Empty,
+            crate::native::NotStartedReason::Empty,
         )
         .unwrap();
         let json = serde_json::to_value(json_report(&report, &observation)).unwrap();

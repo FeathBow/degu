@@ -39,8 +39,8 @@ impl CollectionRunOptions {
 
 pub(crate) fn purge_outcome(
     report: &crate::lifecycle::PurgeReport,
-) -> crate::action_result::StartedActionOutcome {
-    use crate::action_result::StartedActionOutcome;
+) -> crate::native::StartedActionOutcome {
+    use crate::native::StartedActionOutcome;
     if report.failed.is_empty() {
         StartedActionOutcome::Success
     } else if report.purged.is_empty() {

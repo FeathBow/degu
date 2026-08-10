@@ -1,16 +1,18 @@
-use crate::action_result::{ActionId, ActionKind, ActionResultOwner, NotStartedReason};
 use crate::cli::{ReclaimCommand, ReclaimUvArgs};
 use crate::commands::prompt::confirm_native_reclaim;
 use crate::configuration::load_config;
-use crate::native_runner::{CapturedOutput, NativeRunOutcome, NativeRunReport, NativeRunnerError};
+use crate::native::{
+    ActionId, ActionKind, ActionResultOwner, CapturedOutput, NativeRunOutcome, NativeRunReport,
+    NativeRunnerError, NotStartedReason, QuotaActionReport, json as observation_json,
+    not_attempted_action,
+};
 use crate::output::{flush_stdout, stdout_closed_error, stdout_consumer_gone, stdoutln};
 use crate::presentation::{Severity, escape_terminal_text, print_stderr_note};
-use crate::quota_observation::{QuotaActionReport, json as observation_json, not_attempted_action};
 use crate::runtime::Ui;
 use crate::source_selection::SourceSelection;
-use crate::uv_cache_root::UvCacheRootSelection;
-use crate::uv_prune_plan::{
-    ACTION_ID, PreparedUvPrunePlan, UvPruneOutputError, UvPruneSummary, prepare_uv_prune_plan,
+use crate::uv::{
+    ACTION_ID, PreparedUvPrunePlan, UvCacheRootSelection, UvPruneOutputError, UvPruneSummary,
+    prepare_uv_prune_plan,
 };
 use anyhow::{Result, anyhow};
 use degu_adapters::RegisteredAdapter;
@@ -132,11 +134,11 @@ fn run_uv(args: ReclaimUvArgs, ui: Ui) -> Result<()> {
     };
 
     let output_result = if args.output.json {
-        crate::quota_observation::print_warnings(&observation, ui.colors);
+        crate::native::print_warnings(&observation, ui.colors);
         stdoutln!("{}", serde_json::to_string_pretty(&document)?)
     } else {
         stdoutln!("{}", render_execution_human(&document))
-            .and_then(|()| crate::quota_observation::print_human(&observation, ui.colors))
+            .and_then(|()| crate::native::print_human(&observation, ui.colors))
     };
     finish_execution_output(output_result, succeeded, &failure)
 }

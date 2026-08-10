@@ -6,7 +6,7 @@
 //! and timeout before spawn. Process-group cleanup bounds the caller and
 //! cooperative descendants; it is not a cross-platform containment sandbox.
 
-use crate::action_result::StartedActionOutcome;
+use crate::native::StartedActionOutcome;
 use degu_adapters::native::{
     NativeActionRequest, NativeInheritedEnvironment,
     NativeProcessContract as RequestedProcessContract,
@@ -1113,7 +1113,7 @@ mod tests {
     use std::io::Write;
     use std::os::unix::ffi::OsStringExt;
 
-    const HELPER_TEST: &str = "native_runner::tests::controlled_helper_process";
+    const HELPER_TEST: &str = "native::runner::tests::controlled_helper_process";
     const HELPER_MODE: &str = "DEGU_NATIVE_RUNNER_HELPER_MODE";
     const HELPER_FD: &str = "DEGU_NATIVE_RUNNER_HELPER_FD";
 

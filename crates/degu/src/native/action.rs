@@ -4,17 +4,15 @@
 //! Observation requests are frozen, read-only data: they cannot authorize or alter
 //! the invocation, and planning never dereferences them.
 
-use crate::action_result::{
-    ActionId, ActionKind, ActionObservationTargets, ActionResultOwner, ContractError,
-    ObservationRequestPath, PlannedActionBatch, QuotaObservationTarget, StartedActionOutcome,
-};
 #[cfg(test)]
-use crate::native_runner::prepare_native_action;
-use crate::native_runner::{
-    NativePreparationError, NativeRunReport, NativeRunnerError, PreparedNativeAction,
+use crate::native::prepare_native_action;
+use crate::native::{
+    ActionId, ActionKind, ActionObservationTargets, ActionResultOwner, CompletedQuotaAction,
+    ContractError, NativePreparationError, NativeRunReport, NativeRunnerError,
+    ObservationRequestPath, PlannedActionBatch, PostObservationPolicy, PreparedNativeAction,
+    QuotaObservationTarget, StartedActionOutcome, coordinate_with_post_policy,
 };
 use crate::quota::{ProbeError, QuotaSnapshot};
-use crate::quota_observation::{self, CompletedQuotaAction, PostObservationPolicy};
 #[cfg(test)]
 use degu_adapters::native::NativeActionRequest;
 use std::path::Path;
@@ -110,16 +108,15 @@ impl PreparedNativeQuotaAction {
         parse: impl FnOnce(&[u8], &[u8]) -> Result<Parsed, ParseError>,
     ) -> CompletedNativeQuotaAction<Parsed, ParseError> {
         let Self { action, batch } = self;
-        let (execution, observation) =
-            quota_observation::coordinate_with_post_policy(batch, probe, move || {
-                let execution = action.execute_output(parse).result();
-                let outcome = execution
-                    .as_ref()
-                    .map(|report| report.outcome().action_outcome())
-                    .unwrap_or(StartedActionOutcome::Failure);
-                let post_policy = native_post_policy(&execution);
-                (execution, outcome, post_policy)
-            });
+        let (execution, observation) = coordinate_with_post_policy(batch, probe, move || {
+            let execution = action.execute_output(parse).result();
+            let outcome = execution
+                .as_ref()
+                .map(|report| report.outcome().action_outcome())
+                .unwrap_or(StartedActionOutcome::Failure);
+            let post_policy = native_post_policy(&execution);
+            (execution, outcome, post_policy)
+        });
         CompletedNativeQuotaAction {
             execution,
             observation,
@@ -147,11 +144,11 @@ fn native_post_policy<Parsed, ParseError>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::action_result::{ActionOutcome, QuotaObservationState};
+    use crate::native::{ActionOutcome, QuotaObservationState};
+    use crate::native::{ProbePhase, UnavailableObservation};
     use crate::quota::model::{
         ActiveQuota, QuotaDimension, QuotaLimits, QuotaScope, QuotaScopeIdentity,
     };
-    use crate::quota_observation::{ProbePhase, UnavailableObservation};
     use degu_adapters::native::{
         NativeActionIdentity, NativeEnvironmentRequest, NativeExecutableSelection,
         NativeProcessContract,
@@ -161,7 +158,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    const HELPER_TEST: &str = "native_action::tests::controlled_helper_process";
+    const HELPER_TEST: &str = "native::action::tests::controlled_helper_process";
     const HELPER_MODE: &str = "DEGU_NATIVE_ACTION_HELPER_MODE";
 
     fn request(paths: impl IntoIterator<Item = PathBuf>, mode: &str) -> NativeActionRequest {

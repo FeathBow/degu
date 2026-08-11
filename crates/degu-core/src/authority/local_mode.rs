@@ -185,9 +185,10 @@ pub enum ModeSealAssessment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModeSealDenial {
     NotOwner,
+    EvidenceUnverified,
 }
 
-fn mode_facts(evidence: &degu_walk::local_backend::HeldLocalBackendEvidence) -> DirectoryModeFacts {
+fn mode_facts(evidence: &crate::local_backend::HeldLocalBackendEvidence) -> DirectoryModeFacts {
     DirectoryModeFacts {
         mode: evidence.mode(),
         owner_uid: evidence.owner_uid(),
@@ -199,8 +200,11 @@ fn mode_facts(evidence: &degu_walk::local_backend::HeldLocalBackendEvidence) -> 
 /// The token constructor is private to that probe, so callers cannot assert
 /// certification, ACL absence, or process credentials themselves.
 pub fn assess_mode_seal(
-    evidence: &degu_walk::local_backend::HeldLocalBackendEvidence,
+    evidence: &crate::local_backend::HeldLocalBackendEvidence,
 ) -> ModeSealAssessment {
+    if !evidence.mode_is_verified() {
+        return ModeSealAssessment::Denied(ModeSealDenial::EvidenceUnverified);
+    }
     let facts = mode_facts(evidence);
     if facts.owner_uid != evidence.effective_uid() {
         return ModeSealAssessment::Denied(ModeSealDenial::NotOwner);
@@ -215,9 +219,12 @@ pub fn assess_mode_seal(
 /// binding. This remains a pure capability dimension: it creates no mutation
 /// unit, staging, or purge authority.
 pub fn assess_process_capability(
-    evidence: &degu_walk::local_backend::HeldLocalBackendEvidence,
+    evidence: &crate::local_backend::HeldLocalBackendEvidence,
     binding_owner_uid: Option<u32>,
 ) -> CapabilityAssessment {
+    if !evidence.mode_is_verified() {
+        return CapabilityAssessment::Unknown(super::UnknownReason::ProbeFailed);
+    }
     assess_capability_facts(
         mode_facts(evidence),
         &PosixSubject {

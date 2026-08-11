@@ -12,9 +12,11 @@ pub mod config;
 pub mod disposition;
 pub mod ecosystem;
 pub mod finding;
+pub mod local_backend;
 pub mod oplog;
 pub mod plan;
 pub mod safety;
+pub mod seal_executor;
 pub mod seal_store;
 pub mod seal_wal;
 

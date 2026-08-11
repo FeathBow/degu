@@ -12,6 +12,7 @@ const TRASHROOTS_MAX_BYTES: usize = 1024 * 1024;
 const TRASHROOT_RECORD_MAX_BYTES: usize = 64 * 1024;
 const STATE_TRASH_NAME: &str = "trash";
 const CROSS_DEVICE_TRASH_NAME: &str = ".degu-trash";
+const SEALED_STAGING_STORE_NAME: &str = "sealed-staging";
 
 #[cfg(test)]
 mod tests;
@@ -72,6 +73,57 @@ fn ensure_state_dir(ctx: &DetectCtx) -> std::io::Result<PathBuf> {
     let dir = ctx.xdg_state();
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+pub(crate) fn sealed_staging_store_path(ctx: &DetectCtx) -> PathBuf {
+    ctx.xdg_state().join("degu").join(SEALED_STAGING_STORE_NAME)
+}
+
+/// Existing recovery state is always authoritative and must be opened or block.
+/// Returns `Some` on a certified-local backend — the caller then creates an
+/// empty store on first mutation and reopens it thereafter — and `None` on an
+/// uncertified backend (NFS/overlay-backed HPC state directories), where no
+/// store is created and the strict legacy lifecycle is used so it does not
+/// regress there before A3c4 enables forward sealed staging.
+pub(crate) fn sealed_staging_store_for_mutation(
+    ctx: &DetectCtx,
+) -> Result<Option<(PathBuf, bool)>> {
+    let lexical = sealed_staging_store_path(ctx);
+    let lexical_parent = lexical.parent().ok_or_else(|| {
+        anyhow::anyhow!("sealed-staging store has no parent: {}", lexical.display())
+    })?;
+    // SealWalStore rejects every symlink component. Resolve the already-created
+    // state parent once, then let SealWalStore reopen and authenticate the
+    // resulting absolute no-symlink chain descriptor by descriptor. This also
+    // handles macOS's `/var -> /private/var` spelling.
+    let parent = std::fs::canonicalize(lexical_parent).with_context(|| {
+        format!(
+            "failed to canonicalize sealed-staging store parent {}",
+            lexical_parent.display()
+        )
+    })?;
+    let path = parent.join(SEALED_STAGING_STORE_NAME);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => return Ok(Some((path, true))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect sealed-staging store {}", path.display())
+            });
+        }
+    }
+
+    let held_parent = std::fs::File::open(&parent).with_context(|| {
+        format!(
+            "failed to open sealed-staging store parent {}",
+            parent.display()
+        )
+    })?;
+    Ok(
+        degu_core::local_backend::certify_held_fd_backend(&held_parent)
+            .is_ok()
+            .then_some((path, false)),
+    )
 }
 
 pub(crate) fn acquire_mutation_lock(ctx: &DetectCtx) -> Result<std::fs::File> {

@@ -34,6 +34,51 @@ fn creates_private_store_and_exact_wal_modes() {
 }
 
 #[test]
+fn store_initialization_publishes_the_wal_before_any_lease() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let root = temp_path(&temp).join("wal-store");
+    drop(SealWalStore::open_or_create(&root).unwrap());
+
+    let wal = std::fs::metadata(root.join(WAL_FILE_NAME)).unwrap();
+    assert!(wal.is_file());
+    assert_eq!(wal.permissions().mode() & 0o7777, 0o600);
+    assert_eq!(wal.len(), 0);
+}
+
+#[test]
+fn existing_store_without_wal_is_never_reinitialized() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let root = temp_path(&temp).join("wal-store");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(matches!(
+        SealWalStore::open_or_create(&root),
+        Err(StoreError::MissingWal { path }) if path == root.join(WAL_FILE_NAME)
+    ));
+    assert!(!root.join(WAL_FILE_NAME).exists());
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)] // simulates out-of-protocol authority loss
+fn deleted_wal_is_lost_authority_not_an_empty_store() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let root = temp_path(&temp).join("wal-store");
+    drop(SealWalStore::open_or_create(&root).unwrap());
+    rustix::fs::unlinkat(
+        rustix::fs::CWD,
+        root.join(WAL_FILE_NAME),
+        rustix::fs::AtFlags::empty(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        SealWalStore::open_or_create(&root),
+        Err(StoreError::MissingWal { .. })
+    ));
+}
+
+#[test]
 fn existing_directory_retries_uncertain_parent_durability() {
     let temp = crate::secure_test_tempdir().unwrap();
     let root = temp_path(&temp).join("wal-store");
@@ -41,7 +86,7 @@ fn existing_directory_retries_uncertain_parent_durability() {
     let first = SealWalStore::open_or_create_with_sync(&root, |_| {
         let call = first_syncs.get();
         first_syncs.set(call + 1);
-        if call == 1 {
+        if call == 4 {
             Err(io::Error::other("injected parent sync failure"))
         } else {
             Ok(())
@@ -56,7 +101,67 @@ fn existing_directory_retries_uncertain_parent_durability() {
         Ok(())
     })
     .unwrap();
-    assert_eq!(retry_syncs.get(), 2);
+    assert_eq!(retry_syncs.get(), 3);
+    drop(store.try_lease().unwrap());
+}
+
+#[test]
+fn every_store_initialization_sync_failure_reopens_without_empty_wal_recreation() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    for failed_sync in 0..5 {
+        let root = temp_path(&temp).join(format!("wal-store-{failed_sync}"));
+        let calls = std::cell::Cell::new(0);
+        let first = SealWalStore::open_or_create_with_sync(&root, |_| {
+            let call = calls.get();
+            calls.set(call + 1);
+            if call == failed_sync {
+                Err(io::Error::other("injected initialization sync failure"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(first, Err(StoreError::Io { .. })));
+        if failed_sync < 2 {
+            assert!(!root.exists());
+            assert!(unpublished_initializer_exists(&root));
+        } else {
+            assert!(root.join(WAL_FILE_NAME).is_file());
+        }
+
+        let retry = SealWalStore::open_or_create_with_sync(&root, |_| Ok(())).unwrap();
+        drop(retry.try_lease().unwrap());
+    }
+}
+
+#[test]
+fn final_store_name_is_published_only_after_wal_and_directory_sync() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let root = temp_path(&temp).join("wal-store");
+    let observations = std::cell::RefCell::new(Vec::new());
+    let store = SealWalStore::open_or_create_with_sync(&root, |_| {
+        observations.borrow_mut().push(root.exists());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(&*observations.borrow(), &[false, false, true, true, true]);
+    drop(store.try_lease().unwrap());
+}
+
+#[test]
+fn abandoned_unpublished_initializers_never_become_missing_wal_authority() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let parent = temp_path(&temp);
+    let root = parent.join("wal-store");
+    let abandoned_empty = parent.join(".degu-seal-store-initializing-old-empty");
+    let abandoned_partial = parent.join(".degu-seal-store-initializing-old-partial");
+    std::fs::create_dir(&abandoned_empty).unwrap();
+    std::fs::create_dir(&abandoned_partial).unwrap();
+    std::fs::write(abandoned_partial.join(WAL_FILE_NAME), b"").unwrap();
+
+    let store = SealWalStore::open_or_create(&root).unwrap();
+    assert!(root.join(WAL_FILE_NAME).is_file());
+    assert!(abandoned_empty.is_dir());
+    assert!(abandoned_partial.is_dir());
     drop(store.try_lease().unwrap());
 }
 
@@ -137,7 +242,7 @@ fn rejects_store_binding_replaced_after_open() {
             ..
         })
     ));
-    assert!(!moved.join(WAL_FILE_NAME).exists());
+    assert!(moved.join(WAL_FILE_NAME).is_file());
     assert!(!root.join(WAL_FILE_NAME).exists());
 }
 
@@ -235,9 +340,8 @@ fn rejects_symlink_store_and_wal_without_following_them() {
     let victim = temp_path(&temp).join("victim");
     std::fs::write(&victim, b"must remain unchanged").unwrap();
     std::os::unix::fs::symlink(&victim, root.join(WAL_FILE_NAME)).unwrap();
-    let store = SealWalStore::open_or_create(&root).unwrap();
 
-    assert!(store.try_lease().is_err());
+    assert!(SealWalStore::open_or_create(&root).is_err());
     assert_eq!(std::fs::read(victim).unwrap(), b"must remain unchanged");
 }
 

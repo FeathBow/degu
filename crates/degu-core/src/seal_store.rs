@@ -15,11 +15,15 @@ use crate::local_backend::{
 };
 use crate::seal_wal::{ExclusiveFileLock, RecoveryLockError, RecoverySession};
 use rustix::fd::{AsFd, OwnedFd};
-use rustix::fs::{FileType, Mode, OFlags};
+use rustix::fs::{FileType, Mode, OFlags, RenameFlags};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
+#[cfg(test)]
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The only entry managed by [`SealWalStore`].
 pub const WAL_FILE_NAME: &str = "seal.wal";
@@ -31,6 +35,8 @@ const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 const OPEN_WAL: OFlags = OFlags::RDWR.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+const MAX_INITIALIZER_NAMES: usize = 128;
+static NEXT_INITIALIZER_NAME: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -46,14 +52,17 @@ pub enum StoreError {
     UnsafeDirectory { path: PathBuf, reason: &'static str },
     #[error("unsafe seal WAL entry at {path}: {reason}")]
     UnsafeWal { path: PathBuf, reason: &'static str },
+    #[error("existing seal WAL store is missing its durable WAL entry at {path}")]
+    MissingWal { path: PathBuf },
     #[error(transparent)]
     Lease(#[from] RecoveryLockError),
 }
 
 /// An EUID-owned, exact-mode directory containing exactly addressed WAL state.
 ///
-/// Opening the store never relaxes an existing directory's permissions. Creation
-/// is limited to the final component beneath an already-open parent directory.
+/// Opening the store never relaxes an existing directory's permissions. A new
+/// store is populated under an unpublished sibling and atomically renamed to
+/// the final component beneath an already-open parent directory.
 pub struct SealWalStore {
     parent: OwnedFd,
     name: OsString,
@@ -75,20 +84,18 @@ impl SealWalStore {
     {
         let (parent, name, parent_path) = open_authenticated_parent(path)?;
         validate_parent_for_creation(&parent, &parent_path)?;
-
-        let created = match rustix::fs::mkdirat(&parent, &name, DIRECTORY_MODE) {
-            Ok(()) => true,
-            Err(rustix::io::Errno::EXIST) => false,
+        // All protocol participants serialize publication through the held
+        // parent. The final name is never visible until an exact WAL and its
+        // unpublished directory have both been synced.
+        let parent_lock = try_lock_directory(&parent)?;
+        let directory = match rustix::fs::openat(&parent, &name, OPEN_DIRECTORY, Mode::empty()) {
+            Ok(directory) => directory,
+            Err(rustix::io::Errno::NOENT) => {
+                initialize_unpublished_store(&parent, &name, path, &mut sync)?
+            }
             Err(error) => return Err(io_error(path, error.into())),
         };
-        let directory = rustix::fs::openat(&parent, &name, OPEN_DIRECTORY, Mode::empty())
-            .map_err(|error| io_error(path, error.into()))?;
-        if created {
-            // mkdir(2)'s mode is filtered by umask. Tighten to the exact invariant
-            // before the directory is accepted or any WAL entry is created.
-            rustix::fs::fchmod(&directory, DIRECTORY_MODE)
-                .map_err(|error| io_error(path, error.into()))?;
-        }
+
         validate_directory(&directory, path)?;
         let certified = certify_directory(&directory, path)?;
         let backend = certified.backend();
@@ -102,12 +109,27 @@ impl SealWalStore {
             path,
             &parent_path,
         )?;
-        // Always repeat both syncs, including when mkdir reported EEXIST. This
-        // completes a prior attempt whose directory fsync succeeded but parent
-        // fsync failed, leaving creation durability uncertain. No WAL lease can
-        // be issued until a retry observes both syncs succeeding.
+
+        // A published store must already contain its WAL. Missing state is lost
+        // authority, while an interrupted unpublished initializer is resumed by
+        // `initialize_unpublished_store` before the final-name rename.
+        let wal_path = path.join(WAL_FILE_NAME);
+        let wal = match rustix::fs::openat(&directory, WAL_FILE_NAME, OPEN_WAL, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => {
+                return Err(StoreError::MissingWal { path: wal_path });
+            }
+            Err(error) => return Err(io_error(&wal_path, error.into())),
+        };
+        validate_wal(&wal, backend, device, &wal_path)?;
+        validate_entry_binding(&directory, &wal, &wal_path)?;
+
+        // Repeat the full chain on every open. This completes a prior publisher
+        // that renamed the prepared directory but crashed before parent fsync.
+        sync(&wal).map_err(|error| io_error(&wal_path, error))?;
         sync(&directory).map_err(|error| io_error(path, error))?;
         sync(&parent).map_err(|error| io_error(&parent_path, error))?;
+        drop(parent_lock);
         Ok(Self {
             parent,
             name,
@@ -118,8 +140,9 @@ impl SealWalStore {
         })
     }
 
-    /// Opens or creates the exact WAL entry and acquires a nonblocking exclusive
-    /// lock on that same descriptor.
+    /// Opens the mandatory exact WAL entry and acquires a nonblocking exclusive
+    /// lock on that same descriptor. A missing entry in an existing store is
+    /// lost authority, never permission to initialize an empty WAL.
     pub(crate) fn try_lease(&self) -> Result<RecoverySession, StoreError> {
         let wal_path = self.path.join(WAL_FILE_NAME);
         let parent_path = self.path.parent().unwrap_or_else(|| Path::new("/"));
@@ -135,9 +158,7 @@ impl SealWalStore {
         // Serialize protocol participants across the create/publish durability
         // window. A fresh open file description is required: locking the store's
         // shared directory descriptor would not exclude another call in-process.
-        let creation_fd = rustix::fs::openat(&self.directory, ".", OPEN_DIRECTORY, Mode::empty())
-            .map_err(|error| io_error(&self.path, error.into()))?;
-        let creation_lock = ExclusiveFileLock::try_acquire(File::from(creation_fd))?;
+        let creation_lock = try_lock_directory(&self.directory)?;
         // Recheck after serialization so a replacement that raced the first
         // observation cannot redirect WAL replay or append into a detached store.
         validate_store_binding(
@@ -150,34 +171,13 @@ impl SealWalStore {
             parent_path,
         )?;
 
-        let (fd, created) =
-            match rustix::fs::openat(&self.directory, WAL_FILE_NAME, OPEN_WAL, Mode::empty()) {
-                Ok(fd) => (fd, false),
-                Err(rustix::io::Errno::NOENT) => match rustix::fs::openat(
-                    &self.directory,
-                    WAL_FILE_NAME,
-                    OPEN_WAL | OFlags::CREATE | OFlags::EXCL,
-                    WAL_MODE,
-                ) {
-                    Ok(fd) => (fd, true),
-                    // Another same-EUID creator may have won. Re-open without CREATE
-                    // and validate the descriptor instead of trusting its pathname.
-                    Err(rustix::io::Errno::EXIST) => (
-                        rustix::fs::openat(&self.directory, WAL_FILE_NAME, OPEN_WAL, Mode::empty())
-                            .map_err(|error| io_error(&wal_path, error.into()))?,
-                        false,
-                    ),
-                    Err(error) => return Err(io_error(&wal_path, error.into())),
-                },
-                Err(error) => return Err(io_error(&wal_path, error.into())),
-            };
-
-        if created {
-            // openat's requested mode is umask-filtered and can never be broader
-            // than 0600. Establish the exact invariant while creation remains
-            // serialized, but do not publish durability before locking the WAL.
-            rustix::fs::fchmod(&fd, WAL_MODE).map_err(|error| io_error(&wal_path, error.into()))?;
-        }
+        let fd = match rustix::fs::openat(&self.directory, WAL_FILE_NAME, OPEN_WAL, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => {
+                return Err(StoreError::MissingWal { path: wal_path });
+            }
+            Err(error) => return Err(io_error(&wal_path, error.into())),
+        };
         validate_wal(&fd, self.backend, self.device, &wal_path)?;
         let file = File::from(fd);
         let lease = RecoverySession::try_acquire(file)?;
@@ -212,6 +212,98 @@ impl SealWalStore {
         drop(creation_lock);
         Ok(lease)
     }
+}
+
+fn initialize_unpublished_store<F>(
+    parent: &OwnedFd,
+    final_name: &std::ffi::OsStr,
+    final_path: &Path,
+    sync: &mut F,
+) -> Result<OwnedFd, StoreError>
+where
+    F: FnMut(&OwnedFd) -> io::Result<()>,
+{
+    let mut prepared = None;
+    for _ in 0..MAX_INITIALIZER_NAMES {
+        let sequence = NEXT_INITIALIZER_NAME.fetch_add(1, Ordering::Relaxed);
+        let init_name = OsString::from_vec(
+            format!(
+                ".degu-seal-store-initializing-{}-{sequence}",
+                std::process::id()
+            )
+            .into_bytes(),
+        );
+        match rustix::fs::mkdirat(parent, &init_name, DIRECTORY_MODE) {
+            Ok(()) => {
+                prepared = Some(init_name);
+                break;
+            }
+            Err(rustix::io::Errno::EXIST) => continue,
+            Err(error) => return Err(io_error(final_path, error.into())),
+        }
+    }
+    let init_name = prepared.ok_or(StoreError::UnsafeDirectory {
+        path: final_path.to_path_buf(),
+        reason: "unpublished store initializer names are exhausted",
+    })?;
+    let init_path = final_path.with_file_name(&init_name);
+    let directory = rustix::fs::openat(parent, &init_name, OPEN_DIRECTORY, Mode::empty())
+        .map_err(|error| io_error(&init_path, error.into()))?;
+    // The initializer is not published authority. Tightening its umask-filtered
+    // modes and abandoning it on any crash cannot overwrite or recreate a live
+    // WAL at the final name.
+    rustix::fs::fchmod(&directory, DIRECTORY_MODE)
+        .map_err(|error| io_error(&init_path, error.into()))?;
+    validate_directory(&directory, &init_path)?;
+    let certified = certify_directory(&directory, &init_path)?;
+
+    let init_wal_path = init_path.join(WAL_FILE_NAME);
+    let wal = rustix::fs::openat(
+        &directory,
+        WAL_FILE_NAME,
+        OPEN_WAL | OFlags::CREATE | OFlags::EXCL,
+        WAL_MODE,
+    )
+    .map_err(|error| io_error(&init_wal_path, error.into()))?;
+    rustix::fs::fchmod(&wal, WAL_MODE).map_err(|error| io_error(&init_wal_path, error.into()))?;
+    validate_wal(
+        &wal,
+        certified.backend(),
+        certified.device(),
+        &init_wal_path,
+    )?;
+    validate_entry_binding(&directory, &wal, &init_wal_path)?;
+    sync(&wal).map_err(|error| io_error(&init_wal_path, error))?;
+    sync(&directory).map_err(|error| io_error(&init_path, error))?;
+
+    rustix::fs::renameat_with(
+        parent,
+        &init_name,
+        parent,
+        final_name,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| io_error(final_path, error.into()))?;
+    Ok(directory)
+}
+
+#[cfg(test)]
+fn unpublished_initializer_exists(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let prefix = b".degu-seal-store-initializing-";
+    std::fs::read_dir(parent).is_ok_and(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().as_bytes().starts_with(prefix) && entry.path().is_dir())
+    })
+}
+
+fn try_lock_directory(directory: &OwnedFd) -> Result<ExclusiveFileLock, StoreError> {
+    let lock_fd = rustix::fs::openat(directory, ".", OPEN_DIRECTORY, Mode::empty())
+        .map_err(|error| StoreError::Lease(RecoveryLockError::Io(error.into())))?;
+    Ok(ExclusiveFileLock::try_acquire(File::from(lock_fd))?)
 }
 
 fn open_authenticated_parent(path: &Path) -> Result<(OwnedFd, OsString, PathBuf), StoreError> {

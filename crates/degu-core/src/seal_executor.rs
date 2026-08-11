@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn invalidated_mode_evidence_cannot_authorize_later_assessment() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::secure_test_tempdir().unwrap();
         let directory = temp.path().join("directory");
         std::fs::create_dir(&directory).unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o770)).unwrap();
@@ -403,7 +403,7 @@ mod tests {
     #[test]
     fn wal_sync_boundaries_prevent_early_mutation_and_report_applied_uncertainty() {
         for (fail_at, expected_mode) in [(2, 0o770), (3, 0o750)] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::secure_test_tempdir().unwrap();
             let directory = temp.path().join("directory");
             std::fs::create_dir(&directory).unwrap();
             std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o770)).unwrap();

@@ -359,6 +359,10 @@ pub(crate) fn execute_prepared_rename<'a>(
         return Err(StagingRenameError::StartupBlocked);
     }
     binding.verify_before_sealing()?;
+    #[cfg(test)]
+    if FAIL_WAL_STEP.with(|failure| failure.get() == Some("begin-poison")) {
+        wal.poison_for_test();
+    }
     wal.begin_staging(transaction, binding.metadata.clone())?;
     *startup_blocked = true;
 

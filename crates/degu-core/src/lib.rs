@@ -24,6 +24,7 @@ pub mod sealed_staging;
 mod staging_recovery;
 #[allow(dead_code)] // crate-private, unwired A3c2 held-rename foundation
 mod staging_rename;
+pub mod store_activation;
 
 #[cfg(test)]
 pub(crate) fn secure_test_tempdir() -> std::io::Result<tempfile::TempDir> {

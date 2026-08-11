@@ -46,6 +46,18 @@ fn store_initialization_publishes_the_wal_before_any_lease() {
 }
 
 #[test]
+fn existing_only_open_never_creates_a_missing_store() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let root = temp_path(&temp).join("wal-store");
+
+    assert!(matches!(
+        SealWalStore::open_existing(&root),
+        Err(StoreError::MissingStore { path }) if path == root
+    ));
+    assert!(!root.exists());
+}
+
+#[test]
 fn existing_store_without_wal_is_never_reinitialized() {
     let temp = crate::secure_test_tempdir().unwrap();
     let root = temp_path(&temp).join("wal-store");

@@ -2066,6 +2066,48 @@ fn already_exclusive_strategy_is_explicit_exact_and_non_vacuous() {
         .unwrap();
 }
 
+fn wal_at_staged_unverified(transaction: TransactionId) -> SealWal<FaultWriter> {
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    wal.begin_staging(transaction, staging_metadata()).unwrap();
+    advance_to_tree_intent(&mut wal, transaction);
+    wal.complete_tree_manifest(
+        transaction,
+        DurableTreeManifest {
+            entry_count: 0,
+            sha256: [0xa3; 32],
+        },
+    )
+    .unwrap();
+    wal.transition_staging(transaction, TransactionState::TreeSealed)
+        .unwrap();
+    wal.record_rename_intent(transaction).unwrap();
+    wal.record_applied_rename_for_test(transaction).unwrap();
+    wal.transition_staging(transaction, TransactionState::StagedUnverified)
+        .unwrap();
+    wal
+}
+
+#[test]
+fn staged_verification_state_sync_failure_never_publishes_success_or_quarantine() {
+    for next in [
+        TransactionState::StagedSealed,
+        TransactionState::Quarantined,
+    ] {
+        let transaction = tx(if next == TransactionState::StagedSealed {
+            0xa1
+        } else {
+            0xa2
+        });
+        let mut wal = wal_at_staged_unverified(transaction);
+        wal.writer.fail_sync_at = Some((wal.writer.sync_count, libc::EIO));
+        assert!(wal.transition_staging(transaction, next).is_err());
+        assert_eq!(
+            wal.transaction_state(transaction),
+            Some(TransactionState::StagedUnverified)
+        );
+    }
+}
+
 #[test]
 fn authority_neutral_public_methods_cannot_drive_a_staging_transaction() {
     let transaction = tx(80);

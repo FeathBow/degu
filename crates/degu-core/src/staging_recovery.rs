@@ -6,21 +6,23 @@
 //! and rechecks that binding immediately before any held-FD mode restoration.
 
 use crate::authority::TransactionState;
+use crate::local_backend::held_tree::{HeldTreeError, HeldTreeInventory, HeldTreeLimits};
 use crate::local_backend::{
-    CertificationError, CertifiedLocalBackend, HeldLocalBackendEvidence, certify_held_fd,
-    certify_held_fd_backend,
+    CertificationError, CertifiedLocalBackend, HeldLocalBackendEvidence,
+    LocalModeRevalidationFailure, certify_held_fd, certify_held_fd_backend,
 };
 use crate::seal_executor::{
     LocalModeExecutionError, LocalModeMutationRequest, LocalModeTransform, RecoveryLocator,
     execute_staging_local_mode_mutation,
 };
 use crate::seal_wal::{
-    AppendError, DurablePermission, PermissionResolution, RecoverySession, RecoveryWork,
-    ResolveError, SealWal, StagingLocator, StagingTransactionMetadata, StrongObjectIdentity,
-    TransactionId,
+    AppendError, ApplicationStatus, DurablePermission, DurableTreeManifest, PermissionResolution,
+    RecoverySession, RecoveryWork, ResolveError, SealWal, StagingLocator,
+    StagingTransactionMetadata, StrongObjectIdentity, TransactionId,
 };
 use rustix::fd::OwnedFd;
 use rustix::fs::{Mode, OFlags};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
 #[cfg(target_os = "macos")]
@@ -64,6 +66,8 @@ pub(crate) enum RecoveryRebindError {
     BindingChanged,
     #[error("recovery target mode differs from the durable applied seal")]
     ModeChanged,
+    #[error("fresh staged seal evidence changed: {0:?}")]
+    SealChanged(LocalModeRevalidationFailure),
     #[error("held recovery object could not be certified: {0:?}")]
     Certification(CertificationError),
     #[error("recovery descriptor operation failed: {0}")]
@@ -144,6 +148,13 @@ impl ReboundObject {
         }
         Ok(())
     }
+
+    fn verify_fresh_sealed_directory(&self, expected_mode: u32) -> Result<(), RecoveryRebindError> {
+        self.verify_fresh_binding()?;
+        self.held
+            .verify_current_mode(expected_mode)
+            .map_err(RecoveryRebindError::SealChanged)
+    }
 }
 
 #[derive(Debug)]
@@ -154,17 +165,75 @@ struct ReboundRestore {
     completion: TransactionState,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StagedVerificationError {
+    #[error("staged verification capability is not at StagedUnverified")]
+    InvalidState,
+    #[error("verified staged state was not durable: {0}")]
+    StagedSealedNotDurable(#[source] AppendError),
+    #[error("staged verification failed and quarantine was not durable: {source}")]
+    QuarantineNotDurable {
+        failure: StagedVerificationFailure,
+        #[source]
+        source: AppendError,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StagedVerificationFailure {
+    #[error("durable tree manifest is missing")]
+    MissingManifest,
+    #[error("staged held-tree inspection failed: {0}")]
+    HeldTree(#[from] HeldTreeError),
+    #[error("staged binding changed: {0}")]
+    Rebind(#[from] RecoveryRebindError),
+    #[error("durable tree-seal coverage is not exact")]
+    SealCoverage,
+    #[error("staged tree does not match its durable manifest")]
+    ManifestMismatch,
+}
+
+/// Nonforgeable proof that this exact leased transaction reached only
+/// `StagedSealed`. It intentionally has no restore, commit, purge, or namespace
+/// mutation operation.
+pub(crate) struct VerifiedStagedTree<'a> {
+    wal: &'a mut SealWal<RecoverySession>,
+    startup_blocked: &'a mut bool,
+    transaction: TransactionId,
+}
+
+impl VerifiedStagedTree<'_> {
+    pub(crate) fn transaction(&self) -> TransactionId {
+        self.transaction
+    }
+
+    pub(crate) fn wal_state(&self) -> Option<TransactionState> {
+        self.wal.transaction_state(self.transaction)
+    }
+
+    pub(crate) fn startup_is_blocked(&self) -> bool {
+        *self.startup_blocked
+    }
+}
+
+pub(crate) enum StagedVerificationOutcome<'a> {
+    StagedSealed(VerifiedStagedTree<'a>),
+    Quarantined,
+}
+
 /// Capability returned for post-rename verification. It keeps the exact
-/// destination parent/name and staged root descriptors live but exposes no
-/// chmod, unlink, rename, or purge operation.
+/// destination parent/name, staged root, every rebound tree-seal descriptor,
+/// and WAL lease live but exposes no chmod, unlink, rename, or purge operation.
 pub(crate) struct CertifiedStagedRecovery<'a> {
     wal: &'a mut SealWal<RecoverySession>,
     startup_blocked: &'a mut bool,
     transaction: TransactionId,
     root: ReboundObject,
+    expected_manifest: Option<DurableTreeManifest>,
+    rebound_tree_seals: Vec<(DurablePermission, ReboundObject)>,
 }
 
-impl CertifiedStagedRecovery<'_> {
+impl<'a> CertifiedStagedRecovery<'a> {
     pub(crate) fn transaction(&self) -> TransactionId {
         self.transaction
     }
@@ -181,13 +250,158 @@ impl CertifiedStagedRecovery<'_> {
     pub(crate) fn verification_is_pending(&self) -> bool {
         *self.startup_blocked
     }
+
+    /// Consumes the one-shot recovery capability. Verification is read-only; the
+    /// only possible durable success is `StagedUnverified -> StagedSealed`.
+    pub(crate) fn verify_or_quarantine(
+        self,
+    ) -> Result<StagedVerificationOutcome<'a>, StagedVerificationError> {
+        self.verify_or_quarantine_with_limits(HeldTreeLimits::default())
+    }
+
+    fn verify_or_quarantine_with_limits(
+        self,
+        limits: HeldTreeLimits,
+    ) -> Result<StagedVerificationOutcome<'a>, StagedVerificationError> {
+        if self.wal.transaction_state(self.transaction) != Some(TransactionState::StagedUnverified)
+        {
+            return Err(StagedVerificationError::InvalidState);
+        }
+        let verification = self.verify_staged_tree(limits);
+        if let Err(failure) = verification {
+            return match self
+                .wal
+                .transition_staging(self.transaction, TransactionState::Quarantined)
+            {
+                Ok(()) => Ok(StagedVerificationOutcome::Quarantined),
+                Err(source) => {
+                    Err(StagedVerificationError::QuarantineNotDurable { failure, source })
+                }
+            };
+        }
+        self.wal
+            .transition_staging(self.transaction, TransactionState::StagedSealed)
+            .map_err(StagedVerificationError::StagedSealedNotDurable)?;
+        Ok(StagedVerificationOutcome::StagedSealed(
+            VerifiedStagedTree {
+                wal: self.wal,
+                startup_blocked: self.startup_blocked,
+                transaction: self.transaction,
+            },
+        ))
+    }
+
+    fn verify_staged_tree(&self, limits: HeldTreeLimits) -> Result<(), StagedVerificationFailure> {
+        let expected = self
+            .expected_manifest
+            .ok_or(StagedVerificationFailure::MissingManifest)?;
+        self.root.verify_fresh_binding()?;
+        for (permission, rebound) in &self.rebound_tree_seals {
+            rebound.verify_fresh_sealed_directory(permission.expected_mode)?;
+        }
+        let inventory = collect_rebound_staged_tree(&self.root, limits)?;
+        require_exact_tree_seal_coverage(
+            &inventory,
+            &self.root.relative_path,
+            &self.rebound_tree_seals,
+        )?;
+        inventory.rewalk_exact()?;
+        self.root.verify_fresh_binding()?;
+        for (permission, rebound) in &self.rebound_tree_seals {
+            rebound.verify_fresh_sealed_directory(permission.expected_mode)?;
+        }
+        let actual = inventory.fingerprint();
+        if actual.entry_count != expected.entry_count || actual.sha256 != expected.sha256 {
+            return Err(StagedVerificationFailure::ManifestMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn collect_rebound_staged_tree(
+    root: &ReboundObject,
+    limits: HeldTreeLimits,
+) -> Result<HeldTreeInventory, StagedVerificationFailure> {
+    root.verify_fresh_binding()?;
+    let parent = rustix::io::dup(&root.parent)
+        .map_err(io::Error::from)
+        .map_err(RecoveryRebindError::Io)?;
+    let held_parent = certify_held_fd(parent).map_err(RecoveryRebindError::Certification)?;
+    let protected_names = crate::safety::PROTECTED_DESCENDANT_DIR_NAMES
+        .iter()
+        .map(OsString::from)
+        .collect();
+    let inventory =
+        HeldTreeInventory::collect(held_parent, &root.basename, protected_names, limits)?;
+    root.verify_fresh_binding()?;
+    Ok(inventory)
+}
+
+fn require_exact_tree_seal_coverage(
+    inventory: &HeldTreeInventory,
+    destination_root: &Path,
+    seals: &[(DurablePermission, ReboundObject)],
+) -> Result<(), StagedVerificationFailure> {
+    let mut held = BTreeMap::new();
+    for directory in inventory.directories_deepest_first() {
+        if held
+            .insert(
+                directory.relative_path,
+                (
+                    directory.device,
+                    directory.inode,
+                    directory.incarnation,
+                    directory.observed_mode,
+                ),
+            )
+            .is_some()
+        {
+            return Err(StagedVerificationFailure::SealCoverage);
+        }
+    }
+    let mut durable = BTreeMap::new();
+    for (permission, rebound) in seals {
+        if permission.phase != TransactionState::TreeSealIntent
+            || permission.application != ApplicationStatus::Applied
+            || permission.reverses_mutation_id.is_some()
+            || permission.expected_mode != rebound.held.mode()
+        {
+            return Err(StagedVerificationFailure::SealCoverage);
+        }
+        let suffix = rebound
+            .relative_path
+            .strip_prefix(destination_root)
+            .map_err(|_| StagedVerificationFailure::SealCoverage)?
+            .to_path_buf();
+        if durable
+            .insert(
+                suffix,
+                (
+                    permission.evidence.device(),
+                    permission.evidence.inode(),
+                    permission
+                        .evidence
+                        .generation_or_btime()
+                        .ok_or(StagedVerificationFailure::SealCoverage)?,
+                    permission.expected_mode,
+                ),
+            )
+            .is_some()
+        {
+            return Err(StagedVerificationFailure::SealCoverage);
+        }
+    }
+    if held != durable {
+        return Err(StagedVerificationFailure::SealCoverage);
+    }
+    Ok(())
 }
 
 pub(crate) enum StartupRecoveryCapability<'a> {
     Restore(RecoveryRestoreSession<'a>),
     /// Nonforgeable continuation for a future staged-tree verifier. Merely
     /// checking liveness never clears the startup mutation block.
-    PendingVerification(CertifiedStagedRecovery<'a>),
+    PendingVerification(Box<CertifiedStagedRecovery<'a>>),
 }
 
 /// Owns all rebound FDs and borrows the exact leased WAL until ordered restore
@@ -283,7 +497,7 @@ pub(crate) fn prepare_startup_recovery<'a>(
 ) -> Result<StartupRecoveryCapability<'a>, RecoveryRebindError> {
     // Recompute from the exact leased WAL after every durable uncertainty
     // resolution. No caller can supply/omit a permission or choose a rename side.
-    let (metadata, work) = loop {
+    let (metadata, tree_manifest, work) = loop {
         let snapshot = wal
             .recovery_snapshot(transaction)
             .ok_or(RecoveryRebindError::TransactionMismatch)?;
@@ -328,10 +542,10 @@ pub(crate) fn prepare_startup_recovery<'a>(
             }
             continue;
         }
-        break (metadata, work);
+        break (metadata, snapshot.tree_manifest, work);
     };
 
-    match rebind_work(&metadata, work, &anchors) {
+    match rebind_work(&metadata, tree_manifest, work, &anchors) {
         Ok(ReboundWork::Restore(restore)) => {
             Ok(StartupRecoveryCapability::Restore(RecoveryRestoreSession {
                 wal,
@@ -339,14 +553,16 @@ pub(crate) fn prepare_startup_recovery<'a>(
                 restore,
             }))
         }
-        Ok(ReboundWork::VerifyStaged(root)) => Ok(StartupRecoveryCapability::PendingVerification(
-            CertifiedStagedRecovery {
+        Ok(ReboundWork::VerifyStaged(staged)) => Ok(
+            StartupRecoveryCapability::PendingVerification(Box::new(CertifiedStagedRecovery {
                 wal,
                 startup_blocked,
                 transaction,
-                root,
-            },
-        )),
+                root: staged.root,
+                expected_manifest: staged.expected_manifest,
+                rebound_tree_seals: staged.tree_seals,
+            })),
+        ),
         Err(error) => fail_closed(wal, transaction, error),
     }
 }
@@ -362,9 +578,15 @@ fn fail_closed<T>(
     Err(error)
 }
 
+struct ReboundStaged {
+    root: ReboundObject,
+    expected_manifest: Option<DurableTreeManifest>,
+    tree_seals: Vec<(DurablePermission, ReboundObject)>,
+}
+
 enum ReboundWork {
     Restore(ReboundRestore),
-    VerifyStaged(ReboundObject),
+    VerifyStaged(Box<ReboundStaged>),
 }
 
 fn resolve_uncertain_permissions(
@@ -510,6 +732,7 @@ fn uncertain_permission_location<'a>(
 
 fn rebind_work(
     metadata: &StagingTransactionMetadata,
+    tree_manifest: Option<DurableTreeManifest>,
     work: RecoveryWork,
     anchors: &RecoveryAnchors,
 ) -> Result<ReboundWork, RecoveryRebindError> {
@@ -615,7 +838,7 @@ fn rebind_work(
         }
         RecoveryWork::VerifyOrQuarantineAfterRename {
             transaction: work_transaction,
-            ..
+            permissions,
         } => {
             if work_transaction != transaction {
                 return Err(RecoveryRebindError::TransactionMismatch);
@@ -632,7 +855,12 @@ fn rebind_work(
                 metadata,
                 None,
             )?;
-            Ok(ReboundWork::VerifyStaged(root))
+            let tree_seals = rebind_staged_tree_seals(&anchors.destination, metadata, permissions)?;
+            Ok(ReboundWork::VerifyStaged(Box::new(ReboundStaged {
+                root,
+                expected_manifest: tree_manifest,
+                tree_seals,
+            })))
         }
         RecoveryWork::RecoveryRequired { .. }
         | RecoveryWork::ResolveUncertainPermissions { .. }
@@ -704,6 +932,66 @@ fn rebind_locator(
     let fd = open_confined_directory(&anchor.fd, locator.relative_path(), anchor.mount_key)?;
     validate_fd(anchor, &fd, expected)?;
     Ok(fd)
+}
+
+fn rebind_staged_tree_seals(
+    destination_anchor: &RecoveryFilesystemAnchor,
+    metadata: &StagingTransactionMetadata,
+    permissions: Vec<DurablePermission>,
+) -> Result<Vec<(DurablePermission, ReboundObject)>, RecoveryRebindError> {
+    let source_root = metadata
+        .source_parent()
+        .relative_path()
+        .join(metadata.source_basename());
+    let destination_root = metadata
+        .destination_parent()
+        .relative_path()
+        .join(metadata.destination_basename());
+    let mut rebound = Vec::new();
+    for permission in permissions {
+        if permission.application != ApplicationStatus::Applied
+            || permission.reverses_mutation_id.is_some()
+            || permission.evidence.filesystem_id() != Some(metadata.filesystem_id())
+            || permission.evidence.expected_mode() != permission.expected_mode
+        {
+            return Err(RecoveryRebindError::TransactionMismatch);
+        }
+        if permission.phase == TransactionState::ParentSealIntent {
+            continue;
+        }
+        if permission.phase != TransactionState::TreeSealIntent {
+            return Err(RecoveryRebindError::TransactionMismatch);
+        }
+        let suffix = permission
+            .evidence
+            .relative_path()
+            .strip_prefix(&source_root)
+            .map_err(|_| RecoveryRebindError::InvalidLocator)?;
+        let path = destination_root.join(suffix);
+        let expected = StrongObjectIdentity::new_with_mount(
+            permission.evidence.device(),
+            permission.evidence.inode(),
+            crate::seal_wal::ObjectIncarnation::new(
+                permission
+                    .evidence
+                    .generation_or_btime()
+                    .ok_or(RecoveryRebindError::StrongIdentityUnavailable)?,
+            ),
+            destination_anchor.mount_key,
+        );
+        let (parent, basename) =
+            open_confined_parent(&destination_anchor.fd, &path, destination_anchor.mount_key)?;
+        let object = rebind_named_child(
+            parent,
+            &basename,
+            expected,
+            path,
+            metadata,
+            Some(permission.expected_mode),
+        )?;
+        rebound.push((permission, object));
+    }
+    Ok(rebound)
 }
 
 fn rebind_permissions(

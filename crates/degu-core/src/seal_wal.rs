@@ -103,7 +103,7 @@ pub struct SealWal<W> {
 }
 
 impl<W: DurableWrite> SealWal<W> {
-    pub fn new(mut writer: W) -> Result<Self, AppendError> {
+    pub(crate) fn new(mut writer: W) -> Result<Self, AppendError> {
         let committed_len = writer.prepare_append().map_err(AppendError::Io)?;
         if committed_len != 0 {
             return Err(AppendError::InvalidState(
@@ -168,7 +168,7 @@ impl<W: DurableWrite> SealWal<W> {
 
     /// Hydrates append-side validation from a fail-closed replay. The caller
     /// must supply a writer positioned for append to the same validated WAL.
-    pub fn resume(mut writer: W, replay: &Replay) -> Result<Self, AppendError> {
+    pub(crate) fn resume(mut writer: W, replay: &Replay) -> Result<Self, AppendError> {
         let actual_len = writer.prepare_append().map_err(AppendError::Io)?;
         if actual_len != replay.committed_len || actual_len > MAX_WAL_LEN {
             return Err(AppendError::InvalidState(
@@ -531,27 +531,71 @@ pub enum RecoveryLockError {
     Io(#[source] io::Error),
 }
 
-/// Exclusive, nonblocking startup-recovery lease.
-pub struct RecoverySession {
-    _lock: File,
+/// Exclusive, nonblocking `flock` guard that explicitly unlocks on drop.
+///
+/// Explicit unlock makes the logical guard lifetime authoritative even when an
+/// unrelated concurrent `fork` briefly inherits the close-on-exec descriptor.
+pub(crate) struct ExclusiveFileLock {
+    file: File,
 }
 
-impl RecoverySession {
-    /// The caller must securely open and validate the lock file and its private
-    /// parent directory. This authority-neutral layer never resolves paths.
-    pub fn try_acquire(file: File) -> Result<Self, RecoveryLockError> {
+impl ExclusiveFileLock {
+    pub(crate) fn try_acquire(file: File) -> Result<Self, RecoveryLockError> {
         match file.try_lock() {
-            Ok(()) => Ok(Self { _lock: file }),
+            Ok(()) => Ok(Self { file }),
             Err(std::fs::TryLockError::WouldBlock) => Err(RecoveryLockError::Busy),
             Err(std::fs::TryLockError::Error(error)) => Err(RecoveryLockError::Io(error)),
         }
     }
 
+    pub(crate) fn as_file(&self) -> &File {
+        &self.file
+    }
+
+    fn as_file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+}
+
+impl Drop for ExclusiveFileLock {
+    fn drop(&mut self) {
+        // Closing alone does not release `flock` while a fork-inherited duplicate
+        // still exists. The descriptor is private, so no duplicate is a legitimate
+        // co-owner of this logical lease.
+        let _ = self.file.unlock();
+    }
+}
+
+/// Exclusive, nonblocking lease on the exact WAL descriptor.
+///
+/// The descriptor is intentionally private: replay, tail repair, and append can
+/// only operate on the file that carries this lease. Moving the session into a
+/// [`SealWal`] keeps the lock held for the complete writer lifetime.
+pub struct RecoverySession {
+    lock: ExclusiveFileLock,
+    replay: Option<Replay>,
+}
+
+impl RecoverySession {
+    /// The caller must securely open and validate the WAL and its private parent
+    /// directory. [`crate::seal_store::SealWalStore`] is the supported path-based
+    /// constructor.
+    pub(crate) fn try_acquire(file: File) -> Result<Self, RecoveryLockError> {
+        Ok(Self {
+            lock: ExclusiveFileLock::try_acquire(file)?,
+            replay: None,
+        })
+    }
+
+    pub(crate) fn as_file(&self) -> &File {
+        self.lock.as_file()
+    }
+
     /// Reads committed frames and repairs only a physically partial final frame.
     /// Fully present bad checksums, unknown versions, and malformed interior
     /// records fail closed without truncation.
-    /// The caller supplies an already validated, read-write WAL descriptor.
-    pub fn replay_and_repair(&self, file: &mut File) -> Result<Replay, ReplayError> {
+    pub fn replay_and_repair(&mut self) -> Result<&Replay, ReplayError> {
+        let file = self.lock.as_file_mut();
         if file.metadata()?.len() > MAX_WAL_LEN {
             return Err(ReplayError::TooLarge { limit: MAX_WAL_LEN });
         }
@@ -571,12 +615,44 @@ impl RecoverySession {
             });
         }
         replay.committed_len = parsed.committed_len as u64;
-        // `Read::take(...).read_to_end` leaves the shared file cursor at the
-        // old EOF. Recovery callers may hand this same validated descriptor to
-        // `SealWal::resume` without O_APPEND, so position it at the durable end
-        // after both repaired and already-complete replay.
         file.seek(SeekFrom::Start(parsed.committed_len as u64))?;
-        Ok(replay)
+        self.replay = Some(replay);
+        Ok(self.replay.as_ref().unwrap())
+    }
+
+    /// Starts a writer for a newly created, empty WAL while retaining this lease.
+    pub fn into_new_wal(self) -> Result<SealWal<Self>, AppendError> {
+        SealWal::new(self)
+    }
+
+    /// Resumes the replayed WAL on this exact descriptor while retaining the
+    /// exclusive lease for the writer's complete lifetime. Replay evidence is
+    /// stored inside the session, so evidence from another WAL cannot be passed.
+    pub fn resume(mut self) -> Result<SealWal<Self>, AppendError> {
+        let replay = self.replay.take().ok_or(AppendError::InvalidState(
+            "WAL lease has not completed validated replay",
+        ))?;
+        SealWal::resume(self, &replay)
+    }
+}
+
+impl Write for RecoverySession {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.lock.as_file_mut().write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.lock.as_file_mut().flush()
+    }
+}
+
+impl DurableWrite for RecoverySession {
+    fn sync_record(&mut self) -> io::Result<()> {
+        self.lock.as_file().sync_all()
+    }
+
+    fn prepare_append(&mut self) -> io::Result<u64> {
+        self.lock.as_file_mut().seek(SeekFrom::End(0))
     }
 }
 

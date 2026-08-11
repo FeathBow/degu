@@ -15,4 +15,14 @@ pub mod finding;
 pub mod oplog;
 pub mod plan;
 pub mod safety;
+pub mod seal_store;
 pub mod seal_wal;
+
+#[cfg(test)]
+pub(crate) fn secure_test_tempdir() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))?;
+    Ok(temp)
+}

@@ -385,15 +385,14 @@ pub(crate) fn probe_store_parent_backend(path: &Path) -> Result<CertifiedLocalBa
         })
 }
 
-/// Support-only probe used after the activation authority entry has been
-/// observed absent. It first classifies the exact held parent backend without
-/// asking every ancestor to satisfy the certified mutation contract. This
-/// keeps a real NFS/FUSE parent reachable as an explicit unsupported result.
-/// A supported exact parent still goes through the normal full certification.
-pub(crate) fn probe_store_parent_backend_after_authority_absence(
+/// Support-only desired-store probe. It structurally traverses no-follow so a
+/// real NFS/FUSE/tmpfs parent can be classified as definitively unsupported,
+/// but grants no mutation authority. A supported exact parent is repeated
+/// through the fully certified path before support is reported.
+pub(crate) fn probe_store_parent_backend_for_activation_support(
     path: &Path,
 ) -> Result<CertifiedLocalBackend, StoreError> {
-    let (parent, _, parent_path) = open_structurally_authenticated_parent(path)?;
+    let (parent, _, parent_path) = open_parent(path, false)?;
     validate_parent_structure(&parent, &parent_path)?;
     match certify_held_fd_backend(&parent) {
         Err(
@@ -415,67 +414,6 @@ pub(crate) fn open_authenticated_parent(
     path: &Path,
 ) -> Result<(OwnedFd, OsString, PathBuf), StoreError> {
     open_parent(path, true)
-}
-
-/// Structure-only observation of an exact entry beneath an EUID-owned,
-/// namespace-exclusive directory. Neither variant carries mutation authority.
-pub(crate) enum StructuralEntryProbe {
-    Present,
-    Absent(StructuralAbsenceProof),
-}
-
-/// Opaque held-parent proof used only to repeat an absence observation after a
-/// support probe. It deliberately exposes no descriptor or creation method.
-pub(crate) struct StructuralAbsenceProof {
-    parent: OwnedFd,
-    name: OsString,
-    path: PathBuf,
-}
-
-impl StructuralAbsenceProof {
-    pub(crate) fn is_still_absent(&self) -> Result<bool, StoreError> {
-        match rustix::fs::statat(
-            &self.parent,
-            &self.name,
-            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-        ) {
-            Err(rustix::io::Errno::NOENT) => Ok(true),
-            Ok(_) => Ok(false),
-            Err(error) => Err(io_error(&self.path, error.into())),
-        }
-    }
-}
-
-/// Safely establishes only whether `path` is absent. Ancestor and parent
-/// traversal is no-follow and binding-checked, but intentionally performs no
-/// backend/ACL certification so unsupported filesystems remain observable.
-pub(crate) fn probe_private_parent_entry(path: &Path) -> Result<StructuralEntryProbe, StoreError> {
-    let (parent, name, parent_path) = open_structurally_authenticated_parent(path)?;
-    validate_parent_structure(&parent, &parent_path)?;
-    let stat = rustix::fs::fstat(&parent).map_err(|error| io_error(&parent_path, error.into()))?;
-    if stat.st_uid != rustix::process::geteuid().as_raw()
-        || nonowner_write_and_search(raw_mode_u32(stat.st_mode))
-    {
-        return Err(StoreError::UnsafeDirectory {
-            path: parent_path,
-            reason: "absence parent is not EUID-owned and namespace-exclusive",
-        });
-    }
-    match rustix::fs::statat(&parent, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(_) => Ok(StructuralEntryProbe::Present),
-        Err(rustix::io::Errno::NOENT) => Ok(StructuralEntryProbe::Absent(StructuralAbsenceProof {
-            parent,
-            name,
-            path: path.to_path_buf(),
-        })),
-        Err(error) => Err(io_error(path, error.into())),
-    }
-}
-
-fn open_structurally_authenticated_parent(
-    path: &Path,
-) -> Result<(OwnedFd, OsString, PathBuf), StoreError> {
-    open_parent(path, false)
 }
 
 fn open_parent(

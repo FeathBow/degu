@@ -1,11 +1,15 @@
 //! Durable, whole-store activation and discovery authority.
 //!
-//! The seal WAL cannot prove its own continued existence.  This module places a
-//! fixed activation record below canonical HOME, outside the relocatable state
-//! store, and requires a reciprocal marker in the exact store. Stable state
-//! retains matching `prepare` and `active` locator/identity records, so loss of
-//! `active` alone resumes from `prepare`. A missing recorded store is lost
-//! authority, never permission to create an empty one under a changed XDG.
+//! The seal WAL cannot prove its own continued existence. This module places
+//! activation records in one platform/EUID-derived, administrator-provisioned
+//! system anchor outside HOME, XDG, configuration, and the relocatable state
+//! store. Degu opens that anchor but never creates or replaces it. A missing or
+//! unsafe anchor blocks rather than becoming first use or a legacy escape.
+//!
+//! Stable state retains matching `prepare` and `active` locator/identity records
+//! plus a reciprocal marker in the exact store, so loss of `active` alone resumes
+//! from `prepare`. A missing recorded store is lost authority, never permission
+//! to create an empty one under a changed XDG.
 //!
 //! The trust boundary is the same as `seal_store`: root and malicious same-EUID
 //! processes are out of scope. Foreign users are excluded by no-follow,
@@ -14,9 +18,8 @@
 
 use crate::local_backend::{CertificationError, CertifiedLocalBackend, require_held_fd_acl_absent};
 use crate::seal_store::{
-    SealWalStore, StoreError, StructuralEntryProbe, open_authenticated_parent,
-    probe_private_parent_entry, probe_store_parent_backend,
-    probe_store_parent_backend_after_authority_absence, validate_directory,
+    SealWalStore, StoreError, open_authenticated_parent,
+    probe_store_parent_backend_for_activation_support, validate_directory,
 };
 use crate::seal_wal::{ExclusiveFileLock, RecoveryLockError, StrongObjectIdentity};
 use crate::staging_recovery::strong_identity_fd;
@@ -29,13 +32,15 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Fixed HOME-relative root; it intentionally does not honor any XDG variable.
-pub const AUTHORITY_DIRECTORY_NAME: &str = ".degu-store-authority";
+#[cfg(target_os = "linux")]
+const SYSTEM_ANCHOR_ROOT: &str = "/var/lib/degu/store-activation";
+#[cfg(target_os = "macos")]
+const SYSTEM_ANCHOR_ROOT: &str = "/private/var/db/degu/store-activation";
+
 pub const PREPARING_RECORD_NAME: &str = "sealed-staging.prepare";
 pub const ACTIVE_RECORD_NAME: &str = "sealed-staging.active";
 pub const STORE_BINDING_NAME: &str = "store.activation";
 
-const DIRECTORY_MODE: Mode = Mode::RWXU;
 const RECORD_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
 const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
@@ -51,6 +56,38 @@ const MAX_RECORD_BYTES: usize = 128 * 1024;
 const MAX_LOCATOR_BYTES: usize = 64 * 1024;
 static NEXT_TEMP_NAME: AtomicU64 = AtomicU64::new(1);
 
+/// The one activation anchor selected by platform and effective user.
+///
+/// There is deliberately no public arbitrary-path constructor: a locator read
+/// from HOME, XDG, configuration, the environment, or a CLI flag could drift to
+/// an empty directory and forget an earlier activation. Installers provision
+/// [`Self::for_current_euid`] before degu is allowed to activate a store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationAnchorLocator {
+    path: PathBuf,
+}
+
+impl ActivationAnchorLocator {
+    pub fn for_current_euid() -> Result<Self, StoreActivationError> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let path =
+                Path::new(SYSTEM_ANCHOR_ROOT).join(rustix::process::geteuid().as_raw().to_string());
+            Ok(Self { path })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Err(StoreActivationError::Backend(
+                CertificationError::UnsupportedPlatform,
+            ))
+        }
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.path
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreActivationKind {
     NeverActivated,
@@ -64,8 +101,9 @@ pub enum StoreActivationKind {
 /// Result of fixed-root discovery. Only `Activated` carries a store handle.
 pub enum StoreActivationState {
     NeverActivated,
-    /// No authority exists and the desired store backend is explicitly outside
-    /// the certified platform/filesystem set. This is the only legacy escape.
+    /// The authenticated anchor is record-empty and the desired store backend
+    /// is explicitly outside the certified platform/filesystem set. This state
+    /// grants no activation or mutation authority.
     UnsupportedNeverActivated,
     Preparing,
     Activated(ActivatedSealWalStore),
@@ -105,8 +143,10 @@ impl ActivatedSealWalStore {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreActivationError {
-    #[error("canonical HOME is not a safe no-follow authority root: {0}")]
-    UnsafeHome(#[source] StoreError),
+    #[error("system activation anchor is not provisioned at {path}")]
+    AnchorNotProvisioned { path: PathBuf },
+    #[error("system activation anchor is unsafe: {0}")]
+    UnsafeAnchor(#[source] StoreError),
     #[error("store activation I/O failed at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -151,7 +191,8 @@ struct ActiveRecord {
 }
 
 struct AuthorityRoot {
-    _home: OwnedFd,
+    parent: OwnedFd,
+    name: OsString,
     directory: OwnedFd,
     path: PathBuf,
     identity: StrongObjectIdentity,
@@ -159,85 +200,46 @@ struct AuthorityRoot {
     _lock: ExclusiveFileLock,
 }
 
-/// Read the fixed canonical-HOME authority. `desired_store` is inspected only
-/// after the authority entry is authoritatively absent; an existing authority
-/// always goes through strict backend/ACL authentication and every failure
-/// blocks. The structural absence probe grants no store or mutation authority.
+/// Read the one stable, pre-provisioned activation anchor.
+///
+/// The desired store is inspected only when that authenticated anchor is
+/// record-empty. Existing activation evidence always selects its recorded store
+/// and every anchor/open/inspection uncertainty blocks.
 pub fn discover_store_activation(
-    canonical_home: &Path,
+    anchor: &ActivationAnchorLocator,
     desired_store: &Path,
 ) -> Result<StoreActivationState, StoreActivationError> {
-    discover_store_activation_with_probe(canonical_home, desired_store, |path| {
-        probe_desired_store_support_after_authority_absence(path)
-    })
+    discover_store_activation_with_probe(anchor, desired_store, probe_desired_store_support)
 }
 
 fn discover_store_activation_with_probe<F>(
-    canonical_home: &Path,
+    anchor: &ActivationAnchorLocator,
     desired_store: &Path,
-    mut support_probe: F,
+    support_probe: F,
 ) -> Result<StoreActivationState, StoreActivationError>
 where
-    F: FnMut(&Path) -> Result<(), StoreActivationError>,
+    F: FnOnce(&Path) -> Result<(), StoreActivationError>,
 {
-    // Recheck absence through the same held HOME descriptor after the support
-    // probe. This closes the only benign publication race without treating the
-    // structure-only descriptor as authority.
-    for _ in 0..8 {
-        match probe_authority_entry(canonical_home)? {
-            StructuralEntryProbe::Present => {
-                if let Some(authority) = open_authority_root(canonical_home, false)? {
-                    return discover_with_authority(&authority);
-                }
-            }
-            StructuralEntryProbe::Absent(absence) => {
-                let support = support_probe(desired_store);
-                if !absence
-                    .is_still_absent()
-                    .map_err(StoreActivationError::UnsafeHome)?
-                {
-                    continue;
-                }
-                return match support {
-                    Ok(()) => Ok(StoreActivationState::NeverActivated),
-                    Err(StoreActivationError::Backend(
-                        CertificationError::UnsupportedPlatform
-                        | CertificationError::UnsupportedFilesystem,
-                    )) => Ok(StoreActivationState::UnsupportedNeverActivated),
-                    Err(error) => Err(error),
-                };
-            }
-        }
+    let authority = open_activation_anchor(anchor)?;
+    match discover_with_authority(&authority)? {
+        StoreActivationState::NeverActivated => match support_probe(desired_store) {
+            Ok(()) => Ok(StoreActivationState::NeverActivated),
+            Err(StoreActivationError::Backend(
+                CertificationError::UnsupportedPlatform | CertificationError::UnsupportedFilesystem,
+            )) => Ok(StoreActivationState::UnsupportedNeverActivated),
+            Err(error) => Err(error),
+        },
+        state => Ok(state),
     }
-    Err(StoreActivationError::Io {
-        path: canonical_home.join(AUTHORITY_DIRECTORY_NAME),
-        source: io::Error::other("activation authority entry changed during discovery"),
-    })
-}
-
-fn probe_authority_entry(
-    canonical_home: &Path,
-) -> Result<StructuralEntryProbe, StoreActivationError> {
-    validate_absolute_locator(canonical_home)?;
-    probe_private_parent_entry(&canonical_home.join(AUTHORITY_DIRECTORY_NAME))
-        .map_err(StoreActivationError::UnsafeHome)
 }
 
 /// Begin or resume crash-safe activation. `desired_store` is consulted only in
 /// `NeverActivated`; a durable preparing record always wins over changed XDG.
 pub fn activate_or_resume_store(
-    canonical_home: &Path,
+    anchor: &ActivationAnchorLocator,
     desired_store: &Path,
 ) -> Result<ActivatedSealWalStore, StoreActivationError> {
-    // The first probe occurs before authority-root creation, so an explicitly
-    // unsupported first use cannot leave evidence that later blocks legacy.
-    let authority = match open_authority_root(canonical_home, false)? {
-        Some(authority) => authority,
-        None => {
-            probe_desired_store_support(desired_store)?;
-            open_authority_root(canonical_home, true)?.expect("create requested")
-        }
-    };
+    let authority = open_activation_anchor(anchor)?;
     match discover_with_authority(&authority)? {
         StoreActivationState::Activated(store) => return Ok(store),
         StoreActivationState::Lost | StoreActivationState::CorruptOrReplaced => {
@@ -264,8 +266,8 @@ pub fn activate_or_resume_store(
             (record, store)
         }
         None => {
-            // Re-probe while holding the authority lock. The support decision
-            // may have changed after discovery or the pre-creation probe.
+            // Probe while holding the anchor lock. Unsupported or uncertain
+            // storage must not gain activation authority or create a store.
             probe_desired_store_support(desired_store)?;
             let store =
                 SealWalStore::open_or_create(desired_store).map_err(StoreActivationError::Store)?;
@@ -320,15 +322,9 @@ pub fn activate_or_resume_store(
 }
 
 fn probe_desired_store_support(desired_store: &Path) -> Result<(), StoreActivationError> {
-    probe_desired_store_support_with(desired_store, probe_store_parent_backend)
-}
-
-fn probe_desired_store_support_after_authority_absence(
-    desired_store: &Path,
-) -> Result<(), StoreActivationError> {
     probe_desired_store_support_with(
         desired_store,
-        probe_store_parent_backend_after_authority_absence,
+        probe_store_parent_backend_for_activation_support,
     )
 }
 
@@ -493,134 +489,165 @@ fn validate_activated(
             return Err(store_error_from_record_read(error));
         }
     }
+    validate_activation_anchor_binding(
+        &authority.parent,
+        &authority.name,
+        &authority.directory,
+        &authority.path,
+        authority.identity,
+        authority.backend,
+    )?;
     sync_fd(store.directory_fd(), "activated store directory")?;
-    sync_fd(&authority.directory, "activation authority directory")?;
+    sync_fd(&authority.directory, "activation anchor directory")?;
     Ok(StoreActivationState::Activated(ActivatedSealWalStore {
         locator: active.prepare.store_locator,
         store,
     }))
 }
 
-fn open_authority_root(
-    canonical_home: &Path,
-    create: bool,
-) -> Result<Option<AuthorityRoot>, StoreActivationError> {
-    validate_absolute_locator(canonical_home)?;
-    let authority_path = canonical_home.join(AUTHORITY_DIRECTORY_NAME);
-    let (home, name, opened_home_path) =
-        open_authenticated_parent(&authority_path).map_err(StoreActivationError::UnsafeHome)?;
-    if opened_home_path != canonical_home {
+fn open_activation_anchor(
+    locator: &ActivationAnchorLocator,
+) -> Result<AuthorityRoot, StoreActivationError> {
+    let authority_path = locator.as_path();
+    validate_absolute_locator(authority_path)?;
+    let expected_parent = authority_path
+        .parent()
+        .ok_or(StoreActivationError::InvalidLocator)?;
+    let (parent, name, opened_parent_path) = match open_authenticated_parent(authority_path) {
+        Ok(opened) => opened,
+        Err(StoreError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            return Err(StoreActivationError::AnchorNotProvisioned {
+                path: authority_path.to_path_buf(),
+            });
+        }
+        Err(error) => return Err(StoreActivationError::UnsafeAnchor(error)),
+    };
+    if opened_parent_path != expected_parent {
         return Err(StoreActivationError::InvalidLocator);
     }
-    validate_canonical_home(&home, canonical_home)?;
 
-    let mut created = false;
-    let directory = match rustix::fs::openat(&home, &name, OPEN_DIRECTORY, Mode::empty()) {
+    let directory = match rustix::fs::openat(&parent, &name, OPEN_DIRECTORY, Mode::empty()) {
         Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) if !create => return Ok(None),
         Err(rustix::io::Errno::NOENT) => {
-            match rustix::fs::mkdirat(&home, &name, DIRECTORY_MODE) {
-                Ok(()) => created = true,
-                // Another activator may publish between the absent probe and
-                // mkdir. Reopen and authenticate its object; never replace it.
-                Err(rustix::io::Errno::EXIST) => {}
-                Err(error) => {
-                    return Err(StoreActivationError::Io {
-                        path: authority_path.clone(),
-                        source: error.into(),
-                    });
-                }
-            }
-            rustix::fs::openat(&home, &name, OPEN_DIRECTORY, Mode::empty())
-                .map_err(io::Error::from)
-                .map_err(|source| StoreActivationError::Io {
-                    path: authority_path.clone(),
-                    source,
-                })?
+            return Err(StoreActivationError::AnchorNotProvisioned {
+                path: authority_path.to_path_buf(),
+            });
+        }
+        Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
+            return Err(unsafe_anchor(
+                authority_path,
+                "activation anchor is not a no-follow directory",
+            ));
         }
         Err(error) => {
             return Err(StoreActivationError::Io {
-                path: authority_path,
+                path: authority_path.to_path_buf(),
                 source: error.into(),
             });
         }
     };
-    if created {
-        rustix::fs::fchmod(&directory, DIRECTORY_MODE)
-            .map_err(io::Error::from)
-            .map_err(|source| StoreActivationError::Io {
-                path: authority_path.clone(),
-                source,
-            })?;
-    }
-    if validate_directory(&directory, &authority_path).is_err() {
-        return Err(StoreActivationError::UnsafeHome(
-            StoreError::UnsafeDirectory {
-                path: authority_path,
-                reason: "activation authority is not a private certified directory",
-            },
-        ));
-    }
+    validate_directory(&directory, authority_path).map_err(StoreActivationError::UnsafeAnchor)?;
     let identity = strong_identity_fd(&directory).map_err(|_| StoreActivationError::Identity)?;
     let backend = crate::local_backend::certify_held_fd_backend(&directory)
         .map_err(StoreActivationError::Backend)?;
-    if created {
-        sync_fd(&directory, "new authority directory")?;
-    }
-    // Re-establish namespace durability after every successful authority open
-    // and validation, not only after mkdir. A retry necessarily performs this
-    // HOME fsync again before returning authority.
-    sync_fd(&home, "HOME after authority validation")?;
     let lock = try_lock_directory(&directory).map_err(|source| StoreActivationError::Io {
-        path: authority_path.clone(),
+        path: authority_path.to_path_buf(),
         source,
     })?;
-    Ok(Some(AuthorityRoot {
-        _home: home,
+
+    validate_activation_anchor_binding(
+        &parent,
+        &name,
+        &directory,
+        authority_path,
+        identity,
+        backend,
+    )?;
+    // The anchor is provisioned out of process. Re-establish durability of both
+    // its exact contents and its parent binding on every successful open/retry.
+    sync_fd(&directory, "activation anchor directory after validation")?;
+    sync_fd(&parent, "activation anchor parent after validation")?;
+
+    Ok(AuthorityRoot {
+        parent,
+        name,
         directory,
-        path: authority_path,
+        path: authority_path.to_path_buf(),
         identity,
         backend,
         _lock: lock,
-    }))
+    })
 }
 
-fn validate_canonical_home(home: &OwnedFd, path: &Path) -> Result<(), StoreActivationError> {
-    validate_canonical_home_structure(home, path)?;
-    require_held_fd_acl_absent(home).map_err(|_| {
-        StoreActivationError::UnsafeHome(StoreError::UnsafeDirectory {
-            path: path.to_path_buf(),
-            reason: "canonical HOME ACL is present or could not be verified absent",
-        })
-    })?;
-    crate::local_backend::certify_held_fd_backend(home).map_err(StoreActivationError::Backend)?;
-    Ok(())
-}
-
-fn validate_canonical_home_structure(
-    home: &OwnedFd,
+fn validate_activation_anchor_binding(
+    parent: &OwnedFd,
+    name: &OsString,
+    directory: &OwnedFd,
     path: &Path,
+    expected_identity: StrongObjectIdentity,
+    expected_backend: CertifiedLocalBackend,
 ) -> Result<(), StoreActivationError> {
-    let stat = rustix::fs::fstat(home)
+    validate_directory(directory, path).map_err(StoreActivationError::UnsafeAnchor)?;
+    let backend = crate::local_backend::certify_held_fd_backend(directory)
+        .map_err(StoreActivationError::Backend)?;
+    let identity = strong_identity_fd(directory).map_err(|_| StoreActivationError::Identity)?;
+    if backend != expected_backend || identity != expected_identity {
+        return Err(unsafe_anchor(
+            path,
+            "activation anchor backend or strong identity changed",
+        ));
+    }
+
+    let parent_path = path.parent().unwrap_or_else(|| Path::new("/"));
+    let parent_stat = rustix::fs::fstat(parent)
+        .map_err(io::Error::from)
+        .map_err(|source| StoreActivationError::Io {
+            path: parent_path.to_path_buf(),
+            source,
+        })?;
+    let parent_mode = parent_stat.st_mode as u32;
+    if parent_stat.st_uid != 0 && parent_stat.st_uid != rustix::process::geteuid().as_raw() {
+        return Err(unsafe_anchor(
+            parent_path,
+            "activation anchor parent has a foreign non-root owner",
+        ));
+    }
+    if parent_mode & 0o030 == 0o030 || parent_mode & 0o003 == 0o003 {
+        return Err(unsafe_anchor(
+            parent_path,
+            "activation anchor parent grants foreign rename authority",
+        ));
+    }
+
+    let entry = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(io::Error::from)
         .map_err(|source| StoreActivationError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-    let mode = stat.st_mode as u32;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
-        || stat.st_uid != rustix::process::geteuid().as_raw()
-        || mode & 0o030 == 0o030
-        || mode & 0o003 == 0o003
+    let opened = rustix::fs::fstat(directory)
+        .map_err(io::Error::from)
+        .map_err(|source| StoreActivationError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if entry.st_dev != opened.st_dev
+        || entry.st_ino != opened.st_ino
+        || FileType::from_raw_mode(entry.st_mode) != FileType::Directory
     {
-        return Err(StoreActivationError::UnsafeHome(
-            StoreError::UnsafeDirectory {
-                path: path.to_path_buf(),
-                reason: "canonical HOME is not an EUID-owned exclusive directory",
-            },
+        return Err(unsafe_anchor(
+            path,
+            "opened activation anchor is not its exact parent entry",
         ));
     }
     Ok(())
+}
+
+fn unsafe_anchor(path: &Path, reason: &'static str) -> StoreActivationError {
+    StoreActivationError::UnsafeAnchor(StoreError::UnsafeDirectory {
+        path: path.to_path_buf(),
+        reason,
+    })
 }
 
 fn try_lock_directory(directory: &OwnedFd) -> io::Result<ExclusiveFileLock> {

@@ -20,6 +20,8 @@ pub mod seal_executor;
 pub mod seal_store;
 pub mod seal_wal;
 pub mod sealed_staging;
+#[allow(dead_code)] // crate-private lifecycle/held-core integration seam
+mod staging_recovery;
 
 #[cfg(test)]
 pub(crate) fn secure_test_tempdir() -> std::io::Result<tempfile::TempDir> {

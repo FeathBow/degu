@@ -281,6 +281,14 @@ impl HeldLocalBackendEvidence {
         self.mode_verified
     }
 
+    /// Reads only the current mode bits from the already-held descriptor.
+    /// This does not expose the descriptor or grant mutation authority.
+    pub(crate) fn fresh_mode(&self) -> std::io::Result<u32> {
+        rustix::fs::fstat(&self.fd)
+            .map(|stat| raw_mode_u32(stat.st_mode) & 0o7777)
+            .map_err(std::io::Error::from)
+    }
+
     pub fn device(&self) -> u64 {
         self.device
     }
@@ -322,6 +330,46 @@ impl HeldLocalBackendEvidence {
             crate_minimal_sealed_mode(base),
             PreparedModeChangeKind::Seal,
         )
+    }
+
+    /// Re-establish seal lineage after startup recovery has independently
+    /// authenticated this exact held object with strong incarnation evidence.
+    /// This does not inspect a path and cannot be called outside degu-core.
+    #[allow(dead_code, clippy::too_many_arguments)] // startup recovery execution seam
+    pub(crate) fn bind_recovered_seal_lineage(
+        &mut self,
+        transaction: TransactionId,
+        original_mutation_id: u64,
+        original_pre_mode: u32,
+        original_expected_mode: u32,
+        expected_backend: CertifiedLocalBackend,
+        expected_device: u64,
+        expected_inode: u64,
+    ) -> Result<(), LocalModeRevalidationFailure> {
+        if !self.mode_verified
+            || self.seal_lineage.is_some()
+            || self.backend != expected_backend
+            || self.device != expected_device
+            || self.inode != expected_inode
+            || self.mode != original_expected_mode
+        {
+            return Err(LocalModeRevalidationFailure::SealLineageMismatch);
+        }
+        self.seal_lineage = Some(SealLineage {
+            transaction,
+            mutation_id: original_mutation_id,
+            backend: self.backend,
+            mount_id: self.mount_id,
+            device: self.device,
+            inode: self.inode,
+            owner_uid: self.owner_uid,
+            group_gid: self.group_gid,
+            effective_uid: self.effective_uid,
+            effective_groups: self.effective_groups.clone(),
+            original_mode: original_pre_mode,
+            sealed_mode: original_expected_mode,
+        });
+        Ok(())
     }
 
     pub(crate) fn prepare_wal_bound_restore(
@@ -890,6 +938,16 @@ fn raw_dev_u64(device: i32) -> Option<u64> {
 #[cfg(not(target_vendor = "apple"))]
 fn raw_dev_u64(device: u64) -> Option<u64> {
     Some(device)
+}
+
+#[cfg(target_vendor = "apple")]
+fn raw_mode_u32(mode: rustix::fs::RawMode) -> u32 {
+    u32::from(mode)
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn raw_mode_u32(mode: rustix::fs::RawMode) -> u32 {
+    mode
 }
 
 #[cfg(test)]

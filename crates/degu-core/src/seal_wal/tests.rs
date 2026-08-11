@@ -2,6 +2,7 @@ use super::*;
 use std::cell::Cell;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 fn tx(byte: u8) -> TransactionId {
@@ -32,6 +33,53 @@ fn frame(record: &SealRecord) -> Vec<u8> {
     encode_frame(record).unwrap()
 }
 
+fn checked_frame(version: u16, payload: Vec<u8>) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(MAGIC);
+    frame.extend_from_slice(&version.to_le_bytes());
+    frame.extend_from_slice(&0_u16.to_le_bytes());
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&crc32(&frame[4..12]).to_le_bytes());
+    frame.extend_from_slice(&crc32(&payload).to_le_bytes());
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+fn legacy_frame(version: u16, record: &SealRecord) -> Vec<u8> {
+    checked_frame(version, encode_record(record).unwrap())
+}
+
+fn legacy_v3_staging_begin(
+    transaction: TransactionId,
+    metadata: &StagingTransactionMetadata,
+) -> Vec<u8> {
+    fn identity(output: &mut Vec<u8>, identity: StrongObjectIdentity) {
+        output.extend_from_slice(&identity.device().to_le_bytes());
+        output.extend_from_slice(&identity.inode().to_le_bytes());
+        output.extend_from_slice(&identity.incarnation().get().to_le_bytes());
+    }
+    fn locator(output: &mut Vec<u8>, locator: &StagingLocator) {
+        put_bytes(output, locator.relative_path().as_os_str().as_bytes()).unwrap();
+        put_bytes(output, locator.filesystem_id().as_bytes()).unwrap();
+    }
+    let mut payload = vec![5];
+    payload.extend_from_slice(&transaction.0);
+    locator(&mut payload, metadata.source_parent());
+    identity(&mut payload, metadata.source_parent_identity());
+    put_bytes(&mut payload, metadata.source_basename().as_bytes()).unwrap();
+    identity(&mut payload, metadata.root_identity());
+    locator(&mut payload, metadata.destination_parent());
+    identity(&mut payload, metadata.destination_parent_identity());
+    put_bytes(&mut payload, metadata.destination_basename().as_bytes()).unwrap();
+    payload.push(match metadata.backend() {
+        CertifiedLocalBackend::Ext4 => 1,
+        CertifiedLocalBackend::Xfs => 2,
+        CertifiedLocalBackend::Apfs => 3,
+    });
+    payload.push(1); // PermissionSeal
+    checked_frame(3, payload)
+}
+
 fn replay_bytes(bytes: &[u8]) -> Replay {
     let parsed = parse_frames(bytes).unwrap();
     let committed_len = parsed.committed_len as u64;
@@ -48,6 +96,14 @@ fn open_rw(path: &Path) -> File {
         .truncate(false)
         .open(path)
         .unwrap()
+}
+
+fn replay_checked_fixture(bytes: &[u8]) -> Replay {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("legacy.wal");
+    std::fs::write(&path, bytes).unwrap();
+    let mut session = RecoverySession::try_acquire(open_rw(&path)).unwrap();
+    session.replay_and_repair().unwrap().clone()
 }
 
 #[derive(Default)]
@@ -360,14 +416,14 @@ fn checksum_unknown_version_and_malformed_interior_fail_closed() {
 
     let version_path = temp.path().join("version.wal");
     let mut version = good.clone();
-    version[4..6].copy_from_slice(&4_u16.to_le_bytes());
+    version[4..6].copy_from_slice(&5_u16.to_le_bytes());
     let version_header_crc = crc32(&version[4..12]);
     version[12..16].copy_from_slice(&version_header_crc.to_le_bytes());
     std::fs::write(&version_path, &version).unwrap();
     let mut lock = RecoverySession::try_acquire(open_rw(&version_path)).unwrap();
     assert!(matches!(
         lock.replay_and_repair(),
-        Err(ReplayError::UnknownVersion { version: 4, .. })
+        Err(ReplayError::UnsupportedLegacyVersion { version: 5, .. })
     ));
     drop(lock);
 
@@ -382,6 +438,147 @@ fn checksum_unknown_version_and_malformed_interior_fail_closed() {
         Err(ReplayError::Malformed { .. })
     ));
     assert_eq!(std::fs::read(&interior_path).unwrap(), interior);
+}
+
+#[test]
+fn legacy_v1_checksummed_unresolved_permission_replays_explicitly() {
+    let transaction = tx(0x31);
+    let intent = SealRecord::PermissionIntent {
+        transaction,
+        mutation_id: 9,
+        evidence: evidence("legacy/tree"),
+        pre_mode: 0o770,
+        expected_mode: 0o500,
+        reverses_mutation_id: None,
+    };
+    let bytes = [
+        legacy_frame(1, &state(transaction, TransactionState::Prepared)),
+        legacy_frame(1, &state(transaction, TransactionState::ParentSealIntent)),
+        legacy_frame(1, &intent),
+    ]
+    .concat();
+    let replay = replay_checked_fixture(&bytes);
+    let transaction = &replay.transactions[&transaction];
+    assert_eq!(transaction.staging_schema_version, None);
+    assert_eq!(
+        transaction.permissions[0].application,
+        ApplicationStatus::IntentDurableApplicationUnknown
+    );
+}
+
+#[test]
+fn legacy_v3_staging_frame_replays_without_inventing_mount_authority() {
+    let transaction = tx(0x33);
+    let metadata = staging_metadata();
+    let intent = SealRecord::PermissionIntent {
+        transaction,
+        mutation_id: 1,
+        evidence: staging_evidence("source-parent", metadata.source_parent_identity(), 0o500),
+        pre_mode: 0o770,
+        expected_mode: 0o500,
+        reverses_mutation_id: None,
+    };
+    let bytes = [
+        legacy_v3_staging_begin(transaction, &metadata),
+        legacy_frame(3, &state(transaction, TransactionState::ParentSealIntent)),
+        legacy_frame(3, &intent),
+    ]
+    .concat();
+    let replay = replay_checked_fixture(&bytes);
+    let legacy = &replay.transactions[&transaction];
+    assert_eq!(legacy.staging_schema_version, Some(3));
+    assert_eq!(
+        legacy.staging.as_ref().unwrap().root_identity().mount_id(),
+        0
+    );
+    assert_eq!(
+        legacy.permissions[0].application,
+        ApplicationStatus::IntentDurableApplicationUnknown
+    );
+    assert!(matches!(
+        decide_recovery(legacy, |_| RecoveryIdentity::Reestablished),
+        RecoveryWork::RecoveryRequired {
+            reason: RecoveryRequiredReason::LegacySchemaMissingMountIdentity { version: 3 },
+            ..
+        }
+    ));
+    let resumed = SealWal::resume(
+        FaultWriter {
+            bytes,
+            ..FaultWriter::default()
+        },
+        &replay,
+    )
+    .unwrap();
+    assert_eq!(
+        resumed
+            .recovery_snapshot(transaction)
+            .unwrap()
+            .staging_schema_version,
+        Some(3)
+    );
+}
+
+#[test]
+fn staging_begin_version_not_transaction_minimum_controls_mount_authority() {
+    let transaction = tx(0x34);
+    let metadata = staging_metadata();
+    let bytes = [
+        frame(&SealRecord::StagingBegin {
+            transaction,
+            metadata,
+        }),
+        legacy_frame(3, &state(transaction, TransactionState::ParentSealIntent)),
+    ]
+    .concat();
+    let replay = replay_checked_fixture(&bytes);
+    let current_metadata = &replay.transactions[&transaction];
+    assert_eq!(current_metadata.staging_schema_version, Some(VERSION));
+    assert!(!matches!(
+        decide_recovery(current_metadata, |_| RecoveryIdentity::Reestablished),
+        RecoveryWork::RecoveryRequired {
+            reason: RecoveryRequiredReason::LegacySchemaMissingMountIdentity { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn terminal_legacy_staging_metadata_does_not_block_the_next_transaction() {
+    let old_id = tx(0x35);
+    let metadata = staging_metadata();
+    let mut legacy = replay_checked_fixture(&legacy_v3_staging_begin(old_id, &metadata))
+        .transactions
+        .remove(&old_id)
+        .unwrap();
+    assert_eq!(legacy.staging_schema_version, Some(3));
+    for (index, terminal) in [
+        TransactionState::VerifiedCommitted,
+        TransactionState::Restored,
+        TransactionState::RolledBack,
+        TransactionState::Purged,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        legacy.state = terminal;
+        let replay = Replay {
+            transactions: [(old_id, legacy.clone())].into_iter().collect(),
+            tail_repair: None,
+            committed_len: 0,
+        };
+        assert!(!matches!(
+            decide_recovery(&legacy, |_| RecoveryIdentity::Reestablished),
+            RecoveryWork::RecoveryRequired {
+                reason: RecoveryRequiredReason::LegacySchemaMissingMountIdentity { .. },
+                ..
+            }
+        ));
+        let mut wal = SealWal::resume(FaultWriter::default(), &replay).unwrap();
+        assert!(wal.can_begin_staging_transaction());
+        wal.begin_staging(tx(0x40 + index as u8), staging_metadata())
+            .unwrap();
+    }
 }
 
 #[test]
@@ -439,6 +636,7 @@ fn replayed(state: TransactionState) -> ReplayedTransaction {
     ReplayedTransaction {
         id: tx(10),
         state,
+        staging_schema_version: None,
         permissions: vec![DurablePermission {
             mutation_id: 1,
             phase: TransactionState::TreeSealIntent,
@@ -529,13 +727,7 @@ fn decision_callback_receives_evidence_but_not_authority() {
 #[test]
 fn terminal_states_have_no_outgoing_transitions() {
     use TransactionState as S;
-    let terminals = [
-        S::Purged,
-        S::Restored,
-        S::RolledBack,
-        S::Quarantined,
-        S::RecoveryRequired,
-    ];
+    let terminals = [S::Purged, S::Restored, S::RolledBack, S::RecoveryRequired];
     let exception_targets = [
         S::RollbackIntent,
         S::RestoreIntent,
@@ -550,6 +742,8 @@ fn terminal_states_have_no_outgoing_transitions() {
             );
         }
     }
+    assert!(valid_transition(S::Quarantined, S::RecoveryRequired));
+    assert!(!valid_transition(S::Quarantined, S::RestoreIntent));
 }
 
 #[test]
@@ -617,12 +811,11 @@ fn quarantine_is_not_reported_as_a_committed_seal() {
     let result = decide_recovery(&replayed(TransactionState::Quarantined), |_| {
         RecoveryIdentity::Insufficient
     });
-    assert_eq!(
+    assert!(matches!(
         result,
-        RecoveryWork::PreserveQuarantine {
-            transaction: tx(10)
-        }
-    );
+        RecoveryWork::RestoreQuarantinedSeals { transaction, permissions }
+            if transaction == tx(10) && permissions.len() == 1
+    ));
 }
 
 #[test]
@@ -1139,7 +1332,7 @@ fn confirmed_not_applied_seal_cannot_complete_its_phase() {
         TransactionState::ParentSealIntent
     );
     let mut records = parse_frames(&bytes).unwrap().records;
-    records.push(state(transaction, TransactionState::ParentSealed));
+    records.push(state(transaction, TransactionState::ParentSealed).into_versioned());
     assert!(matches!(
         replay_records(records),
         Err(ReplayError::InvalidHistory(
@@ -1253,6 +1446,7 @@ fn strong(device: u64, inode: u64, incarnation: u64) -> StrongObjectIdentity {
         device,
         inode,
         incarnation: ObjectIncarnation::new(incarnation),
+        mount_id: 7,
     }
 }
 
@@ -1313,7 +1507,7 @@ fn staging_begin_is_one_first_frame_and_roundtrips_complete_metadata() {
     let parsed = parse_frames(&wal.into_inner().bytes).unwrap();
     assert_eq!(parsed.records.len(), 1);
     assert!(matches!(
-        &parsed.records[0],
+        &parsed.records[0].record,
         SealRecord::StagingBegin { transaction: id, metadata: actual }
             if *id == transaction && actual == &metadata
     ));

@@ -50,6 +50,8 @@ pub(crate) enum RecoveryRebindError {
     RenameOutcomeUnknown,
     #[error("recovery locator is outside its authenticated anchor")]
     InvalidLocator,
+    #[error("recovery locator anchor or intermediate controller admits foreign namespace writers")]
+    LocatorControllerNotExclusive,
     #[error("recovery filesystem id does not match the durable transaction")]
     FilesystemChanged,
     #[error("recovery backend differs from the durable transaction")]
@@ -116,6 +118,38 @@ impl RecoveryFilesystemAnchor {
             mount_key,
         })
     }
+
+    /// Binds durable locator evidence to an already-held parent descriptor by
+    /// reopening the locator beneath this exact authenticated anchor and
+    /// requiring both descriptors to name the same strong object.
+    fn duplicate_authority(&self) -> Result<Self, RecoveryRebindError> {
+        Ok(Self {
+            fd: rustix::io::dup(&self.fd)
+                .map_err(io::Error::from)
+                .map_err(RecoveryRebindError::Io)?,
+            filesystem_id: self.filesystem_id.clone(),
+            backend: self.backend,
+            mount_key: self.mount_key,
+        })
+    }
+
+    pub(crate) fn verify_locator_binding(
+        &self,
+        locator: &StagingLocator,
+        held_parent: &OwnedFd,
+        expected: StrongObjectIdentity,
+    ) -> Result<(), RecoveryRebindError> {
+        if locator.filesystem_id() != self.filesystem_id {
+            return Err(RecoveryRebindError::FilesystemChanged);
+        }
+        let reopened = open_confined_directory_with_exclusive_ancestors(
+            &self.fd,
+            locator.relative_path(),
+            self.mount_key,
+        )?;
+        validate_fd(self, &reopened, expected)?;
+        validate_fd(self, held_parent, expected)
+    }
 }
 
 #[derive(Debug)]
@@ -124,11 +158,56 @@ pub(crate) struct RecoveryAnchors {
     pub(crate) destination: RecoveryFilesystemAnchor,
 }
 
-/// One exact, freshly rebound object. The parent and object descriptors are
-/// retained together; the value is neither Clone nor Copy and is consumed by
-/// restoration.
+/// Retained authority to re-open and compare a rebound object's complete
+/// anchor-relative parent attachment immediately before proof or mutation.
+#[derive(Debug)]
+struct LocatorAttachment {
+    anchor: RecoveryFilesystemAnchor,
+    parent_locator: PathBuf,
+    parent_identity: StrongObjectIdentity,
+}
+
+impl LocatorAttachment {
+    fn bind(
+        anchor: &RecoveryFilesystemAnchor,
+        object_path: &Path,
+        parent: &OwnedFd,
+    ) -> Result<Self, RecoveryRebindError> {
+        let parent_locator = object_path
+            .parent()
+            .ok_or(RecoveryRebindError::InvalidLocator)?
+            .to_path_buf();
+        Ok(Self {
+            anchor: anchor.duplicate_authority()?,
+            parent_locator,
+            parent_identity: strong_identity_fd(parent)?,
+        })
+    }
+
+    fn verify(&self, held_parent: &OwnedFd) -> Result<(), RecoveryRebindError> {
+        let reopened = if self.parent_locator.as_os_str().is_empty() {
+            rustix::io::dup(&self.anchor.fd)
+                .map_err(io::Error::from)
+                .map_err(RecoveryRebindError::Io)?
+        } else {
+            open_confined_directory_with_exclusive_ancestors(
+                &self.anchor.fd,
+                &self.parent_locator,
+                self.anchor.mount_key,
+            )?
+        };
+        require_exclusive_controller(&reopened)?;
+        validate_fd(&self.anchor, &reopened, self.parent_identity)?;
+        validate_fd(&self.anchor, held_parent, self.parent_identity)
+    }
+}
+
+/// One exact, freshly rebound object. The parent, object, and complete locator
+/// attachment are retained together; the value is neither Clone nor Copy and
+/// is consumed by restoration.
 #[derive(Debug)]
 struct ReboundObject {
+    attachment: LocatorAttachment,
     parent: OwnedFd,
     object_check_fd: OwnedFd,
     basename: OsString,
@@ -139,6 +218,8 @@ struct ReboundObject {
 
 impl ReboundObject {
     fn verify_fresh_binding(&self) -> Result<(), RecoveryRebindError> {
+        self.attachment.verify(&self.parent)?;
+        require_exclusive_controller(&self.parent)?;
         let current = open_directory_at(&self.parent, &self.basename)?;
         if strong_identity_fd(&current)? != self.identity
             || strong_identity_fd(&self.object_check_fd)? != self.identity
@@ -191,6 +272,19 @@ pub(crate) enum StagedVerificationFailure {
     SealCoverage,
     #[error("staged tree does not match its durable manifest")]
     ManifestMismatch,
+}
+
+/// One-use internal proof that exact held-tree verification completed. Its
+/// fields are private to this module, so WAL callers cannot manufacture the
+/// `StagedUnverified -> StagedSealed` authority from a transaction ID.
+pub(crate) struct ExactStagedVerification {
+    transaction: TransactionId,
+}
+
+impl ExactStagedVerification {
+    pub(crate) fn transaction(&self) -> TransactionId {
+        self.transaction
+    }
 }
 
 /// Nonforgeable proof that this exact leased transaction reached only
@@ -271,7 +365,7 @@ impl<'a> CertifiedStagedRecovery<'a> {
         if let Err(failure) = verification {
             return match self
                 .wal
-                .transition_staging(self.transaction, TransactionState::Quarantined)
+                .transition_staging_foundation(self.transaction, TransactionState::Quarantined)
             {
                 Ok(()) => Ok(StagedVerificationOutcome::Quarantined),
                 Err(source) => {
@@ -280,7 +374,9 @@ impl<'a> CertifiedStagedRecovery<'a> {
             };
         }
         self.wal
-            .transition_staging(self.transaction, TransactionState::StagedSealed)
+            .record_staged_sealed(ExactStagedVerification {
+                transaction: self.transaction,
+            })
             .map_err(StagedVerificationError::StagedSealedNotDurable)?;
         Ok(StagedVerificationOutcome::StagedSealed(
             VerifiedStagedTree {
@@ -420,7 +516,7 @@ impl RecoveryRestoreSession<'_> {
             && current != Some(TransactionState::RestoreIntent)
         {
             self.wal
-                .transition_staging(transaction, TransactionState::RestoreIntent)?;
+                .transition_staging_foundation(transaction, TransactionState::RestoreIntent)?;
         }
 
         // Sorting is repeated here rather than trusting serialized/report order.
@@ -453,17 +549,17 @@ impl RecoveryRestoreSession<'_> {
                 LocalModeMutationRequest {
                     transaction,
                     mutation_id,
-                    locator: RecoveryLocator {
-                        relative_path: rebound.relative_path,
-                        filesystem_id: original.evidence.filesystem_id().map(str::to_owned),
-                    },
+                    locator: RecoveryLocator::durable_restore(
+                        rebound.relative_path,
+                        original.evidence.filesystem_id().map(str::to_owned),
+                    ),
                     transform: LocalModeTransform::Restore { original },
                 },
             )?;
         }
         if self.wal.transaction_state(transaction) != Some(self.restore.completion) {
             self.wal
-                .transition_staging(transaction, self.restore.completion)?;
+                .transition_staging_foundation(transaction, self.restore.completion)?;
         }
         *self.startup_blocked = !self.wal.can_begin_staging_transaction();
         Ok(())
@@ -545,6 +641,25 @@ pub(crate) fn prepare_startup_recovery<'a>(
         break (metadata, snapshot.tree_manifest, work);
     };
 
+    if matches!(
+        &work,
+        RecoveryWork::RestoreBeforeRename { permissions, .. } if permissions.is_empty()
+    ) && matches!(
+        wal.transaction_state(transaction),
+        Some(TransactionState::Prepared | TransactionState::ParentSealIntent)
+    ) {
+        return Ok(StartupRecoveryCapability::Restore(RecoveryRestoreSession {
+            wal,
+            startup_blocked,
+            restore: ReboundRestore {
+                transaction,
+                source_parent_last: metadata.source_parent().relative_path().to_path_buf(),
+                entries: Vec::new(),
+                completion: TransactionState::Restored,
+            },
+        }));
+    }
+
     match rebind_work(&metadata, tree_manifest, work, &anchors) {
         Ok(ReboundWork::Restore(restore)) => {
             Ok(StartupRecoveryCapability::Restore(RecoveryRestoreSession {
@@ -553,16 +668,29 @@ pub(crate) fn prepare_startup_recovery<'a>(
                 restore,
             }))
         }
-        Ok(ReboundWork::VerifyStaged(staged)) => Ok(
-            StartupRecoveryCapability::PendingVerification(Box::new(CertifiedStagedRecovery {
-                wal,
-                startup_blocked,
-                transaction,
-                root: staged.root,
-                expected_manifest: staged.expected_manifest,
-                rebound_tree_seals: staged.tree_seals,
-            })),
-        ),
+        Ok(ReboundWork::VerifyStaged(staged)) => {
+            staged.root.verify_fresh_binding()?;
+            // A crash after the durable applied+parents-synced outcome but
+            // before the state append leaves RenameIntent as the durable state.
+            // The exact outcome and fresh destination rebind jointly authorize
+            // only this normalization; verification remains mandatory.
+            if wal.transaction_state(transaction) == Some(TransactionState::RenameIntent) {
+                wal.transition_staging_foundation(transaction, TransactionState::StagedUnverified)?;
+            }
+            if wal.transaction_state(transaction) != Some(TransactionState::StagedUnverified) {
+                return Err(RecoveryRebindError::TransactionMismatch);
+            }
+            Ok(StartupRecoveryCapability::PendingVerification(Box::new(
+                CertifiedStagedRecovery {
+                    wal,
+                    startup_blocked,
+                    transaction,
+                    root: staged.root,
+                    expected_manifest: staged.expected_manifest,
+                    rebound_tree_seals: staged.tree_seals,
+                },
+            )))
+        }
         Err(error) => fail_closed(wal, transaction, error),
     }
 }
@@ -573,7 +701,7 @@ fn fail_closed<T>(
     error: RecoveryRebindError,
 ) -> Result<T, RecoveryRebindError> {
     if wal.transaction_state(transaction) != Some(TransactionState::RecoveryRequired) {
-        wal.transition_staging(transaction, TransactionState::RecoveryRequired)?;
+        wal.transition_staging_foundation(transaction, TransactionState::RecoveryRequired)?;
     }
     Err(error)
 }
@@ -615,7 +743,8 @@ fn resolve_uncertain_permissions(
             anchor.mount_key,
         );
         let (parent, basename) = open_confined_parent(&anchor.fd, &path, anchor.mount_key)?;
-        let rebound = rebind_named_child(parent, &basename, expected, path, metadata, None)?;
+        let rebound =
+            rebind_named_child(anchor, parent, &basename, expected, path, metadata, None)?;
         resolve_rebound_permission(wal, transaction, &permission, &rebound)?;
     }
     Ok(())
@@ -760,6 +889,7 @@ fn rebind_work(
                 return Err(RecoveryRebindError::TransactionMismatch);
             }
             let root = rebind_named_child(
+                &anchors.source,
                 source_parent,
                 metadata.source_basename(),
                 metadata.root_identity(),
@@ -788,6 +918,7 @@ fn rebind_work(
                 return Err(RecoveryRebindError::TransactionMismatch);
             }
             let staged = rebind_named_child(
+                &anchors.destination,
                 destination_parent,
                 metadata.destination_basename(),
                 metadata.root_identity(),
@@ -816,6 +947,7 @@ fn rebind_work(
                 return Err(RecoveryRebindError::TransactionMismatch);
             }
             let staged = rebind_named_child(
+                &anchors.destination,
                 destination_parent,
                 metadata.destination_basename(),
                 metadata.root_identity(),
@@ -845,6 +977,7 @@ fn rebind_work(
             }
             drop(source_parent);
             let root = rebind_named_child(
+                &anchors.destination,
                 destination_parent,
                 metadata.destination_basename(),
                 metadata.root_identity(),
@@ -982,6 +1115,7 @@ fn rebind_staged_tree_seals(
         let (parent, basename) =
             open_confined_parent(&destination_anchor.fd, &path, destination_anchor.mount_key)?;
         let object = rebind_named_child(
+            destination_anchor,
             parent,
             &basename,
             expected,
@@ -1016,6 +1150,7 @@ fn rebind_permissions(
             );
             let (parent, basename) = open_confined_parent(&anchor.fd, &path, anchor.mount_key)?;
             let rebound = rebind_named_child(
+                anchor,
                 parent,
                 &basename,
                 expected,
@@ -1072,6 +1207,7 @@ fn rebind_quarantined_permissions(
             );
             let (parent, basename) = open_confined_parent(&anchor.fd, &path, anchor.mount_key)?;
             let rebound = rebind_named_child(
+                anchor,
                 parent,
                 &basename,
                 expected,
@@ -1085,6 +1221,7 @@ fn rebind_quarantined_permissions(
 }
 
 fn rebind_named_child(
+    anchor: &RecoveryFilesystemAnchor,
     parent: OwnedFd,
     basename: &OsStr,
     expected: StrongObjectIdentity,
@@ -1095,6 +1232,8 @@ fn rebind_named_child(
     if !normal_basename(basename) {
         return Err(RecoveryRebindError::InvalidLocator);
     }
+    let attachment = LocatorAttachment::bind(anchor, &relative_path, &parent)?;
+    attachment.verify(&parent)?;
     let fd = open_directory_at(&parent, basename)?;
     if strong_identity_fd(&fd)? != expected {
         return Err(RecoveryRebindError::BindingChanged);
@@ -1118,6 +1257,7 @@ fn rebind_named_child(
         return Err(RecoveryRebindError::ModeChanged);
     }
     Ok(ReboundObject {
+        attachment,
         parent,
         object_check_fd,
         basename: basename.to_os_string(),
@@ -1144,7 +1284,16 @@ fn validate_fd(
     Ok(())
 }
 
-fn open_confined_directory(
+fn require_exclusive_controller(fd: &OwnedFd) -> Result<(), RecoveryRebindError> {
+    let duplicate = rustix::io::dup(fd)
+        .map_err(io::Error::from)
+        .map_err(RecoveryRebindError::Io)?;
+    certify_held_fd(duplicate)?
+        .verify_namespace_exclusive()
+        .map_err(|_| RecoveryRebindError::LocatorControllerNotExclusive)
+}
+
+fn open_confined_directory_with_exclusive_ancestors(
     anchor: &OwnedFd,
     path: &Path,
     expected_mount: u64,
@@ -1158,6 +1307,7 @@ fn open_confined_directory(
             return Err(RecoveryRebindError::InvalidLocator);
         };
         saw_component = true;
+        require_exclusive_controller(&current)?;
         current = open_directory_at(&current, name)?;
         if held_mount_key(&current)? != expected_mount {
             return Err(RecoveryRebindError::MountChanged);
@@ -1166,6 +1316,14 @@ fn open_confined_directory(
     saw_component
         .then_some(current)
         .ok_or(RecoveryRebindError::InvalidLocator)
+}
+
+fn open_confined_directory(
+    anchor: &OwnedFd,
+    path: &Path,
+    expected_mount: u64,
+) -> Result<OwnedFd, RecoveryRebindError> {
+    open_confined_directory_with_exclusive_ancestors(anchor, path, expected_mount)
 }
 
 fn open_confined_parent(
@@ -1186,6 +1344,7 @@ fn open_confined_parent(
     } else {
         open_confined_directory(anchor, parent, expected_mount)?
     };
+    require_exclusive_controller(&parent_fd)?;
     Ok((parent_fd, basename))
 }
 
@@ -1253,7 +1412,9 @@ fn held_mount_key(_fd: &OwnedFd) -> Result<u64, RecoveryRebindError> {
 }
 
 #[cfg(target_os = "linux")]
-fn strong_identity_fd(fd: &OwnedFd) -> Result<StrongObjectIdentity, RecoveryRebindError> {
+pub(crate) fn strong_identity_fd(
+    fd: &OwnedFd,
+) -> Result<StrongObjectIdentity, RecoveryRebindError> {
     use rustix::fs::{AtFlags, StatxFlags, statx};
     let requested = StatxFlags::BASIC_STATS | StatxFlags::BTIME | StatxFlags::MNT_ID;
     let statx = statx(fd, c"", AtFlags::EMPTY_PATH, requested)
@@ -1276,7 +1437,9 @@ fn strong_identity_fd(fd: &OwnedFd) -> Result<StrongObjectIdentity, RecoveryRebi
 }
 
 #[cfg(target_os = "macos")]
-fn strong_identity_fd(fd: &OwnedFd) -> Result<StrongObjectIdentity, RecoveryRebindError> {
+pub(crate) fn strong_identity_fd(
+    fd: &OwnedFd,
+) -> Result<StrongObjectIdentity, RecoveryRebindError> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `stat` is valid writable storage and fd remains owned for the call.
     if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
@@ -1300,7 +1463,9 @@ fn strong_identity_fd(fd: &OwnedFd) -> Result<StrongObjectIdentity, RecoveryRebi
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn strong_identity_fd(_fd: &OwnedFd) -> Result<StrongObjectIdentity, RecoveryRebindError> {
+pub(crate) fn strong_identity_fd(
+    _fd: &OwnedFd,
+) -> Result<StrongObjectIdentity, RecoveryRebindError> {
     Err(RecoveryRebindError::StrongIdentityUnavailable)
 }
 

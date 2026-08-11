@@ -151,6 +151,7 @@ pub enum LocalModeRevalidationFailure {
     SealAlreadyActive,
     MissingSealLineage,
     SealLineageMismatch,
+    NamespaceWritersPresent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +301,17 @@ impl HeldLocalBackendEvidence {
     ) -> Result<(), LocalModeRevalidationFailure> {
         let actual = inspect_held_fd(&self.fd)?;
         validate_snapshot(&actual, &self.certified_snapshot(), expected_mode)
+    }
+
+    /// Requires the exact held parent to exclude group/world namespace writers.
+    /// Owner write+search remains necessary for the later FD-relative rename.
+    pub(crate) fn verify_namespace_exclusive(&self) -> Result<(), LocalModeRevalidationFailure> {
+        self.verify_current_mode(self.mode)?;
+        if self.mode & 0o030 == 0o030 || self.mode & 0o003 == 0o003 {
+            Err(LocalModeRevalidationFailure::NamespaceWritersPresent)
+        } else {
+            Ok(())
+        }
     }
 
     pub fn device(&self) -> u64 {

@@ -1,14 +1,18 @@
-//! Core-private bounded held-FD traversal and exact rewalk foundation.
+//! Core-private bounded held-FD traversal, sealing, and exact rewalk foundation.
 //!
-//! This deliberately narrow slice performs no chmod, WAL mutation, rename,
-//! purge, or deletion. It returns no lifecycle authority token. A future
-//! staging coordinator must add a lease-bound mutation seam and derive every
-//! durable locator and incarnation from validated staging metadata and held
-//! kernel evidence before this module may participate in sealing.
+//! Collection and rewalk are authority-neutral. A3c2 adds one narrow method that
+//! can apply minimal directory seals only when given an exact leased staging WAL
+//! and descriptor-derived incarnations. This module performs no rename, restore,
+//! purge, unlink, or deletion and returns no lifecycle authority token.
 
 use crate::local_backend::{
     CertificationError, CertifiedLocalBackend, HeldLocalBackendEvidence, certify_held_fd,
 };
+use crate::seal_executor::{
+    LocalModeExecutionError, LocalModeMutationRequest, LocalModeMutationResult, LocalModeTransform,
+    RecoveryLocator, execute_staging_local_mode_mutation,
+};
+use crate::seal_wal::{DurableWrite, SealWal, StrongObjectIdentity, TransactionId};
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -97,6 +101,20 @@ pub(crate) enum HeldTreeError {
     },
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum HeldTreeSealError {
+    #[error("tree seal mutation id space is exhausted")]
+    MutationIdExhausted,
+    #[error("held tree seal failed at {path}: {source}")]
+    Mutation {
+        path: PathBuf,
+        #[source]
+        source: LocalModeExecutionError,
+    },
+    #[error("held tree seal was durably confirmed not applied at {0}")]
+    ConfirmedNotApplied(PathBuf),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NodeKind {
     Directory,
@@ -149,8 +167,9 @@ struct HeldDirectory {
     incarnation: u64,
 }
 
-/// Private bounded inventory retaining all directory FDs only so that the same
-/// objects can be rewalked. This is not rename, purge, or staging authority.
+/// Private bounded inventory retaining all directory FDs for exact rewalk and
+/// lease-bound minimal sealing. By itself it carries no WAL lease and is not
+/// rename, restore, purge, or deletion authority.
 pub(crate) struct HeldTreeInventory {
     parent: HeldLocalBackendEvidence,
     root_name: OsString,
@@ -260,6 +279,101 @@ impl HeldTreeInventory {
                 incarnation: directory.incarnation,
                 observed_mode: directory.held.mode(),
             })
+    }
+
+    pub(crate) fn root_strong_identity(&self) -> StrongObjectIdentity {
+        StrongObjectIdentity::new_with_mount(
+            self.root_identity.device,
+            self.root_identity.inode,
+            crate::seal_wal::ObjectIncarnation::new(self.root_identity.incarnation),
+            self.mount_id,
+        )
+    }
+
+    /// Applies only the fixed minimal directory seals represented by this exact
+    /// inventory. Every mutation is held-FD-only and bound to the leased staging
+    /// WAL with the directory's strong incarnation.
+    pub(crate) fn seal_directories_for_staging<W: DurableWrite>(
+        &mut self,
+        wal: &mut SealWal<W>,
+        transaction: TransactionId,
+        source_root: &Path,
+        filesystem_id: &str,
+        first_mutation_id: u64,
+    ) -> Result<u64, HeldTreeSealError> {
+        let mut mutation_id = first_mutation_id;
+        for directory in self.directories.iter_mut().rev() {
+            let relative_path = source_root.join(&directory.path);
+            let result = execute_staging_local_mode_mutation(
+                wal,
+                &mut directory.held,
+                LocalModeMutationRequest {
+                    transaction,
+                    mutation_id,
+                    locator: RecoveryLocator::held_staging(
+                        relative_path,
+                        filesystem_id.to_owned(),
+                        directory.incarnation,
+                    ),
+                    transform: LocalModeTransform::Seal {
+                        acquire_owner_write_search: false,
+                    },
+                },
+            )
+            .map_err(|source| HeldTreeSealError::Mutation {
+                path: directory.path.clone(),
+                source,
+            })?;
+            if result == LocalModeMutationResult::ConfirmedNotApplied {
+                return Err(HeldTreeSealError::ConfirmedNotApplied(
+                    directory.path.clone(),
+                ));
+            }
+            mutation_id = mutation_id
+                .checked_add(1)
+                .ok_or(HeldTreeSealError::MutationIdExhausted)?;
+        }
+        Ok(mutation_id)
+    }
+
+    /// Proves that a fresh post-seal inventory names the same objects and only
+    /// changes directory modes to the exact modes held by this inventory.
+    pub(crate) fn verify_post_seal_snapshot(
+        &self,
+        post: &HeldTreeInventory,
+    ) -> Result<(), HeldTreeError> {
+        if self.backend != post.backend
+            || self.mount_id != post.mount_id
+            || self.root_identity != post.root_identity
+            || self.manifest.len() != post.manifest.len()
+        {
+            return Err(HeldTreeError::RootBindingChanged);
+        }
+        let sealed_modes = self
+            .directories
+            .iter()
+            .map(|directory| (directory.path.as_path(), directory.held.mode()))
+            .collect::<BTreeMap<_, _>>();
+        for (before, after) in self.manifest.iter().zip(&post.manifest) {
+            if before.path != after.path
+                || before.identity != after.identity
+                || before.uid != after.uid
+                || before.gid != after.gid
+            {
+                return Err(HeldTreeError::PostChanged(after.path.clone()));
+            }
+            let expected_mode = if before.identity.kind == NodeKind::Directory {
+                *sealed_modes
+                    .get(before.path.as_path())
+                    .ok_or_else(|| HeldTreeError::PostChanged(before.path.clone()))?
+            } else {
+                before.mode
+            };
+            if after.mode != expected_mode {
+                return Err(HeldTreeError::PostChanged(after.path.clone()));
+            }
+        }
+        Ok(())
     }
 
     /// Performs a complete second walk under the identical policy and limits.

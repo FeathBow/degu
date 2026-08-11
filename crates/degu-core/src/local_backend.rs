@@ -7,6 +7,9 @@
 //! `fchmod` primitive reserved for degu-core's durable WAL wrapper.
 
 use crate::seal_wal::TransactionId;
+
+#[allow(dead_code)] // closed, authority-neutral traversal foundation
+pub(crate) mod held_tree;
 use rustix::fd::{AsFd, OwnedFd};
 use std::collections::BTreeSet;
 #[cfg(target_os = "linux")]
@@ -289,6 +292,16 @@ impl HeldLocalBackendEvidence {
             .map_err(std::io::Error::from)
     }
 
+    /// Revalidates the complete certified directory snapshot at a required
+    /// current mode without exposing the held descriptor or mutation authority.
+    pub(crate) fn verify_current_mode(
+        &self,
+        expected_mode: u32,
+    ) -> Result<(), LocalModeRevalidationFailure> {
+        let actual = inspect_held_fd(&self.fd)?;
+        validate_snapshot(&actual, &self.certified_snapshot(), expected_mode)
+    }
+
     pub fn device(&self) -> u64 {
         self.device
     }
@@ -309,6 +322,13 @@ impl HeldLocalBackendEvidence {
     /// token to existing mutation code.
     pub fn is_live(&self) -> bool {
         rustix::fs::fcntl_getfl(&self.fd).is_ok()
+    }
+
+    /// Parent-private adapter for the child held-tree foundation. Sibling
+    /// modules cannot obtain this descriptor, and the borrow cannot escape the
+    /// operation's lifetime.
+    fn with_authority_fd<R>(&self, operation: impl FnOnce(rustix::fd::BorrowedFd<'_>) -> R) -> R {
+        operation(self.fd.as_fd())
     }
 
     pub(crate) fn prepare_minimal_seal(

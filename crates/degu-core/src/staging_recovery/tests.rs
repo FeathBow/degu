@@ -110,6 +110,7 @@ fn inode_reuse_or_changed_incarnation_never_rebinds() {
     .unwrap();
     let result = rebind_work(
         &metadata,
+        None,
         RecoveryWork::RestoreBeforeRename {
             transaction: TransactionId([1; 16]),
             permissions: vec![],
@@ -164,6 +165,7 @@ fn exact_name_replacement_is_rejected_even_on_same_backend() {
     fs::create_dir(source.join("root")).unwrap();
     let result = rebind_work(
         &fixture.metadata,
+        None,
         RecoveryWork::RestoreBeforeRename {
             transaction: TransactionId([2; 16]),
             permissions: vec![],
@@ -180,6 +182,7 @@ fn capability_rechecks_name_immediately_before_use() {
     };
     let rebound = rebind_work(
         &fixture.metadata,
+        None,
         RecoveryWork::VerifyOrQuarantineAfterRename {
             transaction: TransactionId([3; 16]),
             permissions: vec![],
@@ -187,14 +190,14 @@ fn capability_rechecks_name_immediately_before_use() {
         &anchors(&fixture),
     )
     .unwrap();
-    let ReboundWork::VerifyStaged(root) = rebound else {
+    let ReboundWork::VerifyStaged(staged) = rebound else {
         panic!("expected staged capability");
     };
     let destination = fixture._temp.path().join("destination");
     fs::rename(destination.join("staged"), destination.join("old-staged")).unwrap();
     fs::create_dir(destination.join("staged")).unwrap();
     assert!(matches!(
-        root.verify_fresh_binding(),
+        staged.root.verify_fresh_binding(),
         Err(RecoveryRebindError::BindingChanged)
     ));
 }
@@ -928,6 +931,342 @@ fn repeated_unknown_rename_attempts_never_lookup_or_erase_typed_ambiguity() {
     }
     assert_eq!(RECOVERY_NAME_LOOKUPS.get(), 0);
     assert!(startup_blocked);
+}
+
+fn staged_pending(
+    include_tree_seal: bool,
+    manifest_matches: bool,
+) -> Option<(Fixture, SealWal<RecoverySession>, bool, TransactionId)> {
+    let fixture = fixture(true)?;
+    let transaction = TransactionId([0xa3; 16]);
+    let store_path = fixture._temp.path().join("verifier-wal");
+    let store = SealWalStore::open_or_create(&store_path).ok()?;
+    let mut wal = store.try_lease().ok()?.into_new_wal().ok()?;
+    wal.begin_staging(transaction, fixture.metadata.clone())
+        .ok()?;
+
+    let source = fixture._temp.path().join("source");
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o770)).ok()?;
+    let source_identity = fixture.metadata.source_parent_identity();
+    let source_fd = open_dir(&source);
+    wal.transition_staging(transaction, TransactionState::ParentSealIntent)
+        .ok()?;
+    wal.apply_staging_permission_mutation(
+        PermissionIntent {
+            transaction,
+            mutation_id: 1,
+            evidence: PersistentRecoveryEvidence::new(
+                PathBuf::from("source"),
+                Some(fixture.filesystem_id.clone()),
+                source_identity.device(),
+                source_identity.inode(),
+                Some(source_identity.incarnation().get()),
+                0o750,
+            )?,
+            pre_mode: 0o770,
+            expected_mode: 0o750,
+            reverses_mutation_id: None,
+        },
+        || rustix::fs::fchmod(&source_fd, Mode::from_raw_mode(0o750)).map_err(io::Error::from),
+    )
+    .ok()?;
+    wal.transition_staging(transaction, TransactionState::ParentSealed)
+        .ok()?;
+    wal.transition_staging(transaction, TransactionState::TreeSealIntent)
+        .ok()?;
+
+    let destination = fixture._temp.path().join("destination");
+    let staged = destination.join("staged");
+    let child = staged.join("child");
+    fs::create_dir(&child).ok()?;
+    fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).ok()?;
+    let child_identity = strong_identity_fd(&open_dir(&child)).ok()?;
+    let root_identity = fixture.metadata.root_identity();
+    if include_tree_seal {
+        let root_fd = open_dir(&staged);
+        wal.apply_staging_permission_mutation(
+            PermissionIntent {
+                transaction,
+                mutation_id: 2,
+                evidence: PersistentRecoveryEvidence::new(
+                    PathBuf::from("source/root"),
+                    Some(fixture.filesystem_id.clone()),
+                    root_identity.device(),
+                    root_identity.inode(),
+                    Some(root_identity.incarnation().get()),
+                    0o500,
+                )?,
+                pre_mode: 0o700,
+                expected_mode: 0o500,
+                reverses_mutation_id: None,
+            },
+            || rustix::fs::fchmod(&root_fd, Mode::from_raw_mode(0o500)).map_err(io::Error::from),
+        )
+        .ok()?;
+        let child_fd = open_dir(&child);
+        wal.apply_staging_permission_mutation(
+            PermissionIntent {
+                transaction,
+                mutation_id: 3,
+                evidence: PersistentRecoveryEvidence::new(
+                    PathBuf::from("source/root/child"),
+                    Some(fixture.filesystem_id.clone()),
+                    child_identity.device(),
+                    child_identity.inode(),
+                    Some(child_identity.incarnation().get()),
+                    0o500,
+                )?,
+                pre_mode: 0o700,
+                expected_mode: 0o500,
+                reverses_mutation_id: None,
+            },
+            || rustix::fs::fchmod(&child_fd, Mode::from_raw_mode(0o500)).map_err(io::Error::from),
+        )
+        .ok()?;
+    }
+    let inventory = HeldTreeInventory::collect(
+        certify_held_fd(open_dir(&destination)).ok()?,
+        OsStr::new("staged"),
+        crate::safety::PROTECTED_DESCENDANT_DIR_NAMES
+            .iter()
+            .map(OsString::from)
+            .collect(),
+        HeldTreeLimits::default(),
+    )
+    .ok()?;
+    let fingerprint = inventory.fingerprint();
+    let manifest = DurableTreeManifest {
+        entry_count: fingerprint.entry_count,
+        sha256: if manifest_matches {
+            fingerprint.sha256
+        } else {
+            [0x55; 32]
+        },
+    };
+    wal.complete_tree_manifest(transaction, manifest).ok()?;
+    wal.transition_staging(transaction, TransactionState::TreeSealed)
+        .ok()?;
+    wal.record_rename_intent(transaction).ok()?;
+    wal.record_applied_rename_for_test(transaction).ok()?;
+    wal.transition_staging(transaction, TransactionState::StagedUnverified)
+        .ok()?;
+    Some((fixture, wal, true, transaction))
+}
+
+#[test]
+fn pending_verification_consumes_exact_tree_and_stops_at_staged_sealed() {
+    let Some((fixture, mut wal, mut startup_blocked, transaction)) = staged_pending(true, true)
+    else {
+        return;
+    };
+    let capability = prepare_startup_recovery(
+        &mut wal,
+        &mut startup_blocked,
+        transaction,
+        anchors(&fixture),
+    )
+    .unwrap();
+    let StartupRecoveryCapability::PendingVerification(pending) = capability else {
+        panic!("expected pending verification");
+    };
+    let StagedVerificationOutcome::StagedSealed(verified) = pending.verify_or_quarantine().unwrap()
+    else {
+        panic!("matching staged tree must verify");
+    };
+    assert_eq!(verified.transaction(), transaction);
+    assert_eq!(verified.wal_state(), Some(TransactionState::StagedSealed));
+    assert!(verified.startup_is_blocked());
+    assert_eq!(
+        wal.transaction_state(transaction),
+        Some(TransactionState::StagedSealed)
+    );
+    assert!(startup_blocked);
+}
+
+#[test]
+fn dropping_pending_before_transition_replays_staged_unverified() {
+    let Some((fixture, mut wal, mut startup_blocked, transaction)) = staged_pending(true, true)
+    else {
+        return;
+    };
+    let capability = prepare_startup_recovery(
+        &mut wal,
+        &mut startup_blocked,
+        transaction,
+        anchors(&fixture),
+    )
+    .unwrap();
+    assert!(matches!(
+        capability,
+        StartupRecoveryCapability::PendingVerification(_)
+    ));
+    drop(capability);
+    drop(wal);
+
+    let store = SealWalStore::open_or_create(&fixture._temp.path().join("verifier-wal")).unwrap();
+    let (reopened, report) = crate::sealed_staging::SealedStagingEngine::open(&store).unwrap();
+    assert_eq!(report.candidates.len(), 1);
+    assert_eq!(
+        reopened.state(transaction),
+        Some(TransactionState::StagedUnverified)
+    );
+}
+
+#[test]
+fn durable_staged_sealed_replays_without_commit_promotion() {
+    let Some((fixture, mut wal, mut startup_blocked, transaction)) = staged_pending(true, true)
+    else {
+        return;
+    };
+    let capability = prepare_startup_recovery(
+        &mut wal,
+        &mut startup_blocked,
+        transaction,
+        anchors(&fixture),
+    )
+    .unwrap();
+    let StartupRecoveryCapability::PendingVerification(pending) = capability else {
+        panic!("expected pending verification");
+    };
+    let outcome = pending.verify_or_quarantine().unwrap();
+    assert!(matches!(
+        outcome,
+        StagedVerificationOutcome::StagedSealed(_)
+    ));
+    drop(wal);
+
+    let store = SealWalStore::open_or_create(&fixture._temp.path().join("verifier-wal")).unwrap();
+    let (reopened, report) = crate::sealed_staging::SealedStagingEngine::open(&store).unwrap();
+    assert_eq!(report.candidates.len(), 1);
+    assert_eq!(
+        reopened.state(transaction),
+        Some(TransactionState::StagedSealed)
+    );
+    assert_ne!(
+        reopened.state(transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+}
+
+#[test]
+fn manifest_mismatch_is_durably_quarantined_without_mode_restore() {
+    let Some((fixture, mut wal, mut startup_blocked, transaction)) = staged_pending(true, false)
+    else {
+        return;
+    };
+    let staged = fixture._temp.path().join("destination/staged");
+    let mode_before = fs::metadata(&staged).unwrap().permissions().mode() & 0o7777;
+    let capability = prepare_startup_recovery(
+        &mut wal,
+        &mut startup_blocked,
+        transaction,
+        anchors(&fixture),
+    )
+    .unwrap();
+    let StartupRecoveryCapability::PendingVerification(pending) = capability else {
+        panic!("expected pending verification");
+    };
+    assert!(matches!(
+        pending.verify_or_quarantine().unwrap(),
+        StagedVerificationOutcome::Quarantined
+    ));
+    assert_eq!(
+        wal.transaction_state(transaction),
+        Some(TransactionState::Quarantined)
+    );
+    assert_eq!(
+        fs::metadata(staged).unwrap().permissions().mode() & 0o7777,
+        mode_before
+    );
+    assert!(startup_blocked);
+}
+
+#[test]
+fn mode_drift_after_capability_creation_is_durably_quarantined() {
+    let Some((fixture, mut wal, mut startup_blocked, transaction)) = staged_pending(true, true)
+    else {
+        return;
+    };
+    let capability = prepare_startup_recovery(
+        &mut wal,
+        &mut startup_blocked,
+        transaction,
+        anchors(&fixture),
+    )
+    .unwrap();
+    let StartupRecoveryCapability::PendingVerification(pending) = capability else {
+        panic!("expected pending verification");
+    };
+    fs::set_permissions(
+        fixture._temp.path().join("destination/staged/child"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    assert!(matches!(
+        pending.verify_or_quarantine().unwrap(),
+        StagedVerificationOutcome::Quarantined
+    ));
+    assert_eq!(
+        wal.transaction_state(transaction),
+        Some(TransactionState::Quarantined)
+    );
+}
+
+#[test]
+fn added_entry_after_manifest_is_durably_quarantined() {
+    let Some((fixture, mut wal, mut startup_blocked, transaction)) = staged_pending(true, true)
+    else {
+        return;
+    };
+    let staged = fixture._temp.path().join("destination/staged");
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(staged.join("added"), b"late").unwrap();
+    // Re-seal so the extra entry is the only divergence from the manifest.
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o500)).unwrap();
+    let capability = prepare_startup_recovery(
+        &mut wal,
+        &mut startup_blocked,
+        transaction,
+        anchors(&fixture),
+    )
+    .unwrap();
+    let StartupRecoveryCapability::PendingVerification(pending) = capability else {
+        panic!("expected pending verification");
+    };
+    assert!(matches!(
+        pending.verify_or_quarantine().unwrap(),
+        StagedVerificationOutcome::Quarantined
+    ));
+    assert_eq!(
+        wal.transaction_state(transaction),
+        Some(TransactionState::Quarantined)
+    );
+}
+
+#[test]
+fn missing_tree_seal_coverage_is_durably_quarantined() {
+    let Some((fixture, mut wal, mut startup_blocked, transaction)) = staged_pending(false, true)
+    else {
+        return;
+    };
+    let capability = prepare_startup_recovery(
+        &mut wal,
+        &mut startup_blocked,
+        transaction,
+        anchors(&fixture),
+    )
+    .unwrap();
+    let StartupRecoveryCapability::PendingVerification(pending) = capability else {
+        panic!("expected pending verification");
+    };
+    assert!(matches!(
+        pending.verify_or_quarantine().unwrap(),
+        StagedVerificationOutcome::Quarantined
+    ));
+    assert_eq!(
+        wal.transaction_state(transaction),
+        Some(TransactionState::Quarantined)
+    );
 }
 
 fn permission(id: u64, path: &str) -> DurablePermission {

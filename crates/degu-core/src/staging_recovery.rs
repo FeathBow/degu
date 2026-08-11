@@ -252,7 +252,7 @@ pub(crate) enum StagedVerificationError {
     InvalidState,
     #[error("verified staged state was not durable: {0}")]
     StagedSealedNotDurable(#[source] AppendError),
-    #[error("staged verification failed and quarantine was not durable: {source}")]
+    #[error("staged verification failed ({failure}) and quarantine was not durable: {source}")]
     QuarantineNotDurable {
         failure: StagedVerificationFailure,
         #[source]
@@ -287,6 +287,48 @@ impl ExactStagedVerification {
     }
 }
 
+/// One-use proofs confined to the ordered source-parent recovery path. Their
+/// fields are private, so WAL code cannot advance these authority states from a
+/// transaction ID alone.
+pub(crate) struct ExactSourceParentRestoreIntent {
+    transaction: TransactionId,
+}
+
+impl ExactSourceParentRestoreIntent {
+    pub(crate) fn transaction(&self) -> TransactionId {
+        self.transaction
+    }
+}
+
+pub(crate) struct ExactSourceParentRestored {
+    transaction: TransactionId,
+}
+
+impl ExactSourceParentRestored {
+    pub(crate) fn transaction(&self) -> TransactionId {
+        self.transaction
+    }
+}
+
+pub(crate) struct ExactVerifiedCommit {
+    transaction: TransactionId,
+}
+
+impl ExactVerifiedCommit {
+    pub(crate) fn transaction(&self) -> TransactionId {
+        self.transaction
+    }
+}
+
+pub(crate) fn certify_verified_commit(
+    wal: &SealWal<RecoverySession>,
+    transaction: TransactionId,
+) -> Result<ExactVerifiedCommit, RecoveryRebindError> {
+    (wal.transaction_state(transaction) == Some(TransactionState::SourceParentRestored))
+        .then_some(ExactVerifiedCommit { transaction })
+        .ok_or(RecoveryRebindError::TransactionMismatch)
+}
+
 /// Nonforgeable proof that this exact leased transaction reached only
 /// `StagedSealed`. It intentionally has no restore, commit, purge, or namespace
 /// mutation operation.
@@ -312,7 +354,7 @@ impl VerifiedStagedTree<'_> {
 
 pub(crate) enum StagedVerificationOutcome<'a> {
     StagedSealed(VerifiedStagedTree<'a>),
-    Quarantined,
+    Quarantined(StagedVerificationFailure),
 }
 
 /// Capability returned for post-rename verification. It keeps the exact
@@ -367,7 +409,7 @@ impl<'a> CertifiedStagedRecovery<'a> {
                 .wal
                 .transition_staging_foundation(self.transaction, TransactionState::Quarantined)
             {
-                Ok(()) => Ok(StagedVerificationOutcome::Quarantined),
+                Ok(()) => Ok(StagedVerificationOutcome::Quarantined(failure)),
                 Err(source) => {
                     Err(StagedVerificationError::QuarantineNotDurable { failure, source })
                 }
@@ -512,11 +554,22 @@ impl RecoveryRestoreSession<'_> {
     pub(crate) fn execute(mut self) -> Result<(), RecoveryRebindError> {
         let transaction = self.restore.transaction;
         let current = self.wal.transaction_state(transaction);
-        if self.restore.completion == TransactionState::Restored
-            && current != Some(TransactionState::RestoreIntent)
-        {
-            self.wal
-                .transition_staging_foundation(transaction, TransactionState::RestoreIntent)?;
+        let intent = match self.restore.completion {
+            TransactionState::Restored => TransactionState::RestoreIntent,
+            TransactionState::SourceParentRestored => TransactionState::SourceParentRestoreIntent,
+            TransactionState::Quarantined => TransactionState::Quarantined,
+            _ => return Err(RecoveryRebindError::TransactionMismatch),
+        };
+        if current != Some(intent) {
+            if intent == TransactionState::SourceParentRestoreIntent {
+                self.wal
+                    .record_source_parent_restore_intent(ExactSourceParentRestoreIntent {
+                        transaction,
+                    })?;
+            } else {
+                self.wal
+                    .transition_staging_foundation(transaction, intent)?;
+            }
         }
 
         // Sorting is repeated here rather than trusting serialized/report order.
@@ -558,8 +611,13 @@ impl RecoveryRestoreSession<'_> {
             )?;
         }
         if self.wal.transaction_state(transaction) != Some(self.restore.completion) {
-            self.wal
-                .transition_staging_foundation(transaction, self.restore.completion)?;
+            if self.restore.completion == TransactionState::SourceParentRestored {
+                self.wal
+                    .record_source_parent_restored(ExactSourceParentRestored { transaction })?;
+            } else {
+                self.wal
+                    .transition_staging_foundation(transaction, self.restore.completion)?;
+            }
         }
         *self.startup_blocked = !self.wal.can_begin_staging_transaction();
         Ok(())
@@ -603,15 +661,17 @@ pub(crate) fn prepare_startup_recovery<'a>(
         // Preserve the typed RenameIntent+missing-outcome ambiguity. Repeated
         // attempts must never turn it into a generic state that permits lookup.
         if recovery_lookup_is_forbidden(&work) {
-            return Err(RecoveryRebindError::RenameOutcomeUnknown);
+            return fail_closed(wal, transaction, RecoveryRebindError::RenameOutcomeUnknown);
         }
         if let RecoveryWork::RecoveryRequired { reason, .. } = &work {
             return match reason {
                 crate::seal_wal::RecoveryRequiredReason::LegacySchemaMissingMountIdentity {
                     version,
-                } => Err(RecoveryRebindError::LegacySchemaMissingMountIdentity(
-                    *version,
-                )),
+                } => fail_closed(
+                    wal,
+                    transaction,
+                    RecoveryRebindError::LegacySchemaMissingMountIdentity(*version),
+                ),
                 crate::seal_wal::RecoveryRequiredReason::RecordedRecoveryRequired => {
                     Err(RecoveryRebindError::RecordedRecoveryRequired)
                 }
@@ -999,6 +1059,7 @@ fn rebind_work(
         | RecoveryWork::ResolveUncertainPermissions { .. }
         | RecoveryWork::PreserveCommittedSeal { .. }
         | RecoveryWork::PreserveQuarantine { .. }
+        | RecoveryWork::FinalizeVerifiedCommit { .. }
         | RecoveryWork::Nothing => Err(RecoveryRebindError::TransactionMismatch),
     }
 }
@@ -1022,6 +1083,7 @@ pub(crate) fn recovery_transaction(work: &RecoveryWork) -> TransactionId {
         | RecoveryWork::ResolveUncertainPermissions { transaction, .. }
         | RecoveryWork::PreserveCommittedSeal { transaction, .. }
         | RecoveryWork::PreserveQuarantine { transaction }
+        | RecoveryWork::FinalizeVerifiedCommit { transaction }
         | RecoveryWork::RecoveryRequired { transaction, .. } => *transaction,
         RecoveryWork::Nothing => TransactionId([0; 16]),
     }

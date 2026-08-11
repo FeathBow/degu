@@ -915,7 +915,7 @@ fn quarantined_active_seals_restore_in_place_and_unblock_without_unquarantining(
 }
 
 #[test]
-fn repeated_unknown_rename_attempts_never_lookup_or_erase_typed_ambiguity() {
+fn unknown_rename_is_durably_blocked_without_any_namespace_lookup() {
     let Some(fixture) = fixture(false) else {
         return;
     };
@@ -975,21 +975,28 @@ fn repeated_unknown_rename_attempts_never_lookup_or_erase_typed_ambiguity() {
 
     RECOVERY_NAME_LOOKUPS.set(0);
     let mut startup_blocked = true;
-    for _ in 0..2 {
-        assert!(matches!(
-            prepare_startup_recovery(
-                &mut wal,
-                &mut startup_blocked,
-                transaction,
-                anchors(&fixture),
-            ),
-            Err(RecoveryRebindError::RenameOutcomeUnknown)
-        ));
-        assert_eq!(
-            wal.transaction_state(transaction),
-            Some(TransactionState::RenameIntent)
-        );
-    }
+    assert!(matches!(
+        prepare_startup_recovery(
+            &mut wal,
+            &mut startup_blocked,
+            transaction,
+            anchors(&fixture),
+        ),
+        Err(RecoveryRebindError::RenameOutcomeUnknown)
+    ));
+    assert_eq!(
+        wal.transaction_state(transaction),
+        Some(TransactionState::RecoveryRequired)
+    );
+    assert!(matches!(
+        prepare_startup_recovery(
+            &mut wal,
+            &mut startup_blocked,
+            transaction,
+            anchors(&fixture),
+        ),
+        Err(RecoveryRebindError::RecordedRecoveryRequired)
+    ));
     assert_eq!(RECOVERY_NAME_LOOKUPS.get(), 0);
     assert!(startup_blocked);
 }
@@ -1166,7 +1173,7 @@ fn dropping_pending_before_transition_replays_staged_unverified() {
 
     let store = SealWalStore::open_or_create(&fixture._temp.path().join("verifier-wal")).unwrap();
     let (reopened, report) = crate::sealed_staging::SealedStagingEngine::open(&store).unwrap();
-    assert_eq!(report.candidates.len(), 1);
+    assert_eq!(report.candidates().len(), 1);
     assert_eq!(
         reopened.state(transaction),
         Some(TransactionState::StagedUnverified)
@@ -1198,7 +1205,7 @@ fn durable_staged_sealed_replays_without_commit_promotion() {
 
     let store = SealWalStore::open_or_create(&fixture._temp.path().join("verifier-wal")).unwrap();
     let (reopened, report) = crate::sealed_staging::SealedStagingEngine::open(&store).unwrap();
-    assert_eq!(report.candidates.len(), 1);
+    assert_eq!(report.candidates().len(), 1);
     assert_eq!(
         reopened.state(transaction),
         Some(TransactionState::StagedSealed)
@@ -1229,7 +1236,7 @@ fn manifest_mismatch_is_durably_quarantined_without_mode_restore() {
     };
     assert!(matches!(
         pending.verify_or_quarantine().unwrap(),
-        StagedVerificationOutcome::Quarantined
+        StagedVerificationOutcome::Quarantined(_)
     ));
     assert_eq!(
         wal.transaction_state(transaction),
@@ -1265,7 +1272,7 @@ fn mode_drift_after_capability_creation_is_durably_quarantined() {
     .unwrap();
     assert!(matches!(
         pending.verify_or_quarantine().unwrap(),
-        StagedVerificationOutcome::Quarantined
+        StagedVerificationOutcome::Quarantined(_)
     ));
     assert_eq!(
         wal.transaction_state(transaction),
@@ -1296,7 +1303,7 @@ fn added_entry_after_manifest_is_durably_quarantined() {
     };
     assert!(matches!(
         pending.verify_or_quarantine().unwrap(),
-        StagedVerificationOutcome::Quarantined
+        StagedVerificationOutcome::Quarantined(_)
     ));
     assert_eq!(
         wal.transaction_state(transaction),
@@ -1322,7 +1329,7 @@ fn missing_tree_seal_coverage_is_durably_quarantined() {
     };
     assert!(matches!(
         pending.verify_or_quarantine().unwrap(),
-        StagedVerificationOutcome::Quarantined
+        StagedVerificationOutcome::Quarantined(_)
     ));
     assert_eq!(
         wal.transaction_state(transaction),

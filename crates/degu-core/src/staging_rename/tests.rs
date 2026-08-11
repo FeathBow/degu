@@ -1,7 +1,9 @@
 use super::*;
 use crate::seal_store::SealWalStore;
 use crate::seal_wal::DurableRenameOutcome;
-use crate::sealed_staging::SealedStagingEngine;
+use crate::sealed_staging::{
+    ForwardFailureDisposition, SealedStagingEngine, StartupRecoveryAnchors,
+};
 use crate::staging_recovery::{
     RecoveryAnchors, RecoveryFilesystemAnchor, StagedVerificationOutcome, StartupRecoveryCapability,
 };
@@ -75,6 +77,13 @@ impl Fixture {
         }
     }
 
+    fn raw_anchors(&self) -> StartupRecoveryAnchors {
+        StartupRecoveryAnchors::new(
+            std::fs::File::open(&self.base).unwrap().into(),
+            std::fs::File::open(&self.base).unwrap().into(),
+        )
+    }
+
     fn prepare(&self) -> PreparedRootBinding {
         let anchors = self.anchors();
         PreparedRootBinding::prepare(
@@ -99,6 +108,46 @@ impl Fixture {
         )
         .unwrap()
     }
+
+    fn forward_request(
+        &self,
+        source_basename: &str,
+        destination_basename: &str,
+    ) -> crate::sealed_staging::ForwardStagingRequest {
+        crate::sealed_staging::ForwardStagingRequest::new(
+            std::fs::File::open(&self.base).unwrap().into(),
+            std::fs::File::open(&self.source_parent).unwrap().into(),
+            StagingLocator::new(
+                std::path::PathBuf::from("source-parent"),
+                self.filesystem_id.clone(),
+            )
+            .unwrap(),
+            OsString::from(source_basename),
+            std::fs::File::open(&self.base).unwrap().into(),
+            std::fs::File::open(&self.destination_parent)
+                .unwrap()
+                .into(),
+            StagingLocator::new(
+                std::path::PathBuf::from("destination-parent"),
+                self.filesystem_id.clone(),
+            )
+            .unwrap(),
+            OsString::from(destination_basename),
+        )
+    }
+
+    fn ready_engine(&self) -> crate::sealed_staging::ReadyStagingEngine {
+        let (engine, report) = SealedStagingEngine::open(&self.store).unwrap();
+        assert!(report.is_empty());
+        engine
+            .recover_startup(report, |_, _| {
+                Err(std::io::Error::other(
+                    "empty startup report must not request anchors",
+                ))
+            })
+            .unwrap()
+            .0
+    }
 }
 
 fn set_mode(path: &Path, mode: u32) {
@@ -113,7 +162,7 @@ fn exact_held_tree_reaches_only_staged_unverified() {
     let binding = fixture.prepare();
     let transaction = TransactionId([0xa3; 16]);
     let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
-    assert!(report.candidates.is_empty());
+    assert!(report.is_empty());
 
     let staged = engine.stage_prepared_root(transaction, binding).unwrap();
     assert_eq!(staged.transaction(), transaction);
@@ -148,10 +197,11 @@ fn exact_held_tree_reaches_only_staged_unverified() {
     assert!(recovered.tree_manifest.is_some());
     drop(lease);
 
-    let (mut recovered_engine, mut report) = SealedStagingEngine::open(&fixture.store).unwrap();
-    assert_eq!(report.candidates.len(), 1);
+    let (mut recovered_engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert_eq!(report.candidates().len(), 1);
+    let candidate = report.into_candidates().pop().unwrap();
     let capability = recovered_engine
-        .prepare_startup_recovery(report.candidates.pop().unwrap(), fixture.anchors())
+        .prepare_startup_recovery(candidate, fixture.anchors())
         .unwrap();
     let StartupRecoveryCapability::PendingVerification(pending) = capability else {
         panic!("applied rename must require staged verification")
@@ -163,6 +213,501 @@ fn exact_held_tree_reaches_only_staged_unverified() {
     assert_eq!(verified.transaction(), transaction);
     assert_eq!(verified.wal_state(), Some(TransactionState::StagedSealed));
     assert!(verified.startup_is_blocked());
+}
+
+#[test]
+fn forward_coordinator_reaches_verified_commit_before_returning() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xc8; 16]);
+    let mut ready = fixture.ready_engine();
+
+    let committed = ready
+        .stage_to_verified_commit(transaction, fixture.forward_request("root", "staged"))
+        .unwrap();
+
+    assert_eq!(committed.transaction(), transaction);
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    assert!(!fixture.source_root.exists());
+    assert!(fixture.destination_root.is_dir());
+    assert_eq!(mode(&fixture.source_parent), 0o770);
+    assert_eq!(mode(&fixture.destination_root), 0o750);
+    assert_eq!(mode(&fixture.destination_root.join("child")), 0o750);
+}
+
+#[test]
+fn forward_coordinator_allows_sequential_terminal_transactions() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let mut ready = fixture.ready_engine();
+    let first = TransactionId([0xc9; 16]);
+    ready
+        .stage_to_verified_commit(first, fixture.forward_request("root", "staged"))
+        .unwrap();
+
+    let second_source = fixture.source_parent.join("second-root");
+    let second_destination = fixture.destination_parent.join("second-staged");
+    std::fs::create_dir(&second_source).unwrap();
+    std::fs::write(second_source.join("data"), b"second").unwrap();
+    set_mode(&second_source, 0o770);
+    let second = TransactionId([0xca; 16]);
+    ready
+        .stage_to_verified_commit(
+            second,
+            fixture.forward_request("second-root", "second-staged"),
+        )
+        .unwrap();
+
+    assert_eq!(
+        ready.state(first),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    assert_eq!(
+        ready.state(second),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    assert!(!second_source.exists());
+    assert_eq!(
+        std::fs::read(second_destination.join("data")).unwrap(),
+        b"second"
+    );
+    assert_eq!(mode(&fixture.source_parent), 0o770);
+}
+
+#[test]
+fn forward_collision_is_restored_before_error_returns() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let destination = fixture.destination_root.clone();
+    BEFORE_RENAME.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::fs::create_dir(&destination).unwrap();
+            std::fs::write(destination.join("sentinel"), b"keep").unwrap();
+        }));
+    });
+    let transaction = TransactionId([0xcb; 16]);
+    let mut ready = fixture.ready_engine();
+
+    let error = ready
+        .stage_to_verified_commit(transaction, fixture.forward_request("root", "staged"))
+        .unwrap_err();
+
+    assert_eq!(error.transaction(), transaction);
+    assert_eq!(error.stage(), "seal and no-replace rename");
+    assert_eq!(
+        error.disposition(),
+        ForwardFailureDisposition::Terminal(TransactionState::Restored)
+    );
+    assert_eq!(error.terminal_state(), Some(TransactionState::Restored));
+    assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+    assert!(fixture.source_root.is_dir());
+    assert_eq!(
+        std::fs::read(fixture.destination_root.join("sentinel")).unwrap(),
+        b"keep"
+    );
+    assert_eq!(mode(&fixture.source_parent), 0o770);
+    assert_eq!(mode(&fixture.source_root), 0o770);
+
+    let retry = TransactionId([0xce; 16]);
+    ready
+        .stage_to_verified_commit(retry, fixture.forward_request("root", "retry-staged"))
+        .unwrap();
+    assert_eq!(
+        ready.state(retry),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    assert!(fixture.destination_parent.join("retry-staged").is_dir());
+}
+
+#[test]
+fn uncertain_first_wal_frame_never_reports_not_started() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    FAIL_WAL_STEP.with(|failure| failure.set(Some("begin-poison")));
+    let transaction = TransactionId([0xd4; 16]);
+    let mut ready = fixture.ready_engine();
+    let error = ready
+        .stage_to_verified_commit(transaction, fixture.forward_request("root", "staged"))
+        .unwrap_err();
+    FAIL_WAL_STEP.with(|failure| failure.set(None));
+
+    assert_eq!(error.stage(), "seal and no-replace rename");
+    assert_eq!(
+        error.disposition(),
+        ForwardFailureDisposition::RecoveryBlocked
+    );
+    assert_eq!(error.terminal_state(), None);
+    assert_eq!(ready.state(transaction), None);
+    assert!(fixture.source_root.is_dir());
+    assert!(!fixture.destination_root.exists());
+
+    let blocked = ready
+        .stage_to_verified_commit(
+            TransactionId([0xd5; 16]),
+            fixture.forward_request("root", "staged"),
+        )
+        .unwrap_err();
+    assert_eq!(blocked.stage(), "transaction admission");
+    assert_eq!(
+        blocked.disposition(),
+        ForwardFailureDisposition::RecoveryBlocked
+    );
+}
+
+#[test]
+fn unknown_forward_outcome_becomes_a_manual_block() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    RENAME_ERROR.with(|error| error.set(Some(libc::EIO)));
+    let transaction = TransactionId([0xcf; 16]);
+    let mut ready = fixture.ready_engine();
+    let error = ready
+        .stage_to_verified_commit(transaction, fixture.forward_request("root", "staged"))
+        .unwrap_err();
+    RENAME_ERROR.with(|error| error.set(None));
+
+    assert_eq!(error.stage(), "failed-forward recovery");
+    assert_eq!(
+        error.disposition(),
+        ForwardFailureDisposition::RecoveryBlocked
+    );
+    assert_eq!(error.terminal_state(), None);
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::RecoveryRequired)
+    );
+    assert!(fixture.source_root.is_dir());
+    assert!(!fixture.destination_root.exists());
+    assert_eq!(mode(&fixture.source_parent), 0o750);
+
+    let blocked = TransactionId([0xd0; 16]);
+    let blocked_error = ready
+        .stage_to_verified_commit(blocked, fixture.forward_request("root", "staged"))
+        .unwrap_err();
+    assert_eq!(blocked_error.stage(), "transaction admission");
+    assert_eq!(
+        blocked_error.disposition(),
+        ForwardFailureDisposition::RecoveryBlocked
+    );
+    assert_eq!(blocked_error.terminal_state(), None);
+    assert_eq!(ready.state(blocked), None);
+}
+
+#[test]
+fn forward_verification_mismatch_quarantines_and_restores_seals() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let destination = fixture.destination_root.clone();
+    AFTER_RENAME.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::fs::write(destination.join("unexpected"), b"mismatch").unwrap();
+        }));
+    });
+    let transaction = TransactionId([0xcc; 16]);
+    let mut ready = fixture.ready_engine();
+
+    let error = ready
+        .stage_to_verified_commit(transaction, fixture.forward_request("root", "staged"))
+        .unwrap_err();
+
+    assert_eq!(error.stage(), "staged-tree verification");
+    assert!(
+        error
+            .to_string()
+            .contains("staged tree does not match its durable manifest"),
+        "verification cause was lost: {error}"
+    );
+    assert_eq!(
+        error.disposition(),
+        ForwardFailureDisposition::Terminal(TransactionState::Quarantined)
+    );
+    assert_eq!(error.terminal_state(), Some(TransactionState::Quarantined));
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::Quarantined)
+    );
+    assert!(!fixture.source_root.exists());
+    assert!(fixture.destination_root.is_dir());
+    assert_eq!(mode(&fixture.source_parent), 0o770);
+    assert_eq!(mode(&fixture.destination_root), 0o770);
+    assert_eq!(mode(&fixture.destination_root.join("child")), 0o770);
+}
+
+#[test]
+fn quarantine_root_cause_survives_a_later_restore_failure() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let destination = fixture.destination_root.clone();
+    AFTER_RENAME.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::fs::write(destination.join("unexpected"), b"mismatch").unwrap();
+        }));
+    });
+    let source_parent = fixture.source_parent.clone();
+    let detached = fixture.base.join("detached-source-parent");
+    crate::sealed_staging::AFTER_FORWARD_QUARANTINE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::fs::rename(&source_parent, &detached).unwrap();
+            std::fs::create_dir(&source_parent).unwrap();
+            set_mode(&source_parent, 0o700);
+        }));
+    });
+    let transaction = TransactionId([0xd6; 16]);
+    let mut ready = fixture.ready_engine();
+
+    let error = ready
+        .stage_to_verified_commit(transaction, fixture.forward_request("root", "staged"))
+        .unwrap_err();
+
+    assert_eq!(error.stage(), "forward commit recovery");
+    assert_eq!(
+        error.disposition(),
+        ForwardFailureDisposition::RecoveryBlocked
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("staged tree does not match its durable manifest"),
+        "verification cause was lost behind restore failure: {error}"
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::RecoveryRequired)
+    );
+}
+
+#[test]
+fn forward_preparation_failure_writes_no_transaction() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    std::fs::create_dir(&fixture.destination_root).unwrap();
+    let transaction = TransactionId([0xcd; 16]);
+    let mut ready = fixture.ready_engine();
+
+    let error = ready
+        .stage_to_verified_commit(transaction, fixture.forward_request("root", "staged"))
+        .unwrap_err();
+
+    assert_eq!(error.stage(), "prepared root binding");
+    assert_eq!(error.disposition(), ForwardFailureDisposition::NotStarted);
+    assert_eq!(error.terminal_state(), None);
+    assert_eq!(ready.state(transaction), None);
+    assert!(fixture.source_root.is_dir());
+
+    let next_source = fixture.source_parent.join("next-root");
+    std::fs::create_dir(&next_source).unwrap();
+    set_mode(&next_source, 0o700);
+    let next = TransactionId([0xd1; 16]);
+    ready
+        .stage_to_verified_commit(next, fixture.forward_request("next-root", "next-staged"))
+        .unwrap();
+    assert_eq!(ready.state(next), Some(TransactionState::VerifiedCommitted));
+}
+
+#[test]
+fn reused_transaction_id_never_inherits_an_old_terminal_receipt() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let mut ready = fixture.ready_engine();
+    let transaction = TransactionId([0xd2; 16]);
+    ready
+        .stage_to_verified_commit(transaction, fixture.forward_request("root", "staged"))
+        .unwrap();
+
+    let second_source = fixture.source_parent.join("second-root");
+    std::fs::create_dir(&second_source).unwrap();
+    set_mode(&second_source, 0o700);
+    let error = ready
+        .stage_to_verified_commit(
+            transaction,
+            fixture.forward_request("second-root", "second-staged"),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.stage(), "transaction admission");
+    assert_eq!(error.disposition(), ForwardFailureDisposition::NotStarted);
+    assert_eq!(error.terminal_state(), None);
+    assert!(second_source.is_dir());
+    assert!(!fixture.destination_parent.join("second-staged").exists());
+
+    let next = TransactionId([0xd3; 16]);
+    ready
+        .stage_to_verified_commit(
+            next,
+            fixture.forward_request("second-root", "second-staged"),
+        )
+        .unwrap();
+    assert_eq!(ready.state(next), Some(TransactionState::VerifiedCommitted));
+}
+
+#[test]
+fn startup_coordinator_verifies_restores_parent_and_commits() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xc1; 16]);
+    {
+        let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+        assert!(report.is_empty());
+        drop(
+            engine
+                .stage_prepared_root(transaction, fixture.prepare())
+                .unwrap(),
+        );
+    }
+
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let (ready, summary) = engine
+        .recover_startup(report, |candidate, _| {
+            assert_eq!(candidate, transaction);
+            Ok(fixture.raw_anchors())
+        })
+        .unwrap();
+
+    assert_eq!(summary.recovered.len(), 1);
+    assert_eq!(
+        summary.recovered[0].terminal_state,
+        TransactionState::VerifiedCommitted
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    assert_eq!(mode(&fixture.source_parent), 0o770);
+    assert_eq!(mode(&fixture.destination_root), 0o750);
+    assert_eq!(mode(&fixture.destination_root.join("child")), 0o750);
+}
+
+#[test]
+fn startup_coordinator_quarantines_mismatch_then_restores_all_active_seals() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xc2; 16]);
+    {
+        let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+        drop(
+            engine
+                .stage_prepared_root(transaction, fixture.prepare())
+                .unwrap(),
+        );
+    }
+    set_mode(&fixture.destination_root, 0o700);
+    std::fs::write(fixture.destination_root.join("unexpected"), b"mismatch").unwrap();
+    set_mode(&fixture.destination_root, 0o750);
+
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let (ready, summary) = engine
+        .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+        .unwrap();
+
+    assert_eq!(summary.recovered.len(), 1);
+    assert_eq!(
+        summary.recovered[0].terminal_state,
+        TransactionState::Quarantined
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::Quarantined)
+    );
+    assert_eq!(mode(&fixture.source_parent), 0o770);
+    assert_eq!(mode(&fixture.destination_root), 0o770);
+    assert_eq!(mode(&fixture.destination_root.join("child")), 0o770);
+}
+
+#[test]
+fn source_parent_restored_crash_reopens_to_state_only_verified_commit() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xc5; 16]);
+    {
+        let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+        drop(
+            engine
+                .stage_prepared_root(transaction, fixture.prepare())
+                .unwrap(),
+        );
+    }
+
+    let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let mut provider = |_, _: &StagingTransactionMetadata| Ok(fixture.raw_anchors());
+    let error = engine
+        .recover_transaction_with_step_limit_for_test(transaction, &mut provider, 2)
+        .unwrap_err();
+    assert_eq!(error.stage(), "step exhaustion");
+    assert_eq!(
+        engine.state(transaction),
+        Some(TransactionState::SourceParentRestored)
+    );
+    drop(engine);
+
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let (ready, summary) = engine
+        .recover_startup(report, |_, _| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::other(
+                "state-only finalization must not request anchors",
+            ))
+        })
+        .unwrap();
+    assert_eq!(calls.get(), 0);
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    assert_eq!(
+        summary.recovered[0].terminal_state,
+        TransactionState::VerifiedCommitted
+    );
+}
+
+#[test]
+fn startup_anchor_failure_returns_no_ready_engine_and_remains_replayable() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xc3; 16]);
+    {
+        let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+        drop(
+            engine
+                .stage_prepared_root(transaction, fixture.prepare())
+                .unwrap(),
+        );
+    }
+
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let error = engine
+        .recover_startup(report, |_, _| {
+            Err(std::io::Error::other("injected anchor refusal"))
+        })
+        .err()
+        .unwrap();
+    assert_eq!(error.transaction(), Some(transaction));
+    assert_eq!(error.stage(), "anchor acquisition");
+
+    let (mut reopened, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert_eq!(report.candidates().len(), 1);
+    let metadata = reopened.metadata(transaction).unwrap().clone();
+    assert!(
+        reopened
+            .begin_transaction(TransactionId([0xc4; 16]), metadata)
+            .is_err()
+    );
 }
 
 #[test]
@@ -440,9 +985,10 @@ fn staged_state_append_boundary_keeps_durable_applied_outcome() {
     );
     drop(lease);
 
-    let (mut recovered_engine, mut report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let (mut recovered_engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let candidate = report.into_candidates().pop().unwrap();
     let capability = recovered_engine
-        .prepare_startup_recovery(report.candidates.pop().unwrap(), fixture.anchors())
+        .prepare_startup_recovery(candidate, fixture.anchors())
         .unwrap();
     let StartupRecoveryCapability::PendingVerification(pending) = capability else {
         panic!("durable applied rename outcome must normalize into verification")
@@ -494,7 +1040,7 @@ fn startup_recovery_block_refuses_new_seals_and_rename() {
             .unwrap();
     }
     let (mut blocked, report) = SealedStagingEngine::open(&fixture.store).unwrap();
-    assert_eq!(report.candidates.len(), 1);
+    assert_eq!(report.candidates().len(), 1);
     assert!(matches!(
         blocked.stage_prepared_root(TransactionId([0xa8; 16]), binding),
         Err(StagingRenameError::StartupBlocked)
@@ -538,7 +1084,7 @@ fn locator_paths_must_reopen_the_exact_held_parents() {
         PreparedRootError::Identity(RecoveryRebindError::BindingChanged)
     ));
     let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
-    assert!(report.candidates.is_empty());
+    assert!(report.is_empty());
     drop(engine);
 }
 
@@ -631,7 +1177,7 @@ fn preparation_rejects_foreign_writer_destination_before_wal_mutation() {
     ));
 
     let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
-    assert!(report.candidates.is_empty());
+    assert!(report.is_empty());
     drop(engine);
 }
 

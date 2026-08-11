@@ -2,8 +2,8 @@ use super::*;
 use crate::authority::PersistentRecoveryEvidence;
 use crate::local_backend::CertifiedLocalBackend;
 use crate::seal_wal::{
-    DurableSourceParentStrategy, DurableTreeManifest, ObjectIncarnation, PermissionIntent,
-    StagingLocator, StrongObjectIdentity,
+    ApplicationStatus, DurablePermission, DurableSourceParentStrategy, DurableTreeManifest,
+    ObjectIncarnation, PermissionIntent, StagingLocator, StrongObjectIdentity,
 };
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -255,6 +255,249 @@ fn active_seals_in_quarantine_block_runtime_and_reopen() {
             .begin_transaction(TransactionId([90; 16]), metadata())
             .is_err()
     );
+}
+
+#[test]
+fn permission_and_path_workload_limits_are_checked_before_rebind() {
+    let permission = DurablePermission {
+        mutation_id: 1,
+        phase: TransactionState::TreeSealIntent,
+        evidence: PersistentRecoveryEvidence::new(
+            PathBuf::from("source-parent/root"),
+            Some("fs".into()),
+            1,
+            2,
+            Some(3),
+            0o500,
+        )
+        .unwrap(),
+        pre_mode: 0o700,
+        expected_mode: 0o500,
+        reverses_mutation_id: None,
+        application: ApplicationStatus::Applied,
+    };
+    let mut snapshot = ReplayedTransaction {
+        id: TransactionId([0xd1; 16]),
+        state: TransactionState::TreeSealIntent,
+        staging_schema_version: Some(4),
+        permissions: vec![permission; MAX_RECOVERY_PERMISSION_RECORDS + 1],
+        staging: Some(metadata()),
+        tree_manifest: None,
+        rename_outcome: None,
+    };
+    assert!(validate_recovery_workload(&snapshot).is_err());
+
+    let permission = snapshot.permissions[0].clone();
+    snapshot.permissions = vec![permission; MAX_RECOVERY_PERMISSION_OPERATIONS + 1];
+    assert!(validate_recovery_workload(&snapshot).is_err());
+
+    let deep = (0..=MAX_RECOVERY_PATH_COMPONENTS)
+        .map(|index| format!("d{index}"))
+        .collect::<PathBuf>();
+    snapshot.permissions = vec![DurablePermission {
+        mutation_id: 2,
+        phase: TransactionState::TreeSealIntent,
+        evidence: PersistentRecoveryEvidence::new(deep, Some("fs".into()), 1, 2, Some(3), 0o500)
+            .unwrap(),
+        pre_mode: 0o700,
+        expected_mode: 0o500,
+        reverses_mutation_id: None,
+        application: ApplicationStatus::Applied,
+    }];
+    assert!(validate_recovery_workload(&snapshot).is_err());
+}
+
+#[test]
+fn oversized_candidate_set_is_rejected_before_anchor_acquisition() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let store_path = temp.path().canonicalize().unwrap().join("wal-store");
+    let store = SealWalStore::open_or_create(&store_path).unwrap();
+    {
+        let (mut engine, _) = SealedStagingEngine::open(&store).unwrap();
+        for index in 0..=MAX_RECOVERY_TRANSACTIONS {
+            let mut bytes = [0_u8; 16];
+            bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            engine
+                .wal
+                .begin_staging(TransactionId(bytes), metadata())
+                .unwrap();
+        }
+    }
+
+    let (engine, report) = SealedStagingEngine::open(&store).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let error = engine
+        .recover_startup(report, |_, _| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::other("provider must not run"))
+        })
+        .err()
+        .unwrap();
+    assert_eq!(error.stage(), "recovery workload budget");
+    assert_eq!(calls.get(), 0);
+}
+
+#[test]
+fn recovery_candidate_order_is_deterministic_by_transaction_id() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let store_path = temp.path().canonicalize().unwrap().join("wal-store");
+    let store = SealWalStore::open_or_create(&store_path).unwrap();
+    {
+        let (mut engine, report) = SealedStagingEngine::open(&store).unwrap();
+        assert!(report.is_empty());
+        engine
+            .wal
+            .begin_staging(TransactionId([0xf2; 16]), metadata())
+            .unwrap();
+        engine
+            .wal
+            .begin_staging(TransactionId([0x12; 16]), metadata())
+            .unwrap();
+    }
+
+    let (_engine, report) = SealedStagingEngine::open(&store).unwrap();
+    assert_eq!(
+        report
+            .candidates()
+            .iter()
+            .map(StartupRecoveryCandidate::transaction)
+            .collect::<Vec<_>>(),
+        vec![TransactionId([0x12; 16]), TransactionId([0xf2; 16])]
+    );
+}
+
+#[test]
+fn report_omission_duplication_and_reordering_fail_before_provider_or_wal_change() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let store_path = temp.path().canonicalize().unwrap().join("wal-store");
+    let store = SealWalStore::open_or_create(&store_path).unwrap();
+    let first = TransactionId([0x31; 16]);
+    let second = TransactionId([0x32; 16]);
+    {
+        let (mut engine, _) = SealedStagingEngine::open(&store).unwrap();
+        engine.wal.begin_staging(second, metadata()).unwrap();
+        engine.wal.begin_staging(first, metadata()).unwrap();
+    }
+
+    for mutation in ["omit", "duplicate", "reorder"] {
+        let (engine, mut report) = SealedStagingEngine::open(&store).unwrap();
+        match mutation {
+            "omit" => {
+                report.candidates.pop();
+            }
+            "duplicate" => {
+                let transaction = report.candidates[0].transaction;
+                let generation = report.candidates[0].generation;
+                report.candidates.push(StartupRecoveryCandidate {
+                    transaction,
+                    generation,
+                });
+            }
+            "reorder" => report.candidates.reverse(),
+            _ => unreachable!(),
+        }
+        let calls = std::cell::Cell::new(0);
+        let error = engine
+            .recover_startup(report, |_, _| {
+                calls.set(calls.get() + 1);
+                Err(std::io::Error::other("provider must not run"))
+            })
+            .err()
+            .unwrap();
+        assert_eq!(error.stage(), "report validation");
+        assert_eq!(calls.get(), 0);
+
+        let (reopened, report) = SealedStagingEngine::open(&store).unwrap();
+        assert_eq!(reopened.state(first), Some(TransactionState::Prepared));
+        assert_eq!(reopened.state(second), Some(TransactionState::Prepared));
+        assert_eq!(report.candidates().len(), 2);
+        drop(reopened);
+    }
+}
+
+#[test]
+fn cross_generation_report_fails_before_provider_or_wal_change() {
+    let first_temp = crate::secure_test_tempdir().unwrap();
+    let first_store =
+        SealWalStore::open_or_create(&first_temp.path().canonicalize().unwrap().join("wal-store"))
+            .unwrap();
+    let transaction = TransactionId([0x41; 16]);
+    {
+        let (mut engine, _) = SealedStagingEngine::open(&first_store).unwrap();
+        engine.begin_transaction(transaction, metadata()).unwrap();
+    }
+    let (_first_engine, report) = SealedStagingEngine::open(&first_store).unwrap();
+
+    let second_temp = crate::secure_test_tempdir().unwrap();
+    let second_store =
+        SealWalStore::open_or_create(&second_temp.path().canonicalize().unwrap().join("wal-store"))
+            .unwrap();
+    let (second_engine, _) = SealedStagingEngine::open(&second_store).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let error = second_engine
+        .recover_startup(report, |_, _| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::other("provider must not run"))
+        })
+        .err()
+        .unwrap();
+    assert_eq!(error.stage(), "report validation");
+    assert_eq!(calls.get(), 0);
+}
+
+#[test]
+fn recovery_step_exhaustion_never_mints_readiness() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let store_path = temp.path().canonicalize().unwrap().join("wal-store");
+    let store = SealWalStore::open_or_create(&store_path).unwrap();
+    let transaction = TransactionId([0xe1; 16]);
+    let (mut engine, _) = SealedStagingEngine::open(&store).unwrap();
+    engine.begin_transaction(transaction, metadata()).unwrap();
+    let mut provider = |_, _: &StagingTransactionMetadata| {
+        Err(std::io::Error::other(
+            "provider must not run after exhaustion",
+        ))
+    };
+
+    let error = engine
+        .recover_transaction_with_step_limit_for_test(transaction, &mut provider, 0)
+        .unwrap_err();
+    assert_eq!(error.transaction(), Some(transaction));
+    assert_eq!(error.stage(), "step exhaustion");
+    assert_eq!(engine.state(transaction), Some(TransactionState::Prepared));
+    assert!(
+        engine
+            .begin_transaction(TransactionId([0xe2; 16]), metadata())
+            .is_err()
+    );
+}
+
+#[test]
+fn manual_recovery_block_never_requests_filesystem_anchors() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let store_path = temp.path().canonicalize().unwrap().join("wal-store");
+    let store = SealWalStore::open_or_create(&store_path).unwrap();
+    let transaction = TransactionId([0xe3; 16]);
+    {
+        let (mut engine, _) = SealedStagingEngine::open(&store).unwrap();
+        engine.begin_transaction(transaction, metadata()).unwrap();
+        engine
+            .wal
+            .transition_staging_for_test(transaction, TransactionState::RecoveryRequired)
+            .unwrap();
+    }
+
+    let (engine, report) = SealedStagingEngine::open(&store).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let error = engine
+        .recover_startup(report, |_, _| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::other("anchor lookup must be forbidden"))
+        })
+        .err()
+        .unwrap();
+    assert_eq!(error.stage(), "manual recovery block");
+    assert_eq!(calls.get(), 0);
 }
 
 #[test]

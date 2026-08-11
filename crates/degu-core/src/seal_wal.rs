@@ -7,7 +7,10 @@
 
 use crate::authority::{PersistentRecoveryEvidence, TransactionState};
 use crate::local_backend::CertifiedLocalBackend;
-use crate::staging_recovery::ExactStagedVerification;
+use crate::staging_recovery::{
+    ExactSourceParentRestoreIntent, ExactSourceParentRestored, ExactStagedVerification,
+    ExactVerifiedCommit,
+};
 use crate::staging_rename::{FreshlyConfirmedSourceResident, ParentsSyncedAppliedRename};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -539,6 +542,15 @@ impl<W: DurableWrite> SealWal<W> {
     /// Exact in-memory projection of the transaction held by this leased WAL.
     /// Recovery must derive work from this snapshot rather than caller-provided
     /// permission subsets or durable-path guesses.
+    pub(crate) fn recovery_snapshots(&self) -> Vec<ReplayedTransaction> {
+        let mut transactions = self.states.keys().copied().collect::<Vec<_>>();
+        transactions.sort();
+        transactions
+            .into_iter()
+            .filter_map(|transaction| self.recovery_snapshot(transaction))
+            .collect()
+    }
+
     pub(crate) fn recovery_snapshot(
         &self,
         transaction: TransactionId,
@@ -574,23 +586,29 @@ impl<W: DurableWrite> SealWal<W> {
             .map_or(Some(0), |id| id.checked_add(1))
     }
 
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&mut self) {
+        self.poisoned = true;
+    }
+
     pub(crate) fn can_begin_staging_transaction(&self) -> bool {
-        self.states.iter().all(|(transaction, state)| {
-            matches!(
-                state,
-                TransactionState::VerifiedCommitted
-                    | TransactionState::Purgeable
-                    | TransactionState::Purged
-                    | TransactionState::Restored
-                    | TransactionState::RolledBack
-            ) || (*state == TransactionState::Quarantined
-                && !retains_active_permission_seals(
-                    self.permissions
-                        .iter()
-                        .filter(|((owner, _), _)| owner == transaction)
-                        .map(|(_, permission)| permission),
-                ))
-        })
+        !self.poisoned
+            && self.states.iter().all(|(transaction, state)| {
+                matches!(
+                    state,
+                    TransactionState::VerifiedCommitted
+                        | TransactionState::Purgeable
+                        | TransactionState::Purged
+                        | TransactionState::Restored
+                        | TransactionState::RolledBack
+                ) || (*state == TransactionState::Quarantined
+                    && !retains_active_permission_seals(
+                        self.permissions
+                            .iter()
+                            .filter(|((owner, _), _)| owner == transaction)
+                            .map(|(_, permission)| permission),
+                    ))
+            })
     }
 
     /// Authority-neutral A1 transition. Staging transactions are deliberately
@@ -650,6 +668,30 @@ impl<W: DurableWrite> SealWal<W> {
         proof: ExactStagedVerification,
     ) -> Result<(), AppendError> {
         self.transition_staging(proof.transaction(), TransactionState::StagedSealed)
+    }
+
+    pub(crate) fn record_source_parent_restore_intent(
+        &mut self,
+        proof: ExactSourceParentRestoreIntent,
+    ) -> Result<(), AppendError> {
+        self.transition_staging(
+            proof.transaction(),
+            TransactionState::SourceParentRestoreIntent,
+        )
+    }
+
+    pub(crate) fn record_source_parent_restored(
+        &mut self,
+        proof: ExactSourceParentRestored,
+    ) -> Result<(), AppendError> {
+        self.transition_staging(proof.transaction(), TransactionState::SourceParentRestored)
+    }
+
+    pub(crate) fn record_verified_committed(
+        &mut self,
+        proof: ExactVerifiedCommit,
+    ) -> Result<(), AppendError> {
+        self.transition_staging(proof.transaction(), TransactionState::VerifiedCommitted)
     }
 
     #[cfg(test)]
@@ -1457,6 +1499,9 @@ pub enum RecoveryWork {
     PreserveQuarantine {
         transaction: TransactionId,
     },
+    FinalizeVerifiedCommit {
+        transaction: TransactionId,
+    },
     RecoveryRequired {
         transaction: TransactionId,
         reason: RecoveryRequiredReason,
@@ -1617,7 +1662,10 @@ where
             None => unreachable!("missing rename outcome handled before identity gating"),
         };
     }
-    if transaction.state == TransactionState::SourceParentRestoreIntent {
+    if matches!(
+        transaction.state,
+        TransactionState::StagedSealed | TransactionState::SourceParentRestoreIntent
+    ) {
         return RecoveryWork::RestoreSourceParentAfterRename {
             transaction: transaction.id,
             permissions: active_permissions()
@@ -1626,12 +1674,14 @@ where
                 .collect(),
         };
     }
+    if transaction.state == TransactionState::SourceParentRestored {
+        return RecoveryWork::FinalizeVerifiedCommit {
+            transaction: transaction.id,
+        };
+    }
     if matches!(
         transaction.state,
-        TransactionState::StagedUnverified
-            | TransactionState::StagedSealed
-            | TransactionState::SourceParentRestored
-            | TransactionState::RollbackIntent
+        TransactionState::StagedUnverified | TransactionState::RollbackIntent
     ) {
         RecoveryWork::VerifyOrQuarantineAfterRename {
             transaction: transaction.id,

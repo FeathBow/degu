@@ -6,6 +6,7 @@
 //! permission or namespace mutation.
 
 use crate::authority::{PersistentRecoveryEvidence, TransactionState};
+use crate::local_backend::CertifiedLocalBackend;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -13,13 +14,248 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
 const MAGIC: &[u8; 4] = b"DSWL";
-const VERSION: u16 = 1;
+const VERSION: u16 = 3;
 const HEADER_LEN: usize = 20;
 const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 const MAX_WAL_LEN: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TransactionId(pub [u8; 16]);
+
+/// Mandatory strong incarnation component used to reject inode reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ObjectIncarnation(u64);
+
+impl ObjectIncarnation {
+    pub fn new(generation_or_btime: u64) -> Self {
+        Self(generation_or_btime)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StrongObjectIdentity {
+    device: u64,
+    inode: u64,
+    incarnation: ObjectIncarnation,
+}
+
+impl StrongObjectIdentity {
+    pub fn new(device: u64, inode: u64, incarnation: ObjectIncarnation) -> Self {
+        Self {
+            device,
+            inode,
+            incarnation,
+        }
+    }
+
+    pub fn device(self) -> u64 {
+        self.device
+    }
+
+    pub fn inode(self) -> u64 {
+        self.inode
+    }
+
+    pub fn incarnation(self) -> ObjectIncarnation {
+        self.incarnation
+    }
+}
+
+/// Confined path evidence beneath a separately authenticated filesystem anchor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagingLocator {
+    relative_path: PathBuf,
+    filesystem_id: String,
+}
+
+impl StagingLocator {
+    pub fn new(relative_path: PathBuf, filesystem_id: String) -> Option<Self> {
+        (staging_path_is_confined(&relative_path) && !filesystem_id.is_empty()).then_some(Self {
+            relative_path,
+            filesystem_id,
+        })
+    }
+
+    pub fn relative_path(&self) -> &std::path::Path {
+        &self.relative_path
+    }
+
+    pub fn filesystem_id(&self) -> &str {
+        &self.filesystem_id
+    }
+}
+
+fn staging_path_is_confined(path: &std::path::Path) -> bool {
+    let mut components = path.components();
+    let Some(std::path::Component::Normal(_)) = components.next() else {
+        return false;
+    };
+    components.all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+/// Immutable evidence for an already-exclusive source parent. There is no
+/// public constructor: the future held-parent executor must mint this only from
+/// an authenticated live parent capability. Replay can decode the durable proof,
+/// but durable evidence never recreates execution authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableAlreadyExclusiveParent {
+    source_parent: StagingLocator,
+    source_parent_identity: StrongObjectIdentity,
+    observed_mode: u32,
+}
+
+/// Immutable source-parent strategy selected before staging begins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableSourceParentStrategy {
+    /// The exact metadata-bound source parent must have an applied permission
+    /// seal and a matching applied inverse before source-parent restoration.
+    PermissionSeal,
+    /// Zero parent mutation is permitted only with a non-vacuous, exact-parent
+    /// proof minted by the future held-parent executor.
+    AlreadyExclusive(DurableAlreadyExclusiveParent),
+}
+
+/// Immutable namespace, object, and source-parent strategy binding written in
+/// the transaction's first durable frame. Locators are relative to separately
+/// authenticated anchors; basenames are single normal components.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagingTransactionMetadata {
+    source_parent: StagingLocator,
+    source_parent_identity: StrongObjectIdentity,
+    source_basename: std::ffi::OsString,
+    root_identity: StrongObjectIdentity,
+    destination_parent: StagingLocator,
+    destination_parent_identity: StrongObjectIdentity,
+    destination_basename: std::ffi::OsString,
+    backend: CertifiedLocalBackend,
+    source_parent_strategy: DurableSourceParentStrategy,
+}
+
+impl StagingTransactionMetadata {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        source_parent: StagingLocator,
+        source_parent_identity: StrongObjectIdentity,
+        source_basename: std::ffi::OsString,
+        root_identity: StrongObjectIdentity,
+        destination_parent: StagingLocator,
+        destination_parent_identity: StrongObjectIdentity,
+        destination_basename: std::ffi::OsString,
+        backend: CertifiedLocalBackend,
+        source_parent_strategy: DurableSourceParentStrategy,
+    ) -> Option<Self> {
+        let metadata = Self {
+            source_parent,
+            source_parent_identity,
+            source_basename,
+            root_identity,
+            destination_parent,
+            destination_parent_identity,
+            destination_basename,
+            backend,
+            source_parent_strategy,
+        };
+        metadata.invariants_hold().then_some(metadata)
+    }
+
+    pub fn source_parent(&self) -> &StagingLocator {
+        &self.source_parent
+    }
+
+    pub fn source_parent_identity(&self) -> StrongObjectIdentity {
+        self.source_parent_identity
+    }
+
+    pub fn source_basename(&self) -> &std::ffi::OsStr {
+        &self.source_basename
+    }
+
+    pub fn root_identity(&self) -> StrongObjectIdentity {
+        self.root_identity
+    }
+
+    pub fn destination_parent(&self) -> &StagingLocator {
+        &self.destination_parent
+    }
+
+    pub fn destination_parent_identity(&self) -> StrongObjectIdentity {
+        self.destination_parent_identity
+    }
+
+    pub fn destination_basename(&self) -> &std::ffi::OsStr {
+        &self.destination_basename
+    }
+
+    pub fn backend(&self) -> CertifiedLocalBackend {
+        self.backend
+    }
+
+    pub fn source_parent_strategy(&self) -> &DurableSourceParentStrategy {
+        &self.source_parent_strategy
+    }
+
+    pub fn filesystem_id(&self) -> &str {
+        self.source_parent.filesystem_id()
+    }
+
+    fn invariants_hold(&self) -> bool {
+        let normal_name = |name: &std::ffi::OsStr| {
+            let path = std::path::Path::new(name);
+            let mut components = path.components();
+            matches!(components.next(), Some(std::path::Component::Normal(_)))
+                && components.next().is_none()
+        };
+        let locator_is_valid = |locator: &StagingLocator| {
+            staging_path_is_confined(&locator.relative_path) && !locator.filesystem_id.is_empty()
+        };
+        let strategy_is_bound = match &self.source_parent_strategy {
+            DurableSourceParentStrategy::PermissionSeal => true,
+            DurableSourceParentStrategy::AlreadyExclusive(proof) => {
+                proof.source_parent == self.source_parent
+                    && proof.source_parent_identity == self.source_parent_identity
+                    && mode_is_exclusive_parent(proof.observed_mode)
+            }
+        };
+        locator_is_valid(&self.source_parent)
+            && locator_is_valid(&self.destination_parent)
+            && self.source_parent.filesystem_id == self.destination_parent.filesystem_id
+            && normal_name(&self.source_basename)
+            && normal_name(&self.destination_basename)
+            && (self.source_parent.relative_path != self.destination_parent.relative_path
+                || self.source_basename != self.destination_basename)
+            && strategy_is_bound
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalidate_for_test(&mut self) {
+        self.source_basename = std::ffi::OsString::from("../invalid");
+    }
+}
+
+fn mode_is_exclusive_parent(mode: u32) -> bool {
+    mode & !0o7777 == 0 && mode & 0o300 == 0o300 && mode & 0o030 != 0o030 && mode & 0o003 != 0o003
+}
+
+/// Completion marker for the exact sealed tree selected by the future held-tree
+/// engine. The digest algorithm is fixed by this schema to SHA-256.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableTreeManifest {
+    pub entry_count: u64,
+    pub sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableRenameOutcome {
+    /// The root is at the destination and both source and destination parent
+    /// directory fsyncs completed successfully.
+    AppliedAndParentsSynced(StrongObjectIdentity),
+    /// The root remains at the source; no namespace mutation was applied.
+    ConfirmedNotAppliedAtSource(StrongObjectIdentity),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SealRecord {
@@ -43,6 +279,21 @@ pub enum SealRecord {
         transaction: TransactionId,
         mutation_id: u64,
     },
+    StagingBegin {
+        transaction: TransactionId,
+        metadata: StagingTransactionMetadata,
+    },
+    TreeManifestComplete {
+        transaction: TransactionId,
+        manifest: DurableTreeManifest,
+    },
+    RenameIntent {
+        transaction: TransactionId,
+    },
+    RenameOutcome {
+        transaction: TransactionId,
+        outcome: DurableRenameOutcome,
+    },
 }
 
 impl SealRecord {
@@ -51,7 +302,11 @@ impl SealRecord {
             Self::State { transaction, .. }
             | Self::PermissionIntent { transaction, .. }
             | Self::PermissionApplied { transaction, .. }
-            | Self::PermissionNotApplied { transaction, .. } => *transaction,
+            | Self::PermissionNotApplied { transaction, .. }
+            | Self::StagingBegin { transaction, .. }
+            | Self::TreeManifestComplete { transaction, .. }
+            | Self::RenameIntent { transaction }
+            | Self::RenameOutcome { transaction, .. } => *transaction,
         }
     }
 }
@@ -98,11 +353,15 @@ pub struct SealWal<W> {
     used_mutations: HashSet<(TransactionId, u64)>,
     permissions: HashMap<(TransactionId, u64), DurablePermission>,
     unresolved_mutations: HashMap<(TransactionId, u64), DurablePermission>,
+    staging: HashMap<TransactionId, StagingTransactionMetadata>,
+    manifests: HashMap<TransactionId, DurableTreeManifest>,
+    rename_outcomes: HashMap<TransactionId, DurableRenameOutcome>,
     committed_len: u64,
     max_wal_len: u64,
 }
 
 impl<W: DurableWrite> SealWal<W> {
+    #[allow(dead_code)] // authority-neutral A1 constructor retained for future coordinator
     pub(crate) fn new(mut writer: W) -> Result<Self, AppendError> {
         let committed_len = writer.prepare_append().map_err(AppendError::Io)?;
         if committed_len != 0 {
@@ -121,6 +380,9 @@ impl<W: DurableWrite> SealWal<W> {
             used_mutations: HashSet::new(),
             permissions: HashMap::new(),
             unresolved_mutations: HashMap::new(),
+            staging: HashMap::new(),
+            manifests: HashMap::new(),
+            rename_outcomes: HashMap::new(),
             committed_len,
             max_wal_len,
         }
@@ -178,6 +440,15 @@ impl<W: DurableWrite> SealWal<W> {
         let mut wal = Self::from_validated(writer, actual_len, MAX_WAL_LEN);
         for transaction in replay.transactions.values() {
             wal.states.insert(transaction.id, transaction.state);
+            if let Some(metadata) = &transaction.staging {
+                wal.staging.insert(transaction.id, metadata.clone());
+            }
+            if let Some(manifest) = transaction.tree_manifest {
+                wal.manifests.insert(transaction.id, manifest);
+            }
+            if let Some(outcome) = transaction.rename_outcome {
+                wal.rename_outcomes.insert(transaction.id, outcome);
+            }
             for permission in &transaction.permissions {
                 let key = (transaction.id, permission.mutation_id);
                 wal.used_mutations.insert(key);
@@ -202,7 +473,92 @@ impl<W: DurableWrite> SealWal<W> {
         Ok(())
     }
 
+    /// Atomically begins a staging transaction with its immutable namespace and
+    /// strong source-identity binding in the first durable frame.
+    pub(crate) fn begin_staging(
+        &mut self,
+        transaction: TransactionId,
+        metadata: StagingTransactionMetadata,
+    ) -> Result<(), AppendError> {
+        if self.states.contains_key(&transaction) {
+            return Err(AppendError::InvalidState("transaction already exists"));
+        }
+        if !metadata.invariants_hold() {
+            return Err(AppendError::InvalidState(
+                "staging metadata invariants are invalid",
+            ));
+        }
+        self.append_synced(&SealRecord::StagingBegin {
+            transaction,
+            metadata: metadata.clone(),
+        })?;
+        self.states.insert(transaction, TransactionState::Prepared);
+        self.staging.insert(transaction, metadata);
+        Ok(())
+    }
+
+    pub(crate) fn staging_metadata(
+        &self,
+        transaction: TransactionId,
+    ) -> Option<&StagingTransactionMetadata> {
+        self.staging.get(&transaction)
+    }
+
+    pub(crate) fn transaction_state(&self, transaction: TransactionId) -> Option<TransactionState> {
+        self.states.get(&transaction).copied()
+    }
+
+    pub(crate) fn can_begin_staging_transaction(&self) -> bool {
+        self.states.iter().all(|(transaction, state)| {
+            matches!(
+                state,
+                TransactionState::VerifiedCommitted
+                    | TransactionState::Purgeable
+                    | TransactionState::Purged
+                    | TransactionState::Restored
+                    | TransactionState::RolledBack
+            ) || (*state == TransactionState::Quarantined
+                && !retains_active_permission_seals(
+                    self.permissions
+                        .iter()
+                        .filter(|((owner, _), _)| owner == transaction)
+                        .map(|(_, permission)| permission),
+                ))
+        })
+    }
+
+    /// Authority-neutral A1 transition. Staging transactions are deliberately
+    /// excluded and can be advanced only by the crate-private high-level engine.
     pub fn transition(
+        &mut self,
+        transaction: TransactionId,
+        next: TransactionState,
+    ) -> Result<(), AppendError> {
+        if self.staging.contains_key(&transaction) {
+            return Err(AppendError::InvalidState(
+                "staging transitions require the high-level engine",
+            ));
+        }
+        self.transition_inner(transaction, next)
+    }
+
+    pub(crate) fn transition_staging(
+        &mut self,
+        transaction: TransactionId,
+        next: TransactionState,
+    ) -> Result<(), AppendError> {
+        if !self.staging.contains_key(&transaction) {
+            return Err(AppendError::InvalidState("transaction is not staged"));
+        }
+        if matches!(next, TransactionState::Purgeable | TransactionState::Purged) {
+            return Err(AppendError::InvalidState(
+                "purge state requires an unavailable held-object capability",
+            ));
+        }
+        self.transition_inner(transaction, next)
+    }
+
+    fn transition_inner(
         &mut self,
         transaction: TransactionId,
         next: TransactionState,
@@ -210,6 +566,11 @@ impl<W: DurableWrite> SealWal<W> {
         let Some(current) = self.states.get(&transaction).copied() else {
             return Err(AppendError::InvalidState("transaction has not begun"));
         };
+        if next == TransactionState::RenameIntent {
+            return Err(AppendError::InvalidState(
+                "rename intent requires its explicit durable record",
+            ));
+        }
         if next != TransactionState::RecoveryRequired
             && self
                 .unresolved_mutations
@@ -232,6 +593,32 @@ impl<W: DurableWrite> SealWal<W> {
                 "seal phase contains a permission intent not durably applied",
             ));
         }
+        if current == TransactionState::ParentSealIntent
+            && next == TransactionState::ParentSealed
+            && !staging_parent_strategy_is_complete(
+                self.staging.get(&transaction),
+                self.permissions
+                    .iter()
+                    .filter(|((owner, _), _)| *owner == transaction)
+                    .map(|(_, permission)| permission),
+            )
+        {
+            return Err(AppendError::InvalidState(
+                "source-parent strategy lacks its required durable proof",
+            ));
+        }
+        if next == TransactionState::SourceParentRestored
+            && !all_applied_parent_seals_have_applied_inverse(
+                self.permissions
+                    .iter()
+                    .filter(|((owner, _), _)| *owner == transaction)
+                    .map(|(_, permission)| permission),
+            )
+        {
+            return Err(AppendError::InvalidState(
+                "source-parent restoration requires applied inverses",
+            ));
+        }
         if matches!(
             next,
             TransactionState::Restored | TransactionState::RolledBack
@@ -245,6 +632,32 @@ impl<W: DurableWrite> SealWal<W> {
                 "terminal restore requires an applied inverse for every applied seal",
             ));
         }
+        if current == TransactionState::TreeSealIntent
+            && next == TransactionState::TreeSealed
+            && !self.manifests.contains_key(&transaction)
+        {
+            return Err(AppendError::InvalidState(
+                "tree seal completion requires a durable manifest digest",
+            ));
+        }
+        if current == TransactionState::RenameIntent {
+            match (self.rename_outcomes.get(&transaction), next) {
+                (
+                    Some(DurableRenameOutcome::AppliedAndParentsSynced(_)),
+                    TransactionState::StagedUnverified,
+                )
+                | (
+                    Some(DurableRenameOutcome::ConfirmedNotAppliedAtSource(_)),
+                    TransactionState::RestoreIntent,
+                )
+                | (_, TransactionState::RecoveryRequired) => {}
+                _ => {
+                    return Err(AppendError::InvalidState(
+                        "rename transition lacks a matching durable outcome",
+                    ));
+                }
+            }
+        }
         if !valid_transition(current, next) {
             return Err(AppendError::InvalidState("invalid transaction transition"));
         }
@@ -256,9 +669,126 @@ impl<W: DurableWrite> SealWal<W> {
         Ok(())
     }
 
+    /// Durably completes the exact tree manifest after all tree seal intents
+    /// have resolved Applied. The future held-tree implementation computes the
+    /// digest; this WAL method only enforces ordering and uniqueness.
+    #[allow(dead_code)] // consumed by the held-tree coordinator seam
+    pub(crate) fn complete_tree_manifest(
+        &mut self,
+        transaction: TransactionId,
+        manifest: DurableTreeManifest,
+    ) -> Result<(), AppendError> {
+        if self.states.get(&transaction).copied() != Some(TransactionState::TreeSealIntent) {
+            return Err(AppendError::InvalidState(
+                "tree manifest is outside tree seal intent",
+            ));
+        }
+        if self.manifests.contains_key(&transaction)
+            || self
+                .unresolved_mutations
+                .keys()
+                .any(|(owner, _)| *owner == transaction)
+            || self.permissions.iter().any(|((owner, _), permission)| {
+                *owner == transaction
+                    && permission.phase == TransactionState::TreeSealIntent
+                    && permission.application != ApplicationStatus::Applied
+            })
+        {
+            return Err(AppendError::InvalidState(
+                "tree manifest is duplicate or permission work is unresolved",
+            ));
+        }
+        self.append_synced(&SealRecord::TreeManifestComplete {
+            transaction,
+            manifest,
+        })?;
+        self.manifests.insert(transaction, manifest);
+        Ok(())
+    }
+
+    /// Atomically transitions TreeSealed to RenameIntent using an explicit WAL
+    /// record. Actual namespace authority remains outside this module.
+    #[allow(dead_code)] // consumed by the held-tree coordinator seam
+    pub(crate) fn record_rename_intent(
+        &mut self,
+        transaction: TransactionId,
+    ) -> Result<(), AppendError> {
+        if self.states.get(&transaction).copied() != Some(TransactionState::TreeSealed)
+            || !self.staging.contains_key(&transaction)
+            || !self.manifests.contains_key(&transaction)
+        {
+            return Err(AppendError::InvalidState(
+                "rename intent requires staging metadata and a complete sealed tree",
+            ));
+        }
+        self.append_synced(&SealRecord::RenameIntent { transaction })?;
+        self.states
+            .insert(transaction, TransactionState::RenameIntent);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_applied_rename_for_test(
+        &mut self,
+        transaction: TransactionId,
+    ) -> Result<(), AppendError> {
+        if self.states.get(&transaction).copied() != Some(TransactionState::RenameIntent)
+            || self.rename_outcomes.contains_key(&transaction)
+        {
+            return Err(AppendError::InvalidState(
+                "test rename outcome is outside rename intent",
+            ));
+        }
+        let identity = self
+            .staging
+            .get(&transaction)
+            .ok_or(AppendError::InvalidState("transaction is not staged"))?
+            .root_identity;
+        let outcome = DurableRenameOutcome::AppliedAndParentsSynced(identity);
+        self.append_synced(&SealRecord::RenameOutcome {
+            transaction,
+            outcome,
+        })?;
+        self.rename_outcomes.insert(transaction, outcome);
+        Ok(())
+    }
+
     /// Durably records intent before invoking `mutate`, then durably records
     /// applied only after the mutation reports success.
     pub fn apply_permission_mutation<F>(
+        &mut self,
+        intent: PermissionIntent,
+        mutate: F,
+    ) -> Result<(), MutationAppendError>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
+        if self.staging.contains_key(&intent.transaction) {
+            return Err(MutationAppendError::IntentWal(AppendError::InvalidState(
+                "staging permission mutation requires the high-level engine",
+            )));
+        }
+        self.apply_permission_mutation_inner(intent, mutate)
+    }
+
+    #[allow(dead_code)] // future held-tree coordinator only
+    pub(crate) fn apply_staging_permission_mutation<F>(
+        &mut self,
+        intent: PermissionIntent,
+        mutate: F,
+    ) -> Result<(), MutationAppendError>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
+        if !self.staging.contains_key(&intent.transaction) {
+            return Err(MutationAppendError::IntentWal(AppendError::InvalidState(
+                "transaction is not staged",
+            )));
+        }
+        self.apply_permission_mutation_inner(intent, mutate)
+    }
+
+    fn apply_permission_mutation_inner<F>(
         &mut self,
         intent: PermissionIntent,
         mutate: F,
@@ -275,12 +805,39 @@ impl<W: DurableWrite> SealWal<W> {
                 TransactionState::ParentSealIntent
                     | TransactionState::TreeSealIntent
                     | TransactionState::RestoreIntent
+                    | TransactionState::SourceParentRestoreIntent
                     | TransactionState::RollbackIntent
             )
         ) {
             return Err(MutationAppendError::IntentWal(AppendError::InvalidState(
                 "permission mutation is outside an intent phase",
             )));
+        }
+        if phase == Some(TransactionState::TreeSealIntent)
+            && self.manifests.contains_key(&transaction)
+        {
+            return Err(MutationAppendError::IntentWal(AppendError::InvalidState(
+                "tree permission membership is frozen by the manifest",
+            )));
+        }
+        if let Some(metadata) = self.staging.get(&transaction) {
+            if intent.evidence.filesystem_id() != Some(metadata.filesystem_id())
+                || intent.evidence.generation_or_btime().is_none()
+            {
+                return Err(MutationAppendError::IntentWal(AppendError::InvalidState(
+                    "staging permission evidence lacks the bound filesystem or strong incarnation",
+                )));
+            }
+            if phase == Some(TransactionState::ParentSealIntent)
+                && (!matches!(
+                    metadata.source_parent_strategy,
+                    DurableSourceParentStrategy::PermissionSeal
+                ) || !evidence_is_exact_source_parent(&intent.evidence, metadata))
+            {
+                return Err(MutationAppendError::IntentWal(AppendError::InvalidState(
+                    "parent seal evidence is not the exact metadata-bound source parent",
+                )));
+            }
         }
         if intent.expected_mode != intent.evidence.expected_mode()
             || intent.pre_mode & !0o7777 != 0
@@ -294,7 +851,9 @@ impl<W: DurableWrite> SealWal<W> {
         match (phase.unwrap(), reverse) {
             (TransactionState::ParentSealIntent | TransactionState::TreeSealIntent, None) => {}
             (
-                TransactionState::RestoreIntent | TransactionState::RollbackIntent,
+                TransactionState::RestoreIntent
+                | TransactionState::SourceParentRestoreIntent
+                | TransactionState::RollbackIntent,
                 Some(original),
             ) => {
                 let Some(original) = self.permissions.get(&(transaction, original)) else {
@@ -307,7 +866,13 @@ impl<W: DurableWrite> SealWal<W> {
                         original.phase,
                         TransactionState::ParentSealIntent | TransactionState::TreeSealIntent
                     )
+                    || (phase == Some(TransactionState::SourceParentRestoreIntent)
+                        && original.phase != TransactionState::ParentSealIntent)
                     || !same_recovery_object(&original.evidence, &intent.evidence)
+                    || (original.phase == TransactionState::ParentSealIntent
+                        && self.staging.get(&transaction).is_some_and(|metadata| {
+                            !evidence_is_exact_source_parent(&intent.evidence, metadata)
+                        }))
                     || intent.pre_mode != original.expected_mode
                     || intent.expected_mode != original.pre_mode
                     || self.permissions.iter().any(|((owner, _), permission)| {
@@ -376,6 +941,37 @@ impl<W: DurableWrite> SealWal<W> {
     /// recovery establishes whether the mutation is applied. This method does
     /// not perform chmod or infer identity from the recorded evidence.
     pub fn resolve_unresolved_permission<F>(
+        &mut self,
+        transaction: TransactionId,
+        mutation_id: u64,
+        resolve: F,
+    ) -> Result<PermissionResolution, ResolveError>
+    where
+        F: FnOnce(&DurablePermission) -> io::Result<PermissionResolution>,
+    {
+        if self.staging.contains_key(&transaction) {
+            return Err(ResolveError::WrongPhase);
+        }
+        self.resolve_unresolved_permission_inner(transaction, mutation_id, resolve)
+    }
+
+    #[allow(dead_code)] // future authorized staging recovery only
+    pub(crate) fn resolve_staging_permission<F>(
+        &mut self,
+        transaction: TransactionId,
+        mutation_id: u64,
+        resolve: F,
+    ) -> Result<PermissionResolution, ResolveError>
+    where
+        F: FnOnce(&DurablePermission) -> io::Result<PermissionResolution>,
+    {
+        if !self.staging.contains_key(&transaction) {
+            return Err(ResolveError::WrongPhase);
+        }
+        self.resolve_unresolved_permission_inner(transaction, mutation_id, resolve)
+    }
+
+    fn resolve_unresolved_permission_inner<F>(
         &mut self,
         transaction: TransactionId,
         mutation_id: u64,
@@ -491,6 +1087,9 @@ pub struct ReplayedTransaction {
     pub id: TransactionId,
     pub state: TransactionState,
     pub permissions: Vec<DurablePermission>,
+    pub staging: Option<StagingTransactionMetadata>,
+    pub tree_manifest: Option<DurableTreeManifest>,
+    pub rename_outcome: Option<DurableRenameOutcome>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -621,14 +1220,15 @@ impl RecoverySession {
     }
 
     /// Starts a writer for a newly created, empty WAL while retaining this lease.
-    pub fn into_new_wal(self) -> Result<SealWal<Self>, AppendError> {
+    #[allow(dead_code)] // authority-neutral A1 constructor retained for future coordinator
+    pub(crate) fn into_new_wal(self) -> Result<SealWal<Self>, AppendError> {
         SealWal::new(self)
     }
 
     /// Resumes the replayed WAL on this exact descriptor while retaining the
     /// exclusive lease for the writer's complete lifetime. Replay evidence is
     /// stored inside the session, so evidence from another WAL cannot be passed.
-    pub fn resume(mut self) -> Result<SealWal<Self>, AppendError> {
+    pub(crate) fn resume(mut self) -> Result<SealWal<Self>, AppendError> {
         let replay = self.replay.take().ok_or(AppendError::InvalidState(
             "WAL lease has not completed validated replay",
         ))?;
@@ -673,6 +1273,10 @@ pub enum RecoveryWork {
         transaction: TransactionId,
         permissions: Vec<DurablePermission>,
     },
+    RestoreSourceParentAfterRename {
+        transaction: TransactionId,
+        permissions: Vec<DurablePermission>,
+    },
     ResolveUncertainPermissions {
         transaction: TransactionId,
         permissions: Vec<DurablePermission>,
@@ -695,6 +1299,13 @@ pub enum RecoveryRequiredReason {
     InsufficientPersistentIdentity,
     RenameOutcomeUnknown,
     RecordedRecoveryRequired,
+}
+
+pub(crate) fn quarantined_transaction_retains_active_permission_seals(
+    transaction: &ReplayedTransaction,
+) -> bool {
+    transaction.state == TransactionState::Quarantined
+        && retains_active_permission_seals(transaction.permissions.iter())
 }
 
 /// Converts durable state into work only. The caller must independently obtain
@@ -731,15 +1342,6 @@ where
     ) {
         return RecoveryWork::Nothing;
     }
-    if transaction.state == TransactionState::RenameIntent {
-        // The rename may have completed before a StagedUnverified record became
-        // durable. This WAL deliberately has no filesystem authority with which
-        // to infer the location, so startup must stop for an authorized probe.
-        return RecoveryWork::RecoveryRequired {
-            transaction: transaction.id,
-            reason: RecoveryRequiredReason::RenameOutcomeUnknown,
-        };
-    }
     let uncertain = transaction
         .permissions
         .iter()
@@ -769,6 +1371,14 @@ where
             .cloned()
             .collect::<Vec<_>>()
     };
+    if transaction.state == TransactionState::RenameIntent && transaction.rename_outcome.is_none() {
+        // No durable outcome exists from which to choose a side of the rename.
+        // The WAL has no filesystem authority with which to infer the location.
+        return RecoveryWork::RecoveryRequired {
+            transaction: transaction.id,
+            reason: RecoveryRequiredReason::RenameOutcomeUnknown,
+        };
+    }
     if transaction
         .permissions
         .iter()
@@ -787,10 +1397,39 @@ where
             reason: RecoveryRequiredReason::InsufficientPersistentIdentity,
         };
     }
+    if transaction.state == TransactionState::RenameIntent {
+        return match transaction.rename_outcome {
+            Some(DurableRenameOutcome::AppliedAndParentsSynced(_)) => {
+                RecoveryWork::VerifyOrQuarantineAfterRename {
+                    transaction: transaction.id,
+                    permissions: active_permissions(),
+                }
+            }
+            Some(DurableRenameOutcome::ConfirmedNotAppliedAtSource(_)) => {
+                let mut permissions = active_permissions();
+                sort_permissions_deepest_first(&mut permissions);
+                RecoveryWork::RestoreBeforeRename {
+                    transaction: transaction.id,
+                    permissions,
+                }
+            }
+            None => unreachable!("missing rename outcome handled before identity gating"),
+        };
+    }
+    if transaction.state == TransactionState::SourceParentRestoreIntent {
+        return RecoveryWork::RestoreSourceParentAfterRename {
+            transaction: transaction.id,
+            permissions: active_permissions()
+                .into_iter()
+                .filter(|permission| permission.phase == TransactionState::ParentSealIntent)
+                .collect(),
+        };
+    }
     if matches!(
         transaction.state,
         TransactionState::StagedUnverified
             | TransactionState::StagedSealed
+            | TransactionState::SourceParentRestored
             | TransactionState::RollbackIntent
     ) {
         RecoveryWork::VerifyOrQuarantineAfterRename {
@@ -799,23 +1438,27 @@ where
         }
     } else {
         let mut permissions = active_permissions();
-        // Evidence paths are confined beneath one recovery anchor. Restoring
-        // deepest objects first keeps every recorded source parent after its
-        // descendants; ties retain deterministic mutation-id order.
-        permissions.sort_by(|left, right| {
-            right
-                .evidence
-                .relative_path()
-                .components()
-                .count()
-                .cmp(&left.evidence.relative_path().components().count())
-                .then_with(|| left.mutation_id.cmp(&right.mutation_id))
-        });
+        sort_permissions_deepest_first(&mut permissions);
         RecoveryWork::RestoreBeforeRename {
             transaction: transaction.id,
             permissions,
         }
     }
+}
+
+fn sort_permissions_deepest_first(permissions: &mut [DurablePermission]) {
+    // Evidence paths are confined beneath one recovery anchor. Restoring
+    // deepest objects first keeps every recorded source parent after its
+    // descendants; ties retain deterministic mutation-id order.
+    permissions.sort_by(|left, right| {
+        right
+            .evidence
+            .relative_path()
+            .components()
+            .count()
+            .cmp(&left.evidence.relative_path().components().count())
+            .then_with(|| left.mutation_id.cmp(&right.mutation_id))
+    });
 }
 
 struct ParsedFrames {
@@ -888,6 +1531,9 @@ struct ReplayBuilding {
     state: Option<TransactionState>,
     permissions: Vec<DurablePermission>,
     indices: HashMap<u64, (usize, TransactionState)>,
+    staging: Option<StagingTransactionMetadata>,
+    tree_manifest: Option<DurableTreeManifest>,
+    rename_outcome: Option<DurableRenameOutcome>,
 }
 
 fn replay_records(records: Vec<SealRecord>) -> Result<Replay, ReplayError> {
@@ -896,8 +1542,72 @@ fn replay_records(records: Vec<SealRecord>) -> Result<Replay, ReplayError> {
         let id = record.transaction();
         let tx = transactions.entry(id).or_default();
         match record {
+            SealRecord::StagingBegin { metadata, .. } => {
+                if tx.state.is_some() || tx.staging.is_some() {
+                    return Err(ReplayError::InvalidHistory(
+                        "staging transaction has a duplicate or noninitial begin",
+                    ));
+                }
+                tx.state = Some(TransactionState::Prepared);
+                tx.staging = Some(metadata);
+            }
+            SealRecord::TreeManifestComplete { manifest, .. } => {
+                if tx.state != Some(TransactionState::TreeSealIntent)
+                    || tx.tree_manifest.is_some()
+                    || tx.permissions.iter().any(|permission| {
+                        permission.application == ApplicationStatus::IntentDurableApplicationUnknown
+                            || (permission.phase == TransactionState::TreeSealIntent
+                                && permission.application != ApplicationStatus::Applied)
+                    })
+                {
+                    return Err(ReplayError::InvalidHistory(
+                        "tree manifest is duplicate, unordered, or has unresolved permissions",
+                    ));
+                }
+                tx.tree_manifest = Some(manifest);
+            }
+            SealRecord::RenameIntent { .. } => {
+                if tx.state != Some(TransactionState::TreeSealed)
+                    || tx.staging.is_none()
+                    || tx.tree_manifest.is_none()
+                {
+                    return Err(ReplayError::InvalidHistory(
+                        "rename intent lacks staging metadata or a completed tree manifest",
+                    ));
+                }
+                tx.state = Some(TransactionState::RenameIntent);
+            }
+            SealRecord::RenameOutcome { outcome, .. } => {
+                if tx.state != Some(TransactionState::RenameIntent) || tx.rename_outcome.is_some() {
+                    return Err(ReplayError::InvalidHistory(
+                        "rename outcome is duplicate or outside rename intent",
+                    ));
+                }
+                let expected = tx
+                    .staging
+                    .as_ref()
+                    .ok_or(ReplayError::InvalidHistory(
+                        "rename outcome has no staging metadata",
+                    ))?
+                    .root_identity;
+                let actual = match outcome {
+                    DurableRenameOutcome::AppliedAndParentsSynced(identity)
+                    | DurableRenameOutcome::ConfirmedNotAppliedAtSource(identity) => identity,
+                };
+                if actual != expected {
+                    return Err(ReplayError::InvalidHistory(
+                        "rename outcome identity differs from the bound root",
+                    ));
+                }
+                tx.rename_outcome = Some(outcome);
+            }
             SealRecord::State { state, .. } => {
                 if let Some(previous) = tx.state {
+                    if state == TransactionState::RenameIntent {
+                        return Err(ReplayError::InvalidHistory(
+                            "rename intent must use its explicit record",
+                        ));
+                    }
                     if state != TransactionState::RecoveryRequired
                         && tx.permissions.iter().any(|permission| {
                             permission.application
@@ -913,6 +1623,24 @@ fn replay_records(records: Vec<SealRecord>) -> Result<Replay, ReplayError> {
                             "seal phase contains a permission intent not durably applied",
                         ));
                     }
+                    if previous == TransactionState::ParentSealIntent
+                        && state == TransactionState::ParentSealed
+                        && !staging_parent_strategy_is_complete(
+                            tx.staging.as_ref(),
+                            tx.permissions.iter(),
+                        )
+                    {
+                        return Err(ReplayError::InvalidHistory(
+                            "source-parent strategy lacks its required durable proof",
+                        ));
+                    }
+                    if state == TransactionState::SourceParentRestored
+                        && !all_applied_parent_seals_have_applied_inverse(tx.permissions.iter())
+                    {
+                        return Err(ReplayError::InvalidHistory(
+                            "source-parent restoration lacks applied inverses",
+                        ));
+                    }
                     if matches!(
                         state,
                         TransactionState::Restored | TransactionState::RolledBack
@@ -921,6 +1649,32 @@ fn replay_records(records: Vec<SealRecord>) -> Result<Replay, ReplayError> {
                         return Err(ReplayError::InvalidHistory(
                             "terminal restore lacks an applied inverse for an applied seal",
                         ));
+                    }
+                    if previous == TransactionState::TreeSealIntent
+                        && state == TransactionState::TreeSealed
+                        && tx.tree_manifest.is_none()
+                    {
+                        return Err(ReplayError::InvalidHistory(
+                            "tree seal completed without a manifest digest",
+                        ));
+                    }
+                    if previous == TransactionState::RenameIntent {
+                        match (tx.rename_outcome, state) {
+                            (
+                                Some(DurableRenameOutcome::AppliedAndParentsSynced(_)),
+                                TransactionState::StagedUnverified,
+                            )
+                            | (
+                                Some(DurableRenameOutcome::ConfirmedNotAppliedAtSource(_)),
+                                TransactionState::RestoreIntent,
+                            )
+                            | (_, TransactionState::RecoveryRequired) => {}
+                            _ => {
+                                return Err(ReplayError::InvalidHistory(
+                                    "rename transition lacks a matching durable outcome",
+                                ));
+                            }
+                        }
                     }
                     if !valid_transition(previous, state) {
                         return Err(ReplayError::InvalidHistory(
@@ -952,11 +1706,36 @@ fn replay_records(records: Vec<SealRecord>) -> Result<Replay, ReplayError> {
                     TransactionState::ParentSealIntent
                         | TransactionState::TreeSealIntent
                         | TransactionState::RestoreIntent
+                        | TransactionState::SourceParentRestoreIntent
                         | TransactionState::RollbackIntent
                 ) {
                     return Err(ReplayError::InvalidHistory(
                         "permission intent is outside a permission-intent phase",
                     ));
+                }
+                if phase == TransactionState::TreeSealIntent && tx.tree_manifest.is_some() {
+                    return Err(ReplayError::InvalidHistory(
+                        "tree permission membership changed after manifest completion",
+                    ));
+                }
+                if let Some(metadata) = &tx.staging {
+                    if evidence.filesystem_id() != Some(metadata.filesystem_id())
+                        || evidence.generation_or_btime().is_none()
+                    {
+                        return Err(ReplayError::InvalidHistory(
+                            "staging permission lacks bound filesystem or strong incarnation",
+                        ));
+                    }
+                    if phase == TransactionState::ParentSealIntent
+                        && (!matches!(
+                            metadata.source_parent_strategy,
+                            DurableSourceParentStrategy::PermissionSeal
+                        ) || !evidence_is_exact_source_parent(&evidence, metadata))
+                    {
+                        return Err(ReplayError::InvalidHistory(
+                            "parent seal evidence differs from the metadata-bound source parent",
+                        ));
+                    }
                 }
                 if tx.indices.contains_key(&mutation_id) {
                     return Err(ReplayError::InvalidHistory("duplicate permission intent"));
@@ -965,6 +1744,7 @@ fn replay_records(records: Vec<SealRecord>) -> Result<Replay, ReplayError> {
                     .insert(mutation_id, (tx.permissions.len(), phase));
                 validate_replayed_inverse(
                     &tx.permissions,
+                    tx.staging.as_ref(),
                     phase,
                     mutation_id,
                     &evidence,
@@ -1004,6 +1784,9 @@ fn replay_records(records: Vec<SealRecord>) -> Result<Replay, ReplayError> {
                     id,
                     state,
                     permissions: tx.permissions,
+                    staging: tx.staging,
+                    tree_manifest: tx.tree_manifest,
+                    rename_outcome: tx.rename_outcome,
                 },
             ))
         })
@@ -1015,8 +1798,10 @@ fn replay_records(records: Vec<SealRecord>) -> Result<Replay, ReplayError> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_replayed_inverse(
     permissions: &[DurablePermission],
+    staging: Option<&StagingTransactionMetadata>,
     phase: TransactionState,
     mutation_id: u64,
     evidence: &PersistentRecoveryEvidence,
@@ -1026,7 +1811,12 @@ fn validate_replayed_inverse(
 ) -> Result<(), ReplayError> {
     match (phase, reverses_mutation_id) {
         (TransactionState::ParentSealIntent | TransactionState::TreeSealIntent, None) => Ok(()),
-        (TransactionState::RestoreIntent | TransactionState::RollbackIntent, Some(original_id)) => {
+        (
+            TransactionState::RestoreIntent
+            | TransactionState::SourceParentRestoreIntent
+            | TransactionState::RollbackIntent,
+            Some(original_id),
+        ) => {
             let original = permissions
                 .iter()
                 .find(|permission| permission.mutation_id == original_id)
@@ -1035,7 +1825,13 @@ fn validate_replayed_inverse(
                 ))?;
             if original.application != ApplicationStatus::Applied
                 || original.reverses_mutation_id.is_some()
+                || (phase == TransactionState::SourceParentRestoreIntent
+                    && original.phase != TransactionState::ParentSealIntent)
                 || !same_recovery_object(&original.evidence, evidence)
+                || (original.phase == TransactionState::ParentSealIntent
+                    && staging.is_some_and(|metadata| {
+                        !evidence_is_exact_source_parent(evidence, metadata)
+                    }))
                 || pre_mode != original.expected_mode
                 || expected_mode != original.pre_mode
                 || permissions.iter().any(|permission| {
@@ -1086,6 +1882,38 @@ fn resolve_replayed_permission(
     Ok(())
 }
 
+fn evidence_is_exact_source_parent(
+    evidence: &PersistentRecoveryEvidence,
+    metadata: &StagingTransactionMetadata,
+) -> bool {
+    evidence.relative_path() == metadata.source_parent.relative_path()
+        && evidence.filesystem_id() == Some(metadata.source_parent.filesystem_id())
+        && evidence.device() == metadata.source_parent_identity.device
+        && evidence.inode() == metadata.source_parent_identity.inode
+        && evidence.generation_or_btime() == Some(metadata.source_parent_identity.incarnation.get())
+}
+
+fn staging_parent_strategy_is_complete<'a>(
+    metadata: Option<&StagingTransactionMetadata>,
+    permissions: impl Iterator<Item = &'a DurablePermission>,
+) -> bool {
+    let Some(metadata) = metadata else {
+        return true;
+    };
+    let parent_permissions = permissions
+        .filter(|permission| permission.phase == TransactionState::ParentSealIntent)
+        .collect::<Vec<_>>();
+    match metadata.source_parent_strategy {
+        DurableSourceParentStrategy::PermissionSeal => {
+            !parent_permissions.is_empty()
+                && parent_permissions
+                    .iter()
+                    .all(|permission| permission.application == ApplicationStatus::Applied)
+        }
+        DurableSourceParentStrategy::AlreadyExclusive(_) => parent_permissions.is_empty(),
+    }
+}
+
 fn same_recovery_object(
     left: &PersistentRecoveryEvidence,
     right: &PersistentRecoveryEvidence,
@@ -1108,6 +1936,9 @@ fn phase_completion_is_valid<'a>(
         (TransactionState::TreeSealIntent, TransactionState::TreeSealed) => {
             Some(TransactionState::TreeSealIntent)
         }
+        (TransactionState::SourceParentRestoreIntent, TransactionState::SourceParentRestored) => {
+            Some(TransactionState::SourceParentRestoreIntent)
+        }
         _ => None,
     };
     completed_phase.is_none_or(|phase| {
@@ -1115,6 +1946,27 @@ fn phase_completion_is_valid<'a>(
             .filter(|permission| permission.phase == phase)
             .all(|permission| permission.application == ApplicationStatus::Applied)
     })
+}
+
+fn all_applied_parent_seals_have_applied_inverse<'a>(
+    permissions: impl Iterator<Item = &'a DurablePermission>,
+) -> bool {
+    let permissions = permissions.collect::<Vec<_>>();
+    permissions.iter().all(|seal| {
+        seal.application != ApplicationStatus::Applied
+            || seal.phase != TransactionState::ParentSealIntent
+            || permissions.iter().any(|inverse| {
+                inverse.application == ApplicationStatus::Applied
+                    && inverse.phase == TransactionState::SourceParentRestoreIntent
+                    && inverse.reverses_mutation_id == Some(seal.mutation_id)
+            })
+    })
+}
+
+fn retains_active_permission_seals<'a>(
+    permissions: impl Iterator<Item = &'a DurablePermission>,
+) -> bool {
+    !all_applied_seals_have_applied_inverse(permissions)
 }
 
 fn all_applied_seals_have_applied_inverse<'a>(
@@ -1146,9 +1998,9 @@ fn valid_transition(from: TransactionState, to: TransactionState) -> bool {
             | (S::TreeSealed, S::RenameIntent)
             | (S::RenameIntent, S::StagedUnverified)
             | (S::StagedUnverified, S::StagedSealed)
-            | (S::StagedSealed, S::VerifiedCommitted)
-            | (S::VerifiedCommitted, S::Purgeable)
-            | (S::Purgeable, S::Purged)
+            | (S::StagedSealed, S::SourceParentRestoreIntent)
+            | (S::SourceParentRestoreIntent, S::SourceParentRestored)
+            | (S::SourceParentRestored, S::VerifiedCommitted)
             // Rollback is meaningful only after rename may have happened.
             | (S::StagedUnverified | S::StagedSealed, S::RollbackIntent)
             | (S::RollbackIntent, S::RolledBack)
@@ -1165,7 +2017,11 @@ fn valid_transition(from: TransactionState, to: TransactionState) -> bool {
             | (S::RestoreIntent, S::Restored)
             // Quarantine is confined to an unverified staged object.
             | (
-                S::StagedUnverified | S::StagedSealed | S::RollbackIntent,
+                S::StagedUnverified
+                    | S::StagedSealed
+                    | S::SourceParentRestoreIntent
+                    | S::SourceParentRestored
+                    | S::RollbackIntent,
                 S::Quarantined
             )
             // Any nonterminal state that may still require recovery may stop
@@ -1179,6 +2035,8 @@ fn valid_transition(from: TransactionState, to: TransactionState) -> bool {
                     | S::RenameIntent
                     | S::StagedUnverified
                     | S::StagedSealed
+                    | S::SourceParentRestoreIntent
+                    | S::SourceParentRestored
                     | S::RollbackIntent
                     | S::RestoreIntent,
                 S::RecoveryRequired
@@ -1255,6 +2113,44 @@ fn encode_record(record: &SealRecord) -> Result<Vec<u8>, FrameError> {
             bytes.push(4);
             bytes.extend_from_slice(&transaction.0);
             bytes.extend_from_slice(&mutation_id.to_le_bytes());
+        }
+        SealRecord::StagingBegin {
+            transaction,
+            metadata,
+        } => {
+            bytes.push(5);
+            bytes.extend_from_slice(&transaction.0);
+            encode_staging_metadata(&mut bytes, metadata)?;
+        }
+        SealRecord::TreeManifestComplete {
+            transaction,
+            manifest,
+        } => {
+            bytes.push(6);
+            bytes.extend_from_slice(&transaction.0);
+            bytes.extend_from_slice(&manifest.entry_count.to_le_bytes());
+            bytes.extend_from_slice(&manifest.sha256);
+        }
+        SealRecord::RenameIntent { transaction } => {
+            bytes.push(7);
+            bytes.extend_from_slice(&transaction.0);
+        }
+        SealRecord::RenameOutcome {
+            transaction,
+            outcome,
+        } => {
+            bytes.push(8);
+            bytes.extend_from_slice(&transaction.0);
+            match outcome {
+                DurableRenameOutcome::AppliedAndParentsSynced(identity) => {
+                    bytes.push(1);
+                    encode_strong_identity(&mut bytes, *identity);
+                }
+                DurableRenameOutcome::ConfirmedNotAppliedAtSource(identity) => {
+                    bytes.push(2);
+                    encode_strong_identity(&mut bytes, *identity);
+                }
+            }
         }
     }
     if bytes.len() > MAX_PAYLOAD_LEN {
@@ -1333,6 +2229,36 @@ fn decode_record(payload: &[u8], offset: u64) -> Result<SealRecord, ReplayError>
             transaction,
             mutation_id: cursor.u64()?,
         },
+        5 => SealRecord::StagingBegin {
+            transaction,
+            metadata: decode_staging_metadata(&mut cursor, offset)?,
+        },
+        6 => SealRecord::TreeManifestComplete {
+            transaction,
+            manifest: DurableTreeManifest {
+                entry_count: cursor.u64()?,
+                sha256: cursor.array_32()?,
+            },
+        },
+        7 => SealRecord::RenameIntent { transaction },
+        8 => {
+            let kind = cursor.u8()?;
+            let identity = decode_strong_identity(&mut cursor)?;
+            let outcome = match kind {
+                1 => DurableRenameOutcome::AppliedAndParentsSynced(identity),
+                2 => DurableRenameOutcome::ConfirmedNotAppliedAtSource(identity),
+                _ => {
+                    return Err(ReplayError::Malformed {
+                        offset,
+                        reason: "unknown rename outcome",
+                    });
+                }
+            };
+            SealRecord::RenameOutcome {
+                transaction,
+                outcome,
+            }
+        }
         _ => {
             return Err(ReplayError::Malformed {
                 offset,
@@ -1347,6 +2273,118 @@ fn decode_record(payload: &[u8], offset: u64) -> Result<SealRecord, ReplayError>
         });
     }
     Ok(record)
+}
+
+fn decode_strong_identity(cursor: &mut Cursor<'_>) -> Result<StrongObjectIdentity, ReplayError> {
+    Ok(StrongObjectIdentity {
+        device: cursor.u64()?,
+        inode: cursor.u64()?,
+        incarnation: ObjectIncarnation::new(cursor.u64()?),
+    })
+}
+
+fn decode_locator(cursor: &mut Cursor<'_>, offset: u64) -> Result<StagingLocator, ReplayError> {
+    let path = PathBuf::from(std::ffi::OsString::from_vec(cursor.bytes()?));
+    let filesystem_id = String::from_utf8(cursor.bytes()?).map_err(|_| ReplayError::Malformed {
+        offset,
+        reason: "staging filesystem id is not UTF-8",
+    })?;
+    StagingLocator::new(path, filesystem_id).ok_or(ReplayError::Malformed {
+        offset,
+        reason: "staging locator is invalid",
+    })
+}
+
+fn decode_staging_metadata(
+    cursor: &mut Cursor<'_>,
+    offset: u64,
+) -> Result<StagingTransactionMetadata, ReplayError> {
+    let source_parent = decode_locator(cursor, offset)?;
+    let source_parent_identity = decode_strong_identity(cursor)?;
+    let source_basename = std::ffi::OsString::from_vec(cursor.bytes()?);
+    let root_identity = decode_strong_identity(cursor)?;
+    let destination_parent = decode_locator(cursor, offset)?;
+    let destination_parent_identity = decode_strong_identity(cursor)?;
+    let destination_basename = std::ffi::OsString::from_vec(cursor.bytes()?);
+    let backend = match cursor.u8()? {
+        1 => CertifiedLocalBackend::Ext4,
+        2 => CertifiedLocalBackend::Xfs,
+        3 => CertifiedLocalBackend::Apfs,
+        _ => {
+            return Err(ReplayError::Malformed {
+                offset,
+                reason: "unknown staging backend",
+            });
+        }
+    };
+    let source_parent_strategy = match cursor.u8()? {
+        1 => DurableSourceParentStrategy::PermissionSeal,
+        2 => DurableSourceParentStrategy::AlreadyExclusive(DurableAlreadyExclusiveParent {
+            source_parent: decode_locator(cursor, offset)?,
+            source_parent_identity: decode_strong_identity(cursor)?,
+            observed_mode: cursor.u32()?,
+        }),
+        _ => {
+            return Err(ReplayError::Malformed {
+                offset,
+                reason: "unknown source-parent strategy",
+            });
+        }
+    };
+    StagingTransactionMetadata::new(
+        source_parent,
+        source_parent_identity,
+        source_basename,
+        root_identity,
+        destination_parent,
+        destination_parent_identity,
+        destination_basename,
+        backend,
+        source_parent_strategy,
+    )
+    .ok_or(ReplayError::Malformed {
+        offset,
+        reason: "staging metadata is inconsistent",
+    })
+}
+
+fn encode_strong_identity(output: &mut Vec<u8>, identity: StrongObjectIdentity) {
+    output.extend_from_slice(&identity.device.to_le_bytes());
+    output.extend_from_slice(&identity.inode.to_le_bytes());
+    output.extend_from_slice(&identity.incarnation.get().to_le_bytes());
+}
+
+fn encode_locator(output: &mut Vec<u8>, locator: &StagingLocator) -> Result<(), FrameError> {
+    put_bytes(output, locator.relative_path().as_os_str().as_bytes())?;
+    put_bytes(output, locator.filesystem_id().as_bytes())
+}
+
+fn encode_staging_metadata(
+    output: &mut Vec<u8>,
+    metadata: &StagingTransactionMetadata,
+) -> Result<(), FrameError> {
+    encode_locator(output, &metadata.source_parent)?;
+    encode_strong_identity(output, metadata.source_parent_identity);
+    put_bytes(output, metadata.source_basename.as_bytes())?;
+    encode_strong_identity(output, metadata.root_identity);
+    encode_locator(output, &metadata.destination_parent)?;
+    encode_strong_identity(output, metadata.destination_parent_identity);
+    put_bytes(output, metadata.destination_basename.as_bytes())?;
+    output.push(match metadata.backend {
+        CertifiedLocalBackend::Ext4 => 1,
+        CertifiedLocalBackend::Xfs => 2,
+        CertifiedLocalBackend::Apfs => 3,
+    });
+    match &metadata.source_parent_strategy {
+        DurableSourceParentStrategy::PermissionSeal => output.push(1),
+        DurableSourceParentStrategy::AlreadyExclusive(proof) => {
+            output.push(2);
+            encode_locator(output, &proof.source_parent)?;
+            encode_strong_identity(output, proof.source_parent_identity);
+            output.extend_from_slice(&proof.observed_mode.to_le_bytes());
+        }
+    }
+    Ok(())
 }
 
 fn put_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), FrameError> {
@@ -1427,6 +2465,10 @@ impl<'a> Cursor<'a> {
         Ok(self.take(16)?.try_into().unwrap())
     }
 
+    fn array_32(&mut self) -> Result<[u8; 32], ReplayError> {
+        Ok(self.take(32)?.try_into().unwrap())
+    }
+
     fn bytes(&mut self) -> Result<Vec<u8>, ReplayError> {
         let len = self.u32()? as usize;
         if len > MAX_PAYLOAD_LEN {
@@ -1485,6 +2527,8 @@ fn encode_state(state: TransactionState) -> u8 {
         S::Restored => 14,
         S::Quarantined => 15,
         S::RecoveryRequired => 16,
+        S::SourceParentRestoreIntent => 17,
+        S::SourceParentRestored => 18,
     }
 }
 
@@ -1508,6 +2552,8 @@ fn decode_state(value: u8, offset: u64) -> Result<TransactionState, ReplayError>
         14 => Ok(S::Restored),
         15 => Ok(S::Quarantined),
         16 => Ok(S::RecoveryRequired),
+        17 => Ok(S::SourceParentRestoreIntent),
+        18 => Ok(S::SourceParentRestored),
         _ => Err(ReplayError::Malformed {
             offset,
             reason: "unknown transaction state",

@@ -120,7 +120,7 @@ impl SealWalStore {
 
     /// Opens or creates the exact WAL entry and acquires a nonblocking exclusive
     /// lock on that same descriptor.
-    pub fn try_lease(&self) -> Result<RecoverySession, StoreError> {
+    pub(crate) fn try_lease(&self) -> Result<RecoverySession, StoreError> {
         let wal_path = self.path.join(WAL_FILE_NAME);
         let parent_path = self.path.parent().unwrap_or_else(|| Path::new("/"));
         validate_store_binding(

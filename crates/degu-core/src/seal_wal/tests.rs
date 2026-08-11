@@ -360,14 +360,14 @@ fn checksum_unknown_version_and_malformed_interior_fail_closed() {
 
     let version_path = temp.path().join("version.wal");
     let mut version = good.clone();
-    version[4..6].copy_from_slice(&2_u16.to_le_bytes());
+    version[4..6].copy_from_slice(&4_u16.to_le_bytes());
     let version_header_crc = crc32(&version[4..12]);
     version[12..16].copy_from_slice(&version_header_crc.to_le_bytes());
     std::fs::write(&version_path, &version).unwrap();
     let mut lock = RecoverySession::try_acquire(open_rw(&version_path)).unwrap();
     assert!(matches!(
         lock.replay_and_repair(),
-        Err(ReplayError::UnknownVersion { version: 2, .. })
+        Err(ReplayError::UnknownVersion { version: 4, .. })
     ));
     drop(lock);
 
@@ -448,6 +448,9 @@ fn replayed(state: TransactionState) -> ReplayedTransaction {
             reverses_mutation_id: None,
             application: ApplicationStatus::Applied,
         }],
+        staging: None,
+        tree_manifest: None,
+        rename_outcome: None,
     }
 }
 
@@ -577,8 +580,7 @@ fn permission_records_are_confined_to_seal_intent_phase() {
             state(transaction, TransactionState::ParentSealIntent),
             state(transaction, TransactionState::ParentSealed),
             state(transaction, TransactionState::TreeSealIntent),
-            state(transaction, TransactionState::TreeSealed),
-            state(transaction, TransactionState::RenameIntent),
+            state(transaction, TransactionState::RecoveryRequired),
             intent,
         ]),
         Err(ReplayError::InvalidHistory(
@@ -1243,5 +1245,674 @@ fn public_writer_rejects_illegal_runtime_transitions() {
             || Ok(())
         ),
         Err(MutationAppendError::IntentWal(AppendError::InvalidState(_)))
+    ));
+}
+
+fn strong(device: u64, inode: u64, incarnation: u64) -> StrongObjectIdentity {
+    StrongObjectIdentity {
+        device,
+        inode,
+        incarnation: ObjectIncarnation::new(incarnation),
+    }
+}
+
+fn staging_metadata() -> StagingTransactionMetadata {
+    let source_parent = StagingLocator::new(PathBuf::from("source-parent"), "fs-1".into()).unwrap();
+    let source_parent_identity = strong(1, 10, 100);
+    StagingTransactionMetadata::new(
+        source_parent.clone(),
+        source_parent_identity,
+        std::ffi::OsString::from("root"),
+        strong(1, 11, 101),
+        StagingLocator::new(PathBuf::from("trash-parent"), "fs-1".into()).unwrap(),
+        strong(1, 12, 102),
+        std::ffi::OsString::from("staged-root"),
+        CertifiedLocalBackend::Ext4,
+        DurableSourceParentStrategy::AlreadyExclusive(DurableAlreadyExclusiveParent {
+            source_parent,
+            source_parent_identity,
+            observed_mode: 0o700,
+        }),
+    )
+    .unwrap()
+}
+
+fn permission_seal_staging_metadata() -> StagingTransactionMetadata {
+    let mut metadata = staging_metadata();
+    metadata.source_parent_strategy = DurableSourceParentStrategy::PermissionSeal;
+    metadata
+}
+
+fn staging_tree_evidence(path: &str, inode: u64) -> PersistentRecoveryEvidence {
+    PersistentRecoveryEvidence::new(
+        PathBuf::from(path),
+        Some("fs-1".into()),
+        1,
+        inode,
+        Some(inode + 100),
+        0o500,
+    )
+    .unwrap()
+}
+
+fn advance_to_tree_intent(wal: &mut SealWal<FaultWriter>, transaction: TransactionId) {
+    wal.transition_staging(transaction, TransactionState::ParentSealIntent)
+        .unwrap();
+    wal.transition_staging(transaction, TransactionState::ParentSealed)
+        .unwrap();
+    wal.transition_staging(transaction, TransactionState::TreeSealIntent)
+        .unwrap();
+}
+
+#[test]
+fn staging_begin_is_one_first_frame_and_roundtrips_complete_metadata() {
+    let transaction = tx(71);
+    let metadata = staging_metadata();
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    wal.begin_staging(transaction, metadata.clone()).unwrap();
+    let parsed = parse_frames(&wal.into_inner().bytes).unwrap();
+    assert_eq!(parsed.records.len(), 1);
+    assert!(matches!(
+        &parsed.records[0],
+        SealRecord::StagingBegin { transaction: id, metadata: actual }
+            if *id == transaction && actual == &metadata
+    ));
+    let replay = replay_records(parsed.records).unwrap();
+    assert_eq!(
+        replay.transactions[&transaction].staging.as_ref(),
+        Some(&metadata)
+    );
+    assert_eq!(
+        replay.transactions[&transaction].state,
+        TransactionState::Prepared
+    );
+}
+
+#[test]
+fn staging_begin_sync_failure_does_not_publish_an_in_memory_transaction() {
+    let transaction = tx(72);
+    let mut wal = SealWal::new(FaultWriter {
+        fail_sync_at: Some((0, libc::EIO)),
+        ..FaultWriter::default()
+    })
+    .unwrap();
+    assert!(matches!(
+        wal.begin_staging(transaction, staging_metadata()),
+        Err(AppendError::Io(_))
+    ));
+    assert_eq!(wal.transaction_state(transaction), None);
+    assert!(matches!(
+        wal.begin_staging(transaction, staging_metadata()),
+        Err(AppendError::Poisoned)
+    ));
+}
+
+#[test]
+fn manifest_and_explicit_rename_intent_enforce_order_and_uniqueness() {
+    let transaction = tx(73);
+    let metadata = staging_metadata();
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    wal.begin_staging(transaction, metadata).unwrap();
+    advance_to_tree_intent(&mut wal, transaction);
+    assert!(matches!(
+        wal.transition_staging(transaction, TransactionState::TreeSealed),
+        Err(AppendError::InvalidState(_))
+    ));
+    let manifest = DurableTreeManifest {
+        entry_count: 9,
+        sha256: [0x5a; 32],
+    };
+    wal.complete_tree_manifest(transaction, manifest).unwrap();
+    assert!(matches!(
+        wal.complete_tree_manifest(transaction, manifest),
+        Err(AppendError::InvalidState(_))
+    ));
+    wal.transition_staging(transaction, TransactionState::TreeSealed)
+        .unwrap();
+    assert!(matches!(
+        wal.transition_staging(transaction, TransactionState::RenameIntent),
+        Err(AppendError::InvalidState(_))
+    ));
+    wal.record_rename_intent(transaction).unwrap();
+
+    // There is intentionally no writer API for a rename outcome until the
+    // held-tree executor can retain both authenticated parent capabilities.
+    let parsed = parse_frames(&wal.into_inner().bytes).unwrap();
+    let replay = replay_records(parsed.records).unwrap();
+    assert_eq!(
+        replay.transactions[&transaction].tree_manifest,
+        Some(manifest)
+    );
+    assert_eq!(
+        replay.transactions[&transaction].state,
+        TransactionState::RenameIntent
+    );
+    assert_eq!(replay.transactions[&transaction].rename_outcome, None);
+}
+fn replay_rename_crash_boundary(
+    transaction: TransactionId,
+    outcome: Option<DurableRenameOutcome>,
+) -> ReplayedTransaction {
+    let metadata = staging_metadata();
+    let mut records = vec![
+        SealRecord::StagingBegin {
+            transaction,
+            metadata,
+        },
+        state(transaction, TransactionState::ParentSealIntent),
+        state(transaction, TransactionState::ParentSealed),
+        state(transaction, TransactionState::TreeSealIntent),
+        SealRecord::PermissionIntent {
+            transaction,
+            mutation_id: 1,
+            evidence: staging_tree_evidence("tree", 20),
+            pre_mode: 0o770,
+            expected_mode: 0o500,
+            reverses_mutation_id: None,
+        },
+        SealRecord::PermissionApplied {
+            transaction,
+            mutation_id: 1,
+        },
+        SealRecord::PermissionIntent {
+            transaction,
+            mutation_id: 2,
+            evidence: staging_tree_evidence("tree/child", 21),
+            pre_mode: 0o770,
+            expected_mode: 0o500,
+            reverses_mutation_id: None,
+        },
+        SealRecord::PermissionApplied {
+            transaction,
+            mutation_id: 2,
+        },
+        SealRecord::TreeManifestComplete {
+            transaction,
+            manifest: DurableTreeManifest {
+                entry_count: 2,
+                sha256: [0xa3; 32],
+            },
+        },
+        state(transaction, TransactionState::TreeSealed),
+        SealRecord::RenameIntent { transaction },
+    ];
+    if let Some(outcome) = outcome {
+        records.push(SealRecord::RenameOutcome {
+            transaction,
+            outcome,
+        });
+    }
+    replay_records(records)
+        .unwrap()
+        .transactions
+        .remove(&transaction)
+        .unwrap()
+}
+
+#[test]
+fn crash_after_durable_applied_rename_outcome_routes_to_post_rename_verification() {
+    let transaction = tx(77);
+    let root = staging_metadata().root_identity;
+    let replayed = replay_rename_crash_boundary(
+        transaction,
+        Some(DurableRenameOutcome::AppliedAndParentsSynced(root)),
+    );
+    assert_eq!(replayed.state, TransactionState::RenameIntent);
+    assert!(matches!(
+        decide_recovery(&replayed, |_| RecoveryIdentity::Reestablished),
+        RecoveryWork::VerifyOrQuarantineAfterRename {
+            transaction: id,
+            permissions,
+        } if id == transaction
+            && permissions.iter().map(|permission| permission.mutation_id).collect::<Vec<_>>()
+                == vec![1, 2]
+    ));
+    assert_eq!(
+        decide_recovery(&replayed, |_| RecoveryIdentity::Insufficient),
+        RecoveryWork::RecoveryRequired {
+            transaction,
+            reason: RecoveryRequiredReason::InsufficientPersistentIdentity,
+        }
+    );
+}
+
+#[test]
+fn crash_after_durable_not_applied_rename_outcome_restores_deepest_first() {
+    let transaction = tx(78);
+    let root = staging_metadata().root_identity;
+    let replayed = replay_rename_crash_boundary(
+        transaction,
+        Some(DurableRenameOutcome::ConfirmedNotAppliedAtSource(root)),
+    );
+    assert_eq!(replayed.state, TransactionState::RenameIntent);
+    assert!(matches!(
+        decide_recovery(&replayed, |_| RecoveryIdentity::Reestablished),
+        RecoveryWork::RestoreBeforeRename {
+            transaction: id,
+            permissions,
+        } if id == transaction
+            && permissions.iter().map(|permission| permission.mutation_id).collect::<Vec<_>>()
+                == vec![2, 1]
+    ));
+}
+
+#[test]
+fn crash_after_rename_intent_without_outcome_requires_outcome_recovery() {
+    let transaction = tx(79);
+    let replayed = replay_rename_crash_boundary(transaction, None);
+    assert_eq!(replayed.state, TransactionState::RenameIntent);
+    assert_eq!(replayed.rename_outcome, None);
+    assert_eq!(
+        decide_recovery(&replayed, |_| panic!(
+            "no mutation identity needed without an outcome"
+        )),
+        RecoveryWork::RecoveryRequired {
+            transaction,
+            reason: RecoveryRequiredReason::RenameOutcomeUnknown,
+        }
+    );
+}
+
+#[test]
+fn replay_rejects_bare_or_duplicate_staging_history_and_conflicting_outcomes() {
+    let transaction = tx(74);
+    let metadata = staging_metadata();
+    assert!(matches!(
+        replay_records(vec![
+            state(transaction, TransactionState::Prepared),
+            SealRecord::RenameIntent { transaction },
+        ]),
+        Err(ReplayError::InvalidHistory(_))
+    ));
+    let mut conflicting = metadata.clone();
+    conflicting.root_identity = strong(1, 700, 701);
+    assert!(matches!(
+        replay_records(vec![
+            SealRecord::StagingBegin {
+                transaction,
+                metadata: metadata.clone(),
+            },
+            SealRecord::StagingBegin {
+                transaction,
+                metadata: conflicting,
+            },
+        ]),
+        Err(ReplayError::InvalidHistory(_))
+    ));
+    assert!(matches!(
+        replay_records(vec![
+            SealRecord::StagingBegin {
+                transaction,
+                metadata: metadata.clone(),
+            },
+            SealRecord::RenameOutcome {
+                transaction,
+                outcome: DurableRenameOutcome::AppliedAndParentsSynced(metadata.root_identity),
+            },
+        ]),
+        Err(ReplayError::InvalidHistory(_))
+    ));
+    let manifest = DurableTreeManifest {
+        entry_count: 1,
+        sha256: [9; 32],
+    };
+    assert!(matches!(
+        replay_records(vec![
+            SealRecord::StagingBegin {
+                transaction,
+                metadata: metadata.clone(),
+            },
+            state(transaction, TransactionState::ParentSealIntent),
+            state(transaction, TransactionState::ParentSealed),
+            state(transaction, TransactionState::TreeSealIntent),
+            SealRecord::TreeManifestComplete {
+                transaction,
+                manifest,
+            },
+            SealRecord::TreeManifestComplete {
+                transaction,
+                manifest,
+            },
+        ]),
+        Err(ReplayError::InvalidHistory(_))
+    ));
+    assert!(matches!(
+        replay_records(vec![
+            SealRecord::StagingBegin {
+                transaction,
+                metadata,
+            },
+            state(transaction, TransactionState::ParentSealIntent),
+            state(transaction, TransactionState::ParentSealed),
+            state(transaction, TransactionState::TreeSealIntent),
+            SealRecord::TreeManifestComplete {
+                transaction,
+                manifest,
+            },
+            state(transaction, TransactionState::TreeSealed),
+            SealRecord::RenameIntent { transaction },
+            SealRecord::RenameOutcome {
+                transaction,
+                outcome: DurableRenameOutcome::AppliedAndParentsSynced(strong(1, 11, 101)),
+            },
+            SealRecord::RenameOutcome {
+                transaction,
+                outcome: DurableRenameOutcome::AppliedAndParentsSynced(strong(1, 11, 101)),
+            },
+        ]),
+        Err(ReplayError::InvalidHistory(_))
+    ));
+}
+
+#[test]
+fn replay_requires_the_post_stage_source_parent_restore_order() {
+    let transaction = tx(75);
+    let metadata = staging_metadata();
+    let manifest = DurableTreeManifest {
+        entry_count: 0,
+        sha256: [7; 32],
+    };
+    let prefix = vec![
+        SealRecord::StagingBegin {
+            transaction,
+            metadata: metadata.clone(),
+        },
+        state(transaction, TransactionState::ParentSealIntent),
+        state(transaction, TransactionState::ParentSealed),
+        state(transaction, TransactionState::TreeSealIntent),
+        SealRecord::TreeManifestComplete {
+            transaction,
+            manifest,
+        },
+        state(transaction, TransactionState::TreeSealed),
+        SealRecord::RenameIntent { transaction },
+        SealRecord::RenameOutcome {
+            transaction,
+            outcome: DurableRenameOutcome::AppliedAndParentsSynced(metadata.root_identity),
+        },
+        state(transaction, TransactionState::StagedUnverified),
+    ];
+    let mut early_restore = prefix.clone();
+    early_restore.push(state(
+        transaction,
+        TransactionState::SourceParentRestoreIntent,
+    ));
+    assert!(matches!(
+        replay_records(early_restore),
+        Err(ReplayError::InvalidHistory(
+            "invalid transaction transition"
+        ))
+    ));
+
+    let mut complete = prefix;
+    complete.extend([
+        state(transaction, TransactionState::StagedSealed),
+        state(transaction, TransactionState::SourceParentRestoreIntent),
+        state(transaction, TransactionState::SourceParentRestored),
+        state(transaction, TransactionState::VerifiedCommitted),
+    ]);
+    assert_eq!(
+        replay_records(complete).unwrap().transactions[&transaction].state,
+        TransactionState::VerifiedCommitted
+    );
+}
+fn staging_evidence(
+    path: &str,
+    identity: StrongObjectIdentity,
+    expected_mode: u32,
+) -> PersistentRecoveryEvidence {
+    PersistentRecoveryEvidence::new(
+        PathBuf::from(path),
+        Some("fs-1".into()),
+        identity.device,
+        identity.inode,
+        Some(identity.incarnation.get()),
+        expected_mode,
+    )
+    .unwrap()
+}
+
+#[test]
+fn manifest_completion_freezes_tree_permission_membership_at_runtime_and_replay() {
+    let transaction = tx(77);
+    let metadata = staging_metadata();
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    wal.begin_staging(transaction, metadata.clone()).unwrap();
+    advance_to_tree_intent(&mut wal, transaction);
+    wal.apply_staging_permission_mutation(
+        PermissionIntent {
+            transaction,
+            mutation_id: 1,
+            evidence: staging_evidence("source-parent/root/child", strong(1, 50, 500), 0o500),
+            pre_mode: 0o770,
+            expected_mode: 0o500,
+            reverses_mutation_id: None,
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    let manifest = DurableTreeManifest {
+        entry_count: 1,
+        sha256: [0x44; 32],
+    };
+    wal.complete_tree_manifest(transaction, manifest).unwrap();
+    let called = Cell::new(false);
+    assert!(matches!(
+        wal.apply_staging_permission_mutation(
+            PermissionIntent {
+                transaction,
+                mutation_id: 2,
+                evidence: staging_evidence(
+                    "source-parent/root/late-child",
+                    strong(1, 51, 501),
+                    0o500,
+                ),
+                pre_mode: 0o770,
+                expected_mode: 0o500,
+                reverses_mutation_id: None,
+            },
+            || {
+                called.set(true);
+                Ok(())
+            },
+        ),
+        Err(MutationAppendError::IntentWal(AppendError::InvalidState(
+            "tree permission membership is frozen by the manifest"
+        )))
+    ));
+    assert!(!called.get());
+
+    assert!(matches!(
+        replay_records(vec![
+            SealRecord::StagingBegin {
+                transaction,
+                metadata,
+            },
+            state(transaction, TransactionState::ParentSealIntent),
+            state(transaction, TransactionState::ParentSealed),
+            state(transaction, TransactionState::TreeSealIntent),
+            SealRecord::TreeManifestComplete {
+                transaction,
+                manifest,
+            },
+            SealRecord::PermissionIntent {
+                transaction,
+                mutation_id: 9,
+                evidence: staging_evidence(
+                    "source-parent/root/late-child",
+                    strong(1, 59, 509),
+                    0o500,
+                ),
+                pre_mode: 0o770,
+                expected_mode: 0o500,
+                reverses_mutation_id: None,
+            },
+        ]),
+        Err(ReplayError::InvalidHistory(
+            "tree permission membership changed after manifest completion"
+        ))
+    ));
+}
+
+#[test]
+fn parent_seal_and_inverse_are_bound_to_exact_metadata_parent() {
+    let transaction = tx(78);
+    let metadata = permission_seal_staging_metadata();
+    let parent = metadata.source_parent_identity;
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    wal.begin_staging(transaction, metadata.clone()).unwrap();
+    wal.transition_staging(transaction, TransactionState::ParentSealIntent)
+        .unwrap();
+
+    let copied_identity_wrong_locator = PermissionIntent {
+        transaction,
+        mutation_id: 1,
+        evidence: staging_evidence("other-parent", parent, 0o500),
+        pre_mode: 0o770,
+        expected_mode: 0o500,
+        reverses_mutation_id: None,
+    };
+    assert!(matches!(
+        wal.apply_staging_permission_mutation(copied_identity_wrong_locator.clone(), || {
+            panic!("mismatched parent must not mutate")
+        }),
+        Err(MutationAppendError::IntentWal(AppendError::InvalidState(_)))
+    ));
+    assert!(matches!(
+        replay_records(vec![
+            SealRecord::StagingBegin {
+                transaction,
+                metadata: metadata.clone(),
+            },
+            state(transaction, TransactionState::ParentSealIntent),
+            copied_identity_wrong_locator.into_record(),
+        ]),
+        Err(ReplayError::InvalidHistory(
+            "parent seal evidence differs from the metadata-bound source parent"
+        ))
+    ));
+
+    wal.apply_staging_permission_mutation(
+        PermissionIntent {
+            transaction,
+            mutation_id: 2,
+            evidence: staging_evidence("source-parent", parent, 0o500),
+            pre_mode: 0o770,
+            expected_mode: 0o500,
+            reverses_mutation_id: None,
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    wal.transition_staging(transaction, TransactionState::ParentSealed)
+        .unwrap();
+    wal.transition_staging(transaction, TransactionState::RestoreIntent)
+        .unwrap();
+    assert!(matches!(
+        wal.apply_staging_permission_mutation(
+            PermissionIntent {
+                transaction,
+                mutation_id: 3,
+                evidence: staging_evidence("other-parent", parent, 0o770),
+                pre_mode: 0o500,
+                expected_mode: 0o770,
+                reverses_mutation_id: Some(2),
+            },
+            || panic!("mismatched inverse must not mutate"),
+        ),
+        Err(MutationAppendError::IntentWal(AppendError::InvalidState(_)))
+    ));
+}
+
+#[test]
+fn already_exclusive_strategy_is_explicit_exact_and_non_vacuous() {
+    let base = staging_metadata();
+    let make = |proof: DurableAlreadyExclusiveParent| {
+        StagingTransactionMetadata::new(
+            base.source_parent.clone(),
+            base.source_parent_identity,
+            base.source_basename.clone(),
+            base.root_identity,
+            base.destination_parent.clone(),
+            base.destination_parent_identity,
+            base.destination_basename.clone(),
+            base.backend,
+            DurableSourceParentStrategy::AlreadyExclusive(proof),
+        )
+    };
+    assert!(
+        make(DurableAlreadyExclusiveParent {
+            source_parent: base.source_parent.clone(),
+            source_parent_identity: strong(1, 999, 999),
+            observed_mode: 0o700,
+        })
+        .is_none()
+    );
+    assert!(
+        make(DurableAlreadyExclusiveParent {
+            source_parent: base.source_parent.clone(),
+            source_parent_identity: base.source_parent_identity,
+            observed_mode: 0o770,
+        })
+        .is_none()
+    );
+
+    let metadata = make(DurableAlreadyExclusiveParent {
+        source_parent: base.source_parent.clone(),
+        source_parent_identity: base.source_parent_identity,
+        observed_mode: 0o700,
+    })
+    .unwrap();
+    let transaction = tx(79);
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    wal.begin_staging(transaction, metadata).unwrap();
+    wal.transition_staging(transaction, TransactionState::ParentSealIntent)
+        .unwrap();
+    wal.transition_staging(transaction, TransactionState::ParentSealed)
+        .unwrap();
+}
+
+#[test]
+fn authority_neutral_public_methods_cannot_drive_a_staging_transaction() {
+    let transaction = tx(80);
+    let metadata = staging_metadata();
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    wal.begin_staging(transaction, metadata.clone()).unwrap();
+    assert!(matches!(
+        wal.transition(transaction, TransactionState::ParentSealIntent),
+        Err(AppendError::InvalidState(
+            "staging transitions require the high-level engine"
+        ))
+    ));
+    assert!(matches!(
+        wal.apply_permission_mutation(
+            PermissionIntent {
+                transaction,
+                mutation_id: 1,
+                evidence: staging_evidence("source-parent/root", metadata.root_identity, 0o500,),
+                pre_mode: 0o770,
+                expected_mode: 0o500,
+                reverses_mutation_id: None,
+            },
+            || panic!("public A1 seam must not mutate staging"),
+        ),
+        Err(MutationAppendError::IntentWal(AppendError::InvalidState(
+            "staging permission mutation requires the high-level engine"
+        )))
+    ));
+    for next in [TransactionState::Purgeable, TransactionState::Purged] {
+        assert!(wal.transition_staging(transaction, next).is_err());
+    }
+}
+
+#[test]
+fn purge_transitions_have_no_wal_edge_until_held_executor_exists() {
+    assert!(!valid_transition(
+        TransactionState::VerifiedCommitted,
+        TransactionState::Purgeable
+    ));
+    assert!(!valid_transition(
+        TransactionState::Purgeable,
+        TransactionState::Purged
     ));
 }

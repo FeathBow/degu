@@ -1,5 +1,45 @@
 # Installation
 
+## Check account readiness
+
+After installing the binary, run one read-only check:
+
+```sh
+$ degu doctor
+```
+
+`doctor` reports whether the current account's fixed sealed-staging system
+anchor is ready. It never creates, repairs, or writes a degu anchor, state
+store, or activation record. Validation briefly takes the protocol's existing
+nonblocking lock and durability-syncs the already-provisioned anchor and its
+parent. Changing `HOME`, XDG variables, configuration, or the
+working directory cannot select another anchor. Use `degu doctor --json` for a
+stable machine-readable result.
+
+Sealed staging is not yet wired into production cleanup. This check prepares
+operators and packaging for that later gate without changing current
+clean/undo/purge behavior.
+
+The expected per-account path is fixed:
+
+- Linux: `/var/lib/degu/store-activation/<decimal-euid>`
+- macOS: `/private/var/db/degu/store-activation/<decimal-euid>`
+
+The leaf must be provisioned explicitly by an administrator for the account
+that will run degu. It must already be an effective-user-owned directory with
+exact mode `0700`, no ACL, on certified ext4/XFS/APFS storage, below a safe
+root- or effective-user-owned hierarchy that grants no foreign rename
+authority. A missing, unsafe, unsupported, busy, or uncertain anchor makes the
+check fail closed.
+
+The generic installer, `cargo install`, cargo-binstall, and manual archives are
+unprivileged binary-install routes. They do not run `sudo`, infer a target user
+from `SUDO_UID`, or write the system anchor. Use an administrator-controlled
+package step or configuration-management policy to provision each intended
+numeric EUID. Do not place authority under HOME/XDG/config, and do not
+implicitly recreate or "repair" an existing entry: loss or replacement may be
+activation evidence that requires operator investigation.
+
 ## Install with Cargo
 
 For versions published on crates.io:

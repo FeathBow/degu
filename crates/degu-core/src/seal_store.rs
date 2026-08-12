@@ -618,13 +618,20 @@ fn require_same_entry(
     Ok(())
 }
 
+pub(crate) const DIRECTORY_ACL_PRESENT_REASON: &str =
+    "directory ACL is present or could not be verified absent";
+pub(crate) const DIRECTORY_UNSUPPORTED_BACKEND_REASON: &str =
+    "directory backend is outside the certified filesystem set";
+pub(crate) const DIRECTORY_BACKEND_MISMATCH_REASON: &str =
+    "directory backend definitively mismatches the certified contract";
+
 fn require_directory_acl_absent(fd: &OwnedFd, path: &Path) -> Result<(), StoreError> {
     match require_held_fd_acl_absent(fd) {
         Ok(()) => Ok(()),
         Err(crate::local_backend::CertificationError::AclPresent) => {
             Err(StoreError::UnsafeDirectory {
                 path: path.to_path_buf(),
-                reason: "directory ACL is present or could not be verified absent",
+                reason: DIRECTORY_ACL_PRESENT_REASON,
             })
         }
         Err(reason) => Err(StoreError::BackendInspection {
@@ -639,10 +646,15 @@ fn certify_directory(fd: &OwnedFd, path: &Path) -> Result<HeldLocalBackendEviden
     let duplicate =
         rustix::io::fcntl_dupfd_cloexec(fd, 0).map_err(|error| io_error(path, error.into()))?;
     certify_held_fd(duplicate).map_err(|reason| {
-        if backend_failure_is_definite(&reason) {
+        if reason == crate::local_backend::CertificationError::UnsupportedFilesystem {
             StoreError::UnsafeDirectory {
                 path: path.to_path_buf(),
-                reason: "directory backend definitively mismatches the certified contract",
+                reason: DIRECTORY_UNSUPPORTED_BACKEND_REASON,
+            }
+        } else if backend_failure_is_definite(&reason) {
+            StoreError::UnsafeDirectory {
+                path: path.to_path_buf(),
+                reason: DIRECTORY_BACKEND_MISMATCH_REASON,
             }
         } else {
             StoreError::BackendInspection {

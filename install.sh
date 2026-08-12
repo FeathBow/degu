@@ -186,3 +186,4 @@ case ":${PATH:-}:" in
 esac
 
 echo "Installed degu $version to $install_dir"
+echo "Next: run 'degu doctor' to check account readiness (read-only; no system state is created)."

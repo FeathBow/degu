@@ -3,6 +3,7 @@ pub(super) const TOP_LEVEL_HELP_TEMPLATE: &str = "{about-with-newline}
 
 Inspect:
   scan         Inspect known caches and selected project roots
+  doctor       Check account readiness for future sealed staging
   quota        Report authoritative filesystem quota for one path
 
 Clean and recover:

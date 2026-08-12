@@ -3,6 +3,7 @@
 targets="x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin"
 man_pages="
 degu.1
+degu-doctor.1
 degu-quota.1
 degu-scan.1
 degu-clean.1

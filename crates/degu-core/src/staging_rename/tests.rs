@@ -1,6 +1,6 @@
 use super::*;
 use crate::seal_store::SealWalStore;
-use crate::seal_wal::DurableRenameOutcome;
+use crate::seal_wal::{DurableRenameOutcome, ProductionAssociation};
 use crate::sealed_staging::{
     ForwardFailureDisposition, SealedStagingEngine, StartupRecoveryAnchors,
 };
@@ -237,6 +237,44 @@ fn forward_coordinator_reaches_verified_commit_before_returning() {
     assert_eq!(mode(&fixture.source_parent), 0o770);
     assert_eq!(mode(&fixture.destination_root), 0o750);
     assert_eq!(mode(&fixture.destination_root.join("child")), 0o750);
+}
+
+#[test]
+fn production_association_is_read_back_only_from_the_exact_leased_wal() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xc7; 16]);
+    let mut ready = fixture.ready_engine();
+    let association = ProductionAssociation::new("reclamation-c1".to_string()).unwrap();
+
+    ready
+        .stage_to_verified_commit(
+            transaction,
+            fixture
+                .forward_request("root", "staged")
+                .with_production_association(association),
+        )
+        .unwrap();
+
+    let entries = ready.production_entries();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry.transaction(), transaction);
+    assert_eq!(entry.state(), TransactionState::VerifiedCommitted);
+    assert_eq!(
+        entry.destination_parent().relative_path(),
+        Path::new("destination-parent")
+    );
+    assert_eq!(entry.destination_basename(), "staged");
+    assert_eq!(entry.reclamation_id(), "reclamation-c1");
+    let destination: OwnedFd = std::fs::File::open(&fixture.destination_root)
+        .unwrap()
+        .into();
+    assert_eq!(
+        entry.root_identity(),
+        strong_identity_fd(&destination).unwrap()
+    );
 }
 
 #[test]

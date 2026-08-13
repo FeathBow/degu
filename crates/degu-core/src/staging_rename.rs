@@ -108,6 +108,31 @@ impl PreparedRootBinding {
         destination_parent_locator: StagingLocator,
         destination_basename: OsString,
     ) -> Result<Self, PreparedRootError> {
+        Self::prepare_with_association(
+            source_anchor,
+            source_parent,
+            source_parent_locator,
+            source_basename,
+            destination_anchor,
+            destination_parent,
+            destination_parent_locator,
+            destination_basename,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_with_association(
+        source_anchor: RecoveryFilesystemAnchor,
+        source_parent: OwnedFd,
+        source_parent_locator: StagingLocator,
+        source_basename: OsString,
+        destination_anchor: RecoveryFilesystemAnchor,
+        destination_parent: OwnedFd,
+        destination_parent_locator: StagingLocator,
+        destination_basename: OsString,
+        production_association: Option<crate::seal_wal::ProductionAssociation>,
+    ) -> Result<Self, PreparedRootError> {
         if !normal_basename(&source_basename) || !normal_basename(&destination_basename) {
             return Err(PreparedRootError::InvalidBasename);
         }
@@ -166,6 +191,10 @@ impl PreparedRootBinding {
             backend,
             DurableSourceParentStrategy::PermissionSeal,
         )
+        .map(|metadata| match production_association {
+            Some(association) => metadata.with_production_association(association),
+            None => metadata,
+        })
         .ok_or(PreparedRootError::InvalidMetadata)?;
 
         Ok(Self {

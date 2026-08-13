@@ -52,6 +52,14 @@ impl Lifecycle {
         storage::trash_dir_state(&self.ctx)
     }
 
+    pub(crate) fn add_trash_roots_to_guard(
+        &self,
+        findings: &[Finding],
+        guard: &mut Guard,
+    ) -> Result<()> {
+        storage::add_resolved_trash_roots_to_guard(&self.ctx, findings, guard)
+    }
+
     pub(crate) fn trash_summary(&self) -> Result<Option<summary::TrashSummary>> {
         summary::trash_summary(&self.ctx)
     }
@@ -69,6 +77,14 @@ impl Lifecycle {
     }
 
     pub(crate) fn lock(self) -> Result<MutationSession> {
+        self.lock_with_forward_clean(false)
+    }
+
+    pub(crate) fn lock_for_clean(self, direct_purge: bool) -> Result<MutationSession> {
+        self.lock_with_forward_clean(!direct_purge)
+    }
+
+    fn lock_with_forward_clean(self, forward_clean: bool) -> Result<MutationSession> {
         let mutation_lock = storage::acquire_mutation_lock(&self.ctx)?;
         let (sealed_staging, unsupported_legacy_lease) =
             match storage::sealed_staging_store_for_mutation(&self.ctx)? {
@@ -115,6 +131,7 @@ impl Lifecycle {
             lifecycle: self,
             _mutation_lock: mutation_lock,
             sealed_staging,
+            forward_clean,
             _unsupported_legacy_lease: unsupported_legacy_lease,
         })
     }
@@ -125,12 +142,20 @@ pub(crate) struct MutationSession {
     _mutation_lock: std::fs::File,
     // When activated, retains the exact WAL lease for the entire production
     // mutation session. `None` is allowed only for authenticated
-    // UnsupportedNeverActivated. Forward staging remains deliberately unwired.
+    // UnsupportedNeverActivated. Direct purge keeps the lease for conflict
+    // checks but deliberately does not grant the forward coordinator deletion.
     sealed_staging: Option<ReadyStagingEngine>,
+    forward_clean: bool,
     _unsupported_legacy_lease: Option<UnsupportedNeverActivatedLease>,
 }
 
 impl MutationSession {
+    pub(crate) fn uses_sealed_staging_for_clean(&self) -> bool {
+        self.forward_clean
+            && self.sealed_staging.is_some()
+            && !(cfg!(debug_assertions) && integration_test_legacy_clean())
+    }
+
     pub(crate) fn add_trash_roots_to_guard(
         &self,
         findings: &[Finding],
@@ -140,12 +165,18 @@ impl MutationSession {
     }
 
     pub(crate) fn execute_clean(
-        &self,
+        &mut self,
         plan: &CapturedCleanPlan,
         purge: bool,
         recheck: &dyn Fn(&Finding) -> Result<(), String>,
-    ) -> Vec<CleanExecution> {
-        stage::execute_clean(&self.lifecycle.ctx, plan, purge, recheck)
+    ) -> Result<Vec<CleanExecution>> {
+        let uses_sealed_staging = self.uses_sealed_staging_for_clean();
+        let sealed_staging = if uses_sealed_staging {
+            self.sealed_staging.as_mut()
+        } else {
+            None
+        };
+        stage::execute_clean(&self.lifecycle.ctx, plan, purge, recheck, sealed_staging)
     }
 
     pub(crate) fn plan_purge_all(&self) -> Result<TrashPurgePlan> {
@@ -233,4 +264,14 @@ impl MutationSession {
         }
         None
     }
+}
+
+#[cfg(debug_assertions)]
+fn integration_test_legacy_clean() -> bool {
+    std::env::var_os("DEGU_INTEGRATION_TEST_LEGACY_CLEAN").is_some()
+}
+
+#[cfg(not(debug_assertions))]
+fn integration_test_legacy_clean() -> bool {
+    false
 }

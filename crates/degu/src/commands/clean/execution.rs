@@ -42,13 +42,10 @@ fn stop_if_stdout_closed() -> Result<()> {
     Ok(())
 }
 
-fn boundary_recheck<'a>(
-    prepared: &'a PreparedClean,
-    session: &'a MutationSession,
-) -> impl Fn(&Finding) -> Result<(), String> + 'a {
+fn boundary_recheck(prepared: &PreparedClean) -> impl Fn(&Finding) -> Result<(), String> + '_ {
     move |finding| {
         prepared
-            .recheck_finding(session, finding)
+            .recheck_finding(finding)
             .map_err(|error| error.to_string())
     }
 }
@@ -84,14 +81,14 @@ fn run_json(prepared: PreparedClean) -> Result<()> {
             &CleanQuotaObservations { direct_purge },
         );
     }
-    let session = prepared.lock()?;
+    let mut session = prepared.lock()?;
     output::validate_json_prepared(&prepared)?;
     let plan = session.plan_expired()?;
     output::validate_json_expiry(&plan)?;
     prepared.revalidate(&session)?;
     stop_if_stdout_closed()?;
-    let recheck = boundary_recheck(&prepared, &session);
-    let (executed, direct_purge) = execute_clean(&prepared, &session, &recheck)?;
+    let recheck = boundary_recheck(&prepared);
+    let (executed, direct_purge) = execute_clean(&prepared, &mut session, &recheck)?;
     let clean_failed = executed.iter().any(CleanExecution::failed);
     let expiry = execute_expiry(&session, plan, clean_failed)?;
     let direct_purge = match direct_purge {
@@ -128,7 +125,11 @@ fn run_human(prepared: PreparedClean) -> Result<()> {
     let session = prepared.lock()?;
     let expiry_plan = session.plan_expired()?;
     output::print_plan(&prepared)?;
-    output::print_mutation_scope(&prepared, &expiry_plan)?;
+    output::print_mutation_scope(
+        &prepared,
+        &expiry_plan,
+        session.uses_sealed_staging_for_clean(),
+    )?;
     if prepared.plan.items().is_empty() && !expiry_plan.has_housekeeping_scope() {
         return Ok(());
     }
@@ -180,18 +181,19 @@ fn confirm_execution(prepared: &PreparedClean, expiry: &ExpiryPlan) -> Result<bo
 }
 
 fn permanent_deletion_planned(prepared: &PreparedClean, expiry: &ExpiryPlan) -> bool {
-    (prepared.settings.purge && !prepared.plan.items().is_empty()) || !expiry.is_empty()
+    (prepared.settings.purge && !prepared.plan.items().is_empty())
+        || expiry.entries().next().is_some()
 }
 
 fn execute_human_plan(
     prepared: PreparedClean,
-    session: MutationSession,
+    mut session: MutationSession,
     plan: ExpiryPlan,
 ) -> Result<()> {
     stop_if_stdout_closed()?;
     let started = std::time::Instant::now();
-    let recheck = boundary_recheck(&prepared, &session);
-    let (executed, direct_purge) = execute_clean(&prepared, &session, &recheck)?;
+    let recheck = boundary_recheck(&prepared);
+    let (executed, direct_purge) = execute_clean(&prepared, &mut session, &recheck)?;
     let elapsed = started.elapsed();
     let failed = executed.iter().any(CleanExecution::failed);
     let expiry = execute_expiry(&session, plan, failed)?;
@@ -228,12 +230,12 @@ fn direct_observation_request(
 
 fn execute_clean(
     prepared: &PreparedClean,
-    session: &MutationSession,
+    session: &mut MutationSession,
     recheck: &dyn Fn(&Finding) -> Result<(), String>,
 ) -> Result<(Vec<CleanExecution>, Option<QuotaActionReport>)> {
     if !prepared.settings.purge || prepared.plan.items().is_empty() {
         return Ok((
-            session.execute_clean(&prepared.plan, prepared.settings.purge, recheck),
+            session.execute_clean(&prepared.plan, prepared.settings.purge, recheck)?,
             None,
         ));
     }
@@ -259,10 +261,12 @@ fn execute_clean(
     let mut probe = crate::quota::probe;
     let (executed, completed) = coordinate(action, &mut probe, || {
         let executed = session.execute_clean(&prepared.plan, true, recheck);
-        let outcome = clean_outcome(&executed);
+        let outcome = executed
+            .as_deref()
+            .map_or(StartedActionOutcome::Failure, clean_outcome);
         (executed, outcome)
     });
-    Ok((executed, Some(QuotaActionReport::Attempted(completed))))
+    Ok((executed?, Some(QuotaActionReport::Attempted(completed))))
 }
 
 fn execute_expiry(

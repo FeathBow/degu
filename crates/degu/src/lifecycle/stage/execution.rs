@@ -29,6 +29,14 @@ enum CleanState {
     StageFailed {
         reason: String,
     },
+    Quarantined {
+        entry: Option<PathBuf>,
+        reason: String,
+    },
+    RecoveryBlocked {
+        entry: Option<PathBuf>,
+        reason: String,
+    },
     UnverifiedDestination {
         entry: PathBuf,
         reason: String,
@@ -37,9 +45,17 @@ enum CleanState {
     Staged {
         entry: PathBuf,
     },
+    ProductionStaged {
+        entry: PathBuf,
+    },
     StagedWithFailure {
         entry: PathBuf,
         failure: StagedFailure,
+    },
+    ProductionCommittedWithFailure {
+        entry: PathBuf,
+        reservation_cleanup_failure: Option<String>,
+        jsonl_projection_failure: Option<String>,
     },
     PurgeFailed {
         entry: PathBuf,
@@ -63,6 +79,42 @@ impl CleanExecution {
 
     fn stage_failed(finding: &Finding, reason: String) -> Self {
         Self::with_state(finding, CleanState::StageFailed { reason })
+    }
+
+    pub(super) fn production_staged(
+        finding: &Finding,
+        entry: PathBuf,
+        reservation_cleanup_failure: Option<String>,
+        jsonl_projection_failure: Option<String>,
+    ) -> Self {
+        if reservation_cleanup_failure.is_none() && jsonl_projection_failure.is_none() {
+            Self::with_state(finding, CleanState::ProductionStaged { entry })
+        } else {
+            Self::with_state(
+                finding,
+                CleanState::ProductionCommittedWithFailure {
+                    entry,
+                    reservation_cleanup_failure,
+                    jsonl_projection_failure,
+                },
+            )
+        }
+    }
+
+    pub(super) fn quarantined(finding: &Finding, entry: Option<PathBuf>, reason: String) -> Self {
+        Self::with_state(finding, CleanState::Quarantined { entry, reason })
+    }
+
+    pub(super) fn recovery_blocked(
+        finding: &Finding,
+        entry: Option<PathBuf>,
+        reason: String,
+    ) -> Self {
+        Self::with_state(finding, CleanState::RecoveryBlocked { entry, reason })
+    }
+
+    pub(super) fn plain_stage_failed(finding: &Finding, reason: String) -> Self {
+        Self::stage_failed(finding, reason)
     }
 
     fn unverified_destination(finding: &Finding, entry: PathBuf, reason: String) -> Self {
@@ -109,9 +161,14 @@ impl CleanExecution {
     pub(crate) fn trash_entry(&self) -> Option<&Path> {
         match &self.state {
             CleanState::StageFailed { .. } => None,
+            CleanState::Quarantined { entry, .. } | CleanState::RecoveryBlocked { entry, .. } => {
+                entry.as_deref()
+            }
             CleanState::UnverifiedDestination { entry, .. }
             | CleanState::Staged { entry, .. }
+            | CleanState::ProductionStaged { entry, .. }
             | CleanState::StagedWithFailure { entry, .. }
+            | CleanState::ProductionCommittedWithFailure { entry, .. }
             | CleanState::PurgeFailed { entry, .. }
             | CleanState::Purged { entry, .. } => Some(entry),
         }
@@ -126,12 +183,30 @@ impl CleanExecution {
             CleanState::StageFailed { reason } => {
                 Some(CleanExecutionFailure::StageFailed { reason })
             }
+            CleanState::Quarantined { entry, reason } => Some(CleanExecutionFailure::Quarantined {
+                entry: entry.as_deref(),
+                reason,
+            }),
+            CleanState::RecoveryBlocked { entry, reason } => {
+                Some(CleanExecutionFailure::RecoveryBlocked {
+                    entry: entry.as_deref(),
+                    reason,
+                })
+            }
             CleanState::UnverifiedDestination { entry, reason, .. } => {
                 Some(CleanExecutionFailure::UnverifiedDestination { entry, reason })
             }
             CleanState::StagedWithFailure { failure, .. } => Some(CleanExecutionFailure::Staged {
                 reason: &failure.reason,
                 final_log_append_failed: failure.final_log_append_failed,
+            }),
+            CleanState::ProductionCommittedWithFailure {
+                reservation_cleanup_failure,
+                jsonl_projection_failure,
+                ..
+            } => Some(CleanExecutionFailure::ProductionCommitted {
+                reservation_cleanup_failure: reservation_cleanup_failure.as_deref(),
+                jsonl_projection_failure: jsonl_projection_failure.as_deref(),
             }),
             CleanState::PurgeFailed { reason, .. } => {
                 Some(CleanExecutionFailure::PurgeFailed { reason })
@@ -141,6 +216,7 @@ impl CleanExecution {
                 ..
             } => Some(CleanExecutionFailure::PurgedLog { reason }),
             CleanState::Staged { .. }
+            | CleanState::ProductionStaged { .. }
             | CleanState::Purged {
                 final_log_failure: None,
                 ..
@@ -159,8 +235,13 @@ impl CleanExecution {
     pub(crate) fn state_label(&self) -> &'static str {
         match &self.state {
             CleanState::StageFailed { .. } => "stage_failed",
+            CleanState::Quarantined { .. } => "quarantined",
+            CleanState::RecoveryBlocked { .. } => "recovery_blocked",
             CleanState::UnverifiedDestination { .. } => "unverified_destination",
-            CleanState::Staged { .. } | CleanState::StagedWithFailure { .. } => "staged",
+            CleanState::Staged { .. }
+            | CleanState::ProductionStaged { .. }
+            | CleanState::StagedWithFailure { .. }
+            | CleanState::ProductionCommittedWithFailure { .. } => "staged",
             CleanState::PurgeFailed { .. } => "purge_failed",
             CleanState::Purged { .. } => "purged",
         }
@@ -169,9 +250,13 @@ impl CleanExecution {
     pub(crate) fn has_trash_location(&self) -> bool {
         matches!(
             self.state,
-            CleanState::UnverifiedDestination { .. }
+            CleanState::Quarantined { entry: Some(_), .. }
+                | CleanState::RecoveryBlocked { entry: Some(_), .. }
+                | CleanState::UnverifiedDestination { .. }
                 | CleanState::Staged { .. }
+                | CleanState::ProductionStaged { .. }
                 | CleanState::StagedWithFailure { .. }
+                | CleanState::ProductionCommittedWithFailure { .. }
                 | CleanState::PurgeFailed { .. }
         )
     }
@@ -189,6 +274,12 @@ impl CleanExecution {
         ) || matches!(
             &self.state,
             CleanState::StagedWithFailure { failure, .. } if failure.final_log_append_failed
+        ) || matches!(
+            &self.state,
+            CleanState::ProductionCommittedWithFailure {
+                jsonl_projection_failure: Some(_),
+                ..
+            }
         )
     }
 
@@ -198,13 +289,31 @@ impl CleanExecution {
         } else {
             matches!(
                 self.state,
-                CleanState::Staged { .. } | CleanState::StagedWithFailure { .. }
+                CleanState::Staged { .. }
+                    | CleanState::ProductionStaged { .. }
+                    | CleanState::StagedWithFailure { .. }
+                    | CleanState::ProductionCommittedWithFailure { .. }
             )
         }
     }
 
+    pub(crate) fn sealed_staging_has_recovery_authority(&self) -> bool {
+        matches!(
+            self.state,
+            CleanState::ProductionStaged { .. }
+                | CleanState::ProductionCommittedWithFailure { .. }
+                | CleanState::Quarantined { .. }
+                | CleanState::RecoveryBlocked { .. }
+        )
+    }
+
     pub(crate) fn requires_manual_recovery(&self) -> bool {
-        matches!(self.state, CleanState::UnverifiedDestination { .. })
+        matches!(
+            self.state,
+            CleanState::Quarantined { .. }
+                | CleanState::RecoveryBlocked { .. }
+                | CleanState::UnverifiedDestination { .. }
+        )
     }
 
     fn staged(staged: CommittedStage) -> Self {

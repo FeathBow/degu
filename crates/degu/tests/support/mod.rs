@@ -66,6 +66,7 @@ pub fn isolated_degu() -> Command {
                  /bin/chmod 700 "$anchor" || exit
                  anchor=$(cd "$anchor" && pwd -P) || exit
                  export DEGU_INTEGRATION_TEST_ANCHOR="$anchor"
+                 export DEGU_INTEGRATION_TEST_LEGACY_CLEAN=1
                fi
                for p in "$HOME" "$XDG_STATE_HOME"; do
                  if [ -n "$p" ] && [ -d "$p" ]; then /bin/chmod go-w "$p" || exit; fi
@@ -94,4 +95,5 @@ pub fn with_mutation_anchor(command: &mut Command, state: &Path) {
         "DEGU_INTEGRATION_TEST_ANCHOR",
         std::fs::canonicalize(anchor).unwrap(),
     );
+    command.env("DEGU_INTEGRATION_TEST_LEGACY_CLEAN", "1");
 }

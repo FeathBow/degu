@@ -22,19 +22,23 @@ pub(super) use json::{
 };
 pub(super) use plan::print as print_plan;
 
-pub(super) fn print_mutation_scope(prepared: &PreparedClean, expiry: &ExpiryPlan) -> Result<()> {
+pub(super) fn print_mutation_scope(
+    prepared: &PreparedClean,
+    expiry: &ExpiryPlan,
+    sealed_staging: bool,
+) -> Result<()> {
     if !prepared.plan.items().is_empty() {
-        print_mechanism(prepared)?;
+        print_mechanism(prepared, sealed_staging)?;
     }
     print_expiry_plan(expiry, prepared, false)?;
     flush_stdout()
 }
 
-fn print_mechanism(prepared: &PreparedClean) -> Result<()> {
+fn print_mechanism(prepared: &PreparedClean, sealed_staging: bool) -> Result<()> {
     let ui = prepared.settings.ui;
     let trash_dirs = clean_plan_trash_dirs(prepared)?;
     if !ui.stdout_is_terminal {
-        return print_mechanism_sentence(prepared, &trash_dirs);
+        return print_mechanism_sentence(prepared, &trash_dirs, sealed_staging);
     }
     stdoutln!(
         "{}",
@@ -57,6 +61,10 @@ fn print_mechanism(prepared: &PreparedClean) -> Result<()> {
             "Staged then purged immediately; not restorable.",
             Tone::Destructive,
         )
+    } else if sealed_staging {
+        ui.prose(
+            "Sealed staging retains exclusive recovery authority; degu undo and automatic trash purge will not mutate these entries.",
+        )
     } else {
         ui.prose(&format!(
             "Restorable with degu undo; a later clean may purge it after {TRASH_RETENTION_DAYS} days."
@@ -65,13 +73,19 @@ fn print_mechanism(prepared: &PreparedClean) -> Result<()> {
     stdoutln!("{mechanism}")
 }
 
-fn print_mechanism_sentence(prepared: &PreparedClean, trash_dirs: &[String]) -> Result<()> {
+fn print_mechanism_sentence(
+    prepared: &PreparedClean,
+    trash_dirs: &[String],
+    sealed_staging: bool,
+) -> Result<()> {
     let mechanism = if prepared.settings.purge {
         semantic::paint(
             "staged then purged immediately; not restorable.",
             Tone::Destructive,
             prepared.settings.ui.colors.stdout,
         )
+    } else if sealed_staging {
+        "sealed staging retains exclusive recovery authority; degu undo and automatic trash purge will not mutate these entries.".to_string()
     } else {
         format!(
             "restorable with degu undo; a later clean may purge it after {TRASH_RETENTION_DAYS} days."
@@ -175,7 +189,17 @@ pub(super) fn print_execution(
         );
         append_elapsed(&mut summary, elapsed, ui);
         stdoutln!("{}", ui.prose(&summary))?;
-        if executed.iter().all(|item| !item.requires_manual_recovery()) {
+        if executed
+            .iter()
+            .any(CleanExecution::sealed_staging_has_recovery_authority)
+        {
+            stdoutln!(
+                "{}",
+                ui.prose(
+                    "Still counts against quota while sealed staging retains recovery authority; 'degu undo' will not mutate these entries."
+                )
+            )?;
+        } else if executed.iter().all(|item| !item.requires_manual_recovery()) {
             stdoutln!(
                 "{}",
                 ui.prose("Still counts against quota while staged; restore with 'degu undo'.")

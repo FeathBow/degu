@@ -6,7 +6,7 @@ use degu_core::oplog::ObjectIdentity;
 
 use super::claims::{CLAIMS_DIR_NAME, MAX_CLAIM_ATTEMPTS, prepare_claims_dir};
 
-mod removal;
+pub(in crate::lifecycle) mod removal;
 
 pub(in crate::lifecycle) use removal::{ParentIdentityExpectation, parent_identity};
 

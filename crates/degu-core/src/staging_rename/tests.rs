@@ -3,7 +3,8 @@ use crate::seal_store::SealWalStore;
 use crate::seal_wal::{DurableRenameOutcome, ProductionAssociation};
 use crate::sealed_staging::{
     ForwardFailureDisposition, SealedStagingEngine, StartupRecoveryAnchors,
-    VerifiedUndoFailureDisposition, VerifiedUndoRequest,
+    VerifiedPurgeFailureDisposition, VerifiedPurgeRequest, VerifiedUndoFailureDisposition,
+    VerifiedUndoRequest,
 };
 use crate::staging_recovery::{
     RecoveryAnchors, RecoveryFilesystemAnchor, StagedVerificationOutcome, StartupRecoveryCapability,
@@ -263,6 +264,199 @@ fn verified_undo_request(fixture: &Fixture) -> VerifiedUndoRequest {
         std::fs::File::open(&fixture.base).unwrap().into(),
         std::fs::File::open(&fixture.base).unwrap().into(),
     )
+}
+
+fn verified_purge_request(
+    fixture: &Fixture,
+    transaction: TransactionId,
+    reclamation_id: &str,
+) -> VerifiedPurgeRequest {
+    VerifiedPurgeRequest::new(
+        transaction,
+        reclamation_id.to_owned(),
+        std::fs::File::open(&fixture.base).unwrap().into(),
+        std::fs::File::open(&fixture.base).unwrap().into(),
+    )
+}
+
+#[test]
+fn recovery_blocked_engine_refuses_later_purge_admission() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0x90; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    // Force exact-object drift so the first request durably blocks recovery.
+    std::fs::write(fixture.destination_root.join("late-drift"), b"drift").unwrap();
+    let first = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap_err();
+    assert!(matches!(
+        first.disposition(),
+        VerifiedPurgeFailureDisposition::Terminal(TransactionState::RecoveryRequired)
+            | VerifiedPurgeFailureDisposition::RecoveryBlocked
+    ));
+
+    let later = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap_err();
+    assert_eq!(
+        later.disposition(),
+        VerifiedPurgeFailureDisposition::RecoveryBlocked
+    );
+    assert_eq!(later.stage(), "ready-engine admission");
+}
+
+#[test]
+fn verified_purge_mints_one_use_authority_after_durable_terminal_transition() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xe1; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+
+    assert_eq!(authority.transaction(), transaction);
+    assert_eq!(authority.reclamation_id(), "undo-group");
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purgeable));
+    assert!(fixture.destination_root.is_dir());
+    assert!(
+        ready
+            .verified_undo_token(transaction, "undo-group")
+            .is_none(),
+        "Purgeable and verified undo must be mutually exclusive"
+    );
+    let second = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap_err();
+    assert_eq!(
+        second.disposition(),
+        VerifiedPurgeFailureDisposition::NotStarted
+    );
+    drop(authority);
+    drop(ready);
+
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty(), "Purgeable is startup terminal");
+    let calls = std::cell::Cell::new(0);
+    let (ready, summary) = engine
+        .recover_startup(report, |_, _| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::other(
+                "Purgeable startup must not acquire mutation anchors",
+            ))
+        })
+        .unwrap();
+    assert_eq!(calls.get(), 0);
+    assert!(summary.recovered.is_empty());
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purgeable));
+    assert!(fixture.destination_root.is_dir(), "startup must not delete");
+}
+
+#[test]
+fn purge_request_selector_is_not_authority() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xe2; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+
+    let error = ready
+        .request_verified_purge(verified_purge_request(
+            &fixture,
+            transaction,
+            "oplog-forged-group",
+        ))
+        .unwrap_err();
+    assert_eq!(
+        error.disposition(),
+        VerifiedPurgeFailureDisposition::NotStarted
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    assert!(fixture.destination_root.is_dir());
+}
+
+#[test]
+fn verified_purge_content_and_mode_drift_fail_closed_to_recovery_required() {
+    for drift in ["content", "mode"] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let transaction = TransactionId(if drift == "content" {
+            [0xe3; 16]
+        } else {
+            [0xe4; 16]
+        });
+        let mut ready = stage_production(&fixture, transaction);
+        if drift == "content" {
+            std::fs::write(
+                fixture.destination_root.join("child/data"),
+                b"changed content",
+            )
+            .unwrap();
+        } else {
+            set_mode(&fixture.destination_root.join("child"), 0o700);
+        }
+
+        let error = ready
+            .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+            .unwrap_err();
+        assert_eq!(
+            error.disposition(),
+            VerifiedPurgeFailureDisposition::Terminal(TransactionState::RecoveryRequired),
+            "{drift}: {error}"
+        );
+        assert_eq!(
+            ready.state(transaction),
+            Some(TransactionState::RecoveryRequired)
+        );
+        assert!(fixture.destination_root.is_dir());
+    }
+}
+
+#[test]
+fn verified_purge_parent_or_root_replacement_never_mints_authority() {
+    for replacement in ["parent", "root"] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let transaction = TransactionId(if replacement == "parent" {
+            [0xe5; 16]
+        } else {
+            [0xe6; 16]
+        });
+        let mut ready = stage_production(&fixture, transaction);
+        if replacement == "parent" {
+            let detached = fixture.base.join("detached-destination-parent");
+            std::fs::rename(&fixture.destination_parent, detached).unwrap();
+            std::fs::create_dir(&fixture.destination_parent).unwrap();
+            set_mode(&fixture.destination_parent, 0o700);
+        } else {
+            let detached = fixture.destination_parent.join("detached-staged");
+            std::fs::rename(&fixture.destination_root, detached).unwrap();
+            std::fs::create_dir(&fixture.destination_root).unwrap();
+            set_mode(&fixture.destination_root, 0o750);
+        }
+
+        let error = ready
+            .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+            .unwrap_err();
+        assert_eq!(
+            error.disposition(),
+            VerifiedPurgeFailureDisposition::Terminal(TransactionState::RecoveryRequired),
+            "{replacement}: {error}"
+        );
+        assert_eq!(
+            ready.state(transaction),
+            Some(TransactionState::RecoveryRequired)
+        );
+    }
 }
 
 #[test]
@@ -1609,4 +1803,54 @@ fn apfs_noreplace_and_both_parent_fsync_contract_is_mandatory() {
 
 fn mode(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verified_purge_acl_drift_fails_closed_to_recovery_required() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xe7; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let child = fixture.destination_root.join("child");
+    let child = std::ffi::CString::new(child.as_os_str().as_bytes()).unwrap();
+    let acl: [u8; 28] = [
+        2, 0, 0, 0, // version
+        1, 0, 7, 0, 0xff, 0xff, 0xff, 0xff, // ACL_USER_OBJ
+        4, 0, 5, 0, 0xff, 0xff, 0xff, 0xff, // ACL_GROUP_OBJ
+        0x20, 0, 5, 0, 0xff, 0xff, 0xff, 0xff, // ACL_OTHER
+    ];
+    // SAFETY: both C path and ACL buffer remain live for the syscall.
+    let result = unsafe {
+        libc::setxattr(
+            child.as_ptr(),
+            c"system.posix_acl_access".as_ptr(),
+            acl.as_ptr().cast(),
+            acl.len(),
+            0,
+        )
+    };
+    assert_eq!(
+        result,
+        0,
+        "failed to plant test ACL: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let error = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap_err();
+    assert_eq!(
+        error.disposition(),
+        VerifiedPurgeFailureDisposition::Terminal(TransactionState::RecoveryRequired),
+        "{error}"
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::RecoveryRequired)
+    );
+    assert!(fixture.destination_root.is_dir());
 }

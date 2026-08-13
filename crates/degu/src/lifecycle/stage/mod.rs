@@ -27,6 +27,7 @@ pub(crate) fn execute_clean(
     purge: bool,
     recheck: &dyn Fn(&Finding) -> Result<(), String>,
     sealed_staging: Option<&mut degu_core::sealed_staging::ReadyStagingEngine>,
+    retained_purge_authorities: &mut Vec<degu_core::sealed_staging::PurgeAuthority>,
 ) -> anyhow::Result<Vec<CleanExecution>> {
     let reclamation_id = reclamation_id();
     if let Some(engine) = sealed_staging {
@@ -36,6 +37,8 @@ pub(crate) fn execute_clean(
             reclamation_id,
             recheck,
             engine,
+            purge,
+            retained_purge_authorities,
         };
         let mut executed = Vec::with_capacity(plan.items().len());
         let mut blocked = false;

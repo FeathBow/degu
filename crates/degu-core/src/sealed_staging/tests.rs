@@ -561,7 +561,7 @@ fn manual_recovery_block_never_requests_filesystem_anchors() {
 }
 
 #[test]
-fn purge_states_are_unreachable_without_future_held_object_capability() {
+fn raw_state_transition_cannot_mint_object_bound_purge_authority() {
     let temp = crate::secure_test_tempdir().unwrap();
     let store_path = temp.path().canonicalize().unwrap().join("wal-store");
     let store = SealWalStore::open_or_create(&store_path).unwrap();

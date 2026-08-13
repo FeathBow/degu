@@ -104,6 +104,54 @@ fn older_frame_versions_reject_states_introduced_by_newer_schemas() {
 }
 
 #[test]
+fn version_seven_staging_and_content_manifest_remain_replayable() {
+    let transaction = tx(0x77);
+    let metadata = staging_metadata().with_production_association(
+        ProductionAssociation::new("v7-production".to_string()).unwrap(),
+    );
+    let manifest = DurableTreeManifest {
+        schema_version: CONTENT_PROOF_MANIFEST_VERSION,
+        entry_count: 4,
+        sha256: [0x77; 32],
+    };
+    let parsed = parse_frames(
+        &[
+            legacy_frame(
+                7,
+                &SealRecord::StagingBegin {
+                    transaction,
+                    metadata: metadata.clone(),
+                },
+            ),
+            legacy_frame(
+                7,
+                &SealRecord::TreeManifestComplete {
+                    transaction,
+                    manifest,
+                },
+            ),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let SealRecord::StagingBegin {
+        metadata: decoded, ..
+    } = &parsed.records[0].record
+    else {
+        panic!("expected v7 staging metadata")
+    };
+    assert_eq!(decoded, &metadata);
+    let SealRecord::TreeManifestComplete {
+        manifest: decoded, ..
+    } = parsed.records[1].record
+    else {
+        panic!("expected v7 content manifest")
+    };
+    assert_eq!(decoded, manifest);
+    assert!(decoded.has_content_proof());
+}
+
+#[test]
 fn version_six_manifest_decodes_as_metadata_only_content_unproven() {
     let transaction = tx(0x76);
     let mut payload = vec![6];
@@ -454,14 +502,14 @@ fn checksum_unknown_version_and_malformed_interior_fail_closed() {
 
     let version_path = temp.path().join("version.wal");
     let mut version = good.clone();
-    version[4..6].copy_from_slice(&8_u16.to_le_bytes());
+    version[4..6].copy_from_slice(&(VERSION + 1).to_le_bytes());
     let version_header_crc = crc32(&version[4..12]);
     version[12..16].copy_from_slice(&version_header_crc.to_le_bytes());
     std::fs::write(&version_path, &version).unwrap();
     let mut lock = RecoverySession::try_acquire(open_rw(&version_path)).unwrap();
     assert!(matches!(
         lock.replay_and_repair(),
-        Err(ReplayError::UnsupportedLegacyVersion { version: 8, .. })
+        Err(ReplayError::UnsupportedLegacyVersion { version, .. }) if version == VERSION + 1
     ));
     drop(lock);
 
@@ -2297,14 +2345,140 @@ fn authority_neutral_public_methods_cannot_drive_a_staging_transaction() {
 }
 
 #[test]
-fn purge_transitions_have_no_wal_edge_until_held_executor_exists() {
-    assert!(!valid_transition(
+fn purge_authorization_sync_failure_never_publishes_purgeable() {
+    let transaction = tx(0xc6);
+    let metadata = staging_metadata()
+        .with_production_association(ProductionAssociation::new("purge-sync".to_string()).unwrap());
+    let manifest = DurableTreeManifest {
+        schema_version: CONTENT_PROOF_MANIFEST_VERSION,
+        entry_count: 0,
+        sha256: [0xa3; 32],
+    };
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    wal.begin_staging(transaction, metadata).unwrap();
+    advance_to_tree_intent(&mut wal, transaction);
+    wal.complete_tree_manifest(transaction, manifest).unwrap();
+    wal.transition_staging(transaction, TransactionState::TreeSealed)
+        .unwrap();
+    wal.record_rename_intent(transaction).unwrap();
+    wal.record_applied_rename_for_test(transaction).unwrap();
+    wal.transition_staging(transaction, TransactionState::StagedUnverified)
+        .unwrap();
+    wal.transition_staging(transaction, TransactionState::StagedSealed)
+        .unwrap();
+    wal.transition_staging(transaction, TransactionState::SourceParentRestoreIntent)
+        .unwrap();
+    wal.transition_staging(transaction, TransactionState::SourceParentRestored)
+        .unwrap();
+    wal.transition_staging(transaction, TransactionState::VerifiedCommitted)
+        .unwrap();
+
+    wal.writer.fail_sync_at = Some((wal.writer.sync_count, libc::EIO));
+    let proof = crate::staging_recovery::ExactPurgeVerification::for_test(transaction, manifest);
+    assert!(matches!(
+        wal.record_purgeable(proof),
+        Err(AppendError::Io(_))
+    ));
+    assert_eq!(
+        wal.transaction_state(transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    assert!(matches!(
+        wal.transition_recovery_required(transaction),
+        Err(AppendError::Poisoned)
+    ));
+}
+
+#[test]
+fn purgeable_has_only_the_explicit_v8_authorization_record() {
+    assert!(valid_transition(
         TransactionState::VerifiedCommitted,
         TransactionState::Purgeable
     ));
     assert!(!valid_transition(
         TransactionState::Purgeable,
         TransactionState::Purged
+    ));
+
+    let transaction = tx(0xc5);
+    let metadata = staging_metadata().with_production_association(
+        ProductionAssociation::new("purge-group".to_string()).unwrap(),
+    );
+    let manifest = DurableTreeManifest {
+        schema_version: CONTENT_PROOF_MANIFEST_VERSION,
+        entry_count: 1,
+        sha256: [0x5a; 32],
+    };
+    let prefix = vec![
+        SealRecord::StagingBegin {
+            transaction,
+            metadata: metadata.clone(),
+        },
+        state(transaction, TransactionState::ParentSealIntent),
+        state(transaction, TransactionState::ParentSealed),
+        state(transaction, TransactionState::TreeSealIntent),
+        SealRecord::TreeManifestComplete {
+            transaction,
+            manifest,
+        },
+        state(transaction, TransactionState::TreeSealed),
+        SealRecord::RenameIntent { transaction },
+        SealRecord::RenameOutcome {
+            transaction,
+            outcome: DurableRenameOutcome::AppliedAndParentsSynced(metadata.root_identity()),
+        },
+        state(transaction, TransactionState::StagedUnverified),
+        state(transaction, TransactionState::StagedSealed),
+        state(transaction, TransactionState::SourceParentRestoreIntent),
+        state(transaction, TransactionState::SourceParentRestored),
+        state(transaction, TransactionState::VerifiedCommitted),
+    ];
+
+    let mut generic = prefix.clone();
+    generic.push(state(transaction, TransactionState::Purgeable));
+    let generic_result = replay_records(generic);
+    assert!(
+        matches!(
+            generic_result,
+            Err(ReplayError::InvalidHistory(
+                "purgeable must use its explicit authorization record"
+            ))
+        ),
+        "unexpected generic replay result: {generic_result:?}"
+    );
+
+    let mut explicit = prefix.clone();
+    explicit.push(SealRecord::PurgeAuthorized {
+        transaction,
+        commitment: DurablePurgeCommitment::exact(&metadata, manifest),
+    });
+    let replayed = replay_records(explicit).unwrap();
+    assert_eq!(
+        replayed.transactions[&transaction].state,
+        TransactionState::Purgeable
+    );
+    assert!(matches!(
+        decide_recovery(&replayed.transactions[&transaction], |_| {
+            RecoveryIdentity::Reestablished
+        }),
+        RecoveryWork::PreserveCommittedSeal {
+            state: TransactionState::Purgeable,
+            ..
+        }
+    ));
+
+    let mut forged = prefix;
+    let mut commitment = DurablePurgeCommitment::exact(&metadata, manifest);
+    commitment.root_identity = strong(9, 9, 9);
+    forged.push(SealRecord::PurgeAuthorized {
+        transaction,
+        commitment,
+    });
+    assert!(matches!(
+        replay_records(forged),
+        Err(ReplayError::InvalidHistory(
+            "purge authorization does not bind the exact committed object"
+        ))
     ));
 }
 

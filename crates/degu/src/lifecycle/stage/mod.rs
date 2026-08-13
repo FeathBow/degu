@@ -1,5 +1,6 @@
 mod execution;
 mod plan;
+mod production;
 mod purge;
 #[cfg(test)]
 mod tests;
@@ -25,17 +26,49 @@ pub(crate) fn execute_clean(
     plan: &CapturedCleanPlan,
     purge: bool,
     recheck: &dyn Fn(&Finding) -> Result<(), String>,
-) -> Vec<CleanExecution> {
+    sealed_staging: Option<&mut degu_core::sealed_staging::ReadyStagingEngine>,
+) -> anyhow::Result<Vec<CleanExecution>> {
+    let reclamation_id = reclamation_id();
+    if let Some(engine) = sealed_staging {
+        let mut run = production::ProductionRun {
+            ctx,
+            log: OperationLog::new(ctx),
+            reclamation_id,
+            recheck,
+            engine,
+        };
+        let mut executed = Vec::with_capacity(plan.items().len());
+        let mut blocked = false;
+        for (finding, identity) in plan.items_with_identities() {
+            if blocked {
+                // A prior item poisoned the WAL lease for the rest of this run;
+                // report each remaining finding as not attempted rather than
+                // silently dropping it from the results.
+                executed.push(CleanExecution::plain_stage_failed(
+                    finding,
+                    "sealed-staging recovery was blocked earlier in this run; not attempted"
+                        .to_string(),
+                ));
+                continue;
+            }
+            let outcome = production::execute(&mut run, finding, identity);
+            blocked = outcome.recovery_blocked;
+            executed.push(outcome.execution);
+        }
+        return Ok(executed);
+    }
+
     let run = CleanRun {
         ctx,
         log: OperationLog::new(ctx),
-        reclamation_id: reclamation_id(),
+        reclamation_id,
         purge,
         recheck,
     };
-    plan.items_with_identities()
+    Ok(plan
+        .items_with_identities()
         .map(|(finding, identity)| execute_finding(&run, finding, identity))
-        .collect()
+        .collect())
 }
 
 struct CleanRun<'a> {

@@ -74,7 +74,8 @@ pub(crate) fn run(request: PtyRun<'_>) -> Output {
         .env("LOGNAME", request.home)
         .env("XDG_CONFIG_HOME", request.config_home)
         .env("XDG_STATE_HOME", request.state_home)
-        .env("DEGU_INTEGRATION_TEST_ANCHOR", anchor);
+        .env("DEGU_INTEGRATION_TEST_ANCHOR", anchor)
+        .env("DEGU_INTEGRATION_TEST_LEGACY_CLEAN", "1");
     for &(name, value) in request.extra_env {
         command.env(name, value);
     }

@@ -19,6 +19,18 @@ pub(in crate::lifecycle) use identity::{
     IdentityExpectation as ParentIdentityExpectation, object_identity_from_stat as parent_identity,
 };
 
+pub(in crate::lifecycle) fn remove_held_file(
+    parent: &OwnedFd,
+    name: &OsStr,
+    path: &Path,
+    expected: ObjectIdentity,
+) -> io::Result<()> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "entry name contains NUL"))?;
+    let parent_mount = degu_walk::mount::identity_for_fd(parent, path)?;
+    NamedEntry::new(parent, &name, path).unlink_file(expected, &parent_mount)
+}
+
 pub(super) fn remove(root: &Path, expected: ObjectIdentity) -> io::Result<()> {
     degu_walk::validate_single_mount_tree(root)?;
     let target = Target::open(root, expected)?;

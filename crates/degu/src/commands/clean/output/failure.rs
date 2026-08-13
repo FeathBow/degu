@@ -15,6 +15,28 @@ fn render(path: &Path, failure: CleanExecutionFailure<'_>) -> (Severity, String)
             Severity::Error,
             format!("failed to stage {path}: {}", escape_terminal_text(reason)),
         ),
+        CleanExecutionFailure::Quarantined { entry, reason } => (
+            Severity::Error,
+            format!(
+                "sealed staging quarantined {path}{}; the entry is retained and requires manual recovery. Do not run undo for this entry: {}",
+                retained_entry(entry),
+                escape_terminal_text(reason)
+            ),
+        ),
+        CleanExecutionFailure::RecoveryBlocked { entry, reason } => (
+            Severity::Error,
+            match entry {
+                Some(entry) => format!(
+                    "sealed staging recovery blocked for {path} at {}; the entry is retained and requires manual recovery. Do not run undo for this entry: {}",
+                    escaped_path(entry),
+                    escape_terminal_text(reason)
+                ),
+                None => format!(
+                    "sealed staging recovery blocked for {path}; WAL and reservation evidence are retained and require manual recovery. Do not run undo for this transaction: {}",
+                    escape_terminal_text(reason)
+                ),
+            },
+        ),
         CleanExecutionFailure::UnverifiedDestination { entry, reason } => (
             Severity::Error,
             format!(
@@ -43,6 +65,31 @@ fn render(path: &Path, failure: CleanExecutionFailure<'_>) -> (Severity, String)
                 escape_terminal_text(reason)
             ),
         ),
+        CleanExecutionFailure::ProductionCommitted {
+            reservation_cleanup_failure,
+            jsonl_projection_failure,
+        } => {
+            let mut details = Vec::new();
+            if let Some(reason) = reservation_cleanup_failure {
+                details.push(format!(
+                    "trash reservation cleanup failed (the reservation is housekeeping only): {}",
+                    escape_terminal_text(reason)
+                ));
+            }
+            if let Some(reason) = jsonl_projection_failure {
+                details.push(format!(
+                    "ops.jsonl projection failed (the WAL commit remains authoritative): {}",
+                    escape_terminal_text(reason)
+                ));
+            }
+            (
+                Severity::Warning,
+                format!(
+                    "sealed staging durably committed {path}, but {}",
+                    details.join("; ")
+                ),
+            )
+        }
         CleanExecutionFailure::PurgeFailed { reason } => (
             Severity::Error,
             format!("failed to purge {path}: {}", escape_terminal_text(reason)),
@@ -55,6 +102,10 @@ fn render(path: &Path, failure: CleanExecutionFailure<'_>) -> (Severity, String)
             ),
         ),
     }
+}
+
+fn retained_entry(entry: Option<&Path>) -> String {
+    entry.map_or_else(String::new, |entry| format!(" at {}", escaped_path(entry)))
 }
 
 fn escaped_path(path: &Path) -> String {
@@ -88,6 +139,41 @@ mod tests {
         assert!(matches!(severity, Severity::Error));
         assert!(unverified.contains("automatic rollback was not attempted"));
         assert!(unverified.contains("recover it manually only after confirming its identity"));
+        let (severity, quarantined) = render(
+            Path::new("/cache"),
+            CleanExecutionFailure::Quarantined {
+                entry: Some(Path::new("/trash/0001-cache")),
+                reason: "strong identity mismatch",
+            },
+        );
+        assert!(matches!(severity, Severity::Error));
+        assert!(quarantined.contains("entry is retained and requires manual recovery"));
+        assert!(quarantined.contains("Do not run undo"));
+
+        let (severity, blocked) = render(
+            Path::new("/cache"),
+            CleanExecutionFailure::RecoveryBlocked {
+                entry: None,
+                reason: "WAL append outcome uncertain",
+            },
+        );
+        assert!(matches!(severity, Severity::Error));
+        assert!(blocked.contains("WAL and reservation evidence are retained"));
+        assert!(!blocked.contains(" at /trash/"));
+
+        let (severity, projection) = render(
+            Path::new("/cache"),
+            CleanExecutionFailure::ProductionCommitted {
+                reservation_cleanup_failure: Some("claim busy"),
+                jsonl_projection_failure: Some("disk full"),
+            },
+        );
+        assert!(matches!(severity, Severity::Warning));
+        assert!(projection.contains("reservation cleanup failed"));
+        assert!(projection.contains("housekeeping only"));
+        assert!(projection.contains("ops.jsonl projection failed"));
+        assert!(projection.contains("WAL commit remains authoritative"));
+
         let (severity, purged) = render(
             Path::new("/cache"),
             CleanExecutionFailure::PurgedLog { reason: "log full" },

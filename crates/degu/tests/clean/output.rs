@@ -24,6 +24,7 @@ fn closed_stdout_stops_clean_before_mutation() {
             "DEGU_INTEGRATION_TEST_ANCHOR",
             std::fs::canonicalize(anchor).unwrap(),
         )
+        .env("DEGU_INTEGRATION_TEST_LEGACY_CLEAN", "1")
         .env("HOME", home.path())
         .env("LOGNAME", home.path())
         .env("XDG_CONFIG_HOME", test_config_home())

@@ -63,7 +63,7 @@ impl PreparedClean {
     }
 
     pub(super) fn lock(&self) -> Result<MutationSession> {
-        Lifecycle::new(&self.ctx).lock()
+        Lifecycle::new(&self.ctx).lock_for_clean(self.settings.purge)
     }
 
     pub(super) fn revalidate(&self, session: &MutationSession) -> Result<()> {
@@ -87,15 +87,11 @@ impl PreparedClean {
     /// boundary. A guard canonicalizes protected paths when it is built, so a
     /// protected path that became an alias of this source after revalidate()
     /// is only visible to a freshly built guard, not to the plan-wide check.
-    pub(super) fn recheck_finding(
-        &self,
-        session: &MutationSession,
-        finding: &Finding,
-    ) -> Result<()> {
+    pub(super) fn recheck_finding(&self, finding: &Finding) -> Result<()> {
         let single = std::slice::from_ref(finding);
         validate_clean_plan_disablement(&self.ctx, &self.config, single)?;
         let mut guard = build_guard(&self.ctx, &self.config)?;
-        session.add_trash_roots_to_guard(single, &mut guard)?;
+        Lifecycle::new(&self.ctx).add_trash_roots_to_guard(single, &mut guard)?;
         guard.check(finding.path())?;
         Ok(())
     }

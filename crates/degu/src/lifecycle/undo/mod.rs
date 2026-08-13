@@ -13,7 +13,10 @@ pub(crate) use report::{
     UndoAmbiguousEntry, UndoEntry, UndoFailedEntry, UndoLogFailure, UndoReport,
 };
 
-pub(crate) fn undo_latest(ctx: &DetectCtx) -> Result<Option<UndoReport>> {
+pub(crate) fn undo_latest(
+    ctx: &DetectCtx,
+    blocker: &dyn Fn(&std::path::Path) -> Option<String>,
+) -> Result<Option<UndoReport>> {
     let log = OperationLog::new(ctx);
     let records = log.read()?;
     let Some(selection) = select_actionable_undo_group(&records) else {
@@ -25,7 +28,7 @@ pub(crate) fn undo_latest(ctx: &DetectCtx) -> Result<Option<UndoReport>> {
         .unwrap_or_else(|| "-".to_string());
     let span = tracing::info_span!(target: "degu", "undo", reclamation_id = %reclamation_label);
     let _guard = span.enter();
-    let report = restore_selection(&log, selection)?;
+    let report = restore_selection(&log, selection, blocker)?;
     trace_summary(&report, &reclamation_label);
     Ok(Some(report))
 }

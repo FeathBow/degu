@@ -66,6 +66,7 @@ fn run(verbose: u8, command: Command, policy: ColorPolicy) -> Result<()> {
         Command::Completions { shell } => commands::completions::run(shell),
         Command::Man { command } => commands::man::run(command),
         Command::Adapters => commands::adapters::run(),
+        Command::Admin { command } => commands::admin::run(command),
         command => {
             runtime::enforce_root_policy(ui.colors)?;
             dispatch(command, ui)
@@ -76,6 +77,7 @@ fn run(verbose: u8, command: Command, policy: ColorPolicy) -> Result<()> {
 fn dispatch(command: Command, ui: runtime::Ui) -> Result<()> {
     match command {
         Command::Scan(args) => commands::scan::run(args, ui),
+        Command::Admin { .. } => unreachable!("handled by dedicated root-only dispatch"),
         Command::Doctor { output } => commands::doctor::run(output.json),
         Command::Quota(args) => commands::quota::run(args, ui),
         Command::Reclaim { command } => commands::reclaim::run(command, ui),

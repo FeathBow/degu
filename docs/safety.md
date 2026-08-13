@@ -50,11 +50,18 @@ fallback. Unsafe entries are not automatically chmodded, replaced, or repaired;
 inspection uncertainty is not compressed into missing or ready. Root and a
 malicious same-EUID process remain outside the Unix trust boundary.
 
-The current unprivileged installers install binaries only and merely suggest
-running `degu doctor`. They do not invoke sudo or write `/var/lib` or
-`/private/var/db`. Explicit administrator provisioning and later production
-lifecycle wiring remain separate review boundaries, so this command does not
-change current clean, undo, purge, or expiry behavior.
+The unprivileged installers install binaries only and merely suggest running
+`degu doctor`. They do not invoke sudo, inspect `SUDO_UID`, or write `/var/lib`
+or `/private/var/db`. For a never-activated numeric UID, a real-EUID-0
+administrator separately runs `degu admin activation-anchor provision --uid
+<UID> --initial`. That command derives the only path from platform plus UID,
+creates with descriptor-relative/no-follow operations, and never repairs an
+existing object.
+
+Production forward cleanup is connected to activation and startup recovery.
+`doctor ready` proves only anchor readiness, not WAL or recovery health. In
+particular, `RecoveryRequired` cannot be repaired by reprovisioning an anchor;
+it remains an operator-investigation state.
 
 ## Staging, undo, and purge
 

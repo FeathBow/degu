@@ -3,7 +3,7 @@ pub(super) const TOP_LEVEL_HELP_TEMPLATE: &str = "{about-with-newline}
 
 Inspect:
   scan         Inspect known caches and selected project roots
-  doctor       Check account readiness for future sealed staging
+  doctor       Check account readiness for sealed staging
   quota        Report authoritative filesystem quota for one path
 
 Clean and recover:
@@ -14,6 +14,9 @@ Clean and recover:
 
 Configure:
   relocate     Print shell config for future cache writes
+
+Administration:
+  admin        Perform an explicit root-only administrative operation
 
 Reference:
   ops          Show recorded clean, restore, and purge operations

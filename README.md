@@ -1,6 +1,6 @@
 <h1 align="center">degu 🐭</h1>
 
-<p align="center">Safely reclaim disk quota from caches and build artifacts on shared HPC and GPU clusters — no root, conservative cleanup, reversible staging by default.</p>
+<p align="center">Safely reclaim disk quota from caches and build artifacts on shared HPC and GPU clusters — unprivileged day-to-day cleanup, conservative cleanup, reversible staging by default.</p>
 
 <p align="center"><em>For ML researchers on login nodes, drowning in pip, conda, HuggingFace, and compile caches.</em></p>
 
@@ -43,7 +43,7 @@ Scan build artifacts under this project, or any parent directory: degu scan .
 - **Reclaims what actually fills your quota.** Built-in sources across the ML/HPC stack — pip, conda, HuggingFace, vLLM, Triton, cargo, and more (`degu adapters` lists them all) — plus build artifacts under any project tree, found in a single read-only pass; two node-runtime diagnostics stay scan-time opt-in.
 - **Safe by default.** Only verified, cheap-to-regenerate findings enter the default plan and are staged for undo.
 - **Honest accounting.** `degu quota` reads authoritative filesystem usage and limits, kept separate from degu-detected storage.
-- **Linux and macOS, offline, no root.**
+- **Linux and macOS, offline, unprivileged normal use.** Normal scan and cleanup need no root and never self-elevate; a separate administrator-controlled step performs the one-time per-UID activation-anchor bootstrap.
 
 ## Why you can trust it to delete
 
@@ -88,7 +88,7 @@ cargo install --path crates/degu --locked --root "$HOME/.local"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Both `degu` and its short alias, `dg`, install into `~/.local/bin`. The [installation guide](https://github.com/FeathBow/degu/blob/main/docs/installation.md) covers published releases, checksum verification, and build provenance.
+Both `degu` and its short alias, `dg`, install into `~/.local/bin` by default. The installer never invokes `sudo`, reads `SUDO_UID`, or creates an activation anchor; `DEGU_INSTALL_DIR` may select another binary destination when the caller already has permission. Before the first production mutation, an administrator must use a separately verified, administrator-owned binary for the fixed numeric-UID bootstrap documented in the [installation guide](https://github.com/FeathBow/degu/blob/main/docs/installation.md), which also covers published releases, checksum verification, and build provenance.
 
 ## Quick start
 

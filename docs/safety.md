@@ -71,6 +71,13 @@ full lifetime, so another process with different XDG state cannot activate a
 store concurrently. Activated sessions instead retain and replay the exact WAL
 lease for the full mutation session.
 
+When that WAL already contains a production-associated staging object, legacy
+undo, explicit trash purge, and expiry purge retain it rather than claiming,
+renaming, or deleting it. The check uses the WAL destination plus held-FD strong
+object identity; missing JSONL cannot remove the protection, and adding a JSONL
+record cannot grant mutation authority. Identity or namespace inspection
+uncertainty also blocks.
+
 Production forward cleanup is connected to activation and startup recovery.
 `doctor ready` proves only anchor readiness, not WAL or recovery health. In
 particular, `RecoveryRequired` cannot be repaired by reprovisioning an anchor;

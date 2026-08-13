@@ -12,6 +12,19 @@ fn identity(inode: u64) -> StrongObjectIdentity {
     StrongObjectIdentity::new_with_mount(1, inode, ObjectIncarnation::new(inode + 1000), 7)
 }
 
+fn captured_identity(path: &std::path::Path) -> StrongObjectIdentity {
+    let fd = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .unwrap();
+    strong_identity_fd(&fd).unwrap()
+}
+
 fn metadata() -> StagingTransactionMetadata {
     StagingTransactionMetadata::new(
         StagingLocator::new(PathBuf::from("source-parent"), "fs".into()).unwrap(),
@@ -25,6 +38,51 @@ fn metadata() -> StagingTransactionMetadata {
         DurableSourceParentStrategy::PermissionSeal,
     )
     .unwrap()
+}
+
+#[test]
+fn forward_identity_probe_distinguishes_match_mismatch_and_uncertainty() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let directory = temp.path().join("directory");
+    let file = temp.path().join("file");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(&file, b"not a directory").unwrap();
+    let expected = captured_identity(&directory);
+
+    assert_eq!(
+        probe_forward_directory_identity(&directory, expected),
+        ForwardDirectoryIdentityProbe::Match
+    );
+    assert_eq!(
+        probe_forward_directory_identity(&file, expected),
+        ForwardDirectoryIdentityProbe::Mismatch
+    );
+    assert_eq!(
+        probe_forward_directory_identity(&temp.path().join("missing"), expected),
+        ForwardDirectoryIdentityProbe::Mismatch
+    );
+    let oversized = temp.path().join("x".repeat(8192));
+    assert!(matches!(
+        probe_forward_directory_identity(&oversized, expected),
+        ForwardDirectoryIdentityProbe::Uncertain(_)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn forward_identity_probe_does_not_require_directory_read_permission() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = crate::secure_test_tempdir().unwrap();
+    let directory = temp.path().join("execute-only");
+    std::fs::create_dir(&directory).unwrap();
+    let expected = captured_identity(&directory);
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o100)).unwrap();
+
+    assert_eq!(
+        probe_forward_directory_identity(&directory, expected),
+        ForwardDirectoryIdentityProbe::Match
+    );
 }
 
 #[test]

@@ -19,7 +19,10 @@ use anyhow::{Context, Result};
 use degu_core::ecosystem::DetectCtx;
 use degu_core::finding::Finding;
 use degu_core::safety::Guard;
-use degu_core::sealed_staging::{ReadyStagingEngine, SealedStagingEngine, StartupRecoveryAnchors};
+use degu_core::sealed_staging::{
+    ForwardDirectoryIdentityProbe, ReadyStagingEngine, SealedStagingEngine, StartupRecoveryAnchors,
+    probe_forward_directory_identity,
+};
 use degu_core::store_activation::{MutationStoreActivation, UnsupportedNeverActivatedLease};
 use std::path::{Path, PathBuf};
 
@@ -111,7 +114,7 @@ impl Lifecycle {
         Ok(MutationSession {
             lifecycle: self,
             _mutation_lock: mutation_lock,
-            _sealed_staging: sealed_staging,
+            sealed_staging,
             _unsupported_legacy_lease: unsupported_legacy_lease,
         })
     }
@@ -123,7 +126,7 @@ pub(crate) struct MutationSession {
     // When activated, retains the exact WAL lease for the entire production
     // mutation session. `None` is allowed only for authenticated
     // UnsupportedNeverActivated. Forward staging remains deliberately unwired.
-    _sealed_staging: Option<ReadyStagingEngine>,
+    sealed_staging: Option<ReadyStagingEngine>,
     _unsupported_legacy_lease: Option<UnsupportedNeverActivatedLease>,
 }
 
@@ -150,7 +153,8 @@ impl MutationSession {
     }
 
     pub(crate) fn execute_purge_all(&self, plan: TrashPurgePlan) -> PurgeReport {
-        purge::execute_purge_plan(&self.lifecycle.ctx, "trash purge", plan)
+        let blocker = |path: &Path| self.sealed_entry_block(path);
+        purge::execute_purge_plan(&self.lifecycle.ctx, "trash purge", plan, &blocker)
     }
 
     pub(crate) fn plan_expired(&self) -> Result<ExpiryPlan> {
@@ -158,10 +162,75 @@ impl MutationSession {
     }
 
     pub(crate) fn execute_expiry(&self, plan: &ExpiryPlan) -> PurgeReport {
-        purge::execute_expiry_plan(&self.lifecycle.ctx, plan)
+        let blocker = |path: &Path| self.sealed_entry_block(path);
+        purge::execute_expiry_plan(&self.lifecycle.ctx, plan, &blocker)
     }
 
     pub(crate) fn undo_latest(&self) -> Result<Option<UndoReport>> {
-        undo::undo_latest(&self.lifecycle.ctx)
+        let blocker = |path: &Path| self.sealed_entry_block(path);
+        undo::undo_latest(&self.lifecycle.ctx, &blocker)
+    }
+
+    /// Returns a reason only when the exact leased WAL prevents this legacy
+    /// entry from being mutated. Absence of an association preserves legacy
+    /// behavior; inspection uncertainty fails closed.
+    fn sealed_entry_block(&self, path: &Path) -> Option<String> {
+        let engine = self.sealed_staging.as_ref()?;
+        let entries = engine.production_entries();
+        if entries.is_empty() {
+            return None;
+        }
+        let canonical_home = match std::fs::canonicalize(&self.lifecycle.ctx.home) {
+            Ok(home) => home,
+            Err(error) => {
+                return Some(format!(
+                    "sealed-staging authority could not authenticate canonical HOME before mutation: {error}; no claim, rename, or deletion was attempted"
+                ));
+            }
+        };
+        let normalized = match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => match std::fs::canonicalize(parent) {
+                Ok(parent) => parent.join(name),
+                Err(error) => {
+                    return Some(format!(
+                        "sealed-staging authority could not authenticate the entry parent before mutation: {error}; no claim, rename, or deletion was attempted"
+                    ));
+                }
+            },
+            _ => {
+                return Some(
+                    "sealed-staging authority rejected an unlocatable entry; no claim, rename, or deletion was attempted".to_string(),
+                );
+            }
+        };
+
+        for entry in entries {
+            let expected = canonical_home
+                .join(entry.destination_parent().relative_path())
+                .join(entry.destination_basename());
+            if normalized == expected {
+                return Some(format!(
+                    "sealed-staging WAL retains exclusive mutation authority for reclamation '{}' ({:?}); no claim, rename, or deletion was attempted",
+                    entry.reclamation_id(),
+                    entry.state()
+                ));
+            }
+            match probe_forward_directory_identity(path, entry.root_identity()) {
+                ForwardDirectoryIdentityProbe::Match => {
+                    return Some(format!(
+                        "sealed-staging WAL retains exclusive mutation authority for the exact object in reclamation '{}' ({:?}); no claim, rename, or deletion was attempted",
+                        entry.reclamation_id(),
+                        entry.state()
+                    ));
+                }
+                ForwardDirectoryIdentityProbe::Mismatch => {}
+                ForwardDirectoryIdentityProbe::Uncertain(error) => {
+                    return Some(format!(
+                        "sealed-staging authority could not strongly inspect this entry: {error}; no claim, rename, or deletion was attempted"
+                    ));
+                }
+            }
+        }
+        None
     }
 }

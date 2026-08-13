@@ -3,7 +3,9 @@ use super::plan::PlannedTrashEntry;
 use super::transaction::PurgeOperation;
 use super::transaction::{failed_outcome, purge_claimed, report_claim_failure};
 use crate::lifecycle::identity::RenameFailure;
+use degu_core::ecosystem::DetectCtx;
 use degu_core::oplog::OpOutcome;
+use std::ffi::OsString;
 
 fn claimed_fixture() -> (tempfile::TempDir, ClaimedTrashEntry, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -14,6 +16,37 @@ fn claimed_fixture() -> (tempfile::TempDir, ClaimedTrashEntry, std::path::PathBu
     let planned = PlannedTrashEntry::capture(entry.clone()).unwrap();
     let claimed = ClaimedTrashEntry::acquire(planned, &trash_root).unwrap();
     (dir, claimed, entry)
+}
+
+#[test]
+fn sealed_blocker_runs_before_claim_or_deletion() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let state = dir.path().join("state");
+    let trash_root = state.join("degu/trash");
+    let entry = trash_root.join("0001-cache");
+    std::fs::create_dir_all(&entry).unwrap();
+    std::fs::write(entry.join("payload"), b"retained").unwrap();
+    let planned = PlannedTrashEntry::capture(entry.clone()).unwrap();
+    let ctx = DetectCtx::for_test(
+        home,
+        [(OsString::from("XDG_STATE_HOME"), state.into_os_string())],
+    );
+    let blocker = |path: &std::path::Path| {
+        assert_eq!(path, entry);
+        Some("sealed WAL retains authority".to_string())
+    };
+
+    let report = super::purge_trash_entries(
+        super::PurgeBatch::new(&ctx, "trash purge", &trash_root).with_blocker(&blocker),
+        vec![planned],
+    );
+
+    assert!(report.purged.is_empty());
+    assert_eq!(report.failed.len(), 1);
+    assert!(report.failed[0].1.contains("sealed WAL"));
+    assert_eq!(std::fs::read(entry.join("payload")).unwrap(), b"retained");
+    assert!(!trash_root.join(".claims").exists());
 }
 
 #[test]

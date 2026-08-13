@@ -18,7 +18,7 @@ use crate::seal_wal::{
 use crate::staging_recovery::{
     RecoveryAnchors, RecoveryFilesystemAnchor, RecoveryRebindError, StagedVerificationFailure,
     StagedVerificationOutcome, StartupRecoveryCapability, certify_verified_commit,
-    prepare_startup_recovery, recovery_transaction,
+    prepare_startup_recovery, recovery_transaction, strong_identity_fd,
 };
 use crate::staging_rename::{
     PreparedRootBinding, StagedUnverifiedTree, StagingRenameError, execute_prepared_rename,
@@ -144,6 +144,60 @@ pub struct StartupRecoverySummary {
 struct RecoveryTerminalOutcome {
     state: TransactionState,
     verification_failure: Option<StagedVerificationFailure>,
+}
+
+/// Derives the kernel filesystem identifier required by forward locators from
+/// a held descriptor. Callers cannot supply pathname-derived identity.
+pub fn forward_filesystem_id(fd: &OwnedFd) -> io::Result<String> {
+    crate::staging_recovery::held_filesystem_id(fd)
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
+/// Result of comparing a named directory with WAL-held strong identity.
+///
+/// `Mismatch` is positive evidence that the name is absent, is not a directory,
+/// or names another incarnation. `Uncertain` is deliberately distinct: callers
+/// must not weaken authority when the namespace could not be inspected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwardDirectoryIdentityProbe {
+    Match,
+    Mismatch,
+    Uncertain(String),
+}
+
+/// Strongly probes a directory for lifecycle conflict detection. On Linux an
+/// `O_PATH` descriptor avoids requiring read permission; every platform keeps a
+/// descriptor held while deriving strong identity. The result is evidence only
+/// and grants no namespace mutation authority.
+pub fn probe_forward_directory_identity(
+    path: &Path,
+    expected: StrongObjectIdentity,
+) -> ForwardDirectoryIdentityProbe {
+    #[cfg(target_os = "linux")]
+    let flags = rustix::fs::OFlags::PATH
+        | rustix::fs::OFlags::DIRECTORY
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::DIRECTORY
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::CLOEXEC;
+
+    let fd = match rustix::fs::open(path, flags, rustix::fs::Mode::empty()) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => {
+            return ForwardDirectoryIdentityProbe::Mismatch;
+        }
+        Err(error) => {
+            return ForwardDirectoryIdentityProbe::Uncertain(io::Error::from(error).to_string());
+        }
+    };
+    match strong_identity_fd(&fd) {
+        Ok(actual) if actual == expected => ForwardDirectoryIdentityProbe::Match,
+        Ok(_) => ForwardDirectoryIdentityProbe::Mismatch,
+        Err(error) => ForwardDirectoryIdentityProbe::Uncertain(error.to_string()),
+    }
 }
 
 /// Raw held inputs for one forward sealed-staging transaction.

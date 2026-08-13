@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use degu_core::oplog::{ObjectIdentity, OpAction, OpOutcome, OpRecord};
 
 use super::failure::RestoreFailure;
-use super::{restore_outcome, restore_selection_with_append};
+use super::{restore_outcome, restore_selection_with_append, restore_selection_with_blocker};
 use crate::lifecycle::identity::RenameFailure;
 use crate::lifecycle::reconcile::active_trash_indices;
 use crate::lifecycle::undo::selection::UndoSelection;
@@ -79,6 +79,31 @@ fn restore_writes_pending_before_the_move_and_then_final() {
         "planned"
     );
     assert!(!fixture.entry.exists());
+}
+
+#[test]
+fn sealed_blocker_runs_after_identity_capture_and_before_log_or_rename() {
+    let fixture = restore_fixture();
+    let entry = fixture.entry.clone();
+    let mut appends = 0;
+    let report = restore_selection_with_blocker(
+        fixture.selection,
+        &mut |_| {
+            appends += 1;
+            Ok(())
+        },
+        &|path| {
+            assert_eq!(path, entry);
+            Some("sealed WAL retains authority".to_string())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(appends, 0, "block must precede pending log publication");
+    assert!(!fixture.original.exists());
+    assert_eq!(std::fs::read_to_string(&fixture.entry).unwrap(), "planned");
+    assert_eq!(report.failed.len(), 1);
+    assert!(report.failed[0].reason.contains("sealed WAL"));
 }
 
 #[test]

@@ -16,17 +16,28 @@ mod tests;
 pub(super) fn restore_selection(
     log: &OperationLog,
     selection: UndoSelection,
+    blocker: &dyn Fn(&Path) -> Option<String>,
 ) -> Result<UndoReport> {
     let mut append = |record: &OpRecord| log.append(record);
-    restore_selection_with_append(selection, &mut append)
+    restore_selection_with_blocker(selection, &mut append, blocker)
 }
 
+#[cfg(test)]
 fn restore_selection_with_append(
     selection: UndoSelection,
     append: &mut dyn FnMut(&OpRecord) -> std::io::Result<()>,
 ) -> Result<UndoReport> {
+    restore_selection_with_blocker(selection, append, &|_| None)
+}
+
+fn restore_selection_with_blocker(
+    selection: UndoSelection,
+    append: &mut dyn FnMut(&OpRecord) -> std::io::Result<()>,
+    blocker: &dyn Fn(&Path) -> Option<String>,
+) -> Result<UndoReport> {
     let mut run = RestoreRun {
         append,
+        blocker,
         reclamation_id: selection.reclamation_id.clone(),
         report: UndoReport::new(selection.reclamation_id),
     };
@@ -44,6 +55,7 @@ fn restore_selection_with_append(
 
 struct RestoreRun<'a> {
     append: &'a mut dyn FnMut(&OpRecord) -> std::io::Result<()>,
+    blocker: &'a dyn Fn(&Path) -> Option<String>,
     reclamation_id: Option<String>,
     report: UndoReport,
 }
@@ -57,6 +69,14 @@ impl RestoreRun<'_> {
         let Some(identity) = self.capture_identity(&target, &trash_entry)? else {
             return Ok(());
         };
+        if let Some(reason) = (self.blocker)(&trash_entry) {
+            self.report.failed.push(UndoFailedEntry {
+                path: target.path,
+                trash_entry,
+                reason,
+            });
+            return Ok(());
+        }
         if let Err(error) = self.append_record(RestoreAppend {
             target: &target,
             trash_entry: &trash_entry,

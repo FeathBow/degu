@@ -36,11 +36,14 @@ impl PurgeReport {
     }
 }
 
+type EntryBlocker<'a> = &'a dyn Fn(&Path) -> Option<String>;
+
 pub(crate) struct PurgeBatch<'a> {
     ctx: &'a DetectCtx,
     command: &'a str,
     trash_root: &'a Path,
     reclamation_id: Option<&'a str>,
+    blocker: Option<EntryBlocker<'a>>,
 }
 
 impl<'a> PurgeBatch<'a> {
@@ -50,12 +53,20 @@ impl<'a> PurgeBatch<'a> {
             command,
             trash_root,
             reclamation_id: None,
+            blocker: None,
         }
     }
 
     pub(crate) fn with_reclamation_id(self, reclamation_id: Option<&'a str>) -> Self {
         Self {
             reclamation_id,
+            ..self
+        }
+    }
+
+    pub(crate) fn with_blocker(self, blocker: EntryBlocker<'a>) -> Self {
+        Self {
+            blocker: Some(blocker),
             ..self
         }
     }
@@ -85,11 +96,15 @@ pub(crate) fn plan_expired_trash(ctx: &DetectCtx) -> Result<ExpiryPlan> {
     Ok(ExpiryPlan { batches })
 }
 
-pub(crate) fn execute_expiry_plan(ctx: &DetectCtx, plan: &ExpiryPlan) -> PurgeReport {
+pub(crate) fn execute_expiry_plan(
+    ctx: &DetectCtx,
+    plan: &ExpiryPlan,
+    blocker: &dyn Fn(&Path) -> Option<String>,
+) -> PurgeReport {
     let mut all = PurgeReport::default();
     for batch in &plan.batches {
         all.extend(purge_trash_entries(
-            PurgeBatch::new(ctx, "clean", &batch.trash_root),
+            PurgeBatch::new(ctx, "clean", &batch.trash_root).with_blocker(blocker),
             batch.entries.clone(),
         ));
         if let Err(err) = purge_expired_claims(&batch.trash_root) {
@@ -129,11 +144,12 @@ pub(crate) fn execute_purge_plan(
     ctx: &DetectCtx,
     command: &str,
     plan: TrashPurgePlan,
+    blocker: &dyn Fn(&Path) -> Option<String>,
 ) -> PurgeReport {
     let mut all = PurgeReport::default();
     for batch in plan.batches {
         all.extend(purge_trash_entries(
-            PurgeBatch::new(ctx, command, &batch.trash_root),
+            PurgeBatch::new(ctx, command, &batch.trash_root).with_blocker(blocker),
             batch.entries,
         ));
         if let Err(error) = purge_expired_claims(&batch.trash_root) {
@@ -152,6 +168,10 @@ pub(crate) fn purge_trash_entries(
     let mut report = PurgeReport::default();
     for entry in entries {
         let path = entry.path().to_path_buf();
+        if let Some(reason) = run.batch.blocker.and_then(|blocker| blocker(&path)) {
+            report.failed.push((path, reason));
+            continue;
+        }
         match ClaimedTrashEntry::acquire(entry, run.batch.trash_root) {
             Ok(claimed) => run.purge(claimed, &mut report),
             Err(error) => report_claim_failure(path, error, &mut report),

@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Enabled only by degu's dev-dependency so integration-test binaries can use a
+# temporary provisioned anchor. Production and release dependencies omit it.
+integration-test-anchor = []
+
 [dependencies]
 degu-walk.workspace = true
 getrandom.workspace = true

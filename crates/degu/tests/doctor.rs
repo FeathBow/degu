@@ -15,6 +15,9 @@ fn doctor_with_environment(
             home.join("config-does-not-select-authority"),
         )
         .env("DEGU_ALLOW_ROOT", "1")
+        // The integration binary enables a mutation-only test seam. Doctor
+        // must still ignore it and report the real platform/EUID authority.
+        .env("DEGU_INTEGRATION_TEST_ANCHOR", state.join("fake-anchor"))
         .args(["doctor", "--json"])
         .output()
         .unwrap()

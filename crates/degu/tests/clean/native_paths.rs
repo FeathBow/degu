@@ -30,6 +30,11 @@ fn clean_json_validates_native_expiry_root_before_housekeeping() {
         .set_modified(expired_time())
         .unwrap();
 
+    // Activation authenticates the anchor ancestry before the UTF-8 check under
+    // test; without this a group-writable umask trips the gate first and masks it.
+    crate::common::make_tree_non_shared_writable(state_parent.path()).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+
     let out = degu()
         .env("HOME", home.path())
         .env("XDG_STATE_HOME", &state)

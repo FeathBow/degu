@@ -17,9 +17,16 @@ working directory cannot select another anchor. Use `degu doctor --json` for a
 stable machine-readable result.
 
 `ready` covers only the activation anchor. It does not attest to the activated
-store's WAL or recovery health. Production forward cleanup is wired through the
-activation/recovery gate; a `RecoveryRequired` WAL remains blocked and must be
-investigated. Never try to clear it by reprovisioning the anchor.
+store's WAL or recovery health. Mutating commands use this exact anchor as their
+only sealed-staging activation/discovery authority. On first supported use they
+durably activate the current state-store locator; later XDG drift cannot select
+a new empty store. Missing, unsafe, uncertain, lost, or corrupt authority blocks
+mutation. Only an authenticated record-empty anchor whose desired store backend
+is explicitly unsupported retains the strict legacy lifecycle, and that session
+holds the anchor lock so concurrent activation cannot cross the decision.
+Production forward cleanup is wired through the activation/recovery gate; a
+`RecoveryRequired` WAL remains blocked and must be investigated. Never try to
+clear it by reprovisioning the anchor.
 
 The expected per-account path is fixed:
 

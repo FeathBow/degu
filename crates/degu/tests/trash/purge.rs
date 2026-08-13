@@ -27,6 +27,7 @@ fn xdg_state_parent_alias_does_not_block_trash_purge() {
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join("wheel.whl"), b"cache").unwrap();
     crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+    crate::common::make_tree_non_shared_writable(state.path()).unwrap();
     let staged = degu()
         .env("HOME", home.path())
         .env("XDG_STATE_HOME", &request)

@@ -182,7 +182,9 @@ pub(super) fn run_clean(
     state: &tempfile::TempDir,
     args: &[&str],
 ) -> std::process::Output {
-    degu()
+    let mut command = degu();
+    crate::common::with_mutation_anchor(&mut command, state.path());
+    command
         .env("HOME", home.path())
         .env("XDG_STATE_HOME", state.path())
         .args(args)

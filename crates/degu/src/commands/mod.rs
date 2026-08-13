@@ -4,6 +4,7 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 pub(crate) mod adapters;
+pub(crate) mod admin;
 pub(crate) mod clean;
 pub(crate) mod completions;
 pub(crate) mod doctor;

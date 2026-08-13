@@ -16,21 +16,42 @@ parent. Changing `HOME`, XDG variables, configuration, or the
 working directory cannot select another anchor. Use `degu doctor --json` for a
 stable machine-readable result.
 
-Sealed staging is not yet wired into production cleanup. This check prepares
-operators and packaging for that later gate without changing current
-clean/undo/purge behavior.
+`ready` covers only the activation anchor. It does not attest to the activated
+store's WAL or recovery health. Production forward cleanup is wired through the
+activation/recovery gate; a `RecoveryRequired` WAL remains blocked and must be
+investigated. Never try to clear it by reprovisioning the anchor.
 
 The expected per-account path is fixed:
 
 - Linux: `/var/lib/degu/store-activation/<decimal-euid>`
 - macOS: `/private/var/db/degu/store-activation/<decimal-euid>`
 
-The leaf must be provisioned explicitly by an administrator for the account
-that will run degu. It must already be an effective-user-owned directory with
-exact mode `0700`, no ACL, on certified ext4/XFS/APFS storage, below a safe
-root- or effective-user-owned hierarchy that grants no foreign rename
-authority. A missing, unsafe, unsupported, busy, or uncertain anchor makes the
-check fail closed.
+For a numeric UID that has never activated degu, an administrator provisions
+the leaf explicitly. Do **not** elevate a copy under the target user's home or
+another user-writable prefix. First install a checksum/provenance-verified
+release binary at an administrator-owned absolute path whose ancestors the
+target user cannot modify; then invoke that exact path, for example:
+
+```sh
+sudo /usr/local/sbin/degu admin activation-anchor provision --uid 1000 --initial
+# or add --json for automation
+```
+
+`/usr/local/sbin/degu` above represents a separately verified,
+administrator-controlled installation; the ordinary user installer does not
+put it there. The command requires real effective UID 0; `DEGU_ALLOW_ROOT`,
+container markers, usernames, paths, environment locators, and configuration
+cannot substitute. `--initial` is the administrator's assertion that this
+numeric UID has never activated a store. This operation is not repair or
+recovery.
+
+The OS base (`/var/lib` on Linux or `/private/var/db` on macOS) must already
+exist and be safe. The command creates missing root-owned product directories
+with exact mode `0755` and the target-UID-owned leaf with exact mode `0700`;
+all must have no ACL and reside on certified ext4/XFS/APFS storage. Safe
+existing entries are accepted without modification. An unsafe, unsupported,
+busy, or uncertain entry fails closed and is never chmodded, replaced, or
+repaired.
 
 The generic installer, `cargo install`, cargo-binstall, and manual archives are
 unprivileged binary-install routes. They do not run `sudo`, infer a target user

@@ -9,12 +9,18 @@ const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[
     &["undo"],
     &["trash"],
     &["relocate"],
+    &["admin"],
     &["ops"],
     &["adapters"],
     &["completions"],
     &["man"],
 ];
 const NESTED_MAN_COMMANDS: &[&[&str]] = &[&["trash", "list"], &["trash", "purge"]];
+const ADMIN_MAN_COMMANDS: &[&[&str]] = &[
+    &["admin"],
+    &["admin", "activation-anchor"],
+    &["admin", "activation-anchor", "provision"],
+];
 const RECLAIM_MAN_COMMANDS: &[&[&str]] = &[&["reclaim", "uv"]];
 
 fn degu() -> Command {
@@ -98,13 +104,19 @@ fn man_renders_every_shipped_command_page() {
         .iter()
         .chain(NESTED_MAN_COMMANDS)
         .chain(RECLAIM_MAN_COMMANDS)
+        .chain(ADMIN_MAN_COMMANDS)
     {
         let output = generated_man(path);
         let title = format!(".TH degu{} 1", page_suffix(path));
         assert!(output.contains(&title), "missing {title:?}");
         let name = canonical_roff_name(path);
         assert!(output.contains(&format!(".SH NAME\n{name} \\-")));
-        assert!(output.contains(&format!(".SH SYNOPSIS\n\\fBdegu {}\\fR", path.join(" "))));
+        let synopsis = path
+            .iter()
+            .map(|segment| segment.replace('-', "\\-"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(output.contains(&format!(".SH SYNOPSIS\n\\fBdegu {synopsis}\\fR")));
         assert!(!output.contains("\\-help(1)"));
     }
     assert!(generated_man(&["scan"]).contains("\\-\\-summary"));
@@ -132,6 +144,14 @@ fn man_references_only_pages_in_the_release_contract() {
         man_references(&generated_man(&["reclaim"])),
         expected_man_references(RECLAIM_MAN_COMMANDS)
     );
+    assert_eq!(
+        man_references(&generated_man(&["admin"])),
+        expected_man_references(&ADMIN_MAN_COMMANDS[1..2])
+    );
+    assert_eq!(
+        man_references(&generated_man(&["admin", "activation-anchor"])),
+        expected_man_references(&ADMIN_MAN_COMMANDS[2..])
+    );
 }
 
 #[test]
@@ -153,6 +173,7 @@ fn assert_top_help_order() {
             "Inspect:",
             "Clean and recover:",
             "Configure:",
+            "Administration:",
             "Reference:",
             "Options:",
         ],
@@ -168,6 +189,7 @@ fn assert_top_help_order() {
             "\n  undo",
             "\n  trash",
             "\n  relocate",
+            "\n  admin",
             "\n  ops",
             "\n  adapters",
             "\n  completions",
@@ -191,6 +213,7 @@ fn assert_man_order() {
             "degu\\-undo(1)",
             "degu\\-trash(1)",
             "degu\\-relocate(1)",
+            "degu\\-admin(1)",
             "degu\\-ops(1)",
             "degu\\-adapters(1)",
             "degu\\-completions(1)",
@@ -207,7 +230,7 @@ fn assert_completion_order(shell: &str) {
     if shell == "bash" {
         assert!(output.contains("complete -F") || output.contains("_degu"));
         assert!(output.contains(
-            "scan doctor quota reclaim clean undo trash relocate ops adapters completions man help"
+            "scan doctor quota reclaim clean undo trash relocate admin ops adapters completions man help"
         ));
         assert!(!output.contains("degu,usage)"));
         return;
@@ -224,6 +247,7 @@ fn assert_completion_order(shell: &str) {
                 "(undo)",
                 "(trash)",
                 "(relocate)",
+                "(admin)",
                 "(ops)",
                 "(adapters)",
                 "(completions)",
@@ -241,6 +265,7 @@ fn assert_completion_order(shell: &str) {
                 "-a \"undo\"",
                 "-a \"trash\"",
                 "-a \"relocate\"",
+                "-a \"admin\"",
                 "-a \"ops\"",
                 "-a \"adapters\"",
                 "-a \"completions\"",
@@ -270,7 +295,13 @@ fn page_suffix(path: &[&str]) -> String {
 }
 
 fn canonical_roff_name(path: &[&str]) -> String {
-    format!("degu\\-{}", path.join("\\-"))
+    format!(
+        "degu\\-{}",
+        path.iter()
+            .map(|segment| segment.replace('-', "\\-"))
+            .collect::<Vec<_>>()
+            .join("\\-")
+    )
 }
 
 fn man_references(output: &str) -> Vec<String> {

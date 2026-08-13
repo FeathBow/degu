@@ -39,7 +39,7 @@ const QUOTA_EXAMPLES: &str = "Examples:
 
 const DOCTOR_EXAMPLES: &str = "Examples:
   degu doctor
-      Check whether this account is ready for future sealed staging
+      Check whether this account is ready for sealed staging
   degu doctor --json | jq .
       Emit the same readiness result as JSON
 
@@ -61,6 +61,14 @@ Safety note:
   Validation creates a private temporary snapshot and starts the selected binary
   with only -V. The fixed ordinary prune bypasses degu trash and cannot be undone.
   The selected binary is not sandboxed.";
+
+const ADMIN_ANCHOR_EXAMPLES: &str = "Example:
+  /usr/local/sbin/degu admin activation-anchor provision --uid 1000 --initial
+      Provision from an administrator-owned, separately verified binary
+
+This command must run with effective UID 0. Never elevate a binary under the
+target user's home or another user-writable prefix. --initial asserts that the
+UID has never activated a store; this is not repair or recovery.";
 
 const MAN_EXAMPLES: &str = "Examples:
   degu man
@@ -146,7 +154,7 @@ pub(crate) enum Command {
     /// Report known cache sources and, when project roots are available, build artifacts (read-only)
     #[command(after_help = SCAN_EXAMPLES)]
     Scan(ScanArgs),
-    /// Check whether this account is ready for future sealed staging (read-only)
+    /// Check whether this account is ready for sealed staging (read-only)
     #[command(after_help = DOCTOR_EXAMPLES)]
     Doctor {
         #[command(flatten)]
@@ -177,6 +185,11 @@ pub(crate) enum Command {
     /// Print shell config directing future cache writes at TARGET; existing data stays in place, no shell profile is modified
     #[command(after_help = RELOCATE_EXAMPLES)]
     Relocate(RelocateArgs),
+    /// Perform an explicit root-only administrative operation
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
     /// Show recorded clean, restore, and purge operations
     Ops {
         #[command(flatten)]
@@ -196,6 +209,49 @@ pub(crate) enum Command {
         /// Command path to render, for example `scan` or `trash purge`
         command: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AdminCommand {
+    /// Manage the platform-fixed per-UID activation anchor
+    ActivationAnchor {
+        #[command(subcommand)]
+        command: ActivationAnchorCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ActivationAnchorCommand {
+    /// Initially provision a numeric UID's fixed activation anchor (not repair or recovery)
+    #[command(after_help = ADMIN_ANCHOR_EXAMPLES)]
+    Provision(ActivationAnchorProvisionArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct ActivationAnchorProvisionArgs {
+    /// Decimal numeric UID that has never activated a degu store
+    #[arg(long, value_name = "DECIMAL_UID", value_parser = parse_decimal_uid)]
+    pub(crate) uid: u32,
+    /// Assert that this numeric UID has never activated a store
+    #[arg(long, required = true)]
+    pub(crate) initial: bool,
+    #[command(flatten)]
+    pub(crate) output: JsonArgs,
+}
+
+fn parse_decimal_uid(value: &str) -> Result<u32, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("UID must contain decimal digits only".to_owned());
+    }
+    let uid = value
+        .parse::<u32>()
+        .map_err(|_| "UID is outside the supported numeric range".to_owned())?;
+    if uid == 0 || uid == u32::MAX {
+        return Err(
+            "UID 0 and the reserved maximum UID are not valid activation-anchor targets".to_owned(),
+        );
+    }
+    Ok(uid)
 }
 
 #[derive(Args)]

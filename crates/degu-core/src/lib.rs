@@ -7,6 +7,7 @@
 //! 2. When [`safety::Guard`] hits a protected path it **rejects the whole
 //!    plan**, never skips the item — silent skipping hides planner bugs.
 
+pub mod activation_anchor_provisioning;
 pub mod authority;
 pub mod config;
 pub mod disposition;

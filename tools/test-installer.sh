@@ -98,6 +98,8 @@ if grep -Fq "run 'degu doctor'" "$scen/out"; then doctor_hint=yes; else doctor_h
 check "$doctor_hint" "yes" "S0 teaches the short read-only readiness command"
 if grep -Eq 'sudo|/var/lib/degu|/private/var/db/degu' "$scen/out" "$scen/err"; then privileged_hint=yes; else privileged_hint=no; fi
 check "$privileged_hint" "no" "S0 installer neither runs nor prescribes an inline privileged write"
+if grep -Eq 'SUDO_UID|(^|[[:space:]])sudo([[:space:]]|$)|/var/lib/degu|/private/var/db/degu' "$installer"; then privileged_code=yes; else privileged_code=no; fi
+check "$privileged_code" "no" "S0 installer code has no UID inference, sudo, or system-anchor write protocol"
 
 echo "--- S1 upgrade succeeds"
 new_scenario; preexisting degu dg; run_installer

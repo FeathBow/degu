@@ -416,14 +416,14 @@ fn checksum_unknown_version_and_malformed_interior_fail_closed() {
 
     let version_path = temp.path().join("version.wal");
     let mut version = good.clone();
-    version[4..6].copy_from_slice(&5_u16.to_le_bytes());
+    version[4..6].copy_from_slice(&6_u16.to_le_bytes());
     let version_header_crc = crc32(&version[4..12]);
     version[12..16].copy_from_slice(&version_header_crc.to_le_bytes());
     std::fs::write(&version_path, &version).unwrap();
     let mut lock = RecoverySession::try_acquire(open_rw(&version_path)).unwrap();
     assert!(matches!(
         lock.replay_and_repair(),
-        Err(ReplayError::UnsupportedLegacyVersion { version: 5, .. })
+        Err(ReplayError::UnsupportedLegacyVersion { version: 6, .. })
     ));
     drop(lock);
 
@@ -2260,4 +2260,44 @@ fn purge_transitions_have_no_wal_edge_until_held_executor_exists() {
         TransactionState::Purgeable,
         TransactionState::Purged
     ));
+}
+
+#[test]
+fn production_association_round_trips_in_atomic_staging_begin() {
+    let transaction = tx(0xc4);
+    let metadata = staging_metadata().with_production_association(
+        ProductionAssociation::new("reclamation-production".to_string()).unwrap(),
+    );
+    let replay = replay_bytes(&frame(&SealRecord::StagingBegin {
+        transaction,
+        metadata,
+    }));
+    let transaction = &replay.transactions[&transaction];
+    let metadata = transaction.staging.as_ref().unwrap();
+    assert_eq!(transaction.staging_schema_version, Some(VERSION));
+    assert_eq!(
+        metadata.production_association().unwrap().reclamation_id(),
+        "reclamation-production"
+    );
+    assert_eq!(metadata.destination_basename(), "staged-root");
+    assert_eq!(metadata.root_identity(), strong(1, 11, 101));
+}
+
+#[test]
+fn version_four_staging_replays_without_inventing_production_authority() {
+    let transaction = tx(0xc5);
+    let metadata = staging_metadata();
+    let mut payload = encode_record(&SealRecord::StagingBegin {
+        transaction,
+        metadata,
+    })
+    .unwrap();
+    assert_eq!(payload.pop(), Some(0), "v5 optional association tag");
+    let replay = replay_bytes(&checked_frame(4, payload));
+    let metadata = replay.transactions[&transaction].staging.as_ref().unwrap();
+    assert!(metadata.production_association().is_none());
+    assert_eq!(
+        replay.transactions[&transaction].staging_schema_version,
+        Some(4)
+    );
 }

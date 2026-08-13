@@ -19,13 +19,32 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
 const MAGIC: &[u8; 4] = b"DSWL";
-const VERSION: u16 = 4;
+const VERSION: u16 = 5;
 const HEADER_LEN: usize = 20;
 const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 const MAX_WAL_LEN: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TransactionId(pub [u8; 16]);
+
+/// Non-authoritative lifecycle grouping carried atomically by the first WAL
+/// frame. The surrounding staging metadata binds the exact transaction,
+/// destination locator, and root identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductionAssociation {
+    reclamation_id: String,
+}
+
+impl ProductionAssociation {
+    pub fn new(reclamation_id: String) -> Option<Self> {
+        (!reclamation_id.is_empty() && reclamation_id.len() <= 4096)
+            .then_some(Self { reclamation_id })
+    }
+
+    pub fn reclamation_id(&self) -> &str {
+        &self.reclamation_id
+    }
+}
 
 /// Mandatory strong incarnation component used to reject inode reuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -154,6 +173,7 @@ pub struct StagingTransactionMetadata {
     destination_basename: std::ffi::OsString,
     backend: CertifiedLocalBackend,
     source_parent_strategy: DurableSourceParentStrategy,
+    production_association: Option<ProductionAssociation>,
 }
 
 impl StagingTransactionMetadata {
@@ -179,6 +199,7 @@ impl StagingTransactionMetadata {
             destination_basename,
             backend,
             source_parent_strategy,
+            production_association: None,
         };
         metadata.invariants_hold().then_some(metadata)
     }
@@ -219,6 +240,17 @@ impl StagingTransactionMetadata {
         &self.source_parent_strategy
     }
 
+    /// Adds the production lifecycle grouping before metadata is placed in the
+    /// atomic first WAL frame.
+    pub fn with_production_association(mut self, association: ProductionAssociation) -> Self {
+        self.production_association = Some(association);
+        self
+    }
+
+    pub fn production_association(&self) -> Option<&ProductionAssociation> {
+        self.production_association.as_ref()
+    }
+
     pub fn filesystem_id(&self) -> &str {
         self.source_parent.filesystem_id()
     }
@@ -252,6 +284,13 @@ impl StagingTransactionMetadata {
             && (self.source_parent.relative_path != self.destination_parent.relative_path
                 || self.source_basename != self.destination_basename)
             && strategy_is_bound
+            && self
+                .production_association
+                .as_ref()
+                .is_none_or(|association| {
+                    !association.reclamation_id.is_empty()
+                        && association.reclamation_id.len() <= 4096
+                })
     }
 
     #[cfg(test)]
@@ -1316,7 +1355,7 @@ pub enum ReplayError {
     #[error("malformed committed WAL frame at byte {offset}: {reason}")]
     Malformed { offset: u64, reason: &'static str },
     #[error(
-        "unsupported legacy WAL version {version} at byte {offset}; supported legacy versions are 1 and 3"
+        "unsupported legacy WAL version {version} at byte {offset}; supported legacy versions are 1, 3, and 4"
     )]
     UnsupportedLegacyVersion { offset: u64, version: u16 },
     #[error("WAL header checksum mismatch at byte {offset}")]
@@ -1763,7 +1802,7 @@ fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
             });
         }
         let version = u16::from_le_bytes([header[4], header[5]]);
-        if !matches!(version, 1 | 3 | VERSION) {
+        if !matches!(version, 1 | 3 | 4 | VERSION) {
             return Err(ReplayError::UnsupportedLegacyVersion {
                 offset: offset as u64,
                 version,
@@ -2623,6 +2662,32 @@ fn decode_staging_metadata(
             });
         }
     };
+    let production_association = if version >= 5 {
+        match cursor.u8()? {
+            0 => None,
+            1 => {
+                let reclamation_id =
+                    String::from_utf8(cursor.bytes()?).map_err(|_| ReplayError::Malformed {
+                        offset,
+                        reason: "production reclamation id is not UTF-8",
+                    })?;
+                Some(
+                    ProductionAssociation::new(reclamation_id).ok_or(ReplayError::Malformed {
+                        offset,
+                        reason: "production reclamation id is invalid",
+                    })?,
+                )
+            }
+            _ => {
+                return Err(ReplayError::Malformed {
+                    offset,
+                    reason: "invalid production association tag",
+                });
+            }
+        }
+    } else {
+        None
+    };
     let metadata = StagingTransactionMetadata {
         source_parent,
         source_parent_identity,
@@ -2633,6 +2698,7 @@ fn decode_staging_metadata(
         destination_basename,
         backend,
         source_parent_strategy,
+        production_association,
     };
     let valid = if version >= 4 {
         metadata.invariants_hold()
@@ -2697,6 +2763,13 @@ fn encode_staging_metadata(
             encode_strong_identity(output, proof.source_parent_identity);
             output.extend_from_slice(&proof.observed_mode.to_le_bytes());
         }
+    }
+    match &metadata.production_association {
+        Some(association) => {
+            output.push(1);
+            put_bytes(output, association.reclamation_id.as_bytes())?;
+        }
+        None => output.push(0),
     }
     Ok(())
 }

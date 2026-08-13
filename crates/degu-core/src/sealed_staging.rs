@@ -11,9 +11,9 @@
 use crate::authority::TransactionState;
 use crate::seal_store::{SealWalStore, StoreError};
 use crate::seal_wal::{
-    AppendError, RecoveryIdentity, RecoverySession, RecoveryWork, ReplayError, ReplayedTransaction,
-    SealWal, StagingTransactionMetadata, TransactionId, decide_recovery,
-    quarantined_transaction_retains_active_permission_seals,
+    AppendError, ProductionAssociation, RecoveryIdentity, RecoverySession, RecoveryWork,
+    ReplayError, ReplayedTransaction, SealWal, StagingTransactionMetadata, StrongObjectIdentity,
+    TransactionId, decide_recovery, quarantined_transaction_retains_active_permission_seals,
 };
 use crate::staging_recovery::{
     RecoveryAnchors, RecoveryFilesystemAnchor, RecoveryRebindError, StagedVerificationFailure,
@@ -162,6 +162,7 @@ pub struct ForwardStagingRequest {
     destination_parent: OwnedFd,
     destination_parent_locator: crate::seal_wal::StagingLocator,
     destination_basename: std::ffi::OsString,
+    production_association: Option<ProductionAssociation>,
 }
 
 impl ForwardStagingRequest {
@@ -185,7 +186,15 @@ impl ForwardStagingRequest {
             destination_parent,
             destination_parent_locator,
             destination_basename,
+            production_association: None,
         }
+    }
+
+    /// Attaches the lifecycle grouping to the same first durable frame that
+    /// binds the exact source, destination, and object identity.
+    pub fn with_production_association(mut self, association: ProductionAssociation) -> Self {
+        self.production_association = Some(association);
+        self
     }
 
     fn prepare(self) -> Result<(PreparedRootBinding, ForwardRecoveryAnchors), BoxError> {
@@ -198,7 +207,7 @@ impl ForwardStagingRequest {
             RecoveryFilesystemAnchor::certify(self.source_anchor, filesystem_id.clone())?;
         let destination_anchor =
             RecoveryFilesystemAnchor::certify(self.destination_anchor, filesystem_id)?;
-        let binding = PreparedRootBinding::prepare(
+        let binding = PreparedRootBinding::prepare_with_association(
             source_anchor,
             self.source_parent,
             self.source_parent_locator,
@@ -207,6 +216,7 @@ impl ForwardStagingRequest {
             self.destination_parent,
             self.destination_parent_locator,
             self.destination_basename,
+            self.production_association,
         )?;
         Ok((binding, recovery))
     }
@@ -341,6 +351,44 @@ impl ForwardStagingError {
     }
 }
 
+/// WAL-authoritative association for one production staging transaction.
+/// Locators remain evidence relative to separately authenticated anchors.
+#[derive(Debug, Clone)]
+pub struct ProductionStagingEntry {
+    transaction: TransactionId,
+    state: TransactionState,
+    destination_parent: crate::seal_wal::StagingLocator,
+    destination_basename: std::ffi::OsString,
+    root_identity: StrongObjectIdentity,
+    reclamation_id: String,
+}
+
+impl ProductionStagingEntry {
+    pub fn transaction(&self) -> TransactionId {
+        self.transaction
+    }
+
+    pub fn state(&self) -> TransactionState {
+        self.state
+    }
+
+    pub fn destination_parent(&self) -> &crate::seal_wal::StagingLocator {
+        &self.destination_parent
+    }
+
+    pub fn destination_basename(&self) -> &std::ffi::OsStr {
+        &self.destination_basename
+    }
+
+    pub fn root_identity(&self) -> StrongObjectIdentity {
+        self.root_identity
+    }
+
+    pub fn reclamation_id(&self) -> &str {
+        &self.reclamation_id
+    }
+}
+
 /// The only engine form that may be retained by a production mutation session.
 pub struct ReadyStagingEngine {
     engine: SealedStagingEngine,
@@ -349,6 +397,27 @@ pub struct ReadyStagingEngine {
 impl ReadyStagingEngine {
     pub fn state(&self, transaction: TransactionId) -> Option<TransactionState> {
         self.engine.state(transaction)
+    }
+
+    /// Complete WAL-authoritative production bindings, independent of JSONL.
+    pub fn production_entries(&self) -> Vec<ProductionStagingEntry> {
+        self.engine
+            .wal
+            .recovery_snapshots()
+            .into_iter()
+            .filter_map(|snapshot| {
+                let metadata = snapshot.staging?;
+                let association = metadata.production_association()?.clone();
+                Some(ProductionStagingEntry {
+                    transaction: snapshot.id,
+                    state: snapshot.state,
+                    destination_parent: metadata.destination_parent().clone(),
+                    destination_basename: metadata.destination_basename().to_os_string(),
+                    root_identity: metadata.root_identity(),
+                    reclamation_id: association.reclamation_id().to_owned(),
+                })
+            })
+            .collect()
     }
 
     /// Executes one complete forward transaction under this engine's exact WAL

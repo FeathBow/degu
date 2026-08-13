@@ -529,8 +529,9 @@ pub enum TransactionState {
     /// A no-replace collision was durably confirmed without moving the staged tree.
     UndoConflict,
     Purgeable,
-    /// The exact object-bound deletion plan is durable and namespace mutation
-    /// may have begun. Restart must never infer completion from a pathname.
+    /// The exact lease-bound object claim is durable and namespace mutation may
+    /// have begun. Per-entry progress is WAL-synced; restart must never infer
+    /// completion or authority from a pathname.
     PurgeIntent,
     /// The exact root was removed and its retained trash parent was fsynced.
     PurgeOutcome,

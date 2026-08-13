@@ -444,6 +444,12 @@ fn purge_partial_unlink_failure_stays_at_intent_and_restart_fails_closed() {
     assert!(fixture.destination_root.exists());
     drop(ready);
 
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    assert_eq!(replay.transactions[&transaction].purge_removed_entries, 1);
+    assert!(replay.transactions[&transaction].purge_last_path.is_some());
+    drop(lease);
+
     let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
     assert_eq!(report.candidates().len(), 1);
     let restart = engine.recover_startup(report, |_, _| Ok(fixture.raw_anchors()));
@@ -476,6 +482,91 @@ fn purge_parent_fsync_failure_records_no_outcome_or_purged_guess() {
         Some(TransactionState::PurgeIntent)
     );
     assert!(!fixture.destination_root.exists());
+    drop(ready);
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    let snapshot = &replay.transactions[&transaction];
+    assert_eq!(
+        snapshot.purge_removed_entries,
+        snapshot.tree_manifest.unwrap().entry_count
+    );
+    assert_eq!(
+        snapshot.purge_last_path.as_deref(),
+        Some(std::path::Path::new(""))
+    );
+}
+
+#[test]
+fn durable_claim_precedes_every_namespace_mutation() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xf1; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    crate::staging_recovery::PURGE_FAIL_AFTER_CLAIM.with(|fail| fail.set(true));
+    let error = ready.execute_verified_purge(authority).unwrap_err();
+    crate::staging_recovery::PURGE_FAIL_AFTER_CLAIM.with(|fail| fail.set(false));
+
+    assert_eq!(
+        error.disposition(),
+        VerifiedPurgeFailureDisposition::RecoveryBlocked
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::PurgeIntent)
+    );
+    assert!(fixture.destination_root.join("child/data").exists());
+    drop(ready);
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    assert_eq!(replay.transactions[&transaction].purge_removed_entries, 0);
+    drop(lease);
+
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert_eq!(report.candidates().len(), 1);
+    assert!(
+        engine
+            .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+            .is_err()
+    );
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    assert_eq!(
+        replay.transactions[&transaction].state,
+        TransactionState::RecoveryRequired
+    );
+}
+
+#[test]
+fn progress_sync_failure_stops_before_another_unlink_and_replays_bounded_progress() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xf2; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    crate::staging_recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(Some(1)));
+    let error = ready.execute_verified_purge(authority).unwrap_err();
+    crate::staging_recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(None));
+
+    assert_eq!(
+        error.disposition(),
+        VerifiedPurgeFailureDisposition::RecoveryBlocked
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::PurgeIntent)
+    );
+    assert!(fixture.destination_root.exists());
+    drop(ready);
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    assert_eq!(replay.transactions[&transaction].purge_removed_entries, 0);
 }
 
 #[test]
@@ -2019,4 +2110,53 @@ fn verified_purge_acl_drift_fails_closed_to_recovery_required() {
         Some(TransactionState::RecoveryRequired)
     );
     assert!(fixture.destination_root.is_dir());
+}
+
+#[test]
+fn every_postorder_progress_boundary_stops_without_outcome_or_replacement_deletion() {
+    for progress in 1..=3 {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let transaction = TransactionId([0xf3 + progress as u8; 16]);
+        let mut ready = stage_production(&fixture, transaction);
+        let authority = ready
+            .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+            .unwrap();
+        crate::staging_recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(Some(progress)));
+        assert!(ready.execute_verified_purge(authority).is_err());
+        crate::staging_recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(None));
+        assert_eq!(
+            ready.state(transaction),
+            Some(TransactionState::PurgeIntent)
+        );
+        drop(ready);
+
+        let mut lease = fixture.store.try_lease().unwrap();
+        let replay = lease.replay_and_repair().unwrap();
+        assert_eq!(
+            replay.transactions[&transaction].purge_removed_entries,
+            progress - 1
+        );
+        drop(lease);
+
+        // Even when the root unlink happened before the failed final progress
+        // sync, startup never treats absence or a newly planted name as proof.
+        if !fixture.destination_root.exists() {
+            std::fs::create_dir(&fixture.destination_root).unwrap();
+            std::fs::write(fixture.destination_root.join("replacement"), b"retain").unwrap();
+        }
+        let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+        assert!(
+            engine
+                .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(fixture.destination_root.join("replacement"))
+                .ok()
+                .as_deref(),
+            (progress == 3).then_some(b"retain".as_slice())
+        );
+    }
 }

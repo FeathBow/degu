@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 const MAGIC: &[u8; 4] = b"DSWL";
-const VERSION: u16 = 9;
+const VERSION: u16 = 10;
 const CONTENT_PROOF_MANIFEST_VERSION: u16 = 2;
 const HEADER_LEN: usize = 20;
 const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
@@ -137,6 +137,13 @@ fn staging_path_is_confined(path: &std::path::Path) -> bool {
         return false;
     };
     components.all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn purge_progress_path_is_confined(path: &std::path::Path) -> bool {
+    path.as_os_str().is_empty()
+        || path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 /// Immutable evidence for an already-exclusive source parent. There is no
@@ -411,6 +418,20 @@ pub enum SealRecord {
         transaction: TransactionId,
         commitment: DurablePurgeCommitment,
     },
+    /// Durable lease-bound claim written before the first unlink. The repeated
+    /// commitment makes the crash boundary self-authenticating rather than
+    /// promoting a `.claims` pathname to authority.
+    PurgeClaimed {
+        transaction: TransactionId,
+        commitment: DurablePurgeCommitment,
+    },
+    /// Monotonic postorder deletion progress. A frame is synced after every
+    /// successful unlink/rmdir; paths are diagnostics, never replay authority.
+    PurgeProgress {
+        transaction: TransactionId,
+        removed_entries: u64,
+        last_path: PathBuf,
+    },
 }
 
 impl SealRecord {
@@ -425,7 +446,9 @@ impl SealRecord {
             | Self::RenameIntent { transaction }
             | Self::RenameOutcome { transaction, .. }
             | Self::UndoRenameOutcome { transaction, .. }
-            | Self::PurgeAuthorized { transaction, .. } => *transaction,
+            | Self::PurgeAuthorized { transaction, .. }
+            | Self::PurgeClaimed { transaction, .. }
+            | Self::PurgeProgress { transaction, .. } => *transaction,
         }
     }
 }
@@ -477,6 +500,7 @@ pub struct SealWal<W> {
     manifests: HashMap<TransactionId, DurableTreeManifest>,
     rename_outcomes: HashMap<TransactionId, DurableRenameOutcome>,
     undo_rename_outcomes: HashMap<TransactionId, DurableUndoRenameOutcome>,
+    purge_progress: HashMap<TransactionId, (u64, PathBuf)>,
     transaction_order: Vec<TransactionId>,
     committed_len: u64,
     max_wal_len: u64,
@@ -507,6 +531,7 @@ impl<W: DurableWrite> SealWal<W> {
             manifests: HashMap::new(),
             rename_outcomes: HashMap::new(),
             undo_rename_outcomes: HashMap::new(),
+            purge_progress: HashMap::new(),
             transaction_order: Vec::new(),
             committed_len,
             max_wal_len,
@@ -587,6 +612,15 @@ impl<W: DurableWrite> SealWal<W> {
             }
             if let Some(outcome) = transaction.undo_rename_outcome {
                 wal.undo_rename_outcomes.insert(transaction.id, outcome);
+            }
+            if transaction.purge_removed_entries != 0 {
+                wal.purge_progress.insert(
+                    transaction.id,
+                    (
+                        transaction.purge_removed_entries,
+                        transaction.purge_last_path.clone().unwrap_or_default(),
+                    ),
+                );
             }
             for permission in &transaction.permissions {
                 let key = (transaction.id, permission.mutation_id);
@@ -683,6 +717,8 @@ impl<W: DurableWrite> SealWal<W> {
             tree_manifest: self.manifests.get(&transaction).copied(),
             rename_outcome: self.rename_outcomes.get(&transaction).copied(),
             undo_rename_outcome: self.undo_rename_outcomes.get(&transaction).copied(),
+            purge_removed_entries: self.purge_progress.get(&transaction).map_or(0, |v| v.0),
+            purge_last_path: self.purge_progress.get(&transaction).map(|v| v.1.clone()),
         })
     }
 
@@ -852,13 +888,86 @@ impl<W: DurableWrite> SealWal<W> {
         &mut self,
         transaction: TransactionId,
     ) -> Result<(), AppendError> {
-        self.transition_staging(transaction, TransactionState::PurgeIntent)
+        if self.transaction_state(transaction) != Some(TransactionState::Purgeable) {
+            return Err(AppendError::InvalidState("purge claim requires Purgeable"));
+        }
+        let metadata = self
+            .staging
+            .get(&transaction)
+            .ok_or(AppendError::InvalidState(
+                "purge claim lacks staging metadata",
+            ))?;
+        let manifest =
+            self.manifests
+                .get(&transaction)
+                .copied()
+                .ok_or(AppendError::InvalidState(
+                    "purge claim lacks durable manifest",
+                ))?;
+        let commitment = DurablePurgeCommitment::exact(metadata, manifest);
+        self.append_synced(&SealRecord::PurgeClaimed {
+            transaction,
+            commitment,
+        })?;
+        self.states
+            .insert(transaction, TransactionState::PurgeIntent);
+        Ok(())
+    }
+
+    pub(crate) fn record_purge_progress(
+        &mut self,
+        transaction: TransactionId,
+        removed_entries: u64,
+        last_path: &std::path::Path,
+    ) -> Result<(), AppendError> {
+        if self.transaction_state(transaction) != Some(TransactionState::PurgeIntent) {
+            return Err(AppendError::InvalidState(
+                "purge progress requires PurgeIntent",
+            ));
+        }
+        let limit = self
+            .manifests
+            .get(&transaction)
+            .map(|m| m.entry_count)
+            .ok_or(AppendError::InvalidState(
+                "purge progress lacks durable manifest",
+            ))?;
+        let previous = self.purge_progress.get(&transaction).map_or(0, |v| v.0);
+        if removed_entries != previous.saturating_add(1)
+            || removed_entries > limit
+            || !purge_progress_path_is_confined(last_path)
+        {
+            return Err(AppendError::InvalidState(
+                "purge progress is not exact and monotonic",
+            ));
+        }
+        self.append_synced(&SealRecord::PurgeProgress {
+            transaction,
+            removed_entries,
+            last_path: last_path.to_path_buf(),
+        })?;
+        self.purge_progress
+            .insert(transaction, (removed_entries, last_path.to_path_buf()));
+        Ok(())
     }
 
     pub(crate) fn record_purge_outcome(
         &mut self,
         transaction: TransactionId,
     ) -> Result<(), AppendError> {
+        let expected = self
+            .manifests
+            .get(&transaction)
+            .map(|m| m.entry_count)
+            .ok_or(AppendError::InvalidState(
+                "purge outcome lacks durable manifest",
+            ))?;
+        let removed = self.purge_progress.get(&transaction).map_or(0, |v| v.0);
+        if removed != expected {
+            return Err(AppendError::InvalidState(
+                "purge outcome precedes complete durable progress",
+            ));
+        }
         self.transition_staging(transaction, TransactionState::PurgeOutcome)
     }
 
@@ -1583,6 +1692,10 @@ pub struct ReplayedTransaction {
     pub tree_manifest: Option<DurableTreeManifest>,
     pub rename_outcome: Option<DurableRenameOutcome>,
     pub undo_rename_outcome: Option<DurableUndoRenameOutcome>,
+    /// Number of exact postorder removals durably acknowledged by the WAL.
+    pub purge_removed_entries: u64,
+    /// Diagnostic path of the last acknowledged removal; never authority.
+    pub purge_last_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1607,7 +1720,7 @@ pub enum ReplayError {
     #[error("malformed committed WAL frame at byte {offset}: {reason}")]
     Malformed { offset: u64, reason: &'static str },
     #[error(
-        "unsupported legacy WAL version {version} at byte {offset}; supported legacy versions are 1, 3, 4, 5, and 6"
+        "unsupported legacy WAL version {version} at byte {offset}; supported legacy versions are 1 and 3 through 9"
     )]
     UnsupportedLegacyVersion { offset: u64, version: u16 },
     #[error("WAL header checksum mismatch at byte {offset}")]
@@ -2162,7 +2275,7 @@ fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
             });
         }
         let version = u16::from_le_bytes([header[4], header[5]]);
-        if !matches!(version, 1 | 3 | 4 | 5 | 6 | 7 | VERSION) {
+        if !matches!(version, 1 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | VERSION) {
             return Err(ReplayError::UnsupportedLegacyVersion {
                 offset: offset as u64,
                 version,
@@ -2214,6 +2327,8 @@ struct ReplayBuilding {
     tree_manifest: Option<DurableTreeManifest>,
     rename_outcome: Option<DurableRenameOutcome>,
     undo_rename_outcome: Option<DurableUndoRenameOutcome>,
+    purge_removed_entries: u64,
+    purge_last_path: Option<PathBuf>,
 }
 
 fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, ReplayError> {
@@ -2313,6 +2428,45 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                 }
                 tx.state = Some(TransactionState::Purgeable);
             }
+            SealRecord::PurgeClaimed { commitment, .. } => {
+                let metadata = tx.staging.as_ref().ok_or(ReplayError::InvalidHistory(
+                    "purge claim lacks staging metadata",
+                ))?;
+                let manifest = tx.tree_manifest.ok_or(ReplayError::InvalidHistory(
+                    "purge claim lacks a durable manifest",
+                ))?;
+                if tx.state != Some(TransactionState::Purgeable)
+                    || commitment != DurablePurgeCommitment::exact(metadata, manifest)
+                {
+                    return Err(ReplayError::InvalidHistory(
+                        "purge claim is not bound to the exact authorized object",
+                    ));
+                }
+                tx.state = Some(TransactionState::PurgeIntent);
+            }
+            SealRecord::PurgeProgress {
+                removed_entries,
+                last_path,
+                ..
+            } => {
+                let limit = tx
+                    .tree_manifest
+                    .ok_or(ReplayError::InvalidHistory(
+                        "purge progress lacks a durable manifest",
+                    ))?
+                    .entry_count;
+                if tx.state != Some(TransactionState::PurgeIntent)
+                    || removed_entries != tx.purge_removed_entries.saturating_add(1)
+                    || removed_entries > limit
+                    || !purge_progress_path_is_confined(&last_path)
+                {
+                    return Err(ReplayError::InvalidHistory(
+                        "purge progress is not exact, bounded, and monotonic",
+                    ));
+                }
+                tx.purge_removed_entries = removed_entries;
+                tx.purge_last_path = Some(last_path);
+            }
             SealRecord::State { state, .. } => {
                 if let Some(previous) = tx.state {
                     if state == TransactionState::RenameIntent {
@@ -2323,6 +2477,22 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                     if state == TransactionState::Purgeable {
                         return Err(ReplayError::InvalidHistory(
                             "purgeable must use its explicit authorization record",
+                        ));
+                    }
+                    if state == TransactionState::PurgeIntent && versioned.version >= 10 {
+                        return Err(ReplayError::InvalidHistory(
+                            "purge intent must use its exact durable claim record",
+                        ));
+                    }
+                    if state == TransactionState::PurgeOutcome
+                        && versioned.version >= 10
+                        && tx.purge_removed_entries
+                            != tx
+                                .tree_manifest
+                                .map_or(u64::MAX, |manifest| manifest.entry_count)
+                    {
+                        return Err(ReplayError::InvalidHistory(
+                            "purge outcome precedes complete durable progress",
                         ));
                     }
                     if state != TransactionState::RecoveryRequired
@@ -2559,6 +2729,8 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                     tree_manifest: tx.tree_manifest,
                     rename_outcome: tx.rename_outcome,
                     undo_rename_outcome: tx.undo_rename_outcome,
+                    purge_removed_entries: tx.purge_removed_entries,
+                    purge_last_path: tx.purge_last_path,
                 },
             ))
         })
@@ -2862,7 +3034,8 @@ fn valid_transition(from: TransactionState, to: TransactionState) -> bool {
                     | S::UndoIntent
                     | S::UndoModesRestored
                     | S::UndoRenameIntent
-                    | S::VerifiedCommitted,
+                    | S::VerifiedCommitted
+                    | S::PurgeIntent,
                 S::RecoveryRequired
             )
     )
@@ -3008,6 +3181,30 @@ fn encode_record(record: &SealRecord) -> Result<Vec<u8>, FrameError> {
             bytes.extend_from_slice(&commitment.manifest.entry_count.to_le_bytes());
             bytes.extend_from_slice(&commitment.manifest.sha256);
         }
+        SealRecord::PurgeClaimed {
+            transaction,
+            commitment,
+        } => {
+            bytes.push(11);
+            bytes.extend_from_slice(&transaction.0);
+            encode_locator(&mut bytes, &commitment.destination_parent)?;
+            encode_strong_identity(&mut bytes, commitment.destination_parent_identity);
+            put_bytes(&mut bytes, commitment.destination_basename.as_bytes())?;
+            encode_strong_identity(&mut bytes, commitment.root_identity);
+            bytes.extend_from_slice(&commitment.manifest.schema_version.to_le_bytes());
+            bytes.extend_from_slice(&commitment.manifest.entry_count.to_le_bytes());
+            bytes.extend_from_slice(&commitment.manifest.sha256);
+        }
+        SealRecord::PurgeProgress {
+            transaction,
+            removed_entries,
+            last_path,
+        } => {
+            bytes.push(12);
+            bytes.extend_from_slice(&transaction.0);
+            bytes.extend_from_slice(&removed_entries.to_le_bytes());
+            put_bytes(&mut bytes, last_path.as_os_str().as_bytes())?;
+        }
     }
     if bytes.len() > MAX_PAYLOAD_LEN {
         return Err(FrameError::PayloadTooLarge {
@@ -3147,6 +3344,25 @@ fn decode_record(payload: &[u8], offset: u64, version: u16) -> Result<SealRecord
                     sha256: cursor.array_32()?,
                 },
             },
+        },
+        11 if version >= 10 => SealRecord::PurgeClaimed {
+            transaction,
+            commitment: DurablePurgeCommitment {
+                destination_parent: decode_locator(&mut cursor, offset)?,
+                destination_parent_identity: decode_strong_identity(&mut cursor, version)?,
+                destination_basename: std::ffi::OsString::from_vec(cursor.bytes()?),
+                root_identity: decode_strong_identity(&mut cursor, version)?,
+                manifest: DurableTreeManifest {
+                    schema_version: cursor.u16()?,
+                    entry_count: cursor.u64()?,
+                    sha256: cursor.array_32()?,
+                },
+            },
+        },
+        12 if version >= 10 => SealRecord::PurgeProgress {
+            transaction,
+            removed_entries: cursor.u64()?,
+            last_path: PathBuf::from(std::ffi::OsString::from_vec(cursor.bytes()?)),
         },
         _ => {
             return Err(ReplayError::Malformed {

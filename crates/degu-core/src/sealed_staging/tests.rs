@@ -344,6 +344,8 @@ fn permission_and_path_workload_limits_are_checked_before_rebind() {
         tree_manifest: None,
         rename_outcome: None,
         undo_rename_outcome: None,
+        purge_removed_entries: 0,
+        purge_last_path: None,
     };
     assert!(validate_recovery_workload(&snapshot).is_err());
 

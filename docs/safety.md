@@ -51,12 +51,25 @@ inspection uncertainty is not compressed into missing or ready. Root and a
 malicious same-EUID process remain outside the Unix trust boundary.
 
 The unprivileged installers install binaries only and merely suggest running
-`degu doctor`. They do not invoke sudo, inspect `SUDO_UID`, or write `/var/lib`
-or `/private/var/db`. For a never-activated numeric UID, a real-EUID-0
-administrator separately runs `degu admin activation-anchor provision --uid
-<UID> --initial`. That command derives the only path from platform plus UID,
-creates with descriptor-relative/no-follow operations, and never repairs an
-existing object.
+`degu doctor`. They do not invoke sudo, inspect `SUDO_UID`, or create an
+activation anchor. For a never-activated numeric UID, an administrator uses a
+separately verified binary from an administrator-owned absolute path to run
+`degu admin activation-anchor provision --uid <UID> --initial` with real EUID
+0. That command derives the only path from platform plus UID, creates with
+descriptor-relative/no-follow operations, and never repairs an existing object.
+
+Mutating clean, undo, purge, and expiry sessions derive the same current-EUID
+anchor and use it as the only whole-store activation/discovery authority. A
+supported record-empty anchor activates the canonical current state-store
+locator. Once activation evidence exists, the recorded exact locator wins over
+HOME/XDG drift; a lost, replaced, corrupt, unsafe, missing, busy, or uncertain
+anchor/store blocks mutation and never creates a substitute store. The sole
+legacy escape is `UnsupportedNeverActivated`: the anchor was authenticated and
+record-empty, and the desired store backend was positively classified outside
+the certified set. That legacy session retains the exact anchor lock for its
+full lifetime, so another process with different XDG state cannot activate a
+store concurrently. Activated sessions instead retain and replay the exact WAL
+lease for the full mutation session.
 
 Production forward cleanup is connected to activation and startup recovery.
 `doctor ready` proves only anchor readiness, not WAL or recovery health. In

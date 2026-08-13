@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::Mutex;
@@ -51,6 +52,17 @@ exit [lindex $result {EXPECT_WAIT_EXIT_STATUS_INDEX}]
 pub(crate) fn run(request: PtyRun<'_>) -> Output {
     let _serialized = PTY_GATE.lock().expect("PTY test gate poisoned");
     let path = std::env::var_os("PATH").expect("PATH is required for PTY integration tests");
+    crate::common::make_tree_non_shared_writable(request.home)
+        .expect("failed to harden PTY HOME fixture");
+    crate::common::make_tree_non_shared_writable(request.state_home)
+        .expect("failed to harden PTY state fixture");
+    let anchor = request
+        .state_home
+        .join("degu-integration-activation-anchor");
+    std::fs::create_dir_all(&anchor).expect("failed to create PTY activation anchor");
+    std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o700))
+        .expect("failed to harden PTY activation anchor");
+    let anchor = std::fs::canonicalize(anchor).expect("failed to canonicalize PTY anchor");
     let mut command = Command::new("expect");
     command
         .arg("-c")
@@ -61,7 +73,8 @@ pub(crate) fn run(request: PtyRun<'_>) -> Output {
         .env("HOME", request.home)
         .env("LOGNAME", request.home)
         .env("XDG_CONFIG_HOME", request.config_home)
-        .env("XDG_STATE_HOME", request.state_home);
+        .env("XDG_STATE_HOME", request.state_home)
+        .env("DEGU_INTEGRATION_TEST_ANCHOR", anchor);
     for &(name, value) in request.extra_env {
         command.env(name, value);
     }

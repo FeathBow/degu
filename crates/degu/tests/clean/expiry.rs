@@ -46,6 +46,7 @@ fn xdg_state_parent_alias_does_not_block_direct_or_expiry_mutation() {
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join("wheel.whl"), b"cache").unwrap();
     crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+    crate::common::make_tree_non_shared_writable(state.path()).unwrap();
 
     let out = degu()
         .env("HOME", home.path())

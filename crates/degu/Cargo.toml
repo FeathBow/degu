@@ -45,6 +45,7 @@ unicode-width.workspace = true
 [dev-dependencies]
 assert_cmd.workspace = true
 tempfile.workspace = true
+degu-core = { workspace = true, features = ["integration-test-anchor"] }
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/degu-v{ version }-{ target }.tar.gz"

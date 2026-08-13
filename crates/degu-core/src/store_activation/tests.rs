@@ -171,6 +171,76 @@ fn record_empty_anchor_reaches_injected_unsupported_support_classification() {
 }
 
 #[test]
+fn production_adapter_activates_then_follows_the_recorded_store_across_xdg_drift() {
+    let fixture = Fixture::new();
+    let activated = activate_store_for_mutation(&fixture.anchor, &fixture.store).unwrap();
+    let MutationStoreActivation::Activated(activated) = activated else {
+        panic!("supported first use did not converge to Activated")
+    };
+    assert_eq!(activated.locator(), fixture.store);
+    let (engine, report) = crate::sealed_staging::SealedStagingEngine::open(activated.store())
+        .expect("activated store must open its exact WAL engine");
+    assert!(report.is_empty());
+    assert!(matches!(
+        crate::sealed_staging::SealedStagingEngine::open(activated.store()),
+        Err(crate::sealed_staging::StagingEngineError::Store(
+            StoreError::Lease(RecoveryLockError::Busy)
+        ))
+    ));
+    drop(engine);
+    drop(activated);
+
+    let changed = fixture.home.join("state/degu/changed-store");
+    let activated = activate_store_for_mutation(&fixture.anchor, &changed).unwrap();
+    let MutationStoreActivation::Activated(activated) = activated else {
+        panic!("activated discovery did not return the recorded store")
+    };
+    assert_eq!(activated.locator(), fixture.store);
+    assert!(!changed.exists());
+}
+
+#[test]
+fn unsupported_legacy_lease_holds_the_anchor_lock_until_session_end() {
+    let fixture = Fixture::new();
+    let lease = activate_store_for_mutation_with_probe(&fixture.anchor, &fixture.store, |_| {
+        Err(StoreActivationError::Backend(
+            CertificationError::UnsupportedFilesystem,
+        ))
+    })
+    .unwrap();
+    assert!(matches!(
+        lease,
+        MutationStoreActivation::UnsupportedNeverActivated(_)
+    ));
+    assert!(!fixture.store.exists());
+    assert!(matches!(
+        check_activation_anchor_readiness(&fixture.anchor),
+        Err(ActivationAnchorReadinessError::Uncertain { .. })
+    ));
+    drop(lease);
+    assert!(check_activation_anchor_readiness(&fixture.anchor).is_ok());
+    assert!(
+        std::fs::read_dir(fixture.authority())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)] // simulates out-of-protocol whole-store loss
+fn production_adapter_never_recreates_lost_or_corrupt_store() {
+    let fixture = Fixture::new();
+    drop(activate_store_for_mutation(&fixture.anchor, &fixture.store).unwrap());
+    std::fs::remove_dir_all(&fixture.store).unwrap();
+    assert!(matches!(
+        activate_store_for_mutation(&fixture.anchor, &fixture.store),
+        Err(StoreActivationError::NotResumable)
+    ));
+    assert!(!fixture.store.exists());
+}
+
+#[test]
 fn activation_records_bypass_the_desired_store_support_probe() {
     let fixture = Fixture::new();
     drop(activate_or_resume_store(&fixture.anchor, &fixture.store).unwrap());

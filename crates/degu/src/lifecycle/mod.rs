@@ -19,8 +19,8 @@ use anyhow::{Context, Result};
 use degu_core::ecosystem::DetectCtx;
 use degu_core::finding::Finding;
 use degu_core::safety::Guard;
-use degu_core::seal_store::SealWalStore;
 use degu_core::sealed_staging::{ReadyStagingEngine, SealedStagingEngine, StartupRecoveryAnchors};
+use degu_core::store_activation::{MutationStoreActivation, UnsupportedNeverActivatedLease};
 use std::path::{Path, PathBuf};
 
 pub(crate) use entries::TrashEntry;
@@ -67,71 +67,52 @@ impl Lifecycle {
 
     pub(crate) fn lock(self) -> Result<MutationSession> {
         let mutation_lock = storage::acquire_mutation_lock(&self.ctx)?;
-        let sealed_staging = if let Some((store_path, existed)) =
-            storage::sealed_staging_store_for_mutation(&self.ctx)?
-        {
-            let store = match SealWalStore::open_or_create(&store_path) {
-                Ok(store) => Some(store),
-                // No A3 forward transaction is production-reachable yet, so a
-                // brand-new store that cannot be initialized safely falls back
-                // to the strict legacy lifecycle rather than blocking a first
-                // mutation. Once the store exists, every open/replay error is
-                // authoritative and blocks. A3c4 MUST remove this new-store
-                // fallback before it exposes its first forward transaction.
-                Err(_) if !existed => None,
-                Err(error) => {
-                    return Err(error).with_context(|| {
+        let (sealed_staging, unsupported_legacy_lease) =
+            match storage::sealed_staging_store_for_mutation(&self.ctx)? {
+                MutationStoreActivation::Activated(activated) => {
+                    let store_path = activated.locator().to_path_buf();
+                    let (engine, report) =
+                    SealedStagingEngine::open(activated.store()).with_context(|| {
                         format!(
-                            "failed to open sealed-staging recovery store {}",
-                            store_path.display()
-                        )
-                    });
-                }
-            };
-            if let Some(store) = store {
-                let (engine, report) = SealedStagingEngine::open(&store).with_context(|| {
-                    format!(
-                        "failed to lease and replay sealed-staging recovery store {}",
-                        store_path.display()
-                    )
-                })?;
-                // The first production anchor policy is deliberately narrow:
-                // locators must have been recorded relative to canonical HOME
-                // on one certified local mount. Redirected/cross-mount roots stay
-                // blocked until A3c4 adds and consumes a mount-root policy.
-                let recovery_home = self.ctx.home.clone();
-                let (ready, _) = engine
-                    .recover_startup(report, |_, _| {
-                        let open_home = || {
-                            rustix::fs::open(
-                                &recovery_home,
-                                rustix::fs::OFlags::RDONLY
-                                    | rustix::fs::OFlags::DIRECTORY
-                                    | rustix::fs::OFlags::NOFOLLOW
-                                    | rustix::fs::OFlags::CLOEXEC,
-                                rustix::fs::Mode::empty(),
-                            )
-                            .map_err(std::io::Error::from)
-                        };
-                        Ok(StartupRecoveryAnchors::new(open_home()?, open_home()?))
-                    })
-                    .with_context(|| {
-                        format!(
-                            "sealed-staging startup recovery did not reach a safe terminal state in {}",
+                            "failed to lease and replay activated sealed-staging recovery store {}",
                             store_path.display()
                         )
                     })?;
-                Some(ready)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+                    // The first production anchor policy is deliberately narrow:
+                    // locators must have been recorded relative to canonical HOME
+                    // on one certified local mount. Redirected/cross-mount roots stay
+                    // blocked until a later association slice consumes a mount-root policy.
+                    let recovery_home = self.ctx.home.clone();
+                    let (ready, _) = engine
+                .recover_startup(report, |_, _| {
+                    let open_home = || {
+                        rustix::fs::open(
+                            &recovery_home,
+                            rustix::fs::OFlags::RDONLY
+                                | rustix::fs::OFlags::DIRECTORY
+                                | rustix::fs::OFlags::NOFOLLOW
+                                | rustix::fs::OFlags::CLOEXEC,
+                            rustix::fs::Mode::empty(),
+                        )
+                        .map_err(std::io::Error::from)
+                    };
+                    Ok(StartupRecoveryAnchors::new(open_home()?, open_home()?))
+                })
+                .with_context(|| {
+                    format!(
+                        "sealed-staging startup recovery did not reach a safe terminal state in {}",
+                        store_path.display()
+                    )
+                })?;
+                    (Some(ready), None)
+                }
+                MutationStoreActivation::UnsupportedNeverActivated(lease) => (None, Some(lease)),
+            };
         Ok(MutationSession {
             lifecycle: self,
             _mutation_lock: mutation_lock,
             _sealed_staging: sealed_staging,
+            _unsupported_legacy_lease: unsupported_legacy_lease,
         })
     }
 }
@@ -140,9 +121,10 @@ pub(crate) struct MutationSession {
     lifecycle: Lifecycle,
     _mutation_lock: std::fs::File,
     // When activated, retains the exact WAL lease for the entire production
-    // mutation session. `None` is allowed only before any store exists on an
-    // unsupported backend; A3c4 must activate the gate before forward staging.
+    // mutation session. `None` is allowed only for authenticated
+    // UnsupportedNeverActivated. Forward staging remains deliberately unwired.
     _sealed_staging: Option<ReadyStagingEngine>,
+    _unsupported_legacy_lease: Option<UnsupportedNeverActivatedLease>,
 }
 
 impl MutationSession {

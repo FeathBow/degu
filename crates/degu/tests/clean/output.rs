@@ -5,15 +5,25 @@ use unicode_width::UnicodeWidthStr;
 #[test]
 fn closed_stdout_stops_clean_before_mutation() {
     use std::os::fd::OwnedFd;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     let home = tempfile::tempdir().unwrap();
     let (cache, state) = fake_pip_cache(&home, ".cache/pip");
     let (reader, writer) = UnixStream::pair().unwrap();
     drop(reader);
-    let output = Command::new(assert_cmd::cargo::cargo_bin("degu"))
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+    crate::common::make_tree_non_shared_writable(state.path()).unwrap();
+    let anchor = state.path().join("degu-integration-activation-anchor");
+    std::fs::create_dir(&anchor).unwrap();
+    std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("degu"))
         .env_clear()
+        .env(
+            "DEGU_INTEGRATION_TEST_ANCHOR",
+            std::fs::canonicalize(anchor).unwrap(),
+        )
         .env("HOME", home.path())
         .env("LOGNAME", home.path())
         .env("XDG_CONFIG_HOME", test_config_home())

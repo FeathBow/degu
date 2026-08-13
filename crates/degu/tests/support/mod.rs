@@ -53,9 +53,45 @@ pub fn isolated_config_home() -> &'static Path {
 }
 
 pub fn isolated_degu() -> Command {
-    let mut command = Command::cargo_bin("degu").unwrap();
+    // The test-built binary recognizes a dev-feature-only anchor variable. The
+    // wrapper derives it from each test's eventual XDG state at child startup;
+    // release binaries compile without that feature and ignore the variable.
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(
+            r#"if [ -n "$XDG_STATE_HOME" ]; then
+                 anchor="$XDG_STATE_HOME/degu-integration-activation-anchor"
+                 /bin/mkdir -p "$anchor" || exit
+                 /bin/chmod 700 "$anchor" || exit
+                 anchor=$(cd "$anchor" && pwd -P) || exit
+                 export DEGU_INTEGRATION_TEST_ANCHOR="$anchor"
+               fi
+               for p in "$HOME" "$XDG_STATE_HOME"; do
+                 if [ -n "$p" ] && [ -d "$p" ]; then /bin/chmod go-w "$p" || exit; fi
+               done
+               exec "$0" "$@""#,
+        )
+        .arg(assert_cmd::cargo::cargo_bin("degu"));
     command.env_clear();
     command.env("LOGNAME", isolated_config_home());
     command.env("XDG_CONFIG_HOME", isolated_config_home());
     command
+}
+
+/// Provision the integration-test-only activation anchor beside this command's
+/// isolated state. The release dependency does not enable the core feature that
+/// recognizes this variable, and `degu doctor` always ignores it.
+#[allow(
+    dead_code,
+    reason = "shared support is compiled into integration-test crates that do not mutate"
+)]
+pub fn with_mutation_anchor(command: &mut Command, state: &Path) {
+    let anchor = state.join("degu-integration-activation-anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o700)).unwrap();
+    command.env(
+        "DEGU_INTEGRATION_TEST_ANCHOR",
+        std::fs::canonicalize(anchor).unwrap(),
+    );
 }

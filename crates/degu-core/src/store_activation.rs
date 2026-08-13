@@ -55,6 +55,10 @@ const ACTIVATION_ID_LEN: usize = 32;
 const MAX_RECORD_BYTES: usize = 128 * 1024;
 const MAX_LOCATOR_BYTES: usize = 64 * 1024;
 static NEXT_TEMP_NAME: AtomicU64 = AtomicU64::new(1);
+#[cfg(all(feature = "integration-test-anchor", not(debug_assertions)))]
+compile_error!("integration-test-anchor must never be enabled in a release build");
+#[cfg(feature = "integration-test-anchor")]
+const INTEGRATION_TEST_ANCHOR_ENV: &str = "DEGU_INTEGRATION_TEST_ANCHOR";
 
 /// The one activation anchor selected by platform and effective user.
 ///
@@ -313,6 +317,90 @@ pub fn discover_store_activation(
     desired_store: &Path,
 ) -> Result<StoreActivationState, StoreActivationError> {
     discover_store_activation_with_probe(anchor, desired_store, probe_desired_store_support)
+}
+
+/// Production mutation result. Both variants retain the authority that makes
+/// their decision stable for the full mutation session.
+pub enum MutationStoreActivation {
+    Activated(ActivatedSealWalStore),
+    UnsupportedNeverActivated(UnsupportedNeverActivatedLease),
+}
+
+/// Opaque proof that the authenticated anchor is record-empty and the desired
+/// backend is explicitly unsupported. Retaining it keeps the anchor lock held,
+/// so another process cannot activate a different XDG store while legacy
+/// mutation is in progress.
+pub struct UnsupportedNeverActivatedLease {
+    _authority: AuthorityRoot,
+}
+
+/// Discover the fixed current-EUID whole-store authority and activate or resume
+/// `desired_store` only when the authenticated record state permits it.
+///
+/// This is the production adapter boundary: callers can select the desired
+/// relocatable store for genuine first use, but cannot supply or redirect the
+/// external activation authority.
+pub fn activate_current_euid_store(
+    desired_store: &Path,
+) -> Result<MutationStoreActivation, StoreActivationError> {
+    let anchor = production_activation_anchor()?;
+    activate_store_for_mutation(&anchor, desired_store)
+}
+
+fn production_activation_anchor() -> Result<ActivationAnchorLocator, StoreActivationError> {
+    #[cfg(feature = "integration-test-anchor")]
+    if let Some(path) = std::env::var_os(INTEGRATION_TEST_ANCHOR_ENV) {
+        return Ok(ActivationAnchorLocator {
+            path: PathBuf::from(path),
+        });
+    }
+    ActivationAnchorLocator::for_current_euid()
+}
+
+fn activate_store_for_mutation(
+    anchor: &ActivationAnchorLocator,
+    desired_store: &Path,
+) -> Result<MutationStoreActivation, StoreActivationError> {
+    activate_store_for_mutation_with_probe(anchor, desired_store, probe_desired_store_support)
+}
+
+fn activate_store_for_mutation_with_probe<F>(
+    anchor: &ActivationAnchorLocator,
+    desired_store: &Path,
+    support_probe: F,
+) -> Result<MutationStoreActivation, StoreActivationError>
+where
+    F: FnOnce(&Path) -> Result<(), StoreActivationError>,
+{
+    let authority = open_activation_anchor(anchor)?;
+    match discover_with_authority(&authority)? {
+        StoreActivationState::Activated(store) => Ok(MutationStoreActivation::Activated(store)),
+        StoreActivationState::Lost | StoreActivationState::CorruptOrReplaced => {
+            Err(StoreActivationError::NotResumable)
+        }
+        StoreActivationState::NeverActivated => match support_probe(desired_store) {
+            Ok(()) => {
+                drop(authority);
+                activate_or_resume_store(anchor, desired_store)
+                    .map(MutationStoreActivation::Activated)
+            }
+            Err(StoreActivationError::Backend(
+                CertificationError::UnsupportedPlatform | CertificationError::UnsupportedFilesystem,
+            )) => Ok(MutationStoreActivation::UnsupportedNeverActivated(
+                UnsupportedNeverActivatedLease {
+                    _authority: authority,
+                },
+            )),
+            Err(error) => Err(error),
+        },
+        StoreActivationState::Preparing => {
+            drop(authority);
+            activate_or_resume_store(anchor, desired_store).map(MutationStoreActivation::Activated)
+        }
+        StoreActivationState::UnsupportedNeverActivated => {
+            unreachable!("discover_with_authority never performs the desired-store support probe")
+        }
+    }
 }
 
 fn discover_store_activation_with_probe<F>(

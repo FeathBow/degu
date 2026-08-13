@@ -52,7 +52,7 @@ fn missing_fixed_anchor_blocks_without_creating_a_store() {
 }
 
 #[test]
-fn clean_lock_selects_forward_staging_only_for_restorable_clean() {
+fn clean_lock_selects_forward_staging_for_restorable_and_direct_purge() {
     let (_temp, ctx) = context();
     let lock = std::fs::File::create(ctx.xdg_state().join("degu/test-session-lock")).unwrap();
     let restorable = MutationSession {
@@ -60,6 +60,7 @@ fn clean_lock_selects_forward_staging_only_for_restorable_clean() {
         _mutation_lock: lock,
         sealed_staging: None,
         forward_clean: true,
+        retained_purge_authorities: Vec::new(),
         _unsupported_legacy_lease: None,
     };
     assert!(restorable.forward_clean);
@@ -69,10 +70,11 @@ fn clean_lock_selects_forward_staging_only_for_restorable_clean() {
         lifecycle: Lifecycle::new(&ctx),
         _mutation_lock: lock,
         sealed_staging: None,
-        forward_clean: false,
+        forward_clean: true,
+        retained_purge_authorities: Vec::new(),
         _unsupported_legacy_lease: None,
     };
-    assert!(!direct_purge.forward_clean);
+    assert!(direct_purge.forward_clean);
 }
 
 #[test]
@@ -183,6 +185,7 @@ fn production_clean_reaches_verified_commit_and_keeps_jsonl_diagnostic_only() {
         _mutation_lock: lock,
         sealed_staging: Some(ready),
         forward_clean: true,
+        retained_purge_authorities: Vec::new(),
         _unsupported_legacy_lease: None,
     };
 
@@ -241,6 +244,150 @@ fn production_clean_reaches_verified_commit_and_keeps_jsonl_diagnostic_only() {
     assert_eq!(records[0].outcome, OpOutcome::Ok);
     let json = serde_json::to_value(&records[0]).unwrap();
     assert!(json.get("transaction").is_none());
+
+    // A later explicit trash batch that finds sealed drift must stop before a
+    // legacy sibling reaches claim, deletion, or claim housekeeping.
+    let second = source_parent.join("second-root");
+    std::fs::create_dir(&second).unwrap();
+    std::fs::write(second.join("payload"), b"second").unwrap();
+    std::fs::set_permissions(&second, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let second_finding = finalize_findings(
+        vec![FindingCandidate {
+            ecosystem: "test".to_string(),
+            path: second.clone(),
+            kind: FindingKind::PackageCache,
+            bytes_apparent: 6,
+            bytes_allocated: 4096,
+            age_days: None,
+            bytes_hardlinked: 0,
+            inodes: 2,
+            skipped: 0,
+            truncated: false,
+            unvisited_dirs: 0,
+            shared_writable_dirs: 0,
+            parent_grants_foreign_mutation: false,
+            protected_boundaries: 0,
+            protected_credential_boundaries: 0,
+            recovery: Recovery::Regenerable {
+                cost: RegenCost::Cheap,
+            },
+            ownership: Ownership::Standalone,
+            hazard: None,
+            rationale: "mixed purge fixture".to_string(),
+        }],
+        FindingSource::WellKnownRoot,
+    )
+    .pop()
+    .unwrap();
+    let second_plan = CapturedCleanPlan::capture(
+        degu_core::plan::Plan::new(vec![second_finding], false).unwrap(),
+    )
+    .unwrap();
+    let second_execution = session
+        .execute_clean(&second_plan, false, &|_| Ok(()))
+        .unwrap();
+    let sealed = second_execution[0].trash_entry().unwrap().to_path_buf();
+    std::fs::write(sealed.join("post-commit-drift"), b"drift").unwrap();
+    let legacy = sealed.parent().unwrap().join("9999-legacy");
+    std::fs::create_dir(&legacy).unwrap();
+    std::fs::write(legacy.join("keep"), b"keep").unwrap();
+
+    let mixed = session.plan_purge_all().unwrap();
+    let report = session.execute_explicit_purge_all(mixed);
+    assert!(report.purged.is_empty());
+    assert!(report.failed.len() >= 2);
+    assert!(sealed.is_dir());
+    assert!(legacy.is_dir());
+    assert!(!sealed.parent().unwrap().join(".claims/9999").exists());
+}
+
+#[test]
+fn production_clean_purge_mints_and_retains_authority_without_deleting() {
+    let (_temp, ctx) = context();
+    let source_parent = ctx.home.join("purge-source-parent");
+    let source = source_parent.join("root");
+    std::fs::create_dir(&source_parent).unwrap();
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("payload"), b"sealed purge").unwrap();
+    std::fs::set_permissions(&source_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let finding = finalize_findings(
+        vec![FindingCandidate {
+            ecosystem: "test".to_string(),
+            path: source.clone(),
+            kind: FindingKind::PackageCache,
+            bytes_apparent: 12,
+            bytes_allocated: 4096,
+            age_days: None,
+            bytes_hardlinked: 0,
+            inodes: 2,
+            skipped: 0,
+            truncated: false,
+            unvisited_dirs: 0,
+            shared_writable_dirs: 0,
+            parent_grants_foreign_mutation: false,
+            protected_boundaries: 0,
+            protected_credential_boundaries: 0,
+            recovery: Recovery::Regenerable {
+                cost: RegenCost::Cheap,
+            },
+            ownership: Ownership::Standalone,
+            hazard: None,
+            rationale: "production purge fixture".to_string(),
+        }],
+        FindingSource::WellKnownRoot,
+    )
+    .pop()
+    .unwrap();
+    let plan =
+        CapturedCleanPlan::capture(degu_core::plan::Plan::new(vec![finding], false).unwrap())
+            .unwrap();
+    let store = SealWalStore::open_or_create(&ctx.xdg_state().join("degu/sealed-staging")).unwrap();
+    let (engine, startup) = SealedStagingEngine::open(&store).unwrap();
+    let (ready, _) = engine
+        .recover_startup(startup, |_, _| {
+            Err(std::io::Error::other(
+                "empty recovery must not request anchors",
+            ))
+        })
+        .unwrap();
+    let lock = std::fs::File::create(ctx.xdg_state().join("degu/test-clean-purge-lock")).unwrap();
+    let mut session = MutationSession {
+        lifecycle: Lifecycle::new(&ctx),
+        _mutation_lock: lock,
+        sealed_staging: Some(ready),
+        forward_clean: true,
+        retained_purge_authorities: Vec::new(),
+        _unsupported_legacy_lease: None,
+    };
+
+    let executed = session.execute_clean(&plan, true, &|_| Ok(())).unwrap();
+    assert_eq!(executed.len(), 1);
+    assert!(executed[0].failed());
+    assert_eq!(executed[0].state_label(), "purge_failed");
+    let staged = executed[0].trash_entry().unwrap().to_path_buf();
+    assert!(staged.is_dir());
+    assert!(!source.exists());
+    assert_eq!(session.retained_purge_authorities.len(), 1);
+    let entries = session
+        .sealed_staging
+        .as_ref()
+        .unwrap()
+        .production_entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].state(),
+        degu_core::authority::TransactionState::Purgeable
+    );
+    assert!(
+        session
+            .sealed_staging
+            .as_ref()
+            .unwrap()
+            .verified_undo_token(entries[0].transaction(), entries[0].reclamation_id())
+            .is_none()
+    );
+    assert!(!staged.parent().unwrap().join(".claims/0001").exists());
 }
 
 #[test]
@@ -293,6 +440,7 @@ fn forged_jsonl_mapping_cannot_steal_wal_undo_authority() {
         _mutation_lock: lock,
         sealed_staging: Some(ready),
         forward_clean: false,
+        retained_purge_authorities: Vec::new(),
         _unsupported_legacy_lease: None,
     };
 

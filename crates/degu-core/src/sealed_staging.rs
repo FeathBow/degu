@@ -5,8 +5,9 @@
 //! candidate reaches a safe durable terminal state. A3c4 adds one narrow forward
 //! coordinator on that readiness capability. It consumes raw held descriptors,
 //! completes seal/rename/verification/source-parent restoration under the same
-//! lease, and returns only after `VerifiedCommitted`. No purge, unlink, deletion,
-//! or committed-tree mode-restoration authority is exported.
+//! lease, and returns only after `VerifiedCommitted`. An explicit later request
+//! may freshly verify that exact held object and durably admit `Purgeable`; this
+//! slice still exports no unlink or deletion executor.
 
 use crate::authority::TransactionState;
 use crate::seal_store::{SealWalStore, StoreError};
@@ -17,8 +18,9 @@ use crate::seal_wal::{
 };
 use crate::staging_recovery::{
     RecoveryAnchors, RecoveryFilesystemAnchor, RecoveryRebindError, StagedVerificationFailure,
-    StagedVerificationOutcome, StartupRecoveryCapability, certify_verified_commit,
-    prepare_startup_recovery, prepare_verified_undo, recovery_transaction, strong_identity_fd,
+    StagedVerificationOutcome, StartupRecoveryCapability, VerifiedPurgeAuthorityMaterial,
+    certify_verified_commit, prepare_startup_recovery, prepare_verified_purge,
+    prepare_verified_undo, recovery_transaction, strong_identity_fd,
 };
 use crate::staging_rename::{
     PreparedRootBinding, StagedUnverifiedTree, StagingRenameError, execute_prepared_rename,
@@ -309,6 +311,103 @@ impl ForwardStagingCommit {
     }
 }
 
+/// Explicit, authority-neutral request to classify one production association
+/// for purge. Transaction IDs and reclamation strings only select a candidate;
+/// the engine independently rebinds and freshly verifies all held objects.
+#[derive(Debug)]
+pub struct VerifiedPurgeRequest {
+    transaction: TransactionId,
+    reclamation_id: String,
+    source_anchor: OwnedFd,
+    destination_anchor: OwnedFd,
+}
+
+impl VerifiedPurgeRequest {
+    pub fn new(
+        transaction: TransactionId,
+        reclamation_id: String,
+        source_anchor: OwnedFd,
+        destination_anchor: OwnedFd,
+    ) -> Self {
+        Self {
+            transaction,
+            reclamation_id,
+            source_anchor,
+            destination_anchor,
+        }
+    }
+}
+
+/// Non-cloneable, non-serializable, one-use purge authority for one exact held
+/// committed staged object. It is produced only after the explicit v8 WAL
+/// authorization record is synced. This slice intentionally provides no delete
+/// or unlink operation which could consume it.
+#[derive(Debug)]
+pub struct PurgeAuthority {
+    transaction: TransactionId,
+    reclamation_id: String,
+    #[allow(dead_code)]
+    held: VerifiedPurgeAuthorityMaterial,
+}
+
+impl PurgeAuthority {
+    pub fn transaction(&self) -> TransactionId {
+        self.transaction
+    }
+
+    pub fn reclamation_id(&self) -> &str {
+        &self.reclamation_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifiedPurgeFailureDisposition {
+    NotStarted,
+    Terminal(TransactionState),
+    RecoveryBlocked,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("verified purge admission for {transaction:?} failed during {stage}: {source}")]
+pub struct VerifiedPurgeError {
+    transaction: TransactionId,
+    stage: &'static str,
+    disposition: VerifiedPurgeFailureDisposition,
+    #[source]
+    source: BoxError,
+}
+
+impl VerifiedPurgeError {
+    fn new<E>(
+        transaction: TransactionId,
+        stage: &'static str,
+        disposition: VerifiedPurgeFailureDisposition,
+        source: E,
+    ) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self {
+            transaction,
+            stage,
+            disposition,
+            source: Box::new(source),
+        }
+    }
+
+    pub fn transaction(&self) -> TransactionId {
+        self.transaction
+    }
+
+    pub fn stage(&self) -> &'static str {
+        self.stage
+    }
+
+    pub fn disposition(&self) -> VerifiedPurgeFailureDisposition {
+        self.disposition
+    }
+}
+
 /// Opaque, one-use authority for the exact WAL association and transaction.
 /// It can only be minted while that transaction is `VerifiedCommitted`.
 #[derive(Debug)]
@@ -573,6 +672,126 @@ impl ReadyStagingEngine {
                 })
             })
             .collect()
+    }
+
+    /// Freshly rebinds an explicit production purge request and returns a
+    /// one-use authority only after the exact content manifest and held object,
+    /// parent, locator, mount/backend, strong identity, mode and ACL policy all
+    /// revalidate and the explicit WAL authorization record is synced.
+    pub fn request_verified_purge(
+        &mut self,
+        request: VerifiedPurgeRequest,
+    ) -> Result<PurgeAuthority, VerifiedPurgeError> {
+        let transaction = request.transaction;
+        if self.engine.startup_blocked || !self.engine.wal.can_begin_staging_transaction() {
+            return Err(VerifiedPurgeError::new(
+                transaction,
+                "ready-engine admission",
+                VerifiedPurgeFailureDisposition::RecoveryBlocked,
+                io::Error::other(
+                    "sealed staging recovery is blocked; no later purge request may be admitted",
+                ),
+            ));
+        }
+        let snapshot = self
+            .engine
+            .wal
+            .recovery_snapshot(transaction)
+            .ok_or_else(|| {
+                VerifiedPurgeError::new(
+                    transaction,
+                    "request classification",
+                    VerifiedPurgeFailureDisposition::NotStarted,
+                    io::Error::other("purge request is absent from the exact leased WAL"),
+                )
+            })?;
+        let metadata = snapshot.staging.clone().ok_or_else(|| {
+            VerifiedPurgeError::new(
+                transaction,
+                "request classification",
+                VerifiedPurgeFailureDisposition::NotStarted,
+                io::Error::other("purge request has no sealed production mapping"),
+            )
+        })?;
+        if snapshot.state != TransactionState::VerifiedCommitted
+            || metadata
+                .production_association()
+                .map(ProductionAssociation::reclamation_id)
+                != Some(request.reclamation_id.as_str())
+            || !snapshot
+                .tree_manifest
+                .is_some_and(|manifest| manifest.has_content_proof())
+        {
+            return Err(VerifiedPurgeError::new(
+                transaction,
+                "request classification",
+                VerifiedPurgeFailureDisposition::NotStarted,
+                io::Error::other(
+                    "purge request does not match a content-proven VerifiedCommitted association",
+                ),
+            ));
+        }
+        let anchors =
+            StartupRecoveryAnchors::new(request.source_anchor, request.destination_anchor)
+                .certify(&metadata)
+                .map_err(|source| {
+                    VerifiedPurgeError::new(
+                        transaction,
+                        "anchor certification",
+                        VerifiedPurgeFailureDisposition::NotStarted,
+                        source,
+                    )
+                })?;
+        let session = match prepare_verified_purge(
+            &mut self.engine.wal,
+            &mut self.engine.startup_blocked,
+            transaction,
+            anchors,
+        ) {
+            Ok(session) => session,
+            Err(source) => {
+                let state = self.engine.wal.transaction_state(transaction);
+                self.engine.startup_blocked = !self.engine.wal.can_begin_staging_transaction();
+                let disposition = match state {
+                    Some(TransactionState::RecoveryRequired) => {
+                        VerifiedPurgeFailureDisposition::Terminal(
+                            TransactionState::RecoveryRequired,
+                        )
+                    }
+                    Some(TransactionState::VerifiedCommitted) if !self.engine.startup_blocked => {
+                        VerifiedPurgeFailureDisposition::NotStarted
+                    }
+                    _ => VerifiedPurgeFailureDisposition::RecoveryBlocked,
+                };
+                return Err(VerifiedPurgeError::new(
+                    transaction,
+                    "object-bound preparation",
+                    disposition,
+                    source,
+                ));
+            }
+        };
+        let held = session.authorize().map_err(|source| {
+            let state = self.engine.wal.transaction_state(transaction);
+            self.engine.startup_blocked = !self.engine.wal.can_begin_staging_transaction();
+            let disposition = match state {
+                Some(TransactionState::RecoveryRequired) => {
+                    VerifiedPurgeFailureDisposition::Terminal(TransactionState::RecoveryRequired)
+                }
+                _ => VerifiedPurgeFailureDisposition::RecoveryBlocked,
+            };
+            VerifiedPurgeError::new(
+                transaction,
+                "fresh verification and durable admission",
+                disposition,
+                source,
+            )
+        })?;
+        Ok(PurgeAuthority {
+            transaction,
+            reclamation_id: request.reclamation_id,
+            held,
+        })
     }
 
     /// Mints an opaque one-use token from the exact sealed association. A JSONL
@@ -1405,9 +1624,8 @@ impl SealedStagingEngine {
     }
 }
 
-// Purge, unlink, and deletion authorization deliberately have no callable
-// engine seam. A3c3 can finish only restore, quarantine-without-active-seals,
-// or VerifiedCommitted; `Purgeable` still requires a future independent proof.
+// `PurgeAuthority` intentionally has no unlink/delete consumer in this slice.
+// Startup treats `Purgeable` as terminal and preserves the staged object.
 
 #[cfg(test)]
 mod tests;

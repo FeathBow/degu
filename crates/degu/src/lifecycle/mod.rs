@@ -21,7 +21,7 @@ use degu_core::finding::Finding;
 use degu_core::safety::Guard;
 use degu_core::sealed_staging::{
     ForwardDirectoryIdentityProbe, ReadyStagingEngine, SealedStagingEngine, StartupRecoveryAnchors,
-    probe_forward_directory_identity,
+    VerifiedPurgeRequest, probe_forward_directory_identity,
 };
 use degu_core::store_activation::{MutationStoreActivation, UnsupportedNeverActivatedLease};
 use std::path::{Path, PathBuf};
@@ -80,8 +80,10 @@ impl Lifecycle {
         self.lock_with_forward_clean(false)
     }
 
-    pub(crate) fn lock_for_clean(self, direct_purge: bool) -> Result<MutationSession> {
-        self.lock_with_forward_clean(!direct_purge)
+    pub(crate) fn lock_for_clean(self, _direct_purge: bool) -> Result<MutationSession> {
+        // Both restorable clean and explicit clean --purge must enter the exact
+        // forward coordinator. A3c6 may mint PurgeAuthority but cannot consume it.
+        self.lock_with_forward_clean(true)
     }
 
     fn lock_with_forward_clean(self, forward_clean: bool) -> Result<MutationSession> {
@@ -132,6 +134,7 @@ impl Lifecycle {
             _mutation_lock: mutation_lock,
             sealed_staging,
             forward_clean,
+            retained_purge_authorities: Vec::new(),
             _unsupported_legacy_lease: unsupported_legacy_lease,
         })
     }
@@ -146,6 +149,9 @@ pub(crate) struct MutationSession {
     // checks but deliberately does not grant the forward coordinator deletion.
     sealed_staging: Option<ReadyStagingEngine>,
     forward_clean: bool,
+    // A3c6 has no consumer, but successful admission retains the exact held
+    // objects and WAL lease material until the mutation session ends.
+    retained_purge_authorities: Vec<degu_core::sealed_staging::PurgeAuthority>,
     _unsupported_legacy_lease: Option<UnsupportedNeverActivatedLease>,
 }
 
@@ -176,11 +182,44 @@ impl MutationSession {
         } else {
             None
         };
-        stage::execute_clean(&self.lifecycle.ctx, plan, purge, recheck, sealed_staging)
+        stage::execute_clean(
+            &self.lifecycle.ctx,
+            plan,
+            purge,
+            recheck,
+            sealed_staging,
+            &mut self.retained_purge_authorities,
+        )
     }
 
     pub(crate) fn plan_purge_all(&self) -> Result<TrashPurgePlan> {
         purge::plan_all_trash(&self.lifecycle.ctx)
+    }
+
+    /// Post-confirmation classification only. A matching sealed entry may reach
+    /// durable Purgeable, but the retained authority has no deletion consumer.
+    pub(crate) fn authorize_purge_all(&mut self, plan: &TrashPurgePlan) -> Option<String> {
+        for path in plan.entries() {
+            if self.classify_explicit_purge(path) {
+                return Some(
+                    "sealed staging recovery is blocked partway through this batch; no trash entry was deleted, and any entries admitted before the block retain durable purge authority".to_string(),
+                );
+            }
+        }
+        None
+    }
+
+    pub(crate) fn execute_explicit_purge_all(&mut self, plan: TrashPurgePlan) -> PurgeReport {
+        if let Some(reason) = self.authorize_purge_all(&plan) {
+            return PurgeReport {
+                purged: Vec::new(),
+                failed: plan
+                    .entries()
+                    .map(|path| (path.to_path_buf(), reason.clone()))
+                    .collect(),
+            };
+        }
+        self.execute_purge_all(plan)
     }
 
     pub(crate) fn execute_purge_all(&self, plan: TrashPurgePlan) -> PurgeReport {
@@ -222,6 +261,73 @@ impl MutationSession {
         let blocker =
             |path: &Path| sealed_legacy_undo_block(path, &sealed_destinations, home_authenticated);
         undo::undo_latest(&self.lifecycle.ctx, self.sealed_staging.as_mut(), &blocker)
+    }
+
+    /// Returns true only when later admissions must stop because recovery is
+    /// blocked. Nonsealed and terminal-retained entries continue classification.
+    fn classify_explicit_purge(&mut self, path: &Path) -> bool {
+        let Some(engine) = self.sealed_staging.as_mut() else {
+            return false;
+        };
+        let entries = engine.production_entries();
+        if entries.is_empty() {
+            return false;
+        }
+        let Ok(canonical_home) = std::fs::canonicalize(&self.lifecycle.ctx.home) else {
+            return true;
+        };
+        let normalized = match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => match std::fs::canonicalize(parent) {
+                Ok(parent) => parent.join(name),
+                Err(_) => return true,
+            },
+            _ => return true,
+        };
+        let Some(entry) = entries.into_iter().find(|entry| {
+            canonical_home
+                .join(entry.destination_parent().relative_path())
+                .join(entry.destination_basename())
+                == normalized
+        }) else {
+            return false;
+        };
+        if entry.state() != degu_core::authority::TransactionState::VerifiedCommitted {
+            return false;
+        }
+        let open_home = || {
+            rustix::fs::open(
+                &canonical_home,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(std::io::Error::from)
+        };
+        let (source_anchor, destination_anchor) = match (open_home(), open_home()) {
+            (Ok(source), Ok(destination)) => (source, destination),
+            (Err(_), _) | (_, Err(_)) => return true,
+        };
+        let request = VerifiedPurgeRequest::new(
+            entry.transaction(),
+            entry.reclamation_id().to_owned(),
+            source_anchor,
+            destination_anchor,
+        );
+        match engine.request_verified_purge(request) {
+            Ok(authority) => {
+                self.retained_purge_authorities.push(authority);
+                false
+            }
+            Err(error) => matches!(
+                error.disposition(),
+                degu_core::sealed_staging::VerifiedPurgeFailureDisposition::RecoveryBlocked
+                    | degu_core::sealed_staging::VerifiedPurgeFailureDisposition::Terminal(
+                        degu_core::authority::TransactionState::RecoveryRequired
+                    )
+            ),
+        }
     }
 
     /// Returns a reason only when the exact leased WAL prevents this legacy

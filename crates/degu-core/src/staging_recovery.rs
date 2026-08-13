@@ -84,7 +84,7 @@ pub(crate) enum RecoveryRebindError {
     Resolution(#[from] ResolveError),
     #[error("held recovery mutation failed: {0}")]
     Execution(#[from] LocalModeExecutionError),
-    #[error("verified undo tree no longer exactly matches the committed manifest")]
+    #[error("committed tree no longer exactly matches its sealed content manifest")]
     UndoManifestChanged,
     #[error("verified undo destination is occupied")]
     UndoDestinationOccupied,
@@ -307,6 +307,32 @@ pub(crate) struct ExactStagedVerification {
 impl ExactStagedVerification {
     pub(crate) fn transaction(&self) -> TransactionId {
         self.transaction
+    }
+}
+
+/// One-use proof minted only after fresh held-descriptor verification of the
+/// committed staged object, destination parent, locator, strong identities,
+/// sealed modes/ACL policy, and complete content manifest.
+pub(crate) struct ExactPurgeVerification {
+    transaction: TransactionId,
+    manifest: DurableTreeManifest,
+}
+
+impl ExactPurgeVerification {
+    pub(crate) fn transaction(&self) -> TransactionId {
+        self.transaction
+    }
+
+    pub(crate) fn manifest(&self) -> DurableTreeManifest {
+        self.manifest
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(transaction: TransactionId, manifest: DurableTreeManifest) -> Self {
+        Self {
+            transaction,
+            manifest,
+        }
     }
 }
 
@@ -657,6 +683,7 @@ impl RecoveryRestoreSession<'_> {
     }
 }
 
+#[derive(Debug)]
 struct ReboundVerifiedUndo {
     anchors: RecoveryAnchors,
     metadata: StagingTransactionMetadata,
@@ -675,6 +702,54 @@ pub(crate) struct VerifiedUndoRecoverySession<'a> {
     startup_blocked: &'a mut bool,
     transaction: TransactionId,
     undo: ReboundVerifiedUndo,
+}
+
+/// Held, one-use object material retained by the public PurgeAuthority. It is
+/// deliberately opaque outside the core crate and cannot be reconstructed from
+/// durable projections.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct VerifiedPurgeAuthorityMaterial {
+    committed: ReboundVerifiedUndo,
+}
+
+pub(crate) struct VerifiedPurgeSession<'a> {
+    wal: &'a mut SealWal<RecoverySession>,
+    startup_blocked: &'a mut bool,
+    transaction: TransactionId,
+    committed: ReboundVerifiedUndo,
+}
+
+impl VerifiedPurgeSession<'_> {
+    pub(crate) fn authorize(self) -> Result<VerifiedPurgeAuthorityMaterial, RecoveryRebindError> {
+        let transaction = self.transaction;
+        let verifier = VerifiedUndoRecoverySession {
+            wal: self.wal,
+            startup_blocked: self.startup_blocked,
+            transaction,
+            undo: self.committed,
+        };
+        let verified = verifier
+            .verify_exact_tree()
+            .and_then(|()| verifier.verify_purge_layout());
+        if let Err(error) = verified {
+            // A request which reached the exact committed association but found
+            // replacement, inode reuse, ACL/mode/content drift, or mount/parent
+            // namespace change can no longer be treated as a healthy terminal.
+            verifier.wal.transition_recovery_required(transaction)?;
+            *verifier.startup_blocked = true;
+            return Err(error);
+        }
+        let manifest = verifier.undo.expected_manifest;
+        verifier.wal.record_purgeable(ExactPurgeVerification {
+            transaction,
+            manifest,
+        })?;
+        *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
+        Ok(VerifiedPurgeAuthorityMaterial {
+            committed: verifier.undo,
+        })
+    }
 }
 
 impl VerifiedUndoRecoverySession<'_> {
@@ -935,6 +1010,22 @@ impl VerifiedUndoRecoverySession<'_> {
         Ok(())
     }
 
+    fn verify_purge_layout(&self) -> Result<(), RecoveryRebindError> {
+        self.undo.anchors.destination.verify_locator_binding(
+            self.undo.metadata.destination_parent(),
+            &self.undo.destination_parent,
+            self.undo.metadata.destination_parent_identity(),
+        )?;
+        certify_held_fd(
+            rustix::io::dup(&self.undo.destination_parent)
+                .map_err(io::Error::from)
+                .map_err(RecoveryRebindError::Io)?,
+        )?
+        .verify_namespace_exclusive()
+        .map_err(RecoveryRebindError::SealChanged)?;
+        self.undo.root.verify_fresh_binding()
+    }
+
     fn verify_parents_and_layout(&self, require_absent: bool) -> Result<(), RecoveryRebindError> {
         self.undo.anchors.source.verify_locator_binding(
             self.undo.metadata.source_parent(),
@@ -1176,6 +1267,52 @@ pub(crate) fn prepare_verified_undo<'a>(
             Err(RecoveryRebindError::TransactionMismatch)
         }
         Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn prepare_verified_purge<'a>(
+    wal: &'a mut SealWal<RecoverySession>,
+    startup_blocked: &'a mut bool,
+    transaction: TransactionId,
+    anchors: RecoveryAnchors,
+) -> Result<VerifiedPurgeSession<'a>, RecoveryRebindError> {
+    let snapshot = wal
+        .recovery_snapshot(transaction)
+        .ok_or(RecoveryRebindError::TransactionMismatch)?;
+    if snapshot.state != TransactionState::VerifiedCommitted {
+        return Err(RecoveryRebindError::TransactionMismatch);
+    }
+    let metadata = snapshot
+        .staging
+        .clone()
+        .ok_or(RecoveryRebindError::TransactionMismatch)?;
+    if metadata.production_association().is_none() {
+        return Err(RecoveryRebindError::TransactionMismatch);
+    }
+    let work = RecoveryWork::ResumeVerifiedUndo {
+        transaction,
+        permissions: snapshot.permissions,
+    };
+    match rebind_work(&metadata, snapshot.tree_manifest, work, &anchors) {
+        Ok(ReboundWork::VerifiedUndo(committed)) => Ok(VerifiedPurgeSession {
+            wal,
+            startup_blocked,
+            transaction,
+            committed: *committed,
+        }),
+        Ok(ReboundWork::Restore(_) | ReboundWork::VerifyStaged(_)) => {
+            Err(RecoveryRebindError::TransactionMismatch)
+        }
+        Err(error) => {
+            // Rebinding an exact committed request already detected that its
+            // durable authority projection is stale. Persist the fail-closed
+            // condition whenever the WAL remains writable.
+            if wal.transaction_state(transaction) == Some(TransactionState::VerifiedCommitted) {
+                wal.transition_recovery_required(transaction)?;
+                *startup_blocked = true;
+            }
+            Err(error)
+        }
     }
 }
 

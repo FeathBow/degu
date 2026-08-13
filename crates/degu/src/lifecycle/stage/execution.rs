@@ -101,6 +101,22 @@ impl CleanExecution {
         }
     }
 
+    pub(super) fn production_purge_authorized_retained(
+        finding: &Finding,
+        entry: PathBuf,
+        reason: String,
+    ) -> Self {
+        Self::with_state(finding, CleanState::PurgeFailed { entry, reason })
+    }
+
+    pub(super) fn production_purge_admission_failed(
+        finding: &Finding,
+        entry: PathBuf,
+        reason: String,
+    ) -> Self {
+        Self::with_state(finding, CleanState::PurgeFailed { entry, reason })
+    }
+
     pub(super) fn quarantined(finding: &Finding, entry: Option<PathBuf>, reason: String) -> Self {
         Self::with_state(finding, CleanState::Quarantined { entry, reason })
     }

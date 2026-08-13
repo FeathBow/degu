@@ -8,8 +8,8 @@
 use crate::authority::{PersistentRecoveryEvidence, TransactionState};
 use crate::local_backend::CertifiedLocalBackend;
 use crate::staging_recovery::{
-    ExactSourceParentRestoreIntent, ExactSourceParentRestored, ExactStagedVerification,
-    ExactVerifiedCommit,
+    ExactPurgeVerification, ExactSourceParentRestoreIntent, ExactSourceParentRestored,
+    ExactStagedVerification, ExactVerifiedCommit,
 };
 use crate::staging_rename::{FreshlyConfirmedSourceResident, ParentsSyncedAppliedRename};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -19,7 +19,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
 const MAGIC: &[u8; 4] = b"DSWL";
-const VERSION: u16 = 7;
+const VERSION: u16 = 8;
 const CONTENT_PROOF_MANIFEST_VERSION: u16 = 2;
 const HEADER_LEN: usize = 20;
 const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
@@ -338,6 +338,30 @@ pub enum DurableUndoRenameOutcome {
     ConfirmedCollisionAtStaged(StrongObjectIdentity),
 }
 
+/// Durable projection of the exact committed object verified before purge
+/// admission. This is replay evidence only; it never recreates held-descriptor
+/// authority after restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurablePurgeCommitment {
+    destination_parent: StagingLocator,
+    destination_parent_identity: StrongObjectIdentity,
+    destination_basename: std::ffi::OsString,
+    root_identity: StrongObjectIdentity,
+    manifest: DurableTreeManifest,
+}
+
+impl DurablePurgeCommitment {
+    fn exact(metadata: &StagingTransactionMetadata, manifest: DurableTreeManifest) -> Self {
+        Self {
+            destination_parent: metadata.destination_parent.clone(),
+            destination_parent_identity: metadata.destination_parent_identity,
+            destination_basename: metadata.destination_basename.clone(),
+            root_identity: metadata.root_identity,
+            manifest,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)] // durable schema favors explicit, allocation-free records
 pub enum SealRecord {
@@ -380,6 +404,12 @@ pub enum SealRecord {
         transaction: TransactionId,
         outcome: DurableUndoRenameOutcome,
     },
+    /// Explicit proof-gated transition. A generic State frame is never accepted
+    /// for `Purgeable`.
+    PurgeAuthorized {
+        transaction: TransactionId,
+        commitment: DurablePurgeCommitment,
+    },
 }
 
 impl SealRecord {
@@ -393,7 +423,8 @@ impl SealRecord {
             | Self::TreeManifestComplete { transaction, .. }
             | Self::RenameIntent { transaction }
             | Self::RenameOutcome { transaction, .. }
-            | Self::UndoRenameOutcome { transaction, .. } => *transaction,
+            | Self::UndoRenameOutcome { transaction, .. }
+            | Self::PurgeAuthorized { transaction, .. } => *transaction,
         }
     }
 }
@@ -774,6 +805,48 @@ impl<W: DurableWrite> SealWal<W> {
         self.transition_staging(proof.transaction(), TransactionState::VerifiedCommitted)
     }
 
+    pub(crate) fn record_purgeable(
+        &mut self,
+        proof: ExactPurgeVerification,
+    ) -> Result<(), AppendError> {
+        let transaction = proof.transaction();
+        if self.transaction_state(transaction) != Some(TransactionState::VerifiedCommitted) {
+            return Err(AppendError::InvalidState(
+                "purge admission requires VerifiedCommitted",
+            ));
+        }
+        let metadata = self
+            .staging
+            .get(&transaction)
+            .ok_or(AppendError::InvalidState(
+                "purge admission lacks staging metadata",
+            ))?;
+        if metadata.production_association().is_none() {
+            return Err(AppendError::InvalidState(
+                "purge admission requires a production association",
+            ));
+        }
+        let manifest =
+            self.manifests
+                .get(&transaction)
+                .copied()
+                .ok_or(AppendError::InvalidState(
+                    "purge admission lacks a durable manifest",
+                ))?;
+        if !manifest.has_content_proof() || manifest != proof.manifest() {
+            return Err(AppendError::InvalidState(
+                "purge admission proof differs from the committed content manifest",
+            ));
+        }
+        let commitment = DurablePurgeCommitment::exact(metadata, manifest);
+        self.append_synced(&SealRecord::PurgeAuthorized {
+            transaction,
+            commitment,
+        })?;
+        self.states.insert(transaction, TransactionState::Purgeable);
+        Ok(())
+    }
+
     pub(crate) fn record_verified_undo_intent(
         &mut self,
         transaction: TransactionId,
@@ -873,6 +946,11 @@ impl<W: DurableWrite> SealWal<W> {
         if next == TransactionState::RenameIntent {
             return Err(AppendError::InvalidState(
                 "rename intent requires its explicit durable record",
+            ));
+        }
+        if next == TransactionState::Purgeable {
+            return Err(AppendError::InvalidState(
+                "purgeable requires its explicit proof-gated durable record",
             ));
         }
         if next != TransactionState::RecoveryRequired
@@ -1998,7 +2076,7 @@ fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
             });
         }
         let version = u16::from_le_bytes([header[4], header[5]]);
-        if !matches!(version, 1 | 3 | 4 | 5 | 6 | VERSION) {
+        if !matches!(version, 1 | 3 | 4 | 5 | 6 | 7 | VERSION) {
             return Err(ReplayError::UnsupportedLegacyVersion {
                 offset: offset as u64,
                 version,
@@ -2127,11 +2205,38 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                 }
                 tx.rename_outcome = Some(outcome);
             }
+            SealRecord::PurgeAuthorized { commitment, .. } => {
+                if tx.state != Some(TransactionState::VerifiedCommitted) {
+                    return Err(ReplayError::InvalidHistory(
+                        "purge authorization is outside VerifiedCommitted",
+                    ));
+                }
+                let metadata = tx.staging.as_ref().ok_or(ReplayError::InvalidHistory(
+                    "purge authorization lacks staging metadata",
+                ))?;
+                let manifest = tx.tree_manifest.ok_or(ReplayError::InvalidHistory(
+                    "purge authorization lacks a durable manifest",
+                ))?;
+                if metadata.production_association().is_none()
+                    || !manifest.has_content_proof()
+                    || commitment != DurablePurgeCommitment::exact(metadata, manifest)
+                {
+                    return Err(ReplayError::InvalidHistory(
+                        "purge authorization does not bind the exact committed object",
+                    ));
+                }
+                tx.state = Some(TransactionState::Purgeable);
+            }
             SealRecord::State { state, .. } => {
                 if let Some(previous) = tx.state {
                     if state == TransactionState::RenameIntent {
                         return Err(ReplayError::InvalidHistory(
                             "rename intent must use its explicit record",
+                        ));
+                    }
+                    if state == TransactionState::Purgeable {
+                        return Err(ReplayError::InvalidHistory(
+                            "purgeable must use its explicit authorization record",
                         ));
                     }
                     if state != TransactionState::RecoveryRequired
@@ -2620,7 +2725,7 @@ fn valid_transition(from: TransactionState, to: TransactionState) -> bool {
             | (S::SourceParentRestoreIntent, S::SourceParentRestored)
             | (S::SourceParentRestored, S::VerifiedCommitted)
             // Verified undo is an independent committed-tree protocol.
-            | (S::VerifiedCommitted, S::UndoIntent)
+            | (S::VerifiedCommitted, S::UndoIntent | S::Purgeable)
             | (S::UndoIntent, S::UndoModesRestored)
             | (S::UndoModesRestored, S::UndoRenameIntent)
             | (S::UndoRenameIntent, S::Restored | S::UndoConflict)
@@ -2665,7 +2770,8 @@ fn valid_transition(from: TransactionState, to: TransactionState) -> bool {
                     | S::Quarantined
                     | S::UndoIntent
                     | S::UndoModesRestored
-                    | S::UndoRenameIntent,
+                    | S::UndoRenameIntent
+                    | S::VerifiedCommitted,
                 S::RecoveryRequired
             )
     )
@@ -2797,6 +2903,20 @@ fn encode_record(record: &SealRecord) -> Result<Vec<u8>, FrameError> {
                 }
             }
         }
+        SealRecord::PurgeAuthorized {
+            transaction,
+            commitment,
+        } => {
+            bytes.push(10);
+            bytes.extend_from_slice(&transaction.0);
+            encode_locator(&mut bytes, &commitment.destination_parent)?;
+            encode_strong_identity(&mut bytes, commitment.destination_parent_identity);
+            put_bytes(&mut bytes, commitment.destination_basename.as_bytes())?;
+            encode_strong_identity(&mut bytes, commitment.root_identity);
+            bytes.extend_from_slice(&commitment.manifest.schema_version.to_le_bytes());
+            bytes.extend_from_slice(&commitment.manifest.entry_count.to_le_bytes());
+            bytes.extend_from_slice(&commitment.manifest.sha256);
+        }
     }
     if bytes.len() > MAX_PAYLOAD_LEN {
         return Err(FrameError::PayloadTooLarge {
@@ -2923,6 +3043,20 @@ fn decode_record(payload: &[u8], offset: u64, version: u16) -> Result<SealRecord
                 outcome,
             }
         }
+        10 if version >= 8 => SealRecord::PurgeAuthorized {
+            transaction,
+            commitment: DurablePurgeCommitment {
+                destination_parent: decode_locator(&mut cursor, offset)?,
+                destination_parent_identity: decode_strong_identity(&mut cursor, version)?,
+                destination_basename: std::ffi::OsString::from_vec(cursor.bytes()?),
+                root_identity: decode_strong_identity(&mut cursor, version)?,
+                manifest: DurableTreeManifest {
+                    schema_version: cursor.u16()?,
+                    entry_count: cursor.u64()?,
+                    sha256: cursor.array_32()?,
+                },
+            },
+        },
         _ => {
             return Err(ReplayError::Malformed {
                 offset,

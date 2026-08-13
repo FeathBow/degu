@@ -19,7 +19,7 @@ pub(super) fn run(json: bool, yes: bool, ui: Ui) -> Result<()> {
     if json && !yes {
         anyhow::bail!("--json requires --yes");
     }
-    let session = Lifecycle::new(&ctx).lock()?;
+    let mut session = Lifecycle::new(&ctx).lock()?;
     let plan = session.plan_purge_all()?;
     if json {
         validate_json_plan(&plan)?;
@@ -57,7 +57,9 @@ pub(super) fn run(json: bool, yes: bool, ui: Ui) -> Result<()> {
         .map_err(|error| anyhow::anyhow!("invalid trash-purge observation contract: {error:?}"))?;
         let mut probe = crate::quota::probe;
         let (report, completed) = coordinate(action, &mut probe, || {
-            let report = session.execute_purge_all(plan);
+            // Admission is itself a durable post-confirmation mutation, so it
+            // belongs inside the same quota observation boundary as execution.
+            let report = session.execute_explicit_purge_all(plan);
             let outcome = crate::commands::purge_outcome(&report);
             (report, outcome)
         });

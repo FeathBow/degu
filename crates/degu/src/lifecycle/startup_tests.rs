@@ -76,6 +76,19 @@ fn clean_lock_selects_forward_staging_only_for_restorable_clean() {
 }
 
 #[test]
+fn restored_association_no_longer_blocks_legacy_mutation() {
+    assert!(!sealed_mutation_authority_active(
+        degu_core::authority::TransactionState::Restored
+    ));
+    assert!(sealed_mutation_authority_active(
+        degu_core::authority::TransactionState::VerifiedCommitted
+    ));
+    assert!(sealed_mutation_authority_active(
+        degu_core::authority::TransactionState::UndoConflict
+    ));
+}
+
+#[test]
 fn production_locator_selection_has_no_home_or_xdg_input() {
     let first = degu_core::store_activation::ActivationAnchorLocator::for_current_euid().unwrap();
     let changed_home = Path::new("/tmp/degu-home-trap");
@@ -201,10 +214,37 @@ fn production_clean_reaches_verified_commit_and_keeps_jsonl_diagnostic_only() {
     assert_eq!(records[0].outcome, OpOutcome::Ok);
     let json = serde_json::to_value(&records[0]).unwrap();
     assert!(json.get("transaction").is_none());
+
+    // Before undo authority is minted, the c2 gate still blocks legacy purge.
+    let purge = session.execute_purge_all(session.plan_purge_all().unwrap());
+    assert!(purge.purged.is_empty());
+    assert_eq!(purge.failed.len(), 1);
+    assert!(staged.is_dir());
+
+    // Remove the entire reporting projection. The leased WAL must still select
+    // and authorize the exact group without reconstructing authority from JSONL.
+    std::fs::rename(
+        ctx.xdg_state().join("degu/ops.jsonl"),
+        ctx.xdg_state().join("degu/ops.detached"),
+    )
+    .unwrap();
+    let undo = session.undo_latest().unwrap().unwrap();
+    assert_eq!(undo.restored.len(), 1);
+    assert!(undo.failed.is_empty());
+    assert!(source.is_dir());
+    assert!(!staged.exists());
+    assert_eq!(std::fs::read(source.join("payload")).unwrap(), b"sealed");
+
+    let records = session.lifecycle.operations().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].action, degu_core::oplog::OpAction::Restore);
+    assert_eq!(records[0].outcome, OpOutcome::Ok);
+    let json = serde_json::to_value(&records[0]).unwrap();
+    assert!(json.get("transaction").is_none());
 }
 
 #[test]
-fn exact_wal_association_blocks_purge_and_undo_without_jsonl_authority() {
+fn forged_jsonl_mapping_cannot_steal_wal_undo_authority() {
     let (_temp, ctx) = context();
     let source_parent = ctx.home.join("source-parent");
     let source = source_parent.join("root");
@@ -248,13 +288,31 @@ fn exact_wal_association_blocks_purge_and_undo_without_jsonl_authority() {
     assert!(staged.is_dir());
 
     let lock = std::fs::File::create(ctx.xdg_state().join("degu/test-session-lock")).unwrap();
-    let session = MutationSession {
+    let mut session = MutationSession {
         lifecycle: Lifecycle::new(&ctx),
         _mutation_lock: lock,
         sealed_staging: Some(ready),
         forward_clean: false,
         _unsupported_legacy_lease: None,
     };
+
+    // Snapshot blockers retain strong identity, so a different current name
+    // cannot route the exact WAL-bound object into legacy undo.
+    let identity = session
+        .sealed_staging
+        .as_ref()
+        .unwrap()
+        .production_entries()[0]
+        .root_identity();
+    let alternate = trash_parent.join("alternate-sealed-name");
+    std::fs::rename(&staged, &alternate).unwrap();
+    let reason = sealed_legacy_undo_block(&alternate, &[(Some(staged.clone()), identity)], true)
+        .expect("strong identity match did not block the alternate name");
+    assert!(reason.contains("exact object"));
+    let reason = sealed_legacy_undo_block(&alternate, &[(None, identity)], false)
+        .expect("HOME authentication failure dropped the active strong identity");
+    assert!(reason.contains("exact object"));
+    std::fs::rename(&alternate, &staged).unwrap();
 
     // WAL alone blocks purge before a claim, even with no JSONL record.
     let plan = session.plan_purge_all().unwrap();
@@ -264,15 +322,17 @@ fn exact_wal_association_blocks_purge_and_undo_without_jsonl_authority() {
     assert!(purge.failed[0].1.contains("sealed-staging WAL"));
     assert!(staged.is_dir());
     assert!(!trash_parent.join(".claims").exists());
+    assert!(session.lifecycle.operations().unwrap().is_empty());
 
-    // A plausible legacy JSONL record cannot steal undo authority from WAL.
-    let original = ctx.home.join("restored-cache");
+    // A plausible record with the genuine group and trash destination but a
+    // forged source mapping cannot select or authorize WAL undo.
+    let forged_original = ctx.home.join("forged-restored-cache");
     let record = serde_json::json!({
         "ts": "2000-01-01T00:00:00Z",
         "tool_version": "0.0.0",
         "command": "clean",
         "action": "trash",
-        "path": original,
+        "path": forged_original,
         "bytes_allocated": 1,
         "inodes": 1,
         "trash_entry": staged,
@@ -282,13 +342,38 @@ fn exact_wal_association_blocks_purge_and_undo_without_jsonl_authority() {
         "outcome": "ok"
     });
     let log_path = ctx.xdg_state().join("degu/ops.jsonl");
-    std::fs::write(&log_path, format!("{record}\n")).unwrap();
+    let unrelated_trash = trash_parent.join("9999-unrelated");
+    std::fs::create_dir(&unrelated_trash).unwrap();
+    let unrelated_original = ctx.home.join("unrelated-original");
+    let newer_unrelated = serde_json::json!({
+        "ts": "2000-01-02T00:00:00Z",
+        "tool_version": "0.0.0",
+        "command": "clean",
+        "action": "trash",
+        "path": unrelated_original,
+        "bytes_allocated": 1,
+        "inodes": 1,
+        "trash_entry": unrelated_trash,
+        "reclamation_id": "newer-unrelated-group",
+        "expected_identity": ObjectIdentity::capture(&unrelated_trash).unwrap(),
+        "destination_parent": ObjectIdentity::capture(&ctx.home).unwrap(),
+        "outcome": "ok"
+    });
+    std::fs::write(&log_path, format!("{record}\n{newer_unrelated}\n")).unwrap();
     let before = std::fs::read(&log_path).unwrap();
+
+    // The newer unrelated group must not hide the forged member of the exact
+    // WAL-selected reclamation group.
     let undo = session.undo_latest().unwrap().unwrap();
     assert!(undo.restored.is_empty());
-    assert_eq!(undo.failed.len(), 1);
-    assert!(undo.failed[0].reason.contains("sealed-staging WAL"));
+    assert!(!undo.failed.is_empty());
+    assert!(
+        undo.failed
+            .iter()
+            .all(|failed| failed.reason.contains("mixes legacy/unmapped"))
+    );
     assert_eq!(std::fs::read(&log_path).unwrap(), before);
     assert!(staged.is_dir());
-    assert!(!original.exists());
+    assert!(!source.exists());
+    assert!(!forged_original.exists());
 }

@@ -520,6 +520,14 @@ pub enum TransactionState {
     SourceParentRestored,
     StagedSealed,
     VerifiedCommitted,
+    /// Durable admission of an object-bound undo from `VerifiedCommitted`.
+    UndoIntent,
+    /// Every committed tree seal has a durable applied inverse at the staged name.
+    UndoModesRestored,
+    /// The FD-relative no-replace rename-back is about to be attempted.
+    UndoRenameIntent,
+    /// A no-replace collision was durably confirmed without moving the staged tree.
+    UndoConflict,
     Purgeable,
     Purged,
     RollbackIntent,
@@ -534,7 +542,13 @@ impl TransactionState {
     pub fn writer_acceptance_expired(self) -> bool {
         matches!(
             self,
-            Self::VerifiedCommitted | Self::Purgeable | Self::Purged
+            Self::VerifiedCommitted
+                | Self::UndoIntent
+                | Self::UndoModesRestored
+                | Self::UndoRenameIntent
+                | Self::UndoConflict
+                | Self::Purgeable
+                | Self::Purged
         )
     }
 }

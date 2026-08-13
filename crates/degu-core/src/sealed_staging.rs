@@ -18,7 +18,7 @@ use crate::seal_wal::{
 use crate::staging_recovery::{
     RecoveryAnchors, RecoveryFilesystemAnchor, RecoveryRebindError, StagedVerificationFailure,
     StagedVerificationOutcome, StartupRecoveryCapability, certify_verified_commit,
-    prepare_startup_recovery, recovery_transaction, strong_identity_fd,
+    prepare_startup_recovery, prepare_verified_undo, recovery_transaction, strong_identity_fd,
 };
 use crate::staging_rename::{
     PreparedRootBinding, StagedUnverifiedTree, StagingRenameError, execute_prepared_rename,
@@ -309,6 +309,95 @@ impl ForwardStagingCommit {
     }
 }
 
+/// Opaque, one-use authority for the exact WAL association and transaction.
+/// It can only be minted while that transaction is `VerifiedCommitted`.
+#[derive(Debug)]
+pub struct VerifiedUndoToken {
+    transaction: TransactionId,
+    reclamation_id: String,
+}
+
+/// Raw filesystem anchors for verified undo. Construction is authority-neutral;
+/// the engine independently certifies and retains every exact parent/object FD.
+#[derive(Debug)]
+pub struct VerifiedUndoRequest {
+    source_anchor: OwnedFd,
+    destination_anchor: OwnedFd,
+}
+
+impl VerifiedUndoRequest {
+    pub fn new(source_anchor: OwnedFd, destination_anchor: OwnedFd) -> Self {
+        Self {
+            source_anchor,
+            destination_anchor,
+        }
+    }
+
+    fn certify(
+        self,
+        metadata: &StagingTransactionMetadata,
+    ) -> Result<RecoveryAnchors, RecoveryRebindError> {
+        StartupRecoveryAnchors::new(self.source_anchor, self.destination_anchor).certify(metadata)
+    }
+}
+
+#[derive(Debug)]
+pub struct VerifiedUndoCommit {
+    transaction: TransactionId,
+}
+
+impl VerifiedUndoCommit {
+    pub fn transaction(&self) -> TransactionId {
+        self.transaction
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifiedUndoFailureDisposition {
+    NotStarted,
+    Terminal(TransactionState),
+    RecoveryBlocked,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("verified undo for {transaction:?} failed during {stage}: {source}")]
+pub struct VerifiedUndoError {
+    transaction: TransactionId,
+    stage: &'static str,
+    disposition: VerifiedUndoFailureDisposition,
+    #[source]
+    source: BoxError,
+}
+
+impl VerifiedUndoError {
+    fn new<E>(
+        transaction: TransactionId,
+        stage: &'static str,
+        disposition: VerifiedUndoFailureDisposition,
+        source: E,
+    ) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self {
+            transaction,
+            stage,
+            disposition,
+            source: Box::new(source),
+        }
+    }
+
+    pub fn transaction(&self) -> TransactionId {
+        self.transaction
+    }
+    pub fn stage(&self) -> &'static str {
+        self.stage
+    }
+    pub fn disposition(&self) -> VerifiedUndoFailureDisposition {
+        self.disposition
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardFailureDisposition {
     /// The request wrote no transaction frame and performed no permission or
@@ -411,6 +500,8 @@ impl ForwardStagingError {
 pub struct ProductionStagingEntry {
     transaction: TransactionId,
     state: TransactionState,
+    source_parent: crate::seal_wal::StagingLocator,
+    source_basename: std::ffi::OsString,
     destination_parent: crate::seal_wal::StagingLocator,
     destination_basename: std::ffi::OsString,
     root_identity: StrongObjectIdentity,
@@ -424,6 +515,14 @@ impl ProductionStagingEntry {
 
     pub fn state(&self) -> TransactionState {
         self.state
+    }
+
+    pub fn source_parent(&self) -> &crate::seal_wal::StagingLocator {
+        &self.source_parent
+    }
+
+    pub fn source_basename(&self) -> &std::ffi::OsStr {
+        &self.source_basename
     }
 
     pub fn destination_parent(&self) -> &crate::seal_wal::StagingLocator {
@@ -465,6 +564,8 @@ impl ReadyStagingEngine {
                 Some(ProductionStagingEntry {
                     transaction: snapshot.id,
                     state: snapshot.state,
+                    source_parent: metadata.source_parent().clone(),
+                    source_basename: metadata.source_basename().to_os_string(),
                     destination_parent: metadata.destination_parent().clone(),
                     destination_basename: metadata.destination_basename().to_os_string(),
                     root_identity: metadata.root_identity(),
@@ -472,6 +573,121 @@ impl ReadyStagingEngine {
                 })
             })
             .collect()
+    }
+
+    /// Mints an opaque one-use token from the exact sealed association. A JSONL
+    /// transaction reference, path, or reclamation id alone can never mint it.
+    pub fn verified_undo_token(
+        &self,
+        transaction: TransactionId,
+        reclamation_id: &str,
+    ) -> Option<VerifiedUndoToken> {
+        let snapshot = self.engine.wal.recovery_snapshot(transaction)?;
+        let association = snapshot.staging?.production_association()?.clone();
+        let content_proven = snapshot.tree_manifest?.has_content_proof();
+        (snapshot.state == TransactionState::VerifiedCommitted
+            && content_proven
+            && association.reclamation_id() == reclamation_id)
+            .then(|| VerifiedUndoToken {
+                transaction,
+                reclamation_id: reclamation_id.to_owned(),
+            })
+    }
+
+    /// Restores one exact committed tree's modes at the staged name before an
+    /// FD-relative no-replace rename-back and dual-parent fsync. The token and
+    /// immutable mapping are consumed together under this exact WAL lease.
+    pub fn undo_verified(
+        &mut self,
+        token: VerifiedUndoToken,
+        request: VerifiedUndoRequest,
+    ) -> Result<VerifiedUndoCommit, VerifiedUndoError> {
+        let transaction = token.transaction;
+        let snapshot = self
+            .engine
+            .wal
+            .recovery_snapshot(transaction)
+            .ok_or_else(|| {
+                VerifiedUndoError::new(
+                    transaction,
+                    "token validation",
+                    VerifiedUndoFailureDisposition::NotStarted,
+                    io::Error::other(
+                        "verified undo transaction is absent from the exact leased WAL",
+                    ),
+                )
+            })?;
+        let metadata = snapshot.staging.clone().ok_or_else(|| {
+            VerifiedUndoError::new(
+                transaction,
+                "token validation",
+                VerifiedUndoFailureDisposition::NotStarted,
+                io::Error::other("verified undo transaction has no sealed mapping"),
+            )
+        })?;
+        if snapshot.state != TransactionState::VerifiedCommitted
+            || metadata
+                .production_association()
+                .map(ProductionAssociation::reclamation_id)
+                != Some(token.reclamation_id.as_str())
+        {
+            return Err(VerifiedUndoError::new(
+                transaction,
+                "token validation",
+                VerifiedUndoFailureDisposition::NotStarted,
+                io::Error::other("verified undo token no longer matches committed authority"),
+            ));
+        }
+        let anchors = request.certify(&metadata).map_err(|source| {
+            VerifiedUndoError::new(
+                transaction,
+                "anchor certification",
+                VerifiedUndoFailureDisposition::NotStarted,
+                source,
+            )
+        })?;
+        let undo = prepare_verified_undo(
+            &mut self.engine.wal,
+            &mut self.engine.startup_blocked,
+            transaction,
+            anchors,
+        )
+        .map_err(|source| {
+            VerifiedUndoError::new(
+                transaction,
+                "object-bound preparation",
+                VerifiedUndoFailureDisposition::NotStarted,
+                source,
+            )
+        })?;
+        match undo.execute() {
+            Ok(TransactionState::Restored) => Ok(VerifiedUndoCommit { transaction }),
+            Ok(state) => Err(VerifiedUndoError::new(
+                transaction,
+                "no-replace rename-back",
+                VerifiedUndoFailureDisposition::Terminal(state),
+                io::Error::other(format!("verified undo reached {state:?}")),
+            )),
+            Err(source) => {
+                let state = self.engine.wal.transaction_state(transaction);
+                self.engine.startup_blocked = !self.engine.wal.can_begin_staging_transaction();
+                let disposition = match state {
+                    Some(TransactionState::Restored | TransactionState::UndoConflict) => {
+                        VerifiedUndoFailureDisposition::Terminal(state.unwrap())
+                    }
+                    Some(TransactionState::VerifiedCommitted) => {
+                        VerifiedUndoFailureDisposition::NotStarted
+                    }
+                    _ => VerifiedUndoFailureDisposition::RecoveryBlocked,
+                };
+                Err(VerifiedUndoError::new(
+                    transaction,
+                    "held-descriptor execution",
+                    disposition,
+                    source,
+                ))
+            }
+        }
     }
 
     /// Executes one complete forward transaction under this engine's exact WAL
@@ -651,6 +867,8 @@ fn recovery_work_requires_candidate(work: &RecoveryWork) -> bool {
             | RecoveryWork::RestoreQuarantinedSeals { .. }
             | RecoveryWork::ResolveUncertainPermissions { .. }
             | RecoveryWork::FinalizeVerifiedCommit { .. }
+            | RecoveryWork::ResumeVerifiedUndo { .. }
+            | RecoveryWork::FinalizeVerifiedUndo { .. }
             | RecoveryWork::RecoveryRequired { .. }
     )
 }
@@ -852,13 +1070,16 @@ impl SealedStagingEngine {
     }
 
     fn current_recovery_transactions(&self) -> Vec<TransactionId> {
-        self.wal
+        let mut transactions = self
+            .wal
             .recovery_snapshots()
             .iter()
             .map(|transaction| decide_recovery(transaction, |_| RecoveryIdentity::Reestablished))
             .filter(recovery_work_requires_candidate)
             .map(|work| recovery_transaction(&work))
-            .collect()
+            .collect::<Vec<_>>();
+        transactions.sort();
+        transactions
     }
 
     #[cfg(test)]
@@ -964,6 +1185,27 @@ impl SealedStagingEngine {
                 self.startup_blocked = !self.wal.can_begin_staging_transaction();
                 continue;
             }
+            if let RecoveryWork::FinalizeVerifiedUndo { outcome, .. } = work {
+                let terminal = match outcome {
+                    crate::seal_wal::DurableUndoRenameOutcome::AppliedAndParentsSynced(_) => {
+                        TransactionState::Restored
+                    }
+                    crate::seal_wal::DurableUndoRenameOutcome::ConfirmedCollisionAtStaged(_) => {
+                        TransactionState::UndoConflict
+                    }
+                };
+                self.wal
+                    .record_undo_terminal(transaction, terminal)
+                    .map_err(|error| {
+                        StartupRecoveryError::new(
+                            Some(transaction),
+                            "verified undo finalization",
+                            error,
+                        )
+                    })?;
+                self.startup_blocked = !self.wal.can_begin_staging_transaction();
+                continue;
+            }
 
             let metadata = snapshot.staging.clone().ok_or_else(|| {
                 StartupRecoveryError::new(
@@ -1028,6 +1270,15 @@ impl SealedStagingEngine {
                         }
                     }
                 }
+                StartupRecoveryCapability::VerifiedUndo(undo) => {
+                    undo.execute().map_err(|error| {
+                        StartupRecoveryError::new(
+                            Some(transaction),
+                            "verified undo recovery",
+                            error,
+                        )
+                    })?;
+                }
             }
 
             if let Some(state) = self.safe_terminal_state(transaction) {
@@ -1068,6 +1319,7 @@ impl SealedStagingEngine {
             | TransactionState::Purgeable
             | TransactionState::Purged
             | TransactionState::Restored
+            | TransactionState::UndoConflict
             | TransactionState::RolledBack) => Some(state),
             TransactionState::Quarantined
                 if !quarantined_transaction_retains_active_permission_seals(&snapshot) =>

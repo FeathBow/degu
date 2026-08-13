@@ -50,7 +50,7 @@ struct LogFailureJson<'a> {
 
 pub(crate) fn run(json: bool, ui: crate::runtime::Ui) -> Result<()> {
     let ctx = degu_core::ecosystem::DetectCtx::from_process()?;
-    let session = Lifecycle::new(&ctx).lock()?;
+    let mut session = Lifecycle::new(&ctx).lock()?;
     let Some(report) = session.undo_latest()? else {
         print_none(json)?;
         return Ok(());

@@ -275,6 +275,7 @@ fn active_seals_in_quarantine_block_runtime_and_reopen() {
             .complete_tree_manifest(
                 transaction,
                 DurableTreeManifest {
+                    schema_version: 2,
                     entry_count: 1,
                     sha256: [0x88; 32],
                 },
@@ -342,6 +343,7 @@ fn permission_and_path_workload_limits_are_checked_before_rebind() {
         staging: Some(metadata()),
         tree_manifest: None,
         rename_outcome: None,
+        undo_rename_outcome: None,
     };
     assert!(validate_recovery_workload(&snapshot).is_err());
 

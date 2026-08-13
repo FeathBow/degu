@@ -514,6 +514,7 @@ fn uncertain_inverse_intents_resolve_before_and_after_fchmod_in_every_restore_ph
             wal.complete_tree_manifest(
                 transaction,
                 DurableTreeManifest {
+                    schema_version: 2,
                     entry_count: 1,
                     sha256: [case_index as u8; 32],
                 },
@@ -760,6 +761,7 @@ fn exact_staging_snapshot_restores_all_applied_permissions_and_reaches_restored(
     wal.complete_tree_manifest(
         transaction,
         DurableTreeManifest {
+            schema_version: 2,
             entry_count: 1,
             sha256: [0xa3; 32],
         },
@@ -874,6 +876,7 @@ fn quarantined_active_seals_restore_in_place_and_unblock_without_unquarantining(
     wal.complete_tree_manifest(
         transaction,
         DurableTreeManifest {
+            schema_version: 2,
             entry_count: 1,
             sha256: [0xd4; 32],
         },
@@ -964,6 +967,7 @@ fn unknown_rename_is_durably_blocked_without_any_namespace_lookup() {
     wal.complete_tree_manifest(
         transaction,
         DurableTreeManifest {
+            schema_version: 2,
             entry_count: 0,
             sha256: [0xc3; 32],
         },
@@ -1104,6 +1108,7 @@ fn staged_pending(
     .ok()?;
     let fingerprint = inventory.fingerprint();
     let manifest = DurableTreeManifest {
+        schema_version: 2,
         entry_count: fingerprint.entry_count,
         sha256: if manifest_matches {
             fingerprint.sha256

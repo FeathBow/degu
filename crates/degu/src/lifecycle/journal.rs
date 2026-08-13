@@ -103,6 +103,31 @@ pub(super) fn purge_record(request: PurgeRecord<'_>) -> OpRecord {
     })
 }
 
+pub(super) struct VerifiedRestoreRecord<'a> {
+    pub(super) path: &'a Path,
+    pub(super) trash_entry: &'a Path,
+    pub(super) reclamation_id: &'a str,
+    pub(super) outcome: OpOutcome,
+}
+
+/// Builds a reporting-only projection after the leased WAL has durably reached
+/// `Restored`. The existing JSONL schema deliberately carries no transaction
+/// identifier and cannot mint sealed-staging authority.
+pub(super) fn verified_restore_record(request: VerifiedRestoreRecord<'_>) -> OpRecord {
+    stamped_record(RecordFields {
+        command: "undo".to_string(),
+        action: OpAction::Restore,
+        path: request.path.to_path_buf(),
+        bytes_allocated: 0,
+        inodes: 0,
+        trash_entry: Some(request.trash_entry.to_path_buf()),
+        reclamation_id: Some(request.reclamation_id.to_owned()),
+        expected_identity: None,
+        destination_parent: None,
+        outcome: request.outcome,
+    })
+}
+
 pub(super) struct RestoreRecord<'a> {
     pub(super) target: &'a OpRecord,
     pub(super) trash_entry: &'a Path,

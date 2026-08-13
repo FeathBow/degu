@@ -213,12 +213,28 @@ fn execute_local_mode_mutation_inner<W: DurableWrite>(
     };
 
     let mut held_outcome = None;
+    #[cfg(test)]
+    let is_inverse = reverses_mutation_id.is_some();
     let mutate = || {
         // A1 invokes this closure only after synchronizing the exact permission
         // intent constructed from `prepared` above.
+        #[cfg(test)]
+        if is_inverse
+            && crate::staging_recovery::UNDO_FAIL_STEP
+                .with(|step| step.get() == Some("inverse-intent"))
+        {
+            return Err(io::Error::other("injected crash after inverse intent"));
+        }
         let outcome = held.apply_wal_bound_mode_change(prepared);
         let verified = matches!(outcome, HeldModeChangeOutcome::AppliedVerified { .. });
         held_outcome = Some(outcome);
+        #[cfg(test)]
+        if is_inverse
+            && crate::staging_recovery::UNDO_FAIL_STEP
+                .with(|step| step.get() == Some("inverse-fchmod"))
+        {
+            return Err(io::Error::other("injected crash after inverse fchmod"));
+        }
         if verified {
             Ok(())
         } else {

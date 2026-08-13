@@ -3,6 +3,7 @@ use crate::seal_store::SealWalStore;
 use crate::seal_wal::{DurableRenameOutcome, ProductionAssociation};
 use crate::sealed_staging::{
     ForwardFailureDisposition, SealedStagingEngine, StartupRecoveryAnchors,
+    VerifiedUndoFailureDisposition, VerifiedUndoRequest,
 };
 use crate::staging_recovery::{
     RecoveryAnchors, RecoveryFilesystemAnchor, StagedVerificationOutcome, StartupRecoveryCapability,
@@ -237,6 +238,381 @@ fn forward_coordinator_reaches_verified_commit_before_returning() {
     assert_eq!(mode(&fixture.source_parent), 0o770);
     assert_eq!(mode(&fixture.destination_root), 0o750);
     assert_eq!(mode(&fixture.destination_root.join("child")), 0o750);
+}
+
+fn stage_production(
+    fixture: &Fixture,
+    transaction: TransactionId,
+) -> crate::sealed_staging::ReadyStagingEngine {
+    set_mode(&fixture.source_parent, 0o700);
+    let mut ready = fixture.ready_engine();
+    let association = crate::seal_wal::ProductionAssociation::new("undo-group".into()).unwrap();
+    ready
+        .stage_to_verified_commit(
+            transaction,
+            fixture
+                .forward_request("root", "staged")
+                .with_production_association(association),
+        )
+        .unwrap();
+    ready
+}
+
+fn verified_undo_request(fixture: &Fixture) -> VerifiedUndoRequest {
+    VerifiedUndoRequest::new(
+        std::fs::File::open(&fixture.base).unwrap().into(),
+        std::fs::File::open(&fixture.base).unwrap().into(),
+    )
+}
+
+#[test]
+fn verified_undo_restores_committed_modes_before_fd_relative_rename_back() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xd8; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    assert_eq!(mode(&fixture.destination_root), 0o750);
+    assert_eq!(mode(&fixture.destination_root.join("child")), 0o750);
+
+    let token = ready
+        .verified_undo_token(transaction, "undo-group")
+        .unwrap();
+    let commit = ready
+        .undo_verified(token, verified_undo_request(&fixture))
+        .unwrap();
+
+    assert_eq!(commit.transaction(), transaction);
+    assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+    assert!(fixture.source_root.is_dir());
+    assert!(!fixture.destination_root.exists());
+    assert_eq!(mode(&fixture.source_root), 0o770);
+    assert_eq!(mode(&fixture.source_root.join("child")), 0o770);
+    assert_eq!(
+        std::fs::read(fixture.source_root.join("child/data")).unwrap(),
+        b"sealed staging"
+    );
+    assert!(
+        ready
+            .verified_undo_token(transaction, "undo-group")
+            .is_none()
+    );
+}
+
+#[test]
+fn verified_undo_preexisting_collision_never_replaces_or_writes_intent() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xd9; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    std::fs::create_dir(&fixture.source_root).unwrap();
+    std::fs::write(fixture.source_root.join("replacement"), b"foreign").unwrap();
+
+    let token = ready
+        .verified_undo_token(transaction, "undo-group")
+        .unwrap();
+    let error = ready
+        .undo_verified(token, verified_undo_request(&fixture))
+        .unwrap_err();
+
+    assert_eq!(
+        error.disposition(),
+        VerifiedUndoFailureDisposition::NotStarted
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    assert_eq!(
+        std::fs::read(fixture.source_root.join("replacement")).unwrap(),
+        b"foreign"
+    );
+    assert!(fixture.destination_root.is_dir());
+    // A pre-existing collision is rejected before UndoIntent or mode mutation.
+    assert_eq!(mode(&fixture.destination_root), 0o750);
+    assert_eq!(mode(&fixture.destination_root.join("child")), 0o750);
+}
+
+#[test]
+fn verified_undo_noreplace_race_reaches_durable_undo_conflict() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xdb; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let collision = fixture.source_root.clone();
+    crate::staging_recovery::BEFORE_UNDO_RENAME.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            std::fs::create_dir(&collision).unwrap();
+            std::fs::write(collision.join("replacement"), b"foreign").unwrap();
+        }));
+    });
+
+    let token = ready
+        .verified_undo_token(transaction, "undo-group")
+        .unwrap();
+    let error = ready
+        .undo_verified(token, verified_undo_request(&fixture))
+        .unwrap_err();
+
+    assert_eq!(
+        error.disposition(),
+        VerifiedUndoFailureDisposition::Terminal(TransactionState::UndoConflict)
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::UndoConflict)
+    );
+    assert_eq!(
+        std::fs::read(fixture.source_root.join("replacement")).unwrap(),
+        b"foreign"
+    );
+    assert!(fixture.destination_root.is_dir());
+    assert_eq!(mode(&fixture.destination_root), 0o770);
+    assert_eq!(mode(&fixture.destination_root.join("child")), 0o770);
+    drop(ready);
+
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty());
+    assert_eq!(
+        engine.state(transaction),
+        Some(TransactionState::UndoConflict)
+    );
+}
+
+#[test]
+fn verified_undo_content_drift_fails_before_durable_undo_intent() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xdc; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    // Same byte length defeats size-only manifests; the content digest and
+    // fresh ctime/mtime evidence must still refuse undo.
+    std::fs::write(
+        fixture.destination_root.join("child/data"),
+        b"evil!! staging",
+    )
+    .unwrap();
+
+    let token = ready
+        .verified_undo_token(transaction, "undo-group")
+        .unwrap();
+    let error = ready
+        .undo_verified(token, verified_undo_request(&fixture))
+        .unwrap_err();
+    assert_eq!(
+        error.disposition(),
+        VerifiedUndoFailureDisposition::NotStarted
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    assert!(!fixture.source_root.exists());
+    assert!(fixture.destination_root.is_dir());
+}
+
+#[test]
+fn verified_undo_mode_drift_fails_before_durable_undo_intent() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xda; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    set_mode(&fixture.destination_root.join("child"), 0o700);
+
+    let token = ready
+        .verified_undo_token(transaction, "undo-group")
+        .unwrap();
+    let error = ready
+        .undo_verified(token, verified_undo_request(&fixture))
+        .unwrap_err();
+
+    assert_eq!(
+        error.disposition(),
+        VerifiedUndoFailureDisposition::NotStarted
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    assert!(!fixture.source_root.exists());
+    assert!(fixture.destination_root.is_dir());
+}
+
+#[test]
+fn verified_undo_crash_boundaries_replay_without_path_guessing() {
+    for (index, step) in [
+        "intent",
+        "inverse-intent",
+        "inverse-fchmod",
+        "modes",
+        "outcome",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let transaction = TransactionId([0xe0 + index as u8; 16]);
+        let mut ready = stage_production(&fixture, transaction);
+        let token = ready
+            .verified_undo_token(transaction, "undo-group")
+            .unwrap();
+        crate::staging_recovery::UNDO_FAIL_STEP.with(|slot| slot.set(Some(step)));
+        let error = ready
+            .undo_verified(token, verified_undo_request(&fixture))
+            .unwrap_err();
+        crate::staging_recovery::UNDO_FAIL_STEP.with(|slot| slot.set(None));
+        assert_eq!(
+            error.disposition(),
+            VerifiedUndoFailureDisposition::RecoveryBlocked
+        );
+        drop(ready);
+
+        let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+        assert_eq!(report.candidates().len(), 1, "step={step}");
+        let (ready, summary) = engine
+            .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+            .unwrap();
+        assert_eq!(summary.recovered.len(), 1);
+        assert_eq!(
+            ready.state(transaction),
+            Some(TransactionState::Restored),
+            "step={step}"
+        );
+        assert!(fixture.source_root.is_dir());
+        assert!(!fixture.destination_root.exists());
+    }
+}
+
+#[test]
+fn undo_rename_crash_window_becomes_manual_recovery_without_namespace_lookup() {
+    for (index, step) in [
+        "rename-intent",
+        "rename",
+        "destination-fsync",
+        "source-fsync",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let transaction = TransactionId([0xe4 + index as u8; 16]);
+        let mut ready = stage_production(&fixture, transaction);
+        let token = ready
+            .verified_undo_token(transaction, "undo-group")
+            .unwrap();
+        crate::staging_recovery::UNDO_FAIL_STEP.with(|slot| slot.set(Some(step)));
+        let error = ready
+            .undo_verified(token, verified_undo_request(&fixture))
+            .unwrap_err();
+        crate::staging_recovery::UNDO_FAIL_STEP.with(|slot| slot.set(None));
+        assert_eq!(
+            error.disposition(),
+            VerifiedUndoFailureDisposition::RecoveryBlocked,
+            "step={step}"
+        );
+        drop(ready);
+
+        let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+        let provider_calls = std::cell::Cell::new(0);
+        let error = engine
+            .recover_startup(report, |_, _| {
+                provider_calls.set(provider_calls.get() + 1);
+                Ok(fixture.raw_anchors())
+            })
+            .err()
+            .unwrap();
+        assert_eq!(provider_calls.get(), 0, "step={step}");
+        assert_eq!(error.stage(), "manual recovery block", "step={step}");
+        if step == "rename-intent" {
+            assert!(fixture.destination_root.is_dir());
+            assert!(!fixture.source_root.exists());
+        } else {
+            assert!(!fixture.destination_root.exists());
+            assert!(fixture.source_root.is_dir());
+        }
+    }
+}
+
+#[test]
+fn durable_undo_terminal_survives_crash_before_oplog_append_without_replay_work() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xef; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let token = ready
+        .verified_undo_token(transaction, "undo-group")
+        .unwrap();
+    crate::staging_recovery::UNDO_FAIL_STEP.with(|slot| slot.set(Some("terminal")));
+    let error = ready
+        .undo_verified(token, verified_undo_request(&fixture))
+        .unwrap_err();
+    crate::staging_recovery::UNDO_FAIL_STEP.with(|slot| slot.set(None));
+    assert_eq!(
+        error.disposition(),
+        VerifiedUndoFailureDisposition::Terminal(TransactionState::Restored)
+    );
+    drop(ready);
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty());
+    assert_eq!(engine.state(transaction), Some(TransactionState::Restored));
+    assert!(fixture.source_root.is_dir());
+    assert!(!fixture.destination_root.exists());
+}
+
+#[test]
+fn verified_undo_parent_and_root_replacement_fail_before_intent() {
+    for replacement in ["source-parent", "destination-parent", "root"] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let transaction = TransactionId([0xe8 + replacement.len() as u8; 16]);
+        let mut ready = stage_production(&fixture, transaction);
+        match replacement {
+            "source-parent" => {
+                let displaced = fixture.base.join("source-parent-displaced");
+                std::fs::rename(&fixture.source_parent, &displaced).unwrap();
+                std::fs::create_dir(&fixture.source_parent).unwrap();
+                set_mode(&fixture.source_parent, 0o700);
+            }
+            "destination-parent" => {
+                let displaced = fixture.base.join("destination-parent-displaced");
+                std::fs::rename(&fixture.destination_parent, &displaced).unwrap();
+                std::fs::create_dir(&fixture.destination_parent).unwrap();
+                set_mode(&fixture.destination_parent, 0o700);
+            }
+            "root" => {
+                let displaced = fixture.destination_parent.join("staged-displaced");
+                std::fs::rename(&fixture.destination_root, &displaced).unwrap();
+                std::fs::create_dir(&fixture.destination_root).unwrap();
+                set_mode(&fixture.destination_root, 0o750);
+            }
+            _ => unreachable!(),
+        }
+        let token = ready
+            .verified_undo_token(transaction, "undo-group")
+            .unwrap();
+        let error = ready
+            .undo_verified(token, verified_undo_request(&fixture))
+            .unwrap_err();
+        assert_eq!(
+            error.disposition(),
+            VerifiedUndoFailureDisposition::NotStarted,
+            "replacement={replacement}: {error}"
+        );
+        assert_eq!(
+            ready.state(transaction),
+            Some(TransactionState::VerifiedCommitted)
+        );
+    }
 }
 
 #[test]

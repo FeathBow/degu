@@ -342,7 +342,7 @@ fn verified_purge_mints_one_use_authority_after_durable_terminal_transition() {
     let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
     assert!(report.is_empty(), "Purgeable is startup terminal");
     let calls = std::cell::Cell::new(0);
-    let (ready, summary) = engine
+    let (mut ready, summary) = engine
         .recover_startup(report, |_, _| {
             calls.set(calls.get() + 1);
             Err(std::io::Error::other(
@@ -354,6 +354,172 @@ fn verified_purge_mints_one_use_authority_after_durable_terminal_transition() {
     assert!(summary.recovered.is_empty());
     assert_eq!(ready.state(transaction), Some(TransactionState::Purgeable));
     assert!(fixture.destination_root.is_dir(), "startup must not delete");
+
+    // A dropped pre-mutation authority is recreated only by a new WAL lease
+    // generation and a fresh complete object rebind.
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    ready.execute_verified_purge(authority).unwrap();
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purged));
+    assert!(!fixture.destination_root.exists());
+}
+
+#[test]
+fn purge_authority_itself_retains_the_exact_wal_lease() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xea; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    drop(ready);
+
+    assert!(
+        SealedStagingEngine::open(&fixture.store).is_err(),
+        "dropping the engine must not release an authority-held WAL lease"
+    );
+    drop(authority);
+    assert!(SealedStagingEngine::open(&fixture.store).is_ok());
+}
+
+#[test]
+fn verified_purge_consumes_exact_tree_without_following_symlinks_and_reaches_purged() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let outside = fixture.base.join("outside");
+    std::fs::write(&outside, b"retain me").unwrap();
+    std::os::unix::fs::symlink(&outside, fixture.source_root.join("outside-link")).unwrap();
+    let transaction = TransactionId([0xe6; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+
+    let commit = ready.execute_verified_purge(authority).unwrap();
+
+    assert_eq!(commit.transaction(), transaction);
+    assert_eq!(commit.reclamation_id(), "undo-group");
+    assert_eq!(commit.removed_entries(), 4);
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purged));
+    assert!(!fixture.destination_root.exists());
+    assert_eq!(std::fs::read(outside).unwrap(), b"retain me");
+    drop(ready);
+
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty());
+    let (ready, _) = engine
+        .recover_startup(report, |_, _| {
+            Err(std::io::Error::other("Purged must not request anchors"))
+        })
+        .unwrap();
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purged));
+}
+
+#[test]
+fn purge_partial_unlink_failure_stays_at_intent_and_restart_fails_closed() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xe7; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    crate::local_backend::held_tree::PURGE_FAIL_AFTER_REMOVALS.with(|limit| limit.set(Some(1)));
+    let error = ready.execute_verified_purge(authority).unwrap_err();
+    crate::local_backend::held_tree::PURGE_FAIL_AFTER_REMOVALS.with(|limit| limit.set(None));
+
+    assert_eq!(
+        error.disposition(),
+        VerifiedPurgeFailureDisposition::RecoveryBlocked
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::PurgeIntent)
+    );
+    assert!(fixture.destination_root.exists());
+    drop(ready);
+
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert_eq!(report.candidates().len(), 1);
+    let restart = engine.recover_startup(report, |_, _| Ok(fixture.raw_anchors()));
+    assert!(
+        restart.is_err(),
+        "partial deletion must never be guessed complete"
+    );
+}
+
+#[test]
+fn purge_parent_fsync_failure_records_no_outcome_or_purged_guess() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xe8; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    crate::local_backend::held_tree::PURGE_FAIL_PARENT_FSYNC.with(|fail| fail.set(true));
+    let error = ready.execute_verified_purge(authority).unwrap_err();
+    crate::local_backend::held_tree::PURGE_FAIL_PARENT_FSYNC.with(|fail| fail.set(false));
+
+    assert_eq!(
+        error.disposition(),
+        VerifiedPurgeFailureDisposition::RecoveryBlocked
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::PurgeIntent)
+    );
+    assert!(!fixture.destination_root.exists());
+}
+
+#[test]
+fn durable_purge_outcome_restart_finalizes_without_namespace_lookup() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xe9; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    crate::staging_recovery::PURGE_FAIL_AFTER_OUTCOME.with(|fail| fail.set(true));
+    let error = ready.execute_verified_purge(authority).unwrap_err();
+    crate::staging_recovery::PURGE_FAIL_AFTER_OUTCOME.with(|fail| fail.set(false));
+
+    assert_eq!(
+        error.disposition(),
+        VerifiedPurgeFailureDisposition::RecoveryBlocked
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::PurgeOutcome)
+    );
+    assert!(!fixture.destination_root.exists());
+    drop(ready);
+
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert_eq!(report.candidates().len(), 1);
+    let calls = std::cell::Cell::new(0);
+    let (ready, summary) = engine
+        .recover_startup(report, |_, _| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::other(
+                "outcome finalization must not lookup",
+            ))
+        })
+        .unwrap();
+    assert_eq!(calls.get(), 0);
+    assert_eq!(
+        summary.recovered[0].terminal_state,
+        TransactionState::Purged
+    );
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purged));
 }
 
 #[test]

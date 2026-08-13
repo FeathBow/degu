@@ -6,8 +6,8 @@
 //! coordinator on that readiness capability. It consumes raw held descriptors,
 //! completes seal/rename/verification/source-parent restoration under the same
 //! lease, and returns only after `VerifiedCommitted`. An explicit later request
-//! may freshly verify that exact held object and durably admit `Purgeable`; this
-//! slice still exports no unlink or deletion executor.
+//! may freshly verify that exact held object, durably admit `Purgeable`, and
+//! consume one-shot authority for bounded FD-relative deletion through `Purged`.
 
 use crate::authority::TransactionState;
 use crate::seal_store::{SealWalStore, StoreError};
@@ -26,6 +26,7 @@ use crate::staging_rename::{
     PreparedRootBinding, StagedUnverifiedTree, StagingRenameError, execute_prepared_rename,
 };
 use rustix::fd::OwnedFd;
+use std::collections::HashSet;
 use std::error::Error;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -63,6 +64,7 @@ pub struct SealedStagingEngine {
     wal: SealWal<RecoverySession>,
     startup_blocked: bool,
     recovery_generation: u64,
+    issued_purge_authorities: HashSet<TransactionId>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -339,15 +341,27 @@ impl VerifiedPurgeRequest {
 }
 
 /// Non-cloneable, non-serializable, one-use purge authority for one exact held
-/// committed staged object. It is produced only after the explicit v8 WAL
-/// authorization record is synced. This slice intentionally provides no delete
-/// or unlink operation which could consume it.
-#[derive(Debug)]
+/// committed staged object. It is produced only after the explicit WAL
+/// authorization record is synced and retains the exact leased WAL together
+/// with the staged-root/trash-parent material until consumed.
 pub struct PurgeAuthority {
     transaction: TransactionId,
     reclamation_id: String,
-    #[allow(dead_code)]
+    engine_generation: u64,
+    // Duplicated from the leased WAL descriptor; never path-reopened. Keeping
+    // this open retains the exact kernel lease with the one-shot object material.
+    _wal_lease: crate::seal_wal::RecoveryLeaseGuard,
     held: VerifiedPurgeAuthorityMaterial,
+}
+
+impl std::fmt::Debug for PurgeAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PurgeAuthority")
+            .field("transaction", &self.transaction)
+            .field("reclamation_id", &self.reclamation_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PurgeAuthority {
@@ -357,6 +371,25 @@ impl PurgeAuthority {
 
     pub fn reclamation_id(&self) -> &str {
         &self.reclamation_id
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct PurgeCommit {
+    transaction: TransactionId,
+    reclamation_id: String,
+    removed_entries: u64,
+}
+
+impl PurgeCommit {
+    pub fn transaction(&self) -> TransactionId {
+        self.transaction
+    }
+    pub fn reclamation_id(&self) -> &str {
+        &self.reclamation_id
+    }
+    pub fn removed_entries(&self) -> u64 {
+        self.removed_entries
     }
 }
 
@@ -705,6 +738,16 @@ impl ReadyStagingEngine {
                     io::Error::other("purge request is absent from the exact leased WAL"),
                 )
             })?;
+        if snapshot.state == TransactionState::Purgeable
+            && self.engine.issued_purge_authorities.contains(&transaction)
+        {
+            return Err(VerifiedPurgeError::new(
+                transaction,
+                "request classification",
+                VerifiedPurgeFailureDisposition::NotStarted,
+                io::Error::other("purge authority was already issued by this WAL lease"),
+            ));
+        }
         let metadata = snapshot.staging.clone().ok_or_else(|| {
             VerifiedPurgeError::new(
                 transaction,
@@ -713,11 +756,13 @@ impl ReadyStagingEngine {
                 io::Error::other("purge request has no sealed production mapping"),
             )
         })?;
-        if snapshot.state != TransactionState::VerifiedCommitted
-            || metadata
-                .production_association()
-                .map(ProductionAssociation::reclamation_id)
-                != Some(request.reclamation_id.as_str())
+        if !matches!(
+            snapshot.state,
+            TransactionState::VerifiedCommitted | TransactionState::Purgeable
+        ) || metadata
+            .production_association()
+            .map(ProductionAssociation::reclamation_id)
+            != Some(request.reclamation_id.as_str())
             || !snapshot
                 .tree_manifest
                 .is_some_and(|manifest| manifest.has_content_proof())
@@ -727,7 +772,7 @@ impl ReadyStagingEngine {
                 "request classification",
                 VerifiedPurgeFailureDisposition::NotStarted,
                 io::Error::other(
-                    "purge request does not match a content-proven VerifiedCommitted association",
+                    "purge request does not match a content-proven committed association",
                 ),
             ));
         }
@@ -758,7 +803,9 @@ impl ReadyStagingEngine {
                             TransactionState::RecoveryRequired,
                         )
                     }
-                    Some(TransactionState::VerifiedCommitted) if !self.engine.startup_blocked => {
+                    Some(TransactionState::VerifiedCommitted | TransactionState::Purgeable)
+                        if !self.engine.startup_blocked =>
+                    {
                         VerifiedPurgeFailureDisposition::NotStarted
                     }
                     _ => VerifiedPurgeFailureDisposition::RecoveryBlocked,
@@ -787,11 +834,53 @@ impl ReadyStagingEngine {
                 source,
             )
         })?;
+        let wal_lease = self.engine.wal.duplicate_lease_guard();
+        self.engine.issued_purge_authorities.insert(transaction);
         Ok(PurgeAuthority {
             transaction,
             reclamation_id: request.reclamation_id,
+            engine_generation: self.engine.recovery_generation,
+            _wal_lease: wal_lease,
             held,
         })
+    }
+
+    /// Consumes authority only on the same live engine generation and exact WAL
+    /// lease that minted it. The authority's held root/parent/inventory and the
+    /// engine lease are never reconstructed from path or durable projections.
+    pub fn execute_verified_purge(
+        &mut self,
+        authority: PurgeAuthority,
+    ) -> Result<PurgeCommit, VerifiedPurgeError> {
+        let transaction = authority.transaction;
+        if authority.engine_generation != self.engine.recovery_generation {
+            return Err(VerifiedPurgeError::new(
+                transaction,
+                "authority lease binding",
+                VerifiedPurgeFailureDisposition::NotStarted,
+                io::Error::other("purge authority belongs to another WAL lease generation"),
+            ));
+        }
+        authority
+            .held
+            .execute(
+                &mut self.engine.wal,
+                &mut self.engine.startup_blocked,
+                transaction,
+            )
+            .map(|removed_entries| PurgeCommit {
+                transaction,
+                reclamation_id: authority.reclamation_id,
+                removed_entries,
+            })
+            .map_err(|source| {
+                VerifiedPurgeError::new(
+                    transaction,
+                    "bounded purge execution",
+                    VerifiedPurgeFailureDisposition::RecoveryBlocked,
+                    source,
+                )
+            })
     }
 
     /// Mints an opaque one-use token from the exact sealed association. A JSONL
@@ -1088,6 +1177,7 @@ fn recovery_work_requires_candidate(work: &RecoveryWork) -> bool {
             | RecoveryWork::FinalizeVerifiedCommit { .. }
             | RecoveryWork::ResumeVerifiedUndo { .. }
             | RecoveryWork::FinalizeVerifiedUndo { .. }
+            | RecoveryWork::FinalizePurge { .. }
             | RecoveryWork::RecoveryRequired { .. }
     )
 }
@@ -1201,6 +1291,7 @@ impl SealedStagingEngine {
                 wal,
                 startup_blocked,
                 recovery_generation,
+                issued_purge_authorities: HashSet::new(),
             },
             StartupRecoveryReport {
                 candidates,
@@ -1390,6 +1481,13 @@ impl SealedStagingEngine {
                 ));
             }
 
+            if matches!(work, RecoveryWork::FinalizePurge { .. }) {
+                self.wal.record_purged(transaction).map_err(|error| {
+                    StartupRecoveryError::new(Some(transaction), "purge finalization", error)
+                })?;
+                self.startup_blocked = !self.wal.can_begin_staging_transaction();
+                continue;
+            }
             if matches!(work, RecoveryWork::FinalizeVerifiedCommit { .. }) {
                 let proof = certify_verified_commit(&self.wal, transaction).map_err(|error| {
                     StartupRecoveryError::new(
@@ -1624,8 +1722,8 @@ impl SealedStagingEngine {
     }
 }
 
-// `PurgeAuthority` intentionally has no unlink/delete consumer in this slice.
-// Startup treats `Purgeable` as terminal and preserves the staged object.
+// PurgeAuthority is deliberately one-shot: executing it consumes the retained
+// object material and the mutable borrow of the exact WAL lease.
 
 #[cfg(test)]
 mod tests;

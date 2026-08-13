@@ -126,7 +126,9 @@ pub(super) fn assert_mechanism_line(stdout: &str, state: &tempfile::TempDir, pur
     assert!(stdout.contains("Plan: move 1 location ("));
     assert!(stdout.contains(&format!(" to {} ", trash_dir.display())));
     if purge {
-        assert!(stdout.contains("staged then purged immediately; not restorable."));
+        assert!(stdout.contains(
+            "sealed, staged, and permanently deleted through exact object-bound authority; not restorable."
+        ));
         assert!(!stdout.contains("restorable with degu undo"));
     } else {
         assert!(stdout.contains("restorable with degu undo"));

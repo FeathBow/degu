@@ -529,6 +529,11 @@ pub enum TransactionState {
     /// A no-replace collision was durably confirmed without moving the staged tree.
     UndoConflict,
     Purgeable,
+    /// The exact object-bound deletion plan is durable and namespace mutation
+    /// may have begun. Restart must never infer completion from a pathname.
+    PurgeIntent,
+    /// The exact root was removed and its retained trash parent was fsynced.
+    PurgeOutcome,
     Purged,
     RollbackIntent,
     RolledBack,
@@ -548,6 +553,8 @@ impl TransactionState {
                 | Self::UndoRenameIntent
                 | Self::UndoConflict
                 | Self::Purgeable
+                | Self::PurgeIntent
+                | Self::PurgeOutcome
                 | Self::Purged
         )
     }

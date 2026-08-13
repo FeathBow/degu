@@ -60,7 +60,7 @@ fn clean_lock_selects_forward_staging_for_restorable_and_direct_purge() {
         _mutation_lock: lock,
         sealed_staging: None,
         forward_clean: true,
-        retained_purge_authorities: Vec::new(),
+        authority_purged: std::collections::HashSet::new(),
         _unsupported_legacy_lease: None,
     };
     assert!(restorable.forward_clean);
@@ -71,7 +71,7 @@ fn clean_lock_selects_forward_staging_for_restorable_and_direct_purge() {
         _mutation_lock: lock,
         sealed_staging: None,
         forward_clean: true,
-        retained_purge_authorities: Vec::new(),
+        authority_purged: std::collections::HashSet::new(),
         _unsupported_legacy_lease: None,
     };
     assert!(direct_purge.forward_clean);
@@ -185,7 +185,7 @@ fn production_clean_reaches_verified_commit_and_keeps_jsonl_diagnostic_only() {
         _mutation_lock: lock,
         sealed_staging: Some(ready),
         forward_clean: true,
-        retained_purge_authorities: Vec::new(),
+        authority_purged: std::collections::HashSet::new(),
         _unsupported_legacy_lease: None,
     };
 
@@ -302,7 +302,7 @@ fn production_clean_reaches_verified_commit_and_keeps_jsonl_diagnostic_only() {
 }
 
 #[test]
-fn production_clean_purge_mints_and_retains_authority_without_deleting() {
+fn production_clean_purge_consumes_authority_and_reaches_purged() {
     let (_temp, ctx) = context();
     let source_parent = ctx.home.join("purge-source-parent");
     let source = source_parent.join("root");
@@ -357,18 +357,18 @@ fn production_clean_purge_mints_and_retains_authority_without_deleting() {
         _mutation_lock: lock,
         sealed_staging: Some(ready),
         forward_clean: true,
-        retained_purge_authorities: Vec::new(),
+        authority_purged: std::collections::HashSet::new(),
         _unsupported_legacy_lease: None,
     };
 
     let executed = session.execute_clean(&plan, true, &|_| Ok(())).unwrap();
     assert_eq!(executed.len(), 1);
-    assert!(executed[0].failed());
-    assert_eq!(executed[0].state_label(), "purge_failed");
+    assert!(!executed[0].failed());
+    assert!(executed[0].purged());
+    assert_eq!(executed[0].state_label(), "purged");
     let staged = executed[0].trash_entry().unwrap().to_path_buf();
-    assert!(staged.is_dir());
+    assert!(!staged.exists());
     assert!(!source.exists());
-    assert_eq!(session.retained_purge_authorities.len(), 1);
     let entries = session
         .sealed_staging
         .as_ref()
@@ -377,7 +377,7 @@ fn production_clean_purge_mints_and_retains_authority_without_deleting() {
     assert_eq!(entries.len(), 1);
     assert_eq!(
         entries[0].state(),
-        degu_core::authority::TransactionState::Purgeable
+        degu_core::authority::TransactionState::Purged
     );
     assert!(
         session
@@ -440,7 +440,7 @@ fn forged_jsonl_mapping_cannot_steal_wal_undo_authority() {
         _mutation_lock: lock,
         sealed_staging: Some(ready),
         forward_clean: false,
-        retained_purge_authorities: Vec::new(),
+        authority_purged: std::collections::HashSet::new(),
         _unsupported_legacy_lease: None,
     };
 

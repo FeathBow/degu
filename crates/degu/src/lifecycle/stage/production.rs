@@ -41,7 +41,6 @@ pub(super) struct ProductionRun<'a> {
     pub(super) recheck: &'a dyn Fn(&Finding) -> Result<(), String>,
     pub(super) engine: &'a mut ReadyStagingEngine,
     pub(super) purge: bool,
-    pub(super) retained_purge_authorities: &'a mut Vec<degu_core::sealed_staging::PurgeAuthority>,
 }
 
 pub(super) struct ProductionOutcome {
@@ -439,48 +438,21 @@ fn execute_reserved(
         }
     }
 
-    // The object is already durably VerifiedCommitted. A purge-admission failure
-    // must never be reported as a stage failure: that would skip the oplog record
-    // below, undercount freed space, and wedge undo. Only a poisoned WAL escalates
-    // to recovery-blocked; every other admission failure degrades to "staged, not
-    // purged" and still falls through to the durable oplog record.
+    // The object is already durably VerifiedCommitted. Neither reopening HOME nor
+    // the purge admission below may be reported as a stage failure: that would skip
+    // the oplog record, undercount freed space, and wedge undo. Only a poisoned WAL
+    // escalates to recovery-blocked; every other purge failure degrades to "staged
+    // in trash, not deleted" and still writes the durable oplog record.
     let mut purge_admission_failure: Option<String> = None;
-    let purge_authority = if run.purge {
+    let purge_request = if run.purge {
         let open_home = || open_directory(&policy.canonical_home);
         match (open_home(), open_home()) {
-            (Ok(source_anchor), Ok(destination_anchor)) => {
-                let request = VerifiedPurgeRequest::new(
-                    transaction,
-                    run.reclamation_id.clone(),
-                    source_anchor,
-                    destination_anchor,
-                );
-                match run.engine.request_verified_purge(request) {
-                    Ok(authority) => Some(authority),
-                    Err(error) => match error.disposition() {
-                        VerifiedPurgeFailureDisposition::Terminal(
-                            TransactionState::RecoveryRequired,
-                        )
-                        | VerifiedPurgeFailureDisposition::RecoveryBlocked => {
-                            return Err((
-                                format!(
-                                    "explicit sealed purge admission failed during {}: {error}",
-                                    error.stage()
-                                ),
-                                ForwardFailureDisposition::RecoveryBlocked,
-                            ));
-                        }
-                        VerifiedPurgeFailureDisposition::NotStarted
-                        | VerifiedPurgeFailureDisposition::Terminal(_) => {
-                            purge_admission_failure = Some(format!(
-                                "purge admission failed during {}: {error}",
-                                error.stage()
-                            ));
-                            None
-                        }
-                    },
-                }
-            }
+            (Ok(source_anchor), Ok(destination_anchor)) => Some(VerifiedPurgeRequest::new(
+                transaction,
+                run.reclamation_id.clone(),
+                source_anchor,
+                destination_anchor,
+            )),
             (Err(error), _) | (_, Err(error)) => {
                 purge_admission_failure = Some(format!(
                     "failed to retain purge HOME anchors after VerifiedCommitted: {error}"
@@ -490,17 +462,6 @@ fn execute_reserved(
         }
     } else {
         None
-    };
-
-    let purge_authorized = if let Some(authority) = purge_authority {
-        debug_assert_eq!(authority.transaction(), transaction);
-        // Retain immediately after the durable admission returns. No fallible
-        // reporting or reservation cleanup may create a Purgeable-without-live-
-        // authority window inside this mutation session.
-        run.retained_purge_authorities.push(authority);
-        true
-    } else {
-        false
     };
 
     let current_identity = held.destination_identity().map_err(|error| {
@@ -519,20 +480,74 @@ fn execute_reserved(
         outcome: OpOutcome::Ok,
     });
     let jsonl_projection_failure = run.log.append(&record).err().map(|error| error.to_string());
-    if purge_authorized {
-        let mut reason = "exact staged object is durably Purgeable, but deletion is unavailable in this slice; the object remains in trash".to_string();
-        if let Some(error) = reservation_cleanup_failure {
-            reason.push_str(&format!("; reservation cleanup failed: {error}"));
+    let purged = if let Some(request) = purge_request {
+        match run.engine.request_verified_purge(request) {
+            Ok(authority) => {
+                // No fallible adapter step is permitted between minting and
+                // consuming the one-use held authority on this exact ready engine
+                // generation.
+                let commit = run
+                    .engine
+                    .execute_verified_purge(authority)
+                    .map_err(|error| {
+                        (
+                            format!(
+                                "explicit sealed purge execution failed during {}: {error}",
+                                error.stage()
+                            ),
+                            ForwardFailureDisposition::RecoveryBlocked,
+                        )
+                    })?;
+                debug_assert_eq!(commit.transaction(), transaction);
+                true
+            }
+            // A poisoned WAL must stop the session; the object stays committed.
+            Err(error)
+                if matches!(
+                    error.disposition(),
+                    VerifiedPurgeFailureDisposition::Terminal(TransactionState::RecoveryRequired)
+                        | VerifiedPurgeFailureDisposition::RecoveryBlocked
+                ) =>
+            {
+                return Err((
+                    format!(
+                        "explicit sealed purge admission failed during {}: {error}",
+                        error.stage()
+                    ),
+                    ForwardFailureDisposition::RecoveryBlocked,
+                ));
+            }
+            // The object stays durably staged in trash; a non-recovery admission
+            // failure is not a stage failure and must not skip the oplog record.
+            Err(error) => {
+                purge_admission_failure = Some(format!(
+                    "purge admission failed during {}: {error}",
+                    error.stage()
+                ));
+                false
+            }
         }
-        if let Some(error) = jsonl_projection_failure {
-            reason.push_str(&format!("; operation-log projection failed: {error}"));
-        }
-        Ok(CleanExecution::production_purge_authorized_retained(
-            finding, entry, reason,
+    } else {
+        false
+    };
+
+    if purged {
+        let failures = [
+            reservation_cleanup_failure.map(|error| format!("reservation cleanup failed: {error}")),
+            jsonl_projection_failure
+                .map(|error| format!("operation-log projection failed: {error}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        Ok(CleanExecution::production_purged(
+            finding,
+            entry,
+            (!failures.is_empty()).then(|| failures.join("; ")),
         ))
     } else if let Some(admission) = purge_admission_failure {
         let mut reason = format!(
-            "object is durably staged in trash but sealed purge authorization failed, so it was not deleted and can be restored with `degu undo`: {admission}"
+            "object is durably staged in trash but sealed purge failed, so it was not deleted and can be restored with `degu undo`: {admission}"
         );
         if let Some(error) = reservation_cleanup_failure {
             reason.push_str(&format!("; reservation cleanup failed: {error}"));
@@ -798,7 +813,6 @@ mod tests {
             recheck: &|_| Ok(()),
             engine: &mut ready,
             purge: false,
-            retained_purge_authorities: &mut Vec::new(),
         };
 
         let outcome = execute(&mut run, &finding, &identity);

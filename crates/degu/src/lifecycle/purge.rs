@@ -100,12 +100,20 @@ pub(crate) fn execute_expiry_plan(
     ctx: &DetectCtx,
     plan: &ExpiryPlan,
     blocker: &dyn Fn(&Path) -> Option<String>,
+    authority_purged: &std::collections::HashSet<PathBuf>,
 ) -> PurgeReport {
     let mut all = PurgeReport::default();
     for batch in &plan.batches {
+        let (already_purged, legacy): (Vec<_>, Vec<_>) = batch
+            .entries
+            .clone()
+            .into_iter()
+            .partition(|entry| authority_purged.contains(entry.path()));
+        all.purged
+            .extend(already_purged.into_iter().map(|entry| entry.into_parts().0));
         all.extend(purge_trash_entries(
             PurgeBatch::new(ctx, "clean", &batch.trash_root).with_blocker(blocker),
-            batch.entries.clone(),
+            legacy,
         ));
         if let Err(err) = purge_expired_claims(&batch.trash_root) {
             all.failed

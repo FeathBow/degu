@@ -17,9 +17,10 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const MAGIC: &[u8; 4] = b"DSWL";
-const VERSION: u16 = 8;
+const VERSION: u16 = 9;
 const CONTENT_PROOF_MANIFEST_VERSION: u16 = 2;
 const HEADER_LEN: usize = 20;
 const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
@@ -847,6 +848,24 @@ impl<W: DurableWrite> SealWal<W> {
         Ok(())
     }
 
+    pub(crate) fn record_purge_intent(
+        &mut self,
+        transaction: TransactionId,
+    ) -> Result<(), AppendError> {
+        self.transition_staging(transaction, TransactionState::PurgeIntent)
+    }
+
+    pub(crate) fn record_purge_outcome(
+        &mut self,
+        transaction: TransactionId,
+    ) -> Result<(), AppendError> {
+        self.transition_staging(transaction, TransactionState::PurgeOutcome)
+    }
+
+    pub(crate) fn record_purged(&mut self, transaction: TransactionId) -> Result<(), AppendError> {
+        self.transition_staging(transaction, TransactionState::Purged)
+    }
+
     pub(crate) fn record_verified_undo_intent(
         &mut self,
         transaction: TransactionId,
@@ -1609,18 +1628,44 @@ pub enum RecoveryLockError {
     Io(#[source] io::Error),
 }
 
-/// Exclusive, nonblocking `flock` guard that explicitly unlocks on drop.
+/// Shared logical lifetime for one exact `flock` open-file description. Its
+/// private duplicate exists solely so the final in-process owner can explicitly
+/// unlock even if an unrelated fork inherited another descriptor.
+struct RecoveryLeaseLifetime {
+    file: File,
+}
+
+impl Drop for RecoveryLeaseLifetime {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+/// Exclusive, nonblocking `flock` guard with an explicit logical lifetime.
 ///
-/// Explicit unlock makes the logical guard lifetime authoritative even when an
-/// unrelated concurrent `fork` briefly inherits the close-on-exec descriptor.
+/// A deliberately minted authority guard shares `lifetime`; an unrelated fork
+/// does not. The final logical owner unlocks through `RecoveryLeaseLifetime`,
+/// while the writer descriptor remains private to replay and append operations.
 pub(crate) struct ExclusiveFileLock {
     file: File,
+    lifetime: Arc<RecoveryLeaseLifetime>,
 }
 
 impl ExclusiveFileLock {
     pub(crate) fn try_acquire(file: File) -> Result<Self, RecoveryLockError> {
         match file.try_lock() {
-            Ok(()) => Ok(Self { file }),
+            Ok(()) => {
+                let lifetime_file = file.try_clone().map_err(|error| {
+                    let _ = file.unlock();
+                    RecoveryLockError::Io(error)
+                })?;
+                Ok(Self {
+                    file,
+                    lifetime: Arc::new(RecoveryLeaseLifetime {
+                        file: lifetime_file,
+                    }),
+                })
+            }
             Err(std::fs::TryLockError::WouldBlock) => Err(RecoveryLockError::Busy),
             Err(std::fs::TryLockError::Error(error)) => Err(RecoveryLockError::Io(error)),
         }
@@ -1633,15 +1678,19 @@ impl ExclusiveFileLock {
     fn as_file_mut(&mut self) -> &mut File {
         &mut self.file
     }
+
+    fn duplicate_guard(&self) -> RecoveryLeaseGuard {
+        RecoveryLeaseGuard {
+            lifetime: Arc::clone(&self.lifetime),
+        }
+    }
 }
 
-impl Drop for ExclusiveFileLock {
-    fn drop(&mut self) {
-        // Closing alone does not release `flock` while a fork-inherited duplicate
-        // still exists. The descriptor is private, so no duplicate is a legitimate
-        // co-owner of this logical lease.
-        let _ = self.file.unlock();
-    }
+/// Authority-lifetime share of one exact recovery lease. It exposes no file,
+/// replay, append, or unlock operation.
+pub(crate) struct RecoveryLeaseGuard {
+    #[allow(dead_code)]
+    lifetime: Arc<RecoveryLeaseLifetime>,
 }
 
 /// Exclusive, nonblocking lease on the exact WAL descriptor.
@@ -1715,6 +1764,14 @@ impl RecoverySession {
     }
 }
 
+impl RecoverySession {
+    /// Retains this exact open-file-description lease without reopening the WAL
+    /// pathname. The duplicate is authority lifetime only and cannot append.
+    pub(crate) fn duplicate_lease_guard(&self) -> RecoveryLeaseGuard {
+        self.lock.duplicate_guard()
+    }
+}
+
 impl Write for RecoverySession {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.lock.as_file_mut().write(bytes)
@@ -1722,6 +1779,12 @@ impl Write for RecoverySession {
 
     fn flush(&mut self) -> io::Result<()> {
         self.lock.as_file_mut().flush()
+    }
+}
+
+impl SealWal<RecoverySession> {
+    pub(crate) fn duplicate_lease_guard(&self) -> RecoveryLeaseGuard {
+        self.writer.duplicate_lease_guard()
     }
 }
 
@@ -1786,6 +1849,11 @@ pub enum RecoveryWork {
     PreserveUndoConflict {
         transaction: TransactionId,
     },
+    /// Parent sync and deletion outcome are durable; only the terminal state
+    /// projection remains. No filesystem lookup or anchor is required.
+    FinalizePurge {
+        transaction: TransactionId,
+    },
     RecoveryRequired {
         transaction: TransactionId,
         reason: RecoveryRequiredReason,
@@ -1797,7 +1865,13 @@ pub enum RecoveryRequiredReason {
     InsufficientPersistentIdentity,
     RenameOutcomeUnknown,
     RecordedRecoveryRequired,
-    LegacySchemaMissingMountIdentity { version: u16 },
+    LegacySchemaMissingMountIdentity {
+        version: u16,
+    },
+    /// Purge may have partially removed the bounded tree. No pathname-side
+    /// inference is permitted; a later recovery tool must use durable progress
+    /// evidence or quarantine the remainder.
+    InterruptedPurge,
 }
 
 pub(crate) fn quarantined_transaction_retains_active_permission_seals(
@@ -1814,6 +1888,7 @@ fn staging_recovery_needs_mount_authority(transaction: &ReplayedTransaction) -> 
         | TransactionState::RolledBack
         | TransactionState::Purged
         | TransactionState::Purgeable
+        | TransactionState::PurgeOutcome
         | TransactionState::UndoConflict
         | TransactionState::RecoveryRequired => false,
         TransactionState::Quarantined => {
@@ -1835,6 +1910,17 @@ where
         return RecoveryWork::RecoveryRequired {
             transaction: transaction.id,
             reason: RecoveryRequiredReason::LegacySchemaMissingMountIdentity { version },
+        };
+    }
+    if transaction.state == TransactionState::PurgeOutcome {
+        return RecoveryWork::FinalizePurge {
+            transaction: transaction.id,
+        };
+    }
+    if transaction.state == TransactionState::PurgeIntent {
+        return RecoveryWork::RecoveryRequired {
+            transaction: transaction.id,
+            reason: RecoveryRequiredReason::InterruptedPurge,
         };
     }
     if transaction.state == TransactionState::RecoveryRequired {
@@ -2726,6 +2812,11 @@ fn valid_transition(from: TransactionState, to: TransactionState) -> bool {
             | (S::SourceParentRestored, S::VerifiedCommitted)
             // Verified undo is an independent committed-tree protocol.
             | (S::VerifiedCommitted, S::UndoIntent | S::Purgeable)
+            // Purge execution is admitted only after the exact object-bound
+            // authorization. Parent-sync completion is durable before Purged.
+            | (S::Purgeable, S::PurgeIntent)
+            | (S::PurgeIntent, S::PurgeOutcome)
+            | (S::PurgeOutcome, S::Purged)
             | (S::UndoIntent, S::UndoModesRestored)
             | (S::UndoModesRestored, S::UndoRenameIntent)
             | (S::UndoRenameIntent, S::Restored | S::UndoConflict)
@@ -3396,6 +3487,8 @@ fn encode_state(state: TransactionState) -> u8 {
         S::UndoModesRestored => 20,
         S::UndoRenameIntent => 21,
         S::UndoConflict => 22,
+        S::PurgeIntent => 23,
+        S::PurgeOutcome => 24,
     }
 }
 
@@ -3429,6 +3522,8 @@ fn decode_state(
         20 if frame_version >= 6 => S::UndoModesRestored,
         21 if frame_version >= 6 => S::UndoRenameIntent,
         22 if frame_version >= 6 => S::UndoConflict,
+        23 if frame_version >= 9 => S::PurgeIntent,
+        24 if frame_version >= 9 => S::PurgeOutcome,
         _ => {
             return Err(ReplayError::Malformed {
                 offset,

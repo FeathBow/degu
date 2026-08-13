@@ -158,7 +158,9 @@ fn clean_purge_rejects_generic_permanent_confirmation_as_non_success() {
     assert!(cache.exists());
     assert!(!state.path().join("degu/trash").exists());
     let transcript = String::from_utf8(out.stdout).unwrap();
-    assert!(transcript.contains("Staged then purged immediately; not restorable."));
+    assert!(transcript.contains(
+        "Sealed, staged, and permanently deleted through exact object-bound authority; not restorable."
+    ));
     assert!(transcript.contains("Canceled; no clean or purge changes made."));
 }
 

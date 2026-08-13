@@ -72,6 +72,24 @@ impl TrashPurgePlan {
     pub(crate) fn len(&self) -> usize {
         batch_entry_count(&self.batches)
     }
+
+    pub(crate) fn take_already_purged(
+        &mut self,
+        purged: &std::collections::HashSet<PathBuf>,
+    ) -> Vec<PathBuf> {
+        let mut removed = Vec::new();
+        for batch in &mut self.batches {
+            batch.entries.retain(|entry| {
+                if purged.contains(entry.path()) {
+                    removed.push(entry.path().to_path_buf());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        removed
+    }
 }
 
 fn batch_entry_count<T>(batches: &[PurgePlanBatch<T>]) -> usize {

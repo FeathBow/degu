@@ -90,7 +90,7 @@ fn run_json(prepared: PreparedClean) -> Result<()> {
     let recheck = boundary_recheck(&prepared);
     let (executed, direct_purge) = execute_clean(&prepared, &mut session, &recheck)?;
     let clean_failed = executed.iter().any(CleanExecution::failed);
-    let expiry = execute_expiry(&session, plan, clean_failed)?;
+    let expiry = execute_expiry(&mut session, plan, clean_failed)?;
     let direct_purge = match direct_purge {
         Some(observation) => observation,
         None => not_attempted_action(
@@ -196,7 +196,7 @@ fn execute_human_plan(
     let (executed, direct_purge) = execute_clean(&prepared, &mut session, &recheck)?;
     let elapsed = started.elapsed();
     let failed = executed.iter().any(CleanExecution::failed);
-    let expiry = execute_expiry(&session, plan, failed)?;
+    let expiry = execute_expiry(&mut session, plan, failed)?;
     let output_result = output::print_execution(&prepared, &executed, Some(elapsed))
         .and_then(|()| {
             if let Some(observation) = &direct_purge {
@@ -270,7 +270,7 @@ fn execute_clean(
 }
 
 fn execute_expiry(
-    session: &MutationSession,
+    session: &mut MutationSession,
     plan: ExpiryPlan,
     clean_failed: bool,
 ) -> Result<ExpiryExecution> {

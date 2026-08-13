@@ -101,12 +101,18 @@ impl CleanExecution {
         }
     }
 
-    pub(super) fn production_purge_authorized_retained(
+    pub(super) fn production_purged(
         finding: &Finding,
         entry: PathBuf,
-        reason: String,
+        final_log_failure: Option<String>,
     ) -> Self {
-        Self::with_state(finding, CleanState::PurgeFailed { entry, reason })
+        Self::with_state(
+            finding,
+            CleanState::Purged {
+                entry,
+                final_log_failure,
+            },
+        )
     }
 
     pub(super) fn production_purge_admission_failed(

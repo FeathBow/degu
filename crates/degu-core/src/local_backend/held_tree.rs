@@ -30,6 +30,13 @@ const HARD_DIRECTORY_CAP: u64 = 1_024;
 const MANIFEST_DOMAIN_V1: &[u8] = b"degu-held-tree-manifest-v1\0";
 const MANIFEST_DOMAIN_V2: &[u8] = b"degu-held-tree-manifest-v2-content\0";
 const CONTENT_PROOF_VERSION: u16 = 2;
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static PURGE_FAIL_AFTER_REMOVALS: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    pub(crate) static PURGE_FAIL_PARENT_FSYNC: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HeldTreeLimits {
@@ -208,6 +215,7 @@ pub(crate) struct HeldDirectoryOrder {
     pub observed_mode: u32,
 }
 
+#[derive(Debug)]
 struct HeldDirectory {
     held: HeldLocalBackendEvidence,
     path: PathBuf,
@@ -218,6 +226,7 @@ struct HeldDirectory {
 /// Private bounded inventory retaining all directory FDs for exact rewalk and
 /// lease-bound minimal sealing. By itself it carries no WAL lease and is not
 /// rename, restore, purge, or deletion authority.
+#[derive(Debug)]
 pub(crate) struct HeldTreeInventory {
     parent: HeldLocalBackendEvidence,
     root_name: OsString,
@@ -407,6 +416,103 @@ impl HeldTreeInventory {
             crate::seal_wal::ObjectIncarnation::new(self.root_identity.incarnation),
             self.mount_id,
         )
+    }
+
+    /// Consumes the freshly verified inventory and removes that exact tree using
+    /// only retained directory descriptors. Every non-directory is revalidated
+    /// (including content, one-link policy, ownership, type and strong
+    /// incarnation) immediately before unlink. Directories are removed in
+    /// bounded postorder, symlinks are never followed, and the retained trash
+    /// parent is synced only after the exact root name has been removed.
+    #[allow(clippy::disallowed_methods)] // this method is the verified fd-relative deletion engine
+    pub(crate) fn purge_postorder(self) -> Result<u64, HeldTreeError> {
+        self.verify_root_binding()?;
+        let mut entries = self
+            .manifest
+            .iter()
+            .filter(|entry| !entry.path.as_os_str().is_empty())
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            right
+                .path
+                .components()
+                .count()
+                .cmp(&left.path.components().count())
+                .then_with(|| right.path.cmp(&left.path))
+        });
+        let mut content_budget = Budget::new(self.limits, CONTENT_PROOF_VERSION);
+        let mut removed = 0_u64;
+        for expected in entries {
+            #[cfg(test)]
+            if PURGE_FAIL_AFTER_REMOVALS.with(|limit| limit.get() == Some(removed)) {
+                return Err(io_error(&expected.path, rustix::io::Errno::IO));
+            }
+            let parent_path = expected.path.parent().unwrap_or_else(|| Path::new(""));
+            let name = expected
+                .path
+                .file_name()
+                .ok_or(HeldTreeError::InvalidRoot)?;
+            let parent = self
+                .directories
+                .iter()
+                .find(|directory| directory.path == parent_path)
+                .ok_or_else(|| HeldTreeError::IdentityChanged(expected.path.clone()))?;
+            require_directory_current(parent, self.backend, self.mount_id)?;
+            let before = with_fd(&parent.held, |fd| inspect_at(fd, name, &expected.path))?;
+            require_owner(
+                &expected.path,
+                before.uid,
+                rustix::process::geteuid().as_raw(),
+            )?;
+            require_boundary(&expected.path, self.backend, self.mount_id, &before)?;
+            let content = inspect_content_at(
+                &parent.held,
+                name,
+                &expected.path,
+                &before,
+                &mut content_budget,
+            )?;
+            let actual = before.into_manifest(expected.path.clone(), content);
+            if &actual != expected {
+                return Err(HeldTreeError::IdentityChanged(expected.path.clone()));
+            }
+            let flags = if expected.identity.kind == NodeKind::Directory {
+                AtFlags::REMOVEDIR
+            } else {
+                AtFlags::empty()
+            };
+            with_fd(&parent.held, |fd| rustix::fs::unlinkat(fd, name, flags))
+                .map_err(|error| io_error(&expected.path, error))?;
+            removed = removed.checked_add(1).ok_or(HeldTreeError::Limit {
+                kind: HeldTreeLimit::Entries,
+                limit: self.limits.max_entries,
+            })?;
+        }
+
+        // Child removal changes directory timestamps, but not the strong root
+        // incarnation committed by the authority. Recheck both the name and
+        // retained root FD immediately before the final rmdir.
+        let named_root = with_fd(&self.parent, |fd| {
+            inspect_at(fd, &self.root_name, Path::new(""))
+        })?;
+        let held_root = inspect_held(&self.directories[0].held, Path::new(""))?;
+        require_same_identity(Path::new(""), self.root_identity, named_root.identity)?;
+        require_same_identity(Path::new(""), self.root_identity, held_root.identity)?;
+        with_fd(&self.parent, |fd| {
+            rustix::fs::unlinkat(fd, &self.root_name, AtFlags::REMOVEDIR)
+        })
+        .map_err(|error| io_error(Path::new(""), error))?;
+        removed = removed.checked_add(1).ok_or(HeldTreeError::Limit {
+            kind: HeldTreeLimit::Entries,
+            limit: self.limits.max_entries,
+        })?;
+        #[cfg(test)]
+        if PURGE_FAIL_PARENT_FSYNC.with(std::cell::Cell::get) {
+            return Err(io_error(Path::new(""), rustix::io::Errno::IO));
+        }
+        with_fd(&self.parent, |fd| rustix::fs::fsync(fd))
+            .map_err(|error| io_error(Path::new(""), error))?;
+        Ok(removed)
     }
 
     /// Applies only the fixed minimal directory seals represented by this exact

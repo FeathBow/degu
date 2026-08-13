@@ -37,6 +37,8 @@ std::thread_local! {
         const { std::cell::Cell::new(None) };
     pub(crate) static BEFORE_UNDO_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    pub(crate) static PURGE_FAIL_AFTER_OUTCOME: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
@@ -92,6 +94,8 @@ pub(crate) enum RecoveryRebindError {
     UndoRenameUnknown(#[source] io::Error),
     #[error("verified undo parent fsync failed: {0}")]
     UndoParentSync(#[source] io::Error),
+    #[error("object-bound purge execution failed: {0}")]
+    PurgeExecution(#[source] HeldTreeError),
 }
 
 impl From<CertificationError> for RecoveryRebindError {
@@ -711,6 +715,7 @@ pub(crate) struct VerifiedUndoRecoverySession<'a> {
 #[allow(dead_code)]
 pub(crate) struct VerifiedPurgeAuthorityMaterial {
     committed: ReboundVerifiedUndo,
+    inventory: HeldTreeInventory,
 }
 
 pub(crate) struct VerifiedPurgeSession<'a> {
@@ -718,6 +723,42 @@ pub(crate) struct VerifiedPurgeSession<'a> {
     startup_blocked: &'a mut bool,
     transaction: TransactionId,
     committed: ReboundVerifiedUndo,
+}
+
+impl VerifiedPurgeAuthorityMaterial {
+    /// Executes the one-shot authority while the exact WAL lease, staged root,
+    /// trash parent, directory set and content-proven inventory are all live.
+    pub(crate) fn execute(
+        self,
+        wal: &mut SealWal<RecoverySession>,
+        startup_blocked: &mut bool,
+        transaction: TransactionId,
+    ) -> Result<u64, RecoveryRebindError> {
+        if wal.transaction_state(transaction) != Some(TransactionState::Purgeable)
+            || self.committed.metadata.root_identity() != self.inventory.root_strong_identity()
+        {
+            return Err(RecoveryRebindError::TransactionMismatch);
+        }
+        // PurgeIntent is the last pre-mutation boundary. Any later error leaves
+        // the engine blocked; restart records RecoveryRequired rather than
+        // guessing from a potentially partial namespace.
+        wal.record_purge_intent(transaction)?;
+        *startup_blocked = true;
+        let removed = self
+            .inventory
+            .purge_postorder()
+            .map_err(RecoveryRebindError::PurgeExecution)?;
+        wal.record_purge_outcome(transaction)?;
+        #[cfg(test)]
+        if PURGE_FAIL_AFTER_OUTCOME.with(std::cell::Cell::get) {
+            return Err(RecoveryRebindError::Io(io::Error::other(
+                "injected crash after durable purge outcome",
+            )));
+        }
+        wal.record_purged(transaction)?;
+        *startup_blocked = !wal.can_begin_staging_transaction();
+        Ok(removed)
+    }
 }
 
 impl VerifiedPurgeSession<'_> {
@@ -730,24 +771,31 @@ impl VerifiedPurgeSession<'_> {
             undo: self.committed,
         };
         let verified = verifier
-            .verify_exact_tree()
-            .and_then(|()| verifier.verify_purge_layout());
-        if let Err(error) = verified {
-            // A request which reached the exact committed association but found
-            // replacement, inode reuse, ACL/mode/content drift, or mount/parent
-            // namespace change can no longer be treated as a healthy terminal.
-            verifier.wal.transition_recovery_required(transaction)?;
-            *verifier.startup_blocked = true;
-            return Err(error);
-        }
+            .collect_exact_tree()
+            .and_then(|inventory| verifier.verify_purge_layout().map(|()| inventory));
+        let inventory = match verified {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                // A request which reached the exact committed association but found
+                // replacement, inode reuse, ACL/mode/content drift, or mount/parent
+                // namespace change can no longer be treated as a healthy terminal.
+                verifier.wal.transition_recovery_required(transaction)?;
+                *verifier.startup_blocked = true;
+                return Err(error);
+            }
+        };
         let manifest = verifier.undo.expected_manifest;
-        verifier.wal.record_purgeable(ExactPurgeVerification {
-            transaction,
-            manifest,
-        })?;
+        if verifier.wal.transaction_state(transaction) == Some(TransactionState::VerifiedCommitted)
+        {
+            verifier.wal.record_purgeable(ExactPurgeVerification {
+                transaction,
+                manifest,
+            })?;
+        }
         *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
         Ok(VerifiedPurgeAuthorityMaterial {
             committed: verifier.undo,
+            inventory,
         })
     }
 }
@@ -939,6 +987,10 @@ impl VerifiedUndoRecoverySession<'_> {
     }
 
     fn verify_exact_tree(&self) -> Result<(), RecoveryRebindError> {
+        self.collect_exact_tree().map(|_| ())
+    }
+
+    fn collect_exact_tree(&self) -> Result<HeldTreeInventory, RecoveryRebindError> {
         self.undo.root.verify_fresh_binding()?;
         for (_, rebound) in &self.undo.tree_seals {
             if strong_identity_fd(&rebound.object_check_fd)? != rebound.identity {
@@ -1007,7 +1059,7 @@ impl VerifiedUndoRecoverySession<'_> {
             return Err(RecoveryRebindError::UndoManifestChanged);
         }
         self.undo.root.verify_fresh_binding()?;
-        Ok(())
+        Ok(inventory)
     }
 
     fn verify_purge_layout(&self) -> Result<(), RecoveryRebindError> {
@@ -1158,6 +1210,11 @@ pub(crate) fn prepare_startup_recovery<'a>(
                 crate::seal_wal::RecoveryRequiredReason::RenameOutcomeUnknown => {
                     unreachable!("rename ambiguity handled before recovery-required dispatch")
                 }
+                crate::seal_wal::RecoveryRequiredReason::InterruptedPurge => fail_closed(
+                    wal,
+                    transaction,
+                    RecoveryRebindError::RecordedRecoveryRequired,
+                ),
             };
         }
         let metadata = snapshot
@@ -1279,7 +1336,10 @@ pub(crate) fn prepare_verified_purge<'a>(
     let snapshot = wal
         .recovery_snapshot(transaction)
         .ok_or(RecoveryRebindError::TransactionMismatch)?;
-    if snapshot.state != TransactionState::VerifiedCommitted {
+    if !matches!(
+        snapshot.state,
+        TransactionState::VerifiedCommitted | TransactionState::Purgeable
+    ) {
         return Err(RecoveryRebindError::TransactionMismatch);
     }
     let metadata = snapshot
@@ -1307,7 +1367,10 @@ pub(crate) fn prepare_verified_purge<'a>(
             // Rebinding an exact committed request already detected that its
             // durable authority projection is stale. Persist the fail-closed
             // condition whenever the WAL remains writable.
-            if wal.transaction_state(transaction) == Some(TransactionState::VerifiedCommitted) {
+            if matches!(
+                wal.transaction_state(transaction),
+                Some(TransactionState::VerifiedCommitted | TransactionState::Purgeable)
+            ) {
                 wal.transition_recovery_required(transaction)?;
                 *startup_blocked = true;
             }
@@ -1681,6 +1744,7 @@ fn rebind_work(
         | RecoveryWork::PreserveCommittedSeal { .. }
         | RecoveryWork::PreserveQuarantine { .. }
         | RecoveryWork::PreserveUndoConflict { .. }
+        | RecoveryWork::FinalizePurge { .. }
         | RecoveryWork::FinalizeVerifiedCommit { .. }
         | RecoveryWork::FinalizeVerifiedUndo { .. }
         | RecoveryWork::Nothing => Err(RecoveryRebindError::TransactionMismatch),
@@ -1710,6 +1774,7 @@ pub(crate) fn recovery_transaction(work: &RecoveryWork) -> TransactionId {
         | RecoveryWork::ResumeVerifiedUndo { transaction, .. }
         | RecoveryWork::FinalizeVerifiedUndo { transaction, .. }
         | RecoveryWork::PreserveUndoConflict { transaction }
+        | RecoveryWork::FinalizePurge { transaction }
         | RecoveryWork::RecoveryRequired { transaction, .. } => *transaction,
         RecoveryWork::Nothing => TransactionId([0; 16]),
     }

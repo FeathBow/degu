@@ -134,7 +134,7 @@ impl Lifecycle {
             _mutation_lock: mutation_lock,
             sealed_staging,
             forward_clean,
-            retained_purge_authorities: Vec::new(),
+            authority_purged: std::collections::HashSet::new(),
             _unsupported_legacy_lease: unsupported_legacy_lease,
         })
     }
@@ -149,9 +149,9 @@ pub(crate) struct MutationSession {
     // checks but deliberately does not grant the forward coordinator deletion.
     sealed_staging: Option<ReadyStagingEngine>,
     forward_clean: bool,
-    // A3c6 has no consumer, but successful admission retains the exact held
-    // objects and WAL lease material until the mutation session ends.
-    retained_purge_authorities: Vec<degu_core::sealed_staging::PurgeAuthority>,
+    // Exact sealed entries already removed through held authority. Legacy code
+    // reports these complete and never claims the now-absent pathname.
+    authority_purged: std::collections::HashSet<PathBuf>,
     _unsupported_legacy_lease: Option<UnsupportedNeverActivatedLease>,
 }
 
@@ -182,44 +182,47 @@ impl MutationSession {
         } else {
             None
         };
-        stage::execute_clean(
-            &self.lifecycle.ctx,
-            plan,
-            purge,
-            recheck,
-            sealed_staging,
-            &mut self.retained_purge_authorities,
-        )
+        stage::execute_clean(&self.lifecycle.ctx, plan, purge, recheck, sealed_staging)
     }
 
     pub(crate) fn plan_purge_all(&self) -> Result<TrashPurgePlan> {
         purge::plan_all_trash(&self.lifecycle.ctx)
     }
 
-    /// Post-confirmation classification only. A matching sealed entry may reach
-    /// durable Purgeable, but the retained authority has no deletion consumer.
+    /// Post-confirmation classification and sealed execution. Each matching
+    /// entry is removed only through freshly rebound authority; any recovery
+    /// block stops the remaining batch before legacy claim or housekeeping.
     pub(crate) fn authorize_purge_all(&mut self, plan: &TrashPurgePlan) -> Option<String> {
         for path in plan.entries() {
-            if self.classify_explicit_purge(path) {
-                return Some(
-                    "sealed staging recovery is blocked partway through this batch; no trash entry was deleted, and any entries admitted before the block retain durable purge authority".to_string(),
-                );
+            if let Some(reason) = self.classify_explicit_purge(path) {
+                return Some(format!(
+                    "{reason}; no later claim, deletion, or housekeeping was attempted for this batch"
+                ));
             }
         }
         None
     }
 
-    pub(crate) fn execute_explicit_purge_all(&mut self, plan: TrashPurgePlan) -> PurgeReport {
-        if let Some(reason) = self.authorize_purge_all(&plan) {
+    pub(crate) fn execute_explicit_purge_all(&mut self, mut plan: TrashPurgePlan) -> PurgeReport {
+        let blocked = self.authorize_purge_all(&plan);
+        let purged = plan.take_already_purged(&self.authority_purged);
+        if let Some(reason) = blocked {
             return PurgeReport {
-                purged: Vec::new(),
+                purged,
                 failed: plan
                     .entries()
                     .map(|path| (path.to_path_buf(), reason.clone()))
                     .collect(),
             };
         }
-        self.execute_purge_all(plan)
+        let mut report = PurgeReport {
+            purged,
+            failed: Vec::new(),
+        };
+        let legacy = self.execute_purge_all(plan);
+        report.purged.extend(legacy.purged);
+        report.failed.extend(legacy.failed);
+        report
     }
 
     pub(crate) fn execute_purge_all(&self, plan: TrashPurgePlan) -> PurgeReport {
@@ -231,9 +234,26 @@ impl MutationSession {
         purge::plan_expired_trash(&self.lifecycle.ctx)
     }
 
-    pub(crate) fn execute_expiry(&self, plan: &ExpiryPlan) -> PurgeReport {
+    pub(crate) fn execute_expiry(&mut self, plan: &ExpiryPlan) -> PurgeReport {
+        for path in plan.entries().map(Path::to_path_buf).collect::<Vec<_>>() {
+            if let Some(reason) = self.classify_explicit_purge(&path) {
+                let reason =
+                    format!("{reason}; no later expiry mutation or housekeeping was attempted");
+                let (purged, failed): (Vec<_>, Vec<_>) = plan
+                    .entries()
+                    .map(Path::to_path_buf)
+                    .partition(|path| self.authority_purged.contains(path));
+                return PurgeReport {
+                    purged,
+                    failed: failed
+                        .into_iter()
+                        .map(|path| (path, reason.clone()))
+                        .collect(),
+                };
+            }
+        }
         let blocker = |path: &Path| self.sealed_entry_block(path);
-        purge::execute_expiry_plan(&self.lifecycle.ctx, plan, &blocker)
+        purge::execute_expiry_plan(&self.lifecycle.ctx, plan, &blocker, &self.authority_purged)
     }
 
     pub(crate) fn undo_latest(&mut self) -> Result<Option<UndoReport>> {
@@ -263,25 +283,33 @@ impl MutationSession {
         undo::undo_latest(&self.lifecycle.ctx, self.sealed_staging.as_mut(), &blocker)
     }
 
-    /// Returns true only when later admissions must stop because recovery is
-    /// blocked. Nonsealed and terminal-retained entries continue classification.
-    fn classify_explicit_purge(&mut self, path: &Path) -> bool {
-        let Some(engine) = self.sealed_staging.as_mut() else {
-            return false;
-        };
+    /// Returns a blocker for any sealed candidate that was not durably purged.
+    /// An unassociated legacy entry returns `None`; every sealed admission or
+    /// execution failure remains outside the legacy claim/delete path.
+    fn classify_explicit_purge(&mut self, path: &Path) -> Option<String> {
+        let engine = self.sealed_staging.as_mut()?;
         let entries = engine.production_entries();
         if entries.is_empty() {
-            return false;
+            return None;
         }
-        let Ok(canonical_home) = std::fs::canonicalize(&self.lifecycle.ctx.home) else {
-            return true;
+        let canonical_home = match std::fs::canonicalize(&self.lifecycle.ctx.home) {
+            Ok(home) => home,
+            Err(error) => {
+                return Some(format!(
+                    "sealed staging could not authenticate canonical HOME for explicit purge: {error}"
+                ));
+            }
         };
         let normalized = match (path.parent(), path.file_name()) {
             (Some(parent), Some(name)) => match std::fs::canonicalize(parent) {
                 Ok(parent) => parent.join(name),
-                Err(_) => return true,
+                Err(error) => {
+                    return Some(format!(
+                        "sealed staging could not authenticate the explicit purge parent: {error}"
+                    ));
+                }
             },
-            _ => return true,
+            _ => return Some("sealed staging rejected an unlocatable explicit purge entry".into()),
         };
         let Some(entry) = entries.into_iter().find(|entry| {
             canonical_home
@@ -289,10 +317,19 @@ impl MutationSession {
                 .join(entry.destination_basename())
                 == normalized
         }) else {
-            return false;
+            return self.sealed_entry_block(path);
         };
-        if entry.state() != degu_core::authority::TransactionState::VerifiedCommitted {
-            return false;
+        if !matches!(
+            entry.state(),
+            degu_core::authority::TransactionState::VerifiedCommitted
+                | degu_core::authority::TransactionState::Purgeable
+        ) {
+            return sealed_mutation_authority_active(entry.state()).then(|| {
+                format!(
+                    "sealed staging transaction is {:?} and cannot admit explicit purge",
+                    entry.state()
+                )
+            });
         }
         let open_home = || {
             rustix::fs::open(
@@ -307,7 +344,11 @@ impl MutationSession {
         };
         let (source_anchor, destination_anchor) = match (open_home(), open_home()) {
             (Ok(source), Ok(destination)) => (source, destination),
-            (Err(_), _) | (_, Err(_)) => return true,
+            (Err(error), _) | (_, Err(error)) => {
+                return Some(format!(
+                    "failed to retain explicit purge HOME anchors: {error}"
+                ));
+            }
         };
         let request = VerifiedPurgeRequest::new(
             entry.transaction(),
@@ -317,16 +358,26 @@ impl MutationSession {
         );
         match engine.request_verified_purge(request) {
             Ok(authority) => {
-                self.retained_purge_authorities.push(authority);
-                false
+                // The next operation immediately consumes the one-use authority;
+                // no path, JSONL, or diagnostic step intervenes.
+                match engine.execute_verified_purge(authority) {
+                    Ok(commit) => {
+                        debug_assert_eq!(commit.transaction(), entry.transaction());
+                        self.authority_purged.insert(path.to_path_buf());
+                        None
+                    }
+                    Err(error) => Some(format!(
+                        "sealed staging explicit purge execution failed during {} ({:?}): {error}",
+                        error.stage(),
+                        error.disposition()
+                    )),
+                }
             }
-            Err(error) => matches!(
-                error.disposition(),
-                degu_core::sealed_staging::VerifiedPurgeFailureDisposition::RecoveryBlocked
-                    | degu_core::sealed_staging::VerifiedPurgeFailureDisposition::Terminal(
-                        degu_core::authority::TransactionState::RecoveryRequired
-                    )
-            ),
+            Err(error) => Some(format!(
+                "sealed staging explicit purge admission failed during {} ({:?}): {error}",
+                error.stage(),
+                error.disposition()
+            )),
         }
     }
 

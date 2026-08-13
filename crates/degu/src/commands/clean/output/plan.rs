@@ -128,7 +128,7 @@ fn print_permanent_preview(prepared: &PreparedClean, stats: cleanup::FindingStat
         "{}",
         semantic::paint(
             prepared.settings.ui.prose(&format!(
-                "Would permanently delete {}",
+                "Would permanently delete {} after exact authority verification",
                 planned_bytes(prepared)
             )),
             Tone::Destructive,
@@ -139,7 +139,7 @@ fn print_permanent_preview(prepared: &PreparedClean, stats: cleanup::FindingStat
     stdoutln!(
         "{}",
         semantic::paint(
-            "Not restorable.",
+            "Preview is mutation-free; confirmed execution must seal and stage before authority-bound deletion. Not restorable.",
             Tone::Destructive,
             prepared.settings.ui.colors.stdout
         )

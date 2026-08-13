@@ -58,7 +58,7 @@ fn print_mechanism(prepared: &PreparedClean, sealed_staging: bool) -> Result<()>
     let mechanism = if prepared.settings.purge {
         ui.toned_prose(
             0,
-            "Staged then purged immediately; not restorable.",
+            "Sealed, staged, and permanently deleted through exact object-bound authority; not restorable.",
             Tone::Destructive,
         )
     } else if sealed_staging {
@@ -80,7 +80,7 @@ fn print_mechanism_sentence(
 ) -> Result<()> {
     let mechanism = if prepared.settings.purge {
         semantic::paint(
-            "staged then purged immediately; not restorable.",
+            "sealed, staged, and permanently deleted through exact object-bound authority; not restorable.",
             Tone::Destructive,
             prepared.settings.ui.colors.stdout,
         )

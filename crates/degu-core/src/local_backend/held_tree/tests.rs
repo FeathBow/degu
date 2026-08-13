@@ -56,6 +56,35 @@ fn bounded_collect_retains_every_directory_and_exact_rewalks() {
 }
 
 #[test]
+fn schema_one_inventory_preserves_legacy_hardlink_semantics() {
+    let (temp, root) = setup_tree();
+    std::fs::hard_link(root.join("a/file"), root.join("a/hardlink")).unwrap();
+    let held_parent = certify_held_fd(open_directory(temp.path())).unwrap();
+    let legacy = HeldTreeInventory::collect_for_schema(
+        held_parent,
+        OsStr::new("root"),
+        vec![],
+        HeldTreeLimits::default(),
+        1,
+    )
+    .unwrap();
+    assert_eq!(legacy.fingerprint_for_schema(1).unwrap().schema_version, 1);
+    legacy.rewalk_exact().unwrap();
+
+    let held_parent = certify_held_fd(open_directory(temp.path())).unwrap();
+    assert!(matches!(
+        HeldTreeInventory::collect_for_schema(
+            held_parent,
+            OsStr::new("root"),
+            vec![],
+            HeldTreeLimits::default(),
+            CONTENT_PROOF_VERSION,
+        ),
+        Err(HeldTreeError::ExternalHardLink(path)) if path == Path::new("a/file") || path == Path::new("a/hardlink")
+    ));
+}
+
+#[test]
 fn fingerprint_codec_is_domain_separated_raw_and_field_complete() {
     let base = ManifestEntry {
         path: PathBuf::from(OsString::from_vec(vec![b'a', 0xff])),
@@ -68,8 +97,17 @@ fn fingerprint_codec_is_domain_separated_raw_and_field_complete() {
         uid: 12,
         gid: 13,
         mode: 0o640,
+        content: ContentProof::Regular {
+            size: 3,
+            nlink: 1,
+            mtime_sec: 17,
+            mtime_nsec: 18,
+            ctime_sec: 19,
+            ctime_nsec: 20,
+            sha256: [0x42; 32],
+        },
     };
-    let fingerprint = fingerprint_manifest(std::slice::from_ref(&base));
+    let fingerprint = fingerprint_manifest_v1(std::slice::from_ref(&base));
     assert_eq!(fingerprint.entry_count, 1);
     assert_eq!(
         fingerprint.sha256,
@@ -106,7 +144,10 @@ fn fingerprint_codec_is_domain_separated_raw_and_field_complete() {
     value.mode ^= 1;
     variants.push(value);
     for variant in variants {
-        assert_ne!(fingerprint_manifest(&[variant]).sha256, fingerprint.sha256);
+        assert_ne!(
+            fingerprint_manifest_v1(&[variant]).sha256,
+            fingerprint.sha256
+        );
     }
 }
 
@@ -136,6 +177,50 @@ fn fingerprint_is_stable_after_inventory_sorting() {
     let second = tree.fingerprint();
     assert_eq!(first, second);
     assert_eq!(first.entry_count, tree.entry_count());
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn content_proof_rejects_same_size_overwrite_and_symlink_target_change() {
+    let (temp, root) = setup_tree();
+    let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    std::fs::write(root.join("a/file"), b"two").unwrap();
+    assert!(tree.rewalk_exact().is_err());
+
+    let (temp, root) = setup_tree();
+    let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    std::fs::remove_file(root.join("link")).unwrap();
+    std::os::unix::fs::symlink("/tmp", root.join("link")).unwrap();
+    assert!(tree.rewalk_exact().is_err());
+}
+
+#[test]
+fn collection_rejects_external_regular_file_hardlinks() {
+    let (temp, root) = setup_tree();
+    std::fs::hard_link(root.join("a/file"), root.join("a/alias")).unwrap();
+    assert!(matches!(
+        collect(&temp, vec![], HeldTreeLimits::default()),
+        Err(HeldTreeError::ExternalHardLink(_))
+    ));
+}
+
+#[test]
+fn content_hashing_is_aggregate_bounded() {
+    let (temp, _) = setup_tree();
+    assert!(matches!(
+        collect(
+            &temp,
+            vec![],
+            HeldTreeLimits {
+                max_content_bytes: 2,
+                ..HeldTreeLimits::default()
+            },
+        ),
+        Err(HeldTreeError::Limit {
+            kind: HeldTreeLimit::ContentBytes,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -279,6 +364,13 @@ fn root_binding_comparison_includes_mount_and_backend() {
         uid: 1,
         gid: 1,
         mode: 0o700,
+        size: 0,
+        nlink: 1,
+        mtime_sec: 0,
+        mtime_nsec: 0,
+        ctime_sec: 0,
+        ctime_nsec: 0,
+        content_fields_available: true,
         mount_id: 42,
         backend: CertifiedLocalBackend::Ext4,
     };

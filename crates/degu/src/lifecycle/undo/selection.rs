@@ -107,6 +107,39 @@ pub(super) fn select_actionable_undo_group(records: &[OpRecord]) -> Option<UndoS
     None
 }
 
+/// Selects one exact active reclamation group independently of whichever JSONL
+/// group is globally newest. Sealed WAL group classification must use this so a
+/// newer unrelated legacy group cannot hide an unmapped same-group member.
+pub(super) fn select_actionable_undo_group_named(
+    records: &[OpRecord],
+    reclamation_id: &str,
+) -> Option<UndoSelection> {
+    let state = active_trash_state(records);
+    let active = state.indices.into_iter().collect::<HashSet<_>>();
+    let group = records
+        .iter()
+        .enumerate()
+        .filter(|(index, record)| {
+            active.contains(index)
+                && record.reclamation_id.as_deref() == Some(reclamation_id)
+                && matches!(
+                    (&record.action, &record.outcome, &record.trash_entry),
+                    (
+                        OpAction::Trash,
+                        OpOutcome::Ok | OpOutcome::Pending | OpOutcome::Failed { .. },
+                        Some(_)
+                    )
+                )
+        })
+        .map(|(_, record)| record.clone())
+        .collect::<Vec<_>>();
+    if group.is_empty() {
+        return None;
+    }
+    let (selection, _) = classify_undo_group(&group, &state.ambiguous_restores);
+    Some(selection)
+}
+
 fn selected_group_cutoff(records: &[OpRecord], group: &[OpRecord]) -> Option<usize> {
     group
         .iter()

@@ -456,6 +456,7 @@ pub(crate) fn execute_prepared_rename<'a>(
     wal.complete_tree_manifest(
         transaction,
         DurableTreeManifest {
+            schema_version: fingerprint.schema_version,
             entry_count: fingerprint.entry_count,
             sha256: fingerprint.sha256,
         },

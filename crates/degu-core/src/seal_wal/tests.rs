@@ -80,6 +80,44 @@ fn legacy_v3_staging_begin(
     checked_frame(3, payload)
 }
 
+#[test]
+fn older_frame_versions_reject_states_introduced_by_newer_schemas() {
+    for (version, state) in [
+        (4, TransactionState::SourceParentRestoreIntent),
+        (5, TransactionState::UndoIntent),
+    ] {
+        let transaction = tx(version as u8);
+        let mut payload = vec![1];
+        payload.extend_from_slice(&transaction.0);
+        payload.push(encode_state(state));
+        let error = parse_frames(&checked_frame(version, payload))
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            ReplayError::Malformed {
+                reason: "transaction state is unknown for this frame version",
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn version_six_manifest_decodes_as_metadata_only_content_unproven() {
+    let transaction = tx(0x76);
+    let mut payload = vec![6];
+    payload.extend_from_slice(&transaction.0);
+    payload.extend_from_slice(&3_u64.to_le_bytes());
+    payload.extend_from_slice(&[0x5a; 32]);
+    let parsed = parse_frames(&checked_frame(6, payload)).unwrap();
+    let SealRecord::TreeManifestComplete { manifest, .. } = &parsed.records[0].record else {
+        panic!("expected manifest");
+    };
+    assert_eq!(manifest.schema_version, 1);
+    assert!(!manifest.has_content_proof());
+}
+
 fn replay_bytes(bytes: &[u8]) -> Replay {
     let parsed = parse_frames(bytes).unwrap();
     let committed_len = parsed.committed_len as u64;
@@ -416,14 +454,14 @@ fn checksum_unknown_version_and_malformed_interior_fail_closed() {
 
     let version_path = temp.path().join("version.wal");
     let mut version = good.clone();
-    version[4..6].copy_from_slice(&6_u16.to_le_bytes());
+    version[4..6].copy_from_slice(&8_u16.to_le_bytes());
     let version_header_crc = crc32(&version[4..12]);
     version[12..16].copy_from_slice(&version_header_crc.to_le_bytes());
     std::fs::write(&version_path, &version).unwrap();
     let mut lock = RecoverySession::try_acquire(open_rw(&version_path)).unwrap();
     assert!(matches!(
         lock.replay_and_repair(),
-        Err(ReplayError::UnsupportedLegacyVersion { version: 6, .. })
+        Err(ReplayError::UnsupportedLegacyVersion { version: 8, .. })
     ));
     drop(lock);
 
@@ -564,6 +602,7 @@ fn terminal_legacy_staging_metadata_does_not_block_the_next_transaction() {
         legacy.state = terminal;
         let replay = Replay {
             transactions: [(old_id, legacy.clone())].into_iter().collect(),
+            transaction_order: vec![old_id],
             tail_repair: None,
             committed_len: 0,
         };
@@ -649,6 +688,7 @@ fn replayed(state: TransactionState) -> ReplayedTransaction {
         staging: None,
         tree_manifest: None,
         rename_outcome: None,
+        undo_rename_outcome: None,
     }
 }
 
@@ -1553,6 +1593,7 @@ fn manifest_and_explicit_rename_intent_enforce_order_and_uniqueness() {
         Err(AppendError::InvalidState(_))
     ));
     let manifest = DurableTreeManifest {
+        schema_version: 2,
         entry_count: 9,
         sha256: [0x5a; 32],
     };
@@ -1623,6 +1664,7 @@ fn replay_rename_crash_boundary(
         SealRecord::TreeManifestComplete {
             transaction,
             manifest: DurableTreeManifest {
+                schema_version: 2,
                 entry_count: 2,
                 sha256: [0xa3; 32],
             },
@@ -1747,6 +1789,7 @@ fn replay_rejects_bare_or_duplicate_staging_history_and_conflicting_outcomes() {
         Err(ReplayError::InvalidHistory(_))
     ));
     let manifest = DurableTreeManifest {
+        schema_version: 2,
         entry_count: 1,
         sha256: [9; 32],
     };
@@ -1803,6 +1846,7 @@ fn replay_requires_the_post_stage_source_parent_restore_order() {
     let transaction = tx(75);
     let metadata = staging_metadata();
     let manifest = DurableTreeManifest {
+        schema_version: 2,
         entry_count: 0,
         sha256: [7; 32],
     };
@@ -1886,6 +1930,7 @@ fn manifest_completion_freezes_tree_permission_membership_at_runtime_and_replay(
     )
     .unwrap();
     let manifest = DurableTreeManifest {
+        schema_version: 2,
         entry_count: 1,
         sha256: [0x44; 32],
     };
@@ -2073,6 +2118,7 @@ fn wal_at_rename_intent(transaction: TransactionId) -> SealWal<FaultWriter> {
     wal.complete_tree_manifest(
         transaction,
         DurableTreeManifest {
+            schema_version: 2,
             entry_count: 0,
             sha256: [0xa3; 32],
         },

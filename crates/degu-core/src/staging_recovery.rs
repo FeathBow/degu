@@ -16,9 +16,9 @@ use crate::seal_executor::{
     execute_staging_local_mode_mutation,
 };
 use crate::seal_wal::{
-    AppendError, ApplicationStatus, DurablePermission, DurableTreeManifest, PermissionResolution,
-    RecoverySession, RecoveryWork, ResolveError, SealWal, StagingLocator,
-    StagingTransactionMetadata, StrongObjectIdentity, TransactionId,
+    AppendError, ApplicationStatus, DurablePermission, DurableTreeManifest,
+    DurableUndoRenameOutcome, PermissionResolution, RecoverySession, RecoveryWork, ResolveError,
+    SealWal, StagingLocator, StagingTransactionMetadata, StrongObjectIdentity, TransactionId,
 };
 use rustix::fd::OwnedFd;
 use rustix::fs::{Mode, OFlags};
@@ -32,6 +32,10 @@ use std::path::{Component, Path, PathBuf};
 std::thread_local! {
     static RECOVERY_NAME_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BEFORE_PERMISSION_RESOLUTION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    pub(crate) static UNDO_FAIL_STEP: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+    pub(crate) static BEFORE_UNDO_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -80,6 +84,14 @@ pub(crate) enum RecoveryRebindError {
     Resolution(#[from] ResolveError),
     #[error("held recovery mutation failed: {0}")]
     Execution(#[from] LocalModeExecutionError),
+    #[error("verified undo tree no longer exactly matches the committed manifest")]
+    UndoManifestChanged,
+    #[error("verified undo destination is occupied")]
+    UndoDestinationOccupied,
+    #[error("verified undo rename outcome is unknown: {0}")]
+    UndoRenameUnknown(#[source] io::Error),
+    #[error("verified undo parent fsync failed: {0}")]
+    UndoParentSync(#[source] io::Error),
 }
 
 impl From<CertificationError> for RecoveryRebindError {
@@ -158,6 +170,15 @@ pub(crate) struct RecoveryAnchors {
     pub(crate) destination: RecoveryFilesystemAnchor,
 }
 
+impl RecoveryAnchors {
+    fn duplicate(&self) -> Result<Self, RecoveryRebindError> {
+        Ok(Self {
+            source: self.source.duplicate_authority()?,
+            destination: self.destination.duplicate_authority()?,
+        })
+    }
+}
+
 /// Retained authority to re-open and compare a rebound object's complete
 /// anchor-relative parent attachment immediately before proof or mutation.
 #[derive(Debug)]
@@ -207,7 +228,7 @@ impl LocatorAttachment {
 /// is consumed by restoration.
 #[derive(Debug)]
 struct ReboundObject {
-    attachment: LocatorAttachment,
+    attachment: Option<LocatorAttachment>,
     parent: OwnedFd,
     object_check_fd: OwnedFd,
     basename: OsString,
@@ -218,7 +239,9 @@ struct ReboundObject {
 
 impl ReboundObject {
     fn verify_fresh_binding(&self) -> Result<(), RecoveryRebindError> {
-        self.attachment.verify(&self.parent)?;
+        if let Some(attachment) = &self.attachment {
+            attachment.verify(&self.parent)?;
+        }
         require_exclusive_controller(&self.parent)?;
         let current = open_directory_at(&self.parent, &self.basename)?;
         if strong_identity_fd(&current)? != self.identity
@@ -437,7 +460,7 @@ impl<'a> CertifiedStagedRecovery<'a> {
         for (permission, rebound) in &self.rebound_tree_seals {
             rebound.verify_fresh_sealed_directory(permission.expected_mode)?;
         }
-        let inventory = collect_rebound_staged_tree(&self.root, limits)?;
+        let inventory = collect_rebound_staged_tree(&self.root, limits, expected.schema_version)?;
         require_exact_tree_seal_coverage(
             &inventory,
             &self.root.relative_path,
@@ -448,7 +471,9 @@ impl<'a> CertifiedStagedRecovery<'a> {
         for (permission, rebound) in &self.rebound_tree_seals {
             rebound.verify_fresh_sealed_directory(permission.expected_mode)?;
         }
-        let actual = inventory.fingerprint();
+        let actual = inventory
+            .fingerprint_for_schema(expected.schema_version)
+            .ok_or(StagedVerificationFailure::ManifestMismatch)?;
         if actual.entry_count != expected.entry_count || actual.sha256 != expected.sha256 {
             return Err(StagedVerificationFailure::ManifestMismatch);
         }
@@ -459,6 +484,7 @@ impl<'a> CertifiedStagedRecovery<'a> {
 fn collect_rebound_staged_tree(
     root: &ReboundObject,
     limits: HeldTreeLimits,
+    manifest_schema: u16,
 ) -> Result<HeldTreeInventory, StagedVerificationFailure> {
     root.verify_fresh_binding()?;
     let parent = rustix::io::dup(&root.parent)
@@ -469,8 +495,13 @@ fn collect_rebound_staged_tree(
         .iter()
         .map(OsString::from)
         .collect();
-    let inventory =
-        HeldTreeInventory::collect(held_parent, &root.basename, protected_names, limits)?;
+    let inventory = HeldTreeInventory::collect_for_schema(
+        held_parent,
+        &root.basename,
+        protected_names,
+        limits,
+        manifest_schema,
+    )?;
     root.verify_fresh_binding()?;
     Ok(inventory)
 }
@@ -540,6 +571,8 @@ pub(crate) enum StartupRecoveryCapability<'a> {
     /// Nonforgeable continuation for a future staged-tree verifier. Merely
     /// checking liveness never clears the startup mutation block.
     PendingVerification(Box<CertifiedStagedRecovery<'a>>),
+    /// Object-bound continuation for a previously admitted verified undo.
+    VerifiedUndo(Box<VerifiedUndoRecoverySession<'a>>),
 }
 
 /// Owns all rebound FDs and borrows the exact leased WAL until ordered restore
@@ -621,6 +654,355 @@ impl RecoveryRestoreSession<'_> {
         }
         *self.startup_blocked = !self.wal.can_begin_staging_transaction();
         Ok(())
+    }
+}
+
+struct ReboundVerifiedUndo {
+    anchors: RecoveryAnchors,
+    metadata: StagingTransactionMetadata,
+    source_parent: OwnedFd,
+    destination_parent: OwnedFd,
+    root: ReboundObject,
+    tree_seals: Vec<(DurablePermission, ReboundObject)>,
+    expected_manifest: DurableTreeManifest,
+}
+
+/// One-shot continuation for committed-mode restoration and rename-back. Every
+/// namespace and object check is performed through descriptors retained here;
+/// durable paths and identities are never execution authority by themselves.
+pub(crate) struct VerifiedUndoRecoverySession<'a> {
+    wal: &'a mut SealWal<RecoverySession>,
+    startup_blocked: &'a mut bool,
+    transaction: TransactionId,
+    undo: ReboundVerifiedUndo,
+}
+
+impl VerifiedUndoRecoverySession<'_> {
+    pub(crate) fn execute(mut self) -> Result<TransactionState, RecoveryRebindError> {
+        let transaction = self.transaction;
+        let state = self
+            .wal
+            .transaction_state(transaction)
+            .ok_or(RecoveryRebindError::TransactionMismatch)?;
+        if state == TransactionState::VerifiedCommitted {
+            self.verify_exact_tree()?;
+            self.verify_parents_and_layout(true)?;
+            self.wal.record_verified_undo_intent(transaction)?;
+            #[cfg(test)]
+            if UNDO_FAIL_STEP.with(|step| step.get() == Some("intent")) {
+                return Err(RecoveryRebindError::Io(io::Error::other(
+                    "injected crash after UndoIntent",
+                )));
+            }
+        } else if !matches!(
+            state,
+            TransactionState::UndoIntent | TransactionState::UndoModesRestored
+        ) {
+            return Err(RecoveryRebindError::TransactionMismatch);
+        }
+
+        if self.wal.transaction_state(transaction) == Some(TransactionState::UndoIntent) {
+            // Durable evidence order is ignored; the live rebound objects are
+            // independently sorted deepest-first before any inverse fchmod.
+            self.undo.tree_seals.sort_by(|(left, _), (right, _)| {
+                right
+                    .evidence
+                    .relative_path()
+                    .components()
+                    .count()
+                    .cmp(&left.evidence.relative_path().components().count())
+                    .then_with(|| left.mutation_id.cmp(&right.mutation_id))
+            });
+            for (original, rebound) in &mut self.undo.tree_seals {
+                let snapshot = self
+                    .wal
+                    .recovery_snapshot(transaction)
+                    .ok_or(RecoveryRebindError::TransactionMismatch)?;
+                let restored = snapshot.permissions.iter().any(|permission| {
+                    permission.application == ApplicationStatus::Applied
+                        && permission.phase == TransactionState::UndoIntent
+                        && permission.reverses_mutation_id == Some(original.mutation_id)
+                });
+                if restored {
+                    rebound
+                        .held
+                        .verify_current_mode(original.pre_mode)
+                        .map_err(RecoveryRebindError::SealChanged)?;
+                    continue;
+                }
+                rebound.verify_fresh_sealed_directory(original.expected_mode)?;
+                rebound
+                    .held
+                    .bind_recovered_seal_lineage(
+                        transaction,
+                        original.mutation_id,
+                        original.pre_mode,
+                        original.expected_mode,
+                        self.undo.metadata.backend(),
+                        original.evidence.device(),
+                        original.evidence.inode(),
+                    )
+                    .map_err(LocalModeExecutionError::Preparation)?;
+                let mutation_id = self.wal.next_recovery_mutation_id(transaction).ok_or(
+                    AppendError::InvalidState("undo mutation id space exhausted"),
+                )?;
+                execute_staging_local_mode_mutation(
+                    self.wal,
+                    &mut rebound.held,
+                    LocalModeMutationRequest {
+                        transaction,
+                        mutation_id,
+                        locator: RecoveryLocator::durable_restore(
+                            rebound.relative_path.clone(),
+                            original.evidence.filesystem_id().map(str::to_owned),
+                        ),
+                        transform: LocalModeTransform::Restore {
+                            original: original.clone(),
+                        },
+                    },
+                )?;
+            }
+            self.wal.record_undo_modes_restored(transaction)?;
+            #[cfg(test)]
+            if UNDO_FAIL_STEP.with(|step| step.get() == Some("modes")) {
+                return Err(RecoveryRebindError::Io(io::Error::other(
+                    "injected crash after UndoModesRestored",
+                )));
+            }
+        }
+
+        self.verify_exact_tree()?;
+        self.verify_parents_and_layout(true)?;
+        self.wal.record_undo_rename_intent(transaction)?;
+        #[cfg(test)]
+        if UNDO_FAIL_STEP.with(|step| step.get() == Some("rename-intent")) {
+            return Err(RecoveryRebindError::Io(io::Error::other(
+                "injected crash after UndoRenameIntent",
+            )));
+        }
+        #[cfg(test)]
+        BEFORE_UNDO_RENAME.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+
+        match rustix::fs::renameat_with(
+            &self.undo.destination_parent,
+            self.undo.metadata.destination_basename(),
+            &self.undo.source_parent,
+            self.undo.metadata.source_basename(),
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => {}
+            Err(error) if error == rustix::io::Errno::EXIST => {
+                self.verify_parents_and_layout(false)?;
+                self.wal.record_undo_rename_outcome(
+                    transaction,
+                    DurableUndoRenameOutcome::ConfirmedCollisionAtStaged(
+                        self.undo.metadata.root_identity(),
+                    ),
+                )?;
+                self.wal
+                    .record_undo_terminal(transaction, TransactionState::UndoConflict)?;
+                *self.startup_blocked = !self.wal.can_begin_staging_transaction();
+                return Ok(TransactionState::UndoConflict);
+            }
+            Err(error) => {
+                let error = io::Error::from(error);
+                let _ = self.wal.transition_recovery_required(transaction);
+                return Err(RecoveryRebindError::UndoRenameUnknown(error));
+            }
+        }
+
+        self.verify_applied_layout()?;
+        #[cfg(test)]
+        if UNDO_FAIL_STEP.with(|step| step.get() == Some("rename")) {
+            return Err(RecoveryRebindError::Io(io::Error::other(
+                "injected crash after undo rename syscall",
+            )));
+        }
+        rustix::fs::fsync(&self.undo.destination_parent)
+            .map_err(io::Error::from)
+            .map_err(RecoveryRebindError::UndoParentSync)?;
+        #[cfg(test)]
+        if UNDO_FAIL_STEP.with(|step| step.get() == Some("destination-fsync")) {
+            return Err(RecoveryRebindError::Io(io::Error::other(
+                "injected crash after undo destination-parent fsync",
+            )));
+        }
+        rustix::fs::fsync(&self.undo.source_parent)
+            .map_err(io::Error::from)
+            .map_err(RecoveryRebindError::UndoParentSync)?;
+        #[cfg(test)]
+        if UNDO_FAIL_STEP.with(|step| step.get() == Some("source-fsync")) {
+            return Err(RecoveryRebindError::Io(io::Error::other(
+                "injected crash after undo source-parent fsync",
+            )));
+        }
+        self.verify_applied_layout()?;
+        self.wal.record_undo_rename_outcome(
+            transaction,
+            DurableUndoRenameOutcome::AppliedAndParentsSynced(self.undo.metadata.root_identity()),
+        )?;
+        #[cfg(test)]
+        if UNDO_FAIL_STEP.with(|step| step.get() == Some("outcome")) {
+            return Err(RecoveryRebindError::Io(io::Error::other(
+                "injected crash after durable undo rename outcome",
+            )));
+        }
+        self.wal
+            .record_undo_terminal(transaction, TransactionState::Restored)?;
+        #[cfg(test)]
+        if UNDO_FAIL_STEP.with(|step| step.get() == Some("terminal")) {
+            return Err(RecoveryRebindError::Io(io::Error::other(
+                "injected crash after durable undo terminal",
+            )));
+        }
+        *self.startup_blocked = !self.wal.can_begin_staging_transaction();
+        Ok(TransactionState::Restored)
+    }
+
+    fn verify_exact_tree(&self) -> Result<(), RecoveryRebindError> {
+        self.undo.root.verify_fresh_binding()?;
+        for (_, rebound) in &self.undo.tree_seals {
+            if strong_identity_fd(&rebound.object_check_fd)? != rebound.identity {
+                return Err(RecoveryRebindError::BindingChanged);
+            }
+            rebound
+                .held
+                .verify_current_mode(rebound.held.mode())
+                .map_err(RecoveryRebindError::SealChanged)?;
+        }
+        let inventory = collect_rebound_staged_tree(
+            &self.undo.root,
+            HeldTreeLimits::default(),
+            self.undo.expected_manifest.schema_version,
+        )
+        .map_err(|_| RecoveryRebindError::UndoManifestChanged)?;
+        let source_root = self
+            .undo
+            .metadata
+            .source_parent()
+            .relative_path()
+            .join(self.undo.metadata.source_basename());
+        let mut expected_modes = BTreeMap::new();
+        let mut expected_identities = BTreeMap::new();
+        for (permission, _) in &self.undo.tree_seals {
+            let suffix = permission
+                .evidence
+                .relative_path()
+                .strip_prefix(&source_root)
+                .map_err(|_| RecoveryRebindError::InvalidLocator)?
+                .to_path_buf();
+            expected_modes.insert(suffix.clone(), permission.expected_mode);
+            expected_identities.insert(
+                suffix,
+                (
+                    permission.evidence.device(),
+                    permission.evidence.inode(),
+                    permission
+                        .evidence
+                        .generation_or_btime()
+                        .ok_or(RecoveryRebindError::StrongIdentityUnavailable)?,
+                ),
+            );
+        }
+        let actual_identities = inventory
+            .directories_deepest_first()
+            .map(|directory| {
+                (
+                    directory.relative_path,
+                    (directory.device, directory.inode, directory.incarnation),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if expected_identities != actual_identities {
+            return Err(RecoveryRebindError::UndoManifestChanged);
+        }
+        inventory
+            .rewalk_exact()
+            .map_err(|_| RecoveryRebindError::UndoManifestChanged)?;
+        let normalized = inventory
+            .fingerprint_with_directory_modes(&expected_modes)
+            .map_err(|_| RecoveryRebindError::UndoManifestChanged)?;
+        if normalized.entry_count != self.undo.expected_manifest.entry_count
+            || normalized.sha256 != self.undo.expected_manifest.sha256
+        {
+            return Err(RecoveryRebindError::UndoManifestChanged);
+        }
+        self.undo.root.verify_fresh_binding()?;
+        Ok(())
+    }
+
+    fn verify_parents_and_layout(&self, require_absent: bool) -> Result<(), RecoveryRebindError> {
+        self.undo.anchors.source.verify_locator_binding(
+            self.undo.metadata.source_parent(),
+            &self.undo.source_parent,
+            self.undo.metadata.source_parent_identity(),
+        )?;
+        self.undo.anchors.destination.verify_locator_binding(
+            self.undo.metadata.destination_parent(),
+            &self.undo.destination_parent,
+            self.undo.metadata.destination_parent_identity(),
+        )?;
+        certify_held_fd(
+            rustix::io::dup(&self.undo.source_parent)
+                .map_err(io::Error::from)
+                .map_err(RecoveryRebindError::Io)?,
+        )?
+        .verify_namespace_exclusive()
+        .map_err(RecoveryRebindError::SealChanged)?;
+        certify_held_fd(
+            rustix::io::dup(&self.undo.destination_parent)
+                .map_err(io::Error::from)
+                .map_err(RecoveryRebindError::Io)?,
+        )?
+        .verify_namespace_exclusive()
+        .map_err(RecoveryRebindError::SealChanged)?;
+        self.undo.root.verify_fresh_binding()?;
+        match rustix::fs::statat(
+            &self.undo.source_parent,
+            self.undo.metadata.source_basename(),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Err(error) if error == rustix::io::Errno::NOENT && require_absent => Ok(()),
+            Ok(_) if !require_absent => Ok(()),
+            Err(error) => Err(RecoveryRebindError::Io(io::Error::from(error))),
+            Ok(_) => Err(RecoveryRebindError::UndoDestinationOccupied),
+        }
+    }
+
+    fn verify_applied_layout(&self) -> Result<(), RecoveryRebindError> {
+        self.undo.anchors.source.verify_locator_binding(
+            self.undo.metadata.source_parent(),
+            &self.undo.source_parent,
+            self.undo.metadata.source_parent_identity(),
+        )?;
+        self.undo.anchors.destination.verify_locator_binding(
+            self.undo.metadata.destination_parent(),
+            &self.undo.destination_parent,
+            self.undo.metadata.destination_parent_identity(),
+        )?;
+        let restored = open_directory_at(
+            &self.undo.source_parent,
+            self.undo.metadata.source_basename(),
+        )?;
+        if strong_identity_fd(&restored)? != self.undo.metadata.root_identity()
+            || strong_identity_fd(&self.undo.root.object_check_fd)?
+                != self.undo.metadata.root_identity()
+        {
+            return Err(RecoveryRebindError::BindingChanged);
+        }
+        match rustix::fs::statat(
+            &self.undo.destination_parent,
+            self.undo.metadata.destination_basename(),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Err(error) if error == rustix::io::Errno::NOENT => Ok(()),
+            Err(error) => Err(RecoveryRebindError::Io(io::Error::from(error))),
+            Ok(_) => Err(RecoveryRebindError::BindingChanged),
+        }
     }
 }
 
@@ -751,7 +1133,49 @@ pub(crate) fn prepare_startup_recovery<'a>(
                 },
             )))
         }
+        Ok(ReboundWork::VerifiedUndo(undo)) => Ok(StartupRecoveryCapability::VerifiedUndo(
+            Box::new(VerifiedUndoRecoverySession {
+                wal,
+                startup_blocked,
+                transaction,
+                undo: *undo,
+            }),
+        )),
         Err(error) => fail_closed(wal, transaction, error),
+    }
+}
+
+pub(crate) fn prepare_verified_undo<'a>(
+    wal: &'a mut SealWal<RecoverySession>,
+    startup_blocked: &'a mut bool,
+    transaction: TransactionId,
+    anchors: RecoveryAnchors,
+) -> Result<VerifiedUndoRecoverySession<'a>, RecoveryRebindError> {
+    let snapshot = wal
+        .recovery_snapshot(transaction)
+        .ok_or(RecoveryRebindError::TransactionMismatch)?;
+    if snapshot.state != TransactionState::VerifiedCommitted {
+        return Err(RecoveryRebindError::TransactionMismatch);
+    }
+    let metadata = snapshot
+        .staging
+        .clone()
+        .ok_or(RecoveryRebindError::TransactionMismatch)?;
+    let work = RecoveryWork::ResumeVerifiedUndo {
+        transaction,
+        permissions: snapshot.permissions,
+    };
+    match rebind_work(&metadata, snapshot.tree_manifest, work, &anchors) {
+        Ok(ReboundWork::VerifiedUndo(undo)) => Ok(VerifiedUndoRecoverySession {
+            wal,
+            startup_blocked,
+            transaction,
+            undo: *undo,
+        }),
+        Ok(ReboundWork::Restore(_) | ReboundWork::VerifyStaged(_)) => {
+            Err(RecoveryRebindError::TransactionMismatch)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -775,6 +1199,7 @@ struct ReboundStaged {
 enum ReboundWork {
     Restore(ReboundRestore),
     VerifyStaged(Box<ReboundStaged>),
+    VerifiedUndo(Box<ReboundVerifiedUndo>),
 }
 
 fn resolve_uncertain_permissions(
@@ -893,6 +1318,25 @@ fn uncertain_permission_location<'a>(
             original.evidence.relative_path().to_path_buf(),
         ),
         TransactionState::Quarantined if original.phase == TransactionState::TreeSealIntent => {
+            let source_root = metadata
+                .source_parent()
+                .relative_path()
+                .join(metadata.source_basename());
+            let suffix = original
+                .evidence
+                .relative_path()
+                .strip_prefix(&source_root)
+                .map_err(|_| RecoveryRebindError::InvalidLocator)?;
+            (
+                &anchors.destination,
+                metadata
+                    .destination_parent()
+                    .relative_path()
+                    .join(metadata.destination_basename())
+                    .join(suffix),
+            )
+        }
+        TransactionState::UndoIntent if original.phase == TransactionState::TreeSealIntent => {
             let source_root = metadata
                 .source_parent()
                 .relative_path()
@@ -1055,11 +1499,53 @@ fn rebind_work(
                 tree_seals,
             })))
         }
+        RecoveryWork::ResumeVerifiedUndo {
+            transaction: work_transaction,
+            permissions,
+        } => {
+            if work_transaction != transaction {
+                return Err(RecoveryRebindError::TransactionMismatch);
+            }
+            let expected_manifest =
+                tree_manifest.ok_or(RecoveryRebindError::UndoManifestChanged)?;
+            if !expected_manifest.has_content_proof() {
+                // Backward replay remains available, but a legacy metadata-only
+                // VerifiedCommitted record can never authorize automatic undo.
+                return Err(RecoveryRebindError::UndoManifestChanged);
+            }
+            let root = rebind_named_child(
+                &anchors.destination,
+                rustix::io::dup(&destination_parent)
+                    .map_err(io::Error::from)
+                    .map_err(RecoveryRebindError::Io)?,
+                metadata.destination_basename(),
+                metadata.root_identity(),
+                metadata
+                    .destination_parent()
+                    .relative_path()
+                    .join(metadata.destination_basename()),
+                metadata,
+                None,
+            )?;
+            let tree_seals =
+                rebind_verified_undo_tree_seals(&anchors.destination, metadata, permissions)?;
+            Ok(ReboundWork::VerifiedUndo(Box::new(ReboundVerifiedUndo {
+                anchors: anchors.duplicate()?,
+                metadata: metadata.clone(),
+                source_parent,
+                destination_parent,
+                root,
+                tree_seals,
+                expected_manifest,
+            })))
+        }
         RecoveryWork::RecoveryRequired { .. }
         | RecoveryWork::ResolveUncertainPermissions { .. }
         | RecoveryWork::PreserveCommittedSeal { .. }
         | RecoveryWork::PreserveQuarantine { .. }
+        | RecoveryWork::PreserveUndoConflict { .. }
         | RecoveryWork::FinalizeVerifiedCommit { .. }
+        | RecoveryWork::FinalizeVerifiedUndo { .. }
         | RecoveryWork::Nothing => Err(RecoveryRebindError::TransactionMismatch),
     }
 }
@@ -1084,6 +1570,9 @@ pub(crate) fn recovery_transaction(work: &RecoveryWork) -> TransactionId {
         | RecoveryWork::PreserveCommittedSeal { transaction, .. }
         | RecoveryWork::PreserveQuarantine { transaction }
         | RecoveryWork::FinalizeVerifiedCommit { transaction }
+        | RecoveryWork::ResumeVerifiedUndo { transaction, .. }
+        | RecoveryWork::FinalizeVerifiedUndo { transaction, .. }
+        | RecoveryWork::PreserveUndoConflict { transaction }
         | RecoveryWork::RecoveryRequired { transaction, .. } => *transaction,
         RecoveryWork::Nothing => TransactionId([0; 16]),
     }
@@ -1190,6 +1679,92 @@ fn rebind_staged_tree_seals(
     Ok(rebound)
 }
 
+fn rebind_verified_undo_tree_seals(
+    destination_anchor: &RecoveryFilesystemAnchor,
+    metadata: &StagingTransactionMetadata,
+    permissions: Vec<DurablePermission>,
+) -> Result<Vec<(DurablePermission, ReboundObject)>, RecoveryRebindError> {
+    let source_root = metadata
+        .source_parent()
+        .relative_path()
+        .join(metadata.source_basename());
+    let destination_root = metadata
+        .destination_parent()
+        .relative_path()
+        .join(metadata.destination_basename());
+    let destination_parent = rebind_locator(
+        destination_anchor,
+        metadata.destination_parent(),
+        metadata.destination_parent_identity(),
+    )?;
+    let staged_root_fd = open_directory_at(&destination_parent, metadata.destination_basename())?;
+    if strong_identity_fd(&staged_root_fd)? != metadata.root_identity() {
+        return Err(RecoveryRebindError::BindingChanged);
+    }
+    let originals = permissions
+        .iter()
+        .filter(|permission| {
+            permission.phase == TransactionState::TreeSealIntent
+                && permission.application == ApplicationStatus::Applied
+                && permission.reverses_mutation_id.is_none()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut rebound = Vec::with_capacity(originals.len());
+    for original in originals {
+        let suffix = original
+            .evidence
+            .relative_path()
+            .strip_prefix(&source_root)
+            .map_err(|_| RecoveryRebindError::InvalidLocator)?;
+        let path = destination_root.join(suffix);
+        let inverse_applied = permissions.iter().any(|inverse| {
+            inverse.phase == TransactionState::UndoIntent
+                && inverse.application == ApplicationStatus::Applied
+                && inverse.reverses_mutation_id == Some(original.mutation_id)
+        });
+        let expected_mode = if inverse_applied {
+            original.pre_mode
+        } else {
+            original.expected_mode
+        };
+        let expected = StrongObjectIdentity::new_with_mount(
+            original.evidence.device(),
+            original.evidence.inode(),
+            crate::seal_wal::ObjectIncarnation::new(
+                original
+                    .evidence
+                    .generation_or_btime()
+                    .ok_or(RecoveryRebindError::StrongIdentityUnavailable)?,
+            ),
+            destination_anchor.mount_key,
+        );
+        let (parent, basename) = if suffix.as_os_str().is_empty() {
+            (
+                rustix::io::dup(&destination_parent)
+                    .map_err(io::Error::from)
+                    .map_err(RecoveryRebindError::Io)?,
+                metadata.destination_basename().to_os_string(),
+            )
+        } else {
+            open_parent_beneath_held_root(&staged_root_fd, suffix, destination_anchor.mount_key)?
+        };
+        let object = rebind_named_child_from_held_parent(
+            parent,
+            &basename,
+            expected,
+            path,
+            metadata,
+            expected_mode,
+        )?;
+        rebound.push((original, object));
+    }
+    if rebound.is_empty() {
+        return Err(RecoveryRebindError::UndoManifestChanged);
+    }
+    Ok(rebound)
+}
+
 fn rebind_permissions(
     anchor: &RecoveryFilesystemAnchor,
     metadata: &StagingTransactionMetadata,
@@ -1282,6 +1857,81 @@ fn rebind_quarantined_permissions(
         .collect()
 }
 
+fn open_parent_beneath_held_root(
+    root: &OwnedFd,
+    suffix: &Path,
+    expected_mount: u64,
+) -> Result<(OwnedFd, OsString), RecoveryRebindError> {
+    if suffix.is_absolute()
+        || suffix
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(RecoveryRebindError::InvalidLocator);
+    }
+    let basename = suffix
+        .file_name()
+        .ok_or(RecoveryRebindError::InvalidLocator)?
+        .to_os_string();
+    let mut current = rustix::io::dup(root)
+        .map_err(io::Error::from)
+        .map_err(RecoveryRebindError::Io)?;
+    if let Some(parent) = suffix.parent() {
+        for component in parent.components() {
+            let Component::Normal(name) = component else {
+                return Err(RecoveryRebindError::InvalidLocator);
+            };
+            current = open_directory_at(&current, name)?;
+            if held_mount_key(&current)? != expected_mount {
+                return Err(RecoveryRebindError::MountChanged);
+            }
+        }
+    }
+    Ok((current, basename))
+}
+
+fn rebind_named_child_from_held_parent(
+    parent: OwnedFd,
+    basename: &OsStr,
+    expected: StrongObjectIdentity,
+    relative_path: PathBuf,
+    metadata: &StagingTransactionMetadata,
+    expected_mode: u32,
+) -> Result<ReboundObject, RecoveryRebindError> {
+    if !normal_basename(basename) {
+        return Err(RecoveryRebindError::InvalidLocator);
+    }
+    let fd = open_directory_at(&parent, basename)?;
+    if strong_identity_fd(&fd)? != expected {
+        return Err(RecoveryRebindError::BindingChanged);
+    }
+    let object_check_fd = rustix::io::dup(&fd)
+        .map_err(io::Error::from)
+        .map_err(RecoveryRebindError::Io)?;
+    let held = certify_held_fd(fd)?;
+    if held.backend() != metadata.backend() {
+        return Err(RecoveryRebindError::BackendChanged);
+    }
+    if held.mount_id() != expected.mount_id() {
+        return Err(RecoveryRebindError::MountChanged);
+    }
+    if held.device() != expected.device()
+        || held.inode() != expected.inode()
+        || held.mode() != expected_mode
+    {
+        return Err(RecoveryRebindError::BindingChanged);
+    }
+    Ok(ReboundObject {
+        attachment: None,
+        parent,
+        object_check_fd,
+        basename: basename.to_os_string(),
+        relative_path,
+        identity: expected,
+        held,
+    })
+}
+
 fn rebind_named_child(
     anchor: &RecoveryFilesystemAnchor,
     parent: OwnedFd,
@@ -1319,7 +1969,7 @@ fn rebind_named_child(
         return Err(RecoveryRebindError::ModeChanged);
     }
     Ok(ReboundObject {
-        attachment,
+        attachment: Some(attachment),
         parent,
         object_check_fd,
         basename: basename.to_os_string(),

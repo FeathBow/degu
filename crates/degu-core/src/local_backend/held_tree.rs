@@ -17,7 +17,8 @@ use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr, OsString};
-use std::io;
+use std::io::{self, Read};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -26,7 +27,9 @@ const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 const HARD_DIRECTORY_CAP: u64 = 1_024;
-const MANIFEST_DOMAIN: &[u8] = b"degu-held-tree-manifest-v1\0";
+const MANIFEST_DOMAIN_V1: &[u8] = b"degu-held-tree-manifest-v1\0";
+const MANIFEST_DOMAIN_V2: &[u8] = b"degu-held-tree-manifest-v2-content\0";
+const CONTENT_PROOF_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HeldTreeLimits {
@@ -35,6 +38,8 @@ pub(crate) struct HeldTreeLimits {
     pub max_depth: u32,
     pub max_path_bytes: u64,
     pub max_manifest_bytes: u64,
+    /// Maximum aggregate regular-file bytes read through held no-follow FDs.
+    pub max_content_bytes: u64,
 }
 
 impl Default for HeldTreeLimits {
@@ -45,6 +50,7 @@ impl Default for HeldTreeLimits {
             max_depth: 128,
             max_path_bytes: 16 * 1024 * 1024,
             max_manifest_bytes: 64 * 1024 * 1024,
+            max_content_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -56,6 +62,7 @@ pub(crate) enum HeldTreeLimit {
     Depth,
     PathBytes,
     ManifestBytes,
+    ContentBytes,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +85,14 @@ pub(crate) enum HeldTreeError {
     IdentityChanged(PathBuf),
     #[error("strong kernel incarnation is unavailable at {0}")]
     StrongIncarnationUnavailable(PathBuf),
+    #[error("regular file has an external hard link at {0}")]
+    ExternalHardLink(PathBuf),
+    #[error("non-directory ACL, xattr, or capability is present or cannot be proven absent at {0}")]
+    NonDirectoryExtendedMetadata(PathBuf),
+    #[error("non-directory content proof is unsupported at {0}")]
+    UnsupportedContentProof(PathBuf),
+    #[error("entry changed while its content was hashed at {0}")]
+    ContentChangedDuringHash(PathBuf),
     #[error("root is not a directory")]
     RootNotDirectory,
     #[error("directory certification failed at {path}: {reason:?}")]
@@ -138,12 +153,45 @@ struct ManifestEntry {
     uid: u32,
     gid: u32,
     mode: u32,
+    content: ContentProof,
+}
+
+/// Mirrors the exact pre-v2 in-memory accounting shape. This is used only for
+/// the historical manifest byte budget; it is never instantiated or persisted.
+struct LegacyManifestEntryAccounting {
+    path: PathBuf,
+    identity: NodeIdentity,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ContentProof {
+    /// Schema-v1 inventory deliberately does not inspect non-directory content.
+    /// The variant is also used for directories so exact legacy rewalks compare
+    /// only the fields committed by the historical manifest.
+    Legacy,
+    Directory,
+    Regular {
+        size: u64,
+        nlink: u64,
+        mtime_sec: i64,
+        mtime_nsec: u32,
+        ctime_sec: i64,
+        ctime_nsec: u32,
+        sha256: [u8; 32],
+    },
+    Symlink {
+        target: Vec<u8>,
+    },
 }
 
 /// Canonical commitment to a bounded complete held-tree inventory. This is
 /// evidence only and carries no FD, WAL lease, or mutation authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HeldTreeFingerprint {
+    pub(crate) schema_version: u16,
     pub(crate) entry_count: u64,
     pub(crate) sha256: [u8; 32],
 }
@@ -178,6 +226,7 @@ pub(crate) struct HeldTreeInventory {
     mount_id: u64,
     protected_names: Vec<OsString>,
     limits: HeldTreeLimits,
+    manifest_schema: u16,
     directories: Vec<HeldDirectory>,
     manifest: Vec<ManifestEntry>,
 }
@@ -190,6 +239,28 @@ impl HeldTreeInventory {
         protected_names: Vec<OsString>,
         limits: HeldTreeLimits,
     ) -> Result<Self, HeldTreeError> {
+        Self::collect_for_schema(
+            parent,
+            root_name,
+            protected_names,
+            limits,
+            CONTENT_PROOF_VERSION,
+        )
+    }
+
+    /// Collects only the evidence committed by the requested durable schema.
+    /// Schema 1 preserves historical recovery semantics and never reads file
+    /// content or imposes v2 hardlink/xattr/content-budget constraints.
+    pub(crate) fn collect_for_schema(
+        parent: HeldLocalBackendEvidence,
+        root_name: &OsStr,
+        protected_names: Vec<OsString>,
+        limits: HeldTreeLimits,
+        manifest_schema: u16,
+    ) -> Result<Self, HeldTreeError> {
+        if !matches!(manifest_schema, 1 | CONTENT_PROOF_VERSION) {
+            return Err(HeldTreeError::UnsupportedContentProof(PathBuf::new()));
+        }
         require_one_component(root_name)?;
         validate_policy(&protected_names)?;
         if limits.max_directories > HARD_DIRECTORY_CAP {
@@ -223,8 +294,13 @@ impl HeldTreeInventory {
             return Err(HeldTreeError::BackendBoundary(root_path));
         }
         let root_identity = opened.identity;
-        let root_entry = opened.into_manifest(PathBuf::new());
-        let mut budget = Budget::new(limits);
+        let root_content = if manifest_schema == CONTENT_PROOF_VERSION {
+            ContentProof::Directory
+        } else {
+            ContentProof::Legacy
+        };
+        let root_entry = opened.into_manifest(PathBuf::new(), root_content);
+        let mut budget = Budget::new(limits, manifest_schema);
         budget.add(&root_entry, 0)?;
         budget.add_directory()?;
         let mut tree = Self {
@@ -235,6 +311,7 @@ impl HeldTreeInventory {
             mount_id: held.mount_id(),
             protected_names,
             limits,
+            manifest_schema,
             directories: vec![HeldDirectory {
                 held,
                 path: PathBuf::new(),
@@ -262,7 +339,49 @@ impl HeldTreeInventory {
     /// Raw path bytes and fixed-width big-endian fields avoid display, UTF-8,
     /// serde, native-endian, and map-order ambiguity.
     pub(crate) fn fingerprint(&self) -> HeldTreeFingerprint {
-        fingerprint_manifest(&self.manifest)
+        debug_assert_eq!(self.manifest_schema, CONTENT_PROOF_VERSION);
+        fingerprint_manifest_v2(&self.manifest)
+    }
+
+    pub(crate) fn fingerprint_for_schema(
+        &self,
+        schema_version: u16,
+    ) -> Option<HeldTreeFingerprint> {
+        if schema_version != self.manifest_schema {
+            return None;
+        }
+        match schema_version {
+            1 => Some(fingerprint_manifest_v1(&self.manifest)),
+            CONTENT_PROOF_VERSION => Some(fingerprint_manifest_v2(&self.manifest)),
+            _ => None,
+        }
+    }
+
+    /// Recomputes the complete manifest after substituting directory modes.
+    /// Verified undo uses this after applying durable inverses: normalizing each
+    /// directory back to its sealed mode proves that no content, identity,
+    /// ownership, type, or non-directory mode drift occurred while modes were
+    /// restored at the staged name.
+    pub(crate) fn fingerprint_with_directory_modes(
+        &self,
+        modes: &std::collections::BTreeMap<PathBuf, u32>,
+    ) -> Result<HeldTreeFingerprint, HeldTreeError> {
+        let mut manifest = self.manifest.clone();
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in &mut manifest {
+            if entry.identity.kind == NodeKind::Directory {
+                let mode = modes
+                    .get(&entry.path)
+                    .copied()
+                    .ok_or_else(|| HeldTreeError::IdentityChanged(entry.path.clone()))?;
+                entry.mode = mode;
+                seen.insert(entry.path.clone());
+            }
+        }
+        if seen.len() != modes.len() {
+            return Err(HeldTreeError::IdentityChanged(PathBuf::new()));
+        }
+        Ok(fingerprint_manifest_v2(&manifest))
     }
 
     pub(crate) fn directories_deepest_first(
@@ -359,6 +478,7 @@ impl HeldTreeInventory {
                 || before.identity != after.identity
                 || before.uid != after.uid
                 || before.gid != after.gid
+                || before.content != after.content
             {
                 return Err(HeldTreeError::PostChanged(after.path.clone()));
             }
@@ -386,9 +506,14 @@ impl HeldTreeInventory {
             .map(|entry| (entry.path.clone(), entry))
             .collect::<BTreeMap<_, _>>();
         let mut actual = BTreeMap::new();
-        let mut budget = Budget::new(self.limits);
-        let root =
-            inspect_held(&self.directories[0].held, Path::new(""))?.into_manifest(PathBuf::new());
+        let mut budget = Budget::new(self.limits, self.manifest_schema);
+        let root_content = if self.manifest_schema == CONTENT_PROOF_VERSION {
+            ContentProof::Directory
+        } else {
+            ContentProof::Legacy
+        };
+        let root = inspect_held(&self.directories[0].held, Path::new(""))?
+            .into_manifest(PathBuf::new(), root_content);
         budget.add(&root, 0)?;
         budget.add_directory()?;
         actual.insert(PathBuf::new(), root);
@@ -410,7 +535,15 @@ impl HeldTreeInventory {
                 let inspected = with_fd(&directory.held, |fd| inspect_at(fd, name, &path))?;
                 require_owner(&path, inspected.uid, rustix::process::geteuid().as_raw())?;
                 require_boundary(&path, self.backend, self.mount_id, &inspected)?;
-                let value = inspected.into_manifest(path.clone());
+                let content = inspect_content_for_schema(
+                    self.manifest_schema,
+                    &directory.held,
+                    name,
+                    &path,
+                    &inspected,
+                    &mut budget,
+                )?;
+                let value = inspected.into_manifest(path.clone(), content);
                 budget.add(&value, directory.depth.saturating_add(1))?;
                 if value.identity.kind == NodeKind::Directory {
                     budget.add_directory()?;
@@ -476,7 +609,15 @@ impl HeldTreeInventory {
             } else {
                 None
             };
-            let manifest = inspected.into_manifest(path.clone());
+            let content = inspect_content_for_schema(
+                self.manifest_schema,
+                &self.directories[index].held,
+                name,
+                &path,
+                &inspected,
+                budget,
+            )?;
+            let manifest = inspected.into_manifest(path.clone(), content);
             budget.add(&manifest, depth)?;
             if child.is_some() {
                 budget.add_directory()?;
@@ -515,19 +656,43 @@ struct Inspection {
     uid: u32,
     gid: u32,
     mode: u32,
+    size: u64,
+    nlink: u64,
+    mtime_sec: i64,
+    mtime_nsec: u32,
+    ctime_sec: i64,
+    ctime_nsec: u32,
+    content_fields_available: bool,
     mount_id: u64,
     backend: CertifiedLocalBackend,
 }
 
 impl Inspection {
-    fn into_manifest(self, path: PathBuf) -> ManifestEntry {
+    fn into_manifest(self, path: PathBuf, content: ContentProof) -> ManifestEntry {
         ManifestEntry {
             path,
             identity: self.identity,
             uid: self.uid,
             gid: self.gid,
             mode: self.mode,
+            content,
         }
+    }
+
+    fn stable_content_fields_equal(&self, other: &Self) -> bool {
+        self.identity == other.identity
+            && self.uid == other.uid
+            && self.gid == other.gid
+            && self.mode == other.mode
+            && self.size == other.size
+            && self.nlink == other.nlink
+            && self.mtime_sec == other.mtime_sec
+            && self.mtime_nsec == other.mtime_nsec
+            && self.ctime_sec == other.ctime_sec
+            && self.ctime_nsec == other.ctime_nsec
+            && self.content_fields_available == other.content_fields_available
+            && self.mount_id == other.mount_id
+            && self.backend == other.backend
     }
 }
 
@@ -593,6 +758,9 @@ fn inspection_from_linux_statx(
             path.to_path_buf(),
         ));
     }
+    let content_fields =
+        StatxFlags::SIZE | StatxFlags::NLINK | StatxFlags::MTIME | StatxFlags::CTIME;
+    let content_fields_available = present.contains(content_fields);
     Ok(Inspection {
         identity: NodeIdentity {
             kind: node_kind(FileType::from_raw_mode(stat.stx_mode as _)),
@@ -607,6 +775,13 @@ fn inspection_from_linux_statx(
         uid: stat.stx_uid,
         gid: stat.stx_gid,
         mode: u32::from(stat.stx_mode) & 0o7777,
+        size: stat.stx_size,
+        nlink: u64::from(stat.stx_nlink),
+        mtime_sec: stat.stx_mtime.tv_sec,
+        mtime_nsec: stat.stx_mtime.tv_nsec,
+        ctime_sec: stat.stx_ctime.tv_sec,
+        ctime_nsec: stat.stx_ctime.tv_nsec,
+        content_fields_available,
         mount_id: stat.stx_mnt_id,
         backend,
     })
@@ -656,6 +831,16 @@ fn inspection_from_macos_stat(
         uid: stat.st_uid,
         gid: stat.st_gid,
         mode: stat.st_mode as u32 & 0o7777,
+        size: u64::try_from(stat.st_size)
+            .map_err(|_| HeldTreeError::UnsupportedContentProof(path.to_path_buf()))?,
+        nlink: u64::from(stat.st_nlink),
+        mtime_sec: stat.st_mtime,
+        mtime_nsec: u32::try_from(stat.st_mtime_nsec)
+            .map_err(|_| HeldTreeError::UnsupportedContentProof(path.to_path_buf()))?,
+        ctime_sec: stat.st_ctime,
+        ctime_nsec: u32::try_from(stat.st_ctime_nsec)
+            .map_err(|_| HeldTreeError::UnsupportedContentProof(path.to_path_buf()))?,
+        content_fields_available: true,
         mount_id: device,
         backend,
     })
@@ -680,6 +865,274 @@ fn inspect_at(
     Err(HeldTreeError::StrongIncarnationUnavailable(
         path.to_path_buf(),
     ))
+}
+
+fn inspect_content_for_schema(
+    schema_version: u16,
+    parent: &HeldLocalBackendEvidence,
+    name: &OsStr,
+    path: &Path,
+    before: &Inspection,
+    budget: &mut Budget,
+) -> Result<ContentProof, HeldTreeError> {
+    match schema_version {
+        1 => Ok(ContentProof::Legacy),
+        CONTENT_PROOF_VERSION => inspect_content_at(parent, name, path, before, budget),
+        _ => Err(HeldTreeError::UnsupportedContentProof(path.to_path_buf())),
+    }
+}
+
+fn inspect_content_at(
+    parent: &HeldLocalBackendEvidence,
+    name: &OsStr,
+    path: &Path,
+    before: &Inspection,
+    budget: &mut Budget,
+) -> Result<ContentProof, HeldTreeError> {
+    if !before.content_fields_available {
+        return Err(HeldTreeError::UnsupportedContentProof(path.to_path_buf()));
+    }
+    match before.identity.kind {
+        NodeKind::Directory => Ok(ContentProof::Directory),
+        NodeKind::Regular => inspect_regular_content(parent, name, path, before, budget),
+        NodeKind::Symlink => inspect_symlink_content(parent, name, path, before, budget),
+        NodeKind::Other => Err(HeldTreeError::UnsupportedContentProof(path.to_path_buf())),
+    }
+}
+
+fn inspect_regular_content(
+    parent: &HeldLocalBackendEvidence,
+    name: &OsStr,
+    path: &Path,
+    before: &Inspection,
+    budget: &mut Budget,
+) -> Result<ContentProof, HeldTreeError> {
+    if before.nlink != 1 {
+        return Err(HeldTreeError::ExternalHardLink(path.to_path_buf()));
+    }
+    budget.add_content(before.size)?;
+    let fd = with_fd(parent, |parent_fd| {
+        rustix::fs::openat(
+            parent_fd,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+    })
+    .map_err(|error| io_error(path, error))?;
+    require_fd_extended_metadata_absent(&fd, path)?;
+    crate::local_backend::require_held_fd_acl_absent(&fd)
+        .map_err(|_| HeldTreeError::NonDirectoryExtendedMetadata(path.to_path_buf()))?;
+    let opened = inspect_raw_fd(&fd, parent.backend(), path)?;
+    if !before.stable_content_fields_equal(&opened) || opened.identity.kind != NodeKind::Regular {
+        return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
+    }
+
+    let mut file = std::fs::File::from(fd);
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 128 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| io_error(path, error))?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| HeldTreeError::ContentChangedDuringHash(path.to_path_buf()))?;
+        if total > before.size {
+            return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
+        }
+        digest.update(&buffer[..read]);
+    }
+    let after = inspect_raw_fd(&file, parent.backend(), path)?;
+    require_fd_extended_metadata_absent(&file, path)?;
+    let final_inspection = inspect_raw_fd(&file, parent.backend(), path)?;
+    if total != before.size
+        || !before.stable_content_fields_equal(&after)
+        || !opened.stable_content_fields_equal(&after)
+        || !after.stable_content_fields_equal(&final_inspection)
+        || after.nlink != 1
+    {
+        return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
+    }
+    Ok(ContentProof::Regular {
+        size: after.size,
+        nlink: after.nlink,
+        mtime_sec: after.mtime_sec,
+        mtime_nsec: after.mtime_nsec,
+        ctime_sec: after.ctime_sec,
+        ctime_nsec: after.ctime_nsec,
+        sha256: digest.finalize().into(),
+    })
+}
+
+fn inspect_symlink_content(
+    parent: &HeldLocalBackendEvidence,
+    name: &OsStr,
+    path: &Path,
+    before: &Inspection,
+    budget: &mut Budget,
+) -> Result<ContentProof, HeldTreeError> {
+    require_symlink_extended_metadata_absent(parent, name, path)?;
+    let target = with_fd(parent, |fd| rustix::fs::readlinkat(fd, name, Vec::new()))
+        .map_err(|error| io_error(path, error))?
+        .into_bytes();
+    budget.add_content(target.len() as u64)?;
+    let middle = with_fd(parent, |fd| inspect_at(fd, name, path))?;
+    require_symlink_extended_metadata_absent(parent, name, path)?;
+    let target_again = with_fd(parent, |fd| rustix::fs::readlinkat(fd, name, Vec::new()))
+        .map_err(|error| io_error(path, error))?
+        .into_bytes();
+    let after = with_fd(parent, |fd| inspect_at(fd, name, path))?;
+    require_symlink_extended_metadata_absent(parent, name, path)?;
+    let final_inspection = with_fd(parent, |fd| inspect_at(fd, name, path))?;
+    if !before.stable_content_fields_equal(&middle)
+        || !before.stable_content_fields_equal(&after)
+        || !after.stable_content_fields_equal(&final_inspection)
+        || target != target_again
+    {
+        return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
+    }
+    Ok(ContentProof::Symlink { target })
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_raw_fd<Fd: rustix::fd::AsFd>(
+    fd: &Fd,
+    backend: CertifiedLocalBackend,
+    path: &Path,
+) -> Result<Inspection, HeldTreeError> {
+    use rustix::fs::{StatxFlags, statx};
+    let requested = StatxFlags::BASIC_STATS | StatxFlags::BTIME | StatxFlags::MNT_ID;
+    let stat =
+        statx(fd, c"", AtFlags::EMPTY_PATH, requested).map_err(|error| io_error(path, error))?;
+    inspection_from_linux_statx(stat, backend, path)
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_raw_fd<Fd: rustix::fd::AsFd>(
+    fd: &Fd,
+    backend: CertifiedLocalBackend,
+    path: &Path,
+) -> Result<Inspection, HeldTreeError> {
+    let stat = rustix::fs::fstat(fd).map_err(|error| io_error(path, error))?;
+    inspection_from_macos_stat(stat, backend, path)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn inspect_raw_fd<Fd: rustix::fd::AsFd>(
+    _fd: &Fd,
+    _backend: CertifiedLocalBackend,
+    path: &Path,
+) -> Result<Inspection, HeldTreeError> {
+    Err(HeldTreeError::UnsupportedContentProof(path.to_path_buf()))
+}
+
+#[cfg(target_os = "linux")]
+fn require_fd_extended_metadata_absent<Fd: rustix::fd::AsFd>(
+    fd: &Fd,
+    path: &Path,
+) -> Result<(), HeldTreeError> {
+    // SAFETY: the borrowed descriptor remains live and no output buffer is supplied.
+    let result = unsafe { libc::flistxattr(fd.as_fd().as_raw_fd(), std::ptr::null_mut(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(HeldTreeError::NonDirectoryExtendedMetadata(
+            path.to_path_buf(),
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn require_fd_extended_metadata_absent<Fd: rustix::fd::AsFd>(
+    fd: &Fd,
+    path: &Path,
+) -> Result<(), HeldTreeError> {
+    // SAFETY: the borrowed descriptor remains live and no output buffer is supplied.
+    let result = unsafe { libc::flistxattr(fd.as_fd().as_raw_fd(), std::ptr::null_mut(), 0, 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(HeldTreeError::NonDirectoryExtendedMetadata(
+            path.to_path_buf(),
+        ))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn require_fd_extended_metadata_absent<Fd: rustix::fd::AsFd>(
+    _fd: &Fd,
+    path: &Path,
+) -> Result<(), HeldTreeError> {
+    Err(HeldTreeError::UnsupportedContentProof(path.to_path_buf()))
+}
+
+#[cfg(target_os = "linux")]
+fn require_symlink_extended_metadata_absent(
+    parent: &HeldLocalBackendEvidence,
+    name: &OsStr,
+    path: &Path,
+) -> Result<(), HeldTreeError> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| HeldTreeError::UnsupportedContentProof(path.to_path_buf()))?;
+    let proc_path = with_fd(parent, |fd| {
+        let mut bytes = format!("/proc/self/fd/{}/", fd.as_raw_fd()).into_bytes();
+        bytes.extend_from_slice(name.as_bytes());
+        CString::new(bytes)
+    })
+    .map_err(|_| HeldTreeError::UnsupportedContentProof(path.to_path_buf()))?;
+    // SAFETY: the NUL-terminated path remains live and no output buffer is supplied.
+    let result = unsafe { libc::llistxattr(proc_path.as_ptr(), std::ptr::null_mut(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(HeldTreeError::NonDirectoryExtendedMetadata(
+            path.to_path_buf(),
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn require_symlink_extended_metadata_absent(
+    parent: &HeldLocalBackendEvidence,
+    name: &OsStr,
+    path: &Path,
+) -> Result<(), HeldTreeError> {
+    use std::os::fd::FromRawFd;
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| HeldTreeError::UnsupportedContentProof(path.to_path_buf()))?;
+    let raw = with_fd(parent, |fd| {
+        // SAFETY: parent/name remain live; macOS O_SYMLINK opens the link
+        // itself rather than following it to the target.
+        unsafe {
+            libc::openat(
+                fd.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_SYMLINK | libc::O_CLOEXEC,
+            )
+        }
+    });
+    if raw < 0 {
+        return Err(HeldTreeError::NonDirectoryExtendedMetadata(
+            path.to_path_buf(),
+        ));
+    }
+    // SAFETY: openat returned a new uniquely-owned descriptor.
+    let fd = unsafe { rustix::fd::OwnedFd::from_raw_fd(raw) };
+    require_fd_extended_metadata_absent(&fd, path)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn require_symlink_extended_metadata_absent(
+    _parent: &HeldLocalBackendEvidence,
+    _name: &OsStr,
+    path: &Path,
+) -> Result<(), HeldTreeError> {
+    Err(HeldTreeError::UnsupportedContentProof(path.to_path_buf()))
 }
 
 fn incarnation_from_timestamp(seconds: i64, nanos: u32, path: &Path) -> Result<u64, HeldTreeError> {
@@ -829,9 +1282,25 @@ fn require_one_component(name: &OsStr) -> Result<(), HeldTreeError> {
     }
 }
 
-fn fingerprint_manifest(manifest: &[ManifestEntry]) -> HeldTreeFingerprint {
+fn fingerprint_manifest_v1(manifest: &[ManifestEntry]) -> HeldTreeFingerprint {
+    fingerprint_manifest(manifest, 1, false)
+}
+
+fn fingerprint_manifest_v2(manifest: &[ManifestEntry]) -> HeldTreeFingerprint {
+    fingerprint_manifest(manifest, CONTENT_PROOF_VERSION, true)
+}
+
+fn fingerprint_manifest(
+    manifest: &[ManifestEntry],
+    schema_version: u16,
+    include_content: bool,
+) -> HeldTreeFingerprint {
     let mut digest = Sha256::new();
-    digest.update(MANIFEST_DOMAIN);
+    digest.update(if include_content {
+        MANIFEST_DOMAIN_V2
+    } else {
+        MANIFEST_DOMAIN_V1
+    });
     digest.update((manifest.len() as u64).to_be_bytes());
     for entry in manifest {
         let path = entry.path.as_os_str().as_bytes();
@@ -849,8 +1318,41 @@ fn fingerprint_manifest(manifest: &[ManifestEntry]) -> HeldTreeFingerprint {
         digest.update(entry.uid.to_be_bytes());
         digest.update(entry.gid.to_be_bytes());
         digest.update(entry.mode.to_be_bytes());
+        if include_content {
+            match &entry.content {
+                ContentProof::Legacy => {
+                    debug_assert!(false, "v2 fingerprint requires content proof");
+                    digest.update([0xff]);
+                }
+                ContentProof::Directory => digest.update([0]),
+                ContentProof::Regular {
+                    size,
+                    nlink,
+                    mtime_sec,
+                    mtime_nsec,
+                    ctime_sec,
+                    ctime_nsec,
+                    sha256,
+                } => {
+                    digest.update([1]);
+                    digest.update(size.to_be_bytes());
+                    digest.update(nlink.to_be_bytes());
+                    digest.update(mtime_sec.to_be_bytes());
+                    digest.update(mtime_nsec.to_be_bytes());
+                    digest.update(ctime_sec.to_be_bytes());
+                    digest.update(ctime_nsec.to_be_bytes());
+                    digest.update(sha256);
+                }
+                ContentProof::Symlink { target } => {
+                    digest.update([2]);
+                    digest.update((target.len() as u64).to_be_bytes());
+                    digest.update(target);
+                }
+            }
+        }
     }
     HeldTreeFingerprint {
+        schema_version,
         entry_count: manifest.len() as u64,
         sha256: digest.finalize().into(),
     }
@@ -858,20 +1360,29 @@ fn fingerprint_manifest(manifest: &[ManifestEntry]) -> HeldTreeFingerprint {
 
 struct Budget {
     limits: HeldTreeLimits,
+    manifest_entry_bytes: u64,
     entries: u64,
     directories: u64,
     path_bytes: u64,
     manifest_bytes: u64,
+    content_bytes: u64,
 }
 
 impl Budget {
-    fn new(limits: HeldTreeLimits) -> Self {
+    fn new(limits: HeldTreeLimits, manifest_schema: u16) -> Self {
+        let manifest_entry_bytes = if manifest_schema == 1 {
+            std::mem::size_of::<LegacyManifestEntryAccounting>() as u64
+        } else {
+            std::mem::size_of::<ManifestEntry>() as u64
+        };
         Self {
             limits,
+            manifest_entry_bytes,
             entries: 0,
             directories: 0,
             path_bytes: 0,
             manifest_bytes: 0,
+            content_bytes: 0,
         }
     }
 
@@ -881,7 +1392,7 @@ impl Budget {
         self.path_bytes = self.path_bytes.saturating_add(path_len);
         self.manifest_bytes = self
             .manifest_bytes
-            .saturating_add(std::mem::size_of::<ManifestEntry>() as u64)
+            .saturating_add(self.manifest_entry_bytes)
             .saturating_add(path_len);
         check(
             self.entries,
@@ -902,6 +1413,15 @@ impl Budget {
             self.manifest_bytes,
             self.limits.max_manifest_bytes,
             HeldTreeLimit::ManifestBytes,
+        )
+    }
+
+    fn add_content(&mut self, bytes: u64) -> Result<(), HeldTreeError> {
+        self.content_bytes = self.content_bytes.saturating_add(bytes);
+        check(
+            self.content_bytes,
+            self.limits.max_content_bytes,
+            HeldTreeLimit::ContentBytes,
         )
     }
 

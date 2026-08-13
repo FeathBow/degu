@@ -19,7 +19,8 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
 const MAGIC: &[u8; 4] = b"DSWL";
-const VERSION: u16 = 5;
+const VERSION: u16 = 7;
+const CONTENT_PROOF_MANIFEST_VERSION: u16 = 2;
 const HEADER_LEN: usize = 20;
 const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 const MAX_WAL_LEN: u64 = 64 * 1024 * 1024;
@@ -307,8 +308,17 @@ fn mode_is_exclusive_parent(mode: u32) -> bool {
 /// engine. The digest algorithm is fixed by this schema to SHA-256.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableTreeManifest {
+    /// Version 1 committed only namespace metadata. Version 2 additionally
+    /// commits held-FD content/freshness evidence for every non-directory.
+    pub schema_version: u16,
     pub entry_count: u64,
     pub sha256: [u8; 32],
+}
+
+impl DurableTreeManifest {
+    pub(crate) fn has_content_proof(self) -> bool {
+        self.schema_version == CONTENT_PROOF_MANIFEST_VERSION
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,6 +328,14 @@ pub enum DurableRenameOutcome {
     AppliedAndParentsSynced(StrongObjectIdentity),
     /// The root remains at the source; no namespace mutation was applied.
     ConfirmedNotAppliedAtSource(StrongObjectIdentity),
+}
+
+/// Durable result of the independently authorized rename-back. This is kept
+/// separate from the forward outcome so replay can never confuse rename sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableUndoRenameOutcome {
+    AppliedAndParentsSynced(StrongObjectIdentity),
+    ConfirmedCollisionAtStaged(StrongObjectIdentity),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,6 +376,10 @@ pub enum SealRecord {
         transaction: TransactionId,
         outcome: DurableRenameOutcome,
     },
+    UndoRenameOutcome {
+        transaction: TransactionId,
+        outcome: DurableUndoRenameOutcome,
+    },
 }
 
 impl SealRecord {
@@ -370,7 +392,8 @@ impl SealRecord {
             | Self::StagingBegin { transaction, .. }
             | Self::TreeManifestComplete { transaction, .. }
             | Self::RenameIntent { transaction }
-            | Self::RenameOutcome { transaction, .. } => *transaction,
+            | Self::RenameOutcome { transaction, .. }
+            | Self::UndoRenameOutcome { transaction, .. } => *transaction,
         }
     }
 }
@@ -421,6 +444,8 @@ pub struct SealWal<W> {
     staging: HashMap<TransactionId, StagingTransactionMetadata>,
     manifests: HashMap<TransactionId, DurableTreeManifest>,
     rename_outcomes: HashMap<TransactionId, DurableRenameOutcome>,
+    undo_rename_outcomes: HashMap<TransactionId, DurableUndoRenameOutcome>,
+    transaction_order: Vec<TransactionId>,
     committed_len: u64,
     max_wal_len: u64,
 }
@@ -449,6 +474,8 @@ impl<W: DurableWrite> SealWal<W> {
             staging: HashMap::new(),
             manifests: HashMap::new(),
             rename_outcomes: HashMap::new(),
+            undo_rename_outcomes: HashMap::new(),
+            transaction_order: Vec::new(),
             committed_len,
             max_wal_len,
         }
@@ -504,7 +531,15 @@ impl<W: DurableWrite> SealWal<W> {
             ));
         }
         let mut wal = Self::from_validated(writer, actual_len, MAX_WAL_LEN);
-        for transaction in replay.transactions.values() {
+        for transaction_id in &replay.transaction_order {
+            let transaction =
+                replay
+                    .transactions
+                    .get(transaction_id)
+                    .ok_or(AppendError::InvalidState(
+                        "replay transaction order is inconsistent",
+                    ))?;
+            wal.transaction_order.push(transaction.id);
             wal.states.insert(transaction.id, transaction.state);
             if let Some(version) = transaction.staging_schema_version {
                 wal.staging_schema_versions.insert(transaction.id, version);
@@ -517,6 +552,9 @@ impl<W: DurableWrite> SealWal<W> {
             }
             if let Some(outcome) = transaction.rename_outcome {
                 wal.rename_outcomes.insert(transaction.id, outcome);
+            }
+            if let Some(outcome) = transaction.undo_rename_outcome {
+                wal.undo_rename_outcomes.insert(transaction.id, outcome);
             }
             for permission in &transaction.permissions {
                 let key = (transaction.id, permission.mutation_id);
@@ -539,6 +577,7 @@ impl<W: DurableWrite> SealWal<W> {
             state: TransactionState::Prepared,
         })?;
         self.states.insert(transaction, TransactionState::Prepared);
+        self.transaction_order.push(transaction);
         Ok(())
     }
 
@@ -562,6 +601,7 @@ impl<W: DurableWrite> SealWal<W> {
             metadata: metadata.clone(),
         })?;
         self.states.insert(transaction, TransactionState::Prepared);
+        self.transaction_order.push(transaction);
         self.staging.insert(transaction, metadata);
         self.staging_schema_versions.insert(transaction, VERSION);
         Ok(())
@@ -582,10 +622,9 @@ impl<W: DurableWrite> SealWal<W> {
     /// Recovery must derive work from this snapshot rather than caller-provided
     /// permission subsets or durable-path guesses.
     pub(crate) fn recovery_snapshots(&self) -> Vec<ReplayedTransaction> {
-        let mut transactions = self.states.keys().copied().collect::<Vec<_>>();
-        transactions.sort();
-        transactions
-            .into_iter()
+        self.transaction_order
+            .iter()
+            .copied()
             .filter_map(|transaction| self.recovery_snapshot(transaction))
             .collect()
     }
@@ -611,6 +650,7 @@ impl<W: DurableWrite> SealWal<W> {
             staging: self.staging.get(&transaction).cloned(),
             tree_manifest: self.manifests.get(&transaction).copied(),
             rename_outcome: self.rename_outcomes.get(&transaction).copied(),
+            undo_rename_outcome: self.undo_rename_outcomes.get(&transaction).copied(),
         })
     }
 
@@ -639,6 +679,7 @@ impl<W: DurableWrite> SealWal<W> {
                         | TransactionState::Purgeable
                         | TransactionState::Purged
                         | TransactionState::Restored
+                        | TransactionState::UndoConflict
                         | TransactionState::RolledBack
                 ) || (*state == TransactionState::Quarantined
                     && !retains_active_permission_seals(
@@ -733,6 +774,77 @@ impl<W: DurableWrite> SealWal<W> {
         self.transition_staging(proof.transaction(), TransactionState::VerifiedCommitted)
     }
 
+    pub(crate) fn record_verified_undo_intent(
+        &mut self,
+        transaction: TransactionId,
+    ) -> Result<(), AppendError> {
+        self.transition_staging(transaction, TransactionState::UndoIntent)
+    }
+
+    pub(crate) fn record_undo_modes_restored(
+        &mut self,
+        transaction: TransactionId,
+    ) -> Result<(), AppendError> {
+        self.transition_staging(transaction, TransactionState::UndoModesRestored)
+    }
+
+    pub(crate) fn record_undo_rename_intent(
+        &mut self,
+        transaction: TransactionId,
+    ) -> Result<(), AppendError> {
+        self.transition_staging(transaction, TransactionState::UndoRenameIntent)
+    }
+
+    pub(crate) fn record_undo_rename_outcome(
+        &mut self,
+        transaction: TransactionId,
+        outcome: DurableUndoRenameOutcome,
+    ) -> Result<(), AppendError> {
+        if self.transaction_state(transaction) != Some(TransactionState::UndoRenameIntent)
+            || self.undo_rename_outcomes.contains_key(&transaction)
+        {
+            return Err(AppendError::InvalidState(
+                "undo rename outcome is duplicate or outside undo rename intent",
+            ));
+        }
+        let expected = self
+            .staging
+            .get(&transaction)
+            .ok_or(AppendError::InvalidState(
+                "undo transaction lacks staging metadata",
+            ))?
+            .root_identity();
+        let actual = match outcome {
+            DurableUndoRenameOutcome::AppliedAndParentsSynced(identity)
+            | DurableUndoRenameOutcome::ConfirmedCollisionAtStaged(identity) => identity,
+        };
+        if actual != expected {
+            return Err(AppendError::InvalidState(
+                "undo rename outcome identity differs from the bound root",
+            ));
+        }
+        self.append_synced(&SealRecord::UndoRenameOutcome {
+            transaction,
+            outcome,
+        })?;
+        self.undo_rename_outcomes.insert(transaction, outcome);
+        Ok(())
+    }
+
+    pub(crate) fn record_undo_terminal(
+        &mut self,
+        transaction: TransactionId,
+        state: TransactionState,
+    ) -> Result<(), AppendError> {
+        if !matches!(
+            state,
+            TransactionState::Restored | TransactionState::UndoConflict
+        ) {
+            return Err(AppendError::InvalidState("invalid verified undo terminal"));
+        }
+        self.transition_staging(transaction, state)
+    }
+
     #[cfg(test)]
     pub(crate) fn transition_staging_for_test(
         &mut self,
@@ -824,6 +936,36 @@ impl<W: DurableWrite> SealWal<W> {
                 "terminal restore requires an applied inverse for every applied seal",
             ));
         }
+        if next == TransactionState::UndoModesRestored
+            && !all_applied_tree_seals_have_applied_inverse(
+                self.permissions
+                    .iter()
+                    .filter(|((owner, _), _)| *owner == transaction)
+                    .map(|(_, permission)| permission),
+            )
+        {
+            return Err(AppendError::InvalidState(
+                "verified undo requires every committed tree seal inverse",
+            ));
+        }
+        if current == TransactionState::UndoRenameIntent {
+            match (self.undo_rename_outcomes.get(&transaction), next) {
+                (
+                    Some(DurableUndoRenameOutcome::AppliedAndParentsSynced(_)),
+                    TransactionState::Restored,
+                )
+                | (
+                    Some(DurableUndoRenameOutcome::ConfirmedCollisionAtStaged(_)),
+                    TransactionState::UndoConflict,
+                )
+                | (_, TransactionState::RecoveryRequired) => {}
+                _ => {
+                    return Err(AppendError::InvalidState(
+                        "undo terminal lacks a matching durable rename outcome",
+                    ));
+                }
+            }
+        }
         if current == TransactionState::TreeSealIntent
             && next == TransactionState::TreeSealed
             && !self.manifests.contains_key(&transaction)
@@ -873,6 +1015,11 @@ impl<W: DurableWrite> SealWal<W> {
         if self.states.get(&transaction).copied() != Some(TransactionState::TreeSealIntent) {
             return Err(AppendError::InvalidState(
                 "tree manifest is outside tree seal intent",
+            ));
+        }
+        if !manifest.has_content_proof() {
+            return Err(AppendError::InvalidState(
+                "new tree manifest lacks versioned content proof",
             ));
         }
         if self.manifests.contains_key(&transaction)
@@ -1046,6 +1193,7 @@ impl<W: DurableWrite> SealWal<W> {
                     | TransactionState::RestoreIntent
                     | TransactionState::SourceParentRestoreIntent
                     | TransactionState::RollbackIntent
+                    | TransactionState::UndoIntent
                     | TransactionState::Quarantined
             )
         ) {
@@ -1094,6 +1242,7 @@ impl<W: DurableWrite> SealWal<W> {
                 TransactionState::RestoreIntent
                 | TransactionState::SourceParentRestoreIntent
                 | TransactionState::RollbackIntent
+                | TransactionState::UndoIntent
                 | TransactionState::Quarantined,
                 Some(original),
             ) => {
@@ -1109,6 +1258,8 @@ impl<W: DurableWrite> SealWal<W> {
                     )
                     || (phase == Some(TransactionState::SourceParentRestoreIntent)
                         && original.phase != TransactionState::ParentSealIntent)
+                    || (phase == Some(TransactionState::UndoIntent)
+                        && original.phase != TransactionState::TreeSealIntent)
                     || !same_recovery_object(&original.evidence, &intent.evidence)
                     || (original.phase == TransactionState::ParentSealIntent
                         && self.staging.get(&transaction).is_some_and(|metadata| {
@@ -1334,11 +1485,15 @@ pub struct ReplayedTransaction {
     pub staging: Option<StagingTransactionMetadata>,
     pub tree_manifest: Option<DurableTreeManifest>,
     pub rename_outcome: Option<DurableRenameOutcome>,
+    pub undo_rename_outcome: Option<DurableUndoRenameOutcome>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Replay {
     pub transactions: BTreeMap<TransactionId, ReplayedTransaction>,
+    /// First-frame order, retained so production grouping never depends on
+    /// random transaction-id sorting or the JSONL projection.
+    pub transaction_order: Vec<TransactionId>,
     pub tail_repair: Option<TailRepair>,
     pub committed_len: u64,
 }
@@ -1355,7 +1510,7 @@ pub enum ReplayError {
     #[error("malformed committed WAL frame at byte {offset}: {reason}")]
     Malformed { offset: u64, reason: &'static str },
     #[error(
-        "unsupported legacy WAL version {version} at byte {offset}; supported legacy versions are 1, 3, and 4"
+        "unsupported legacy WAL version {version} at byte {offset}; supported legacy versions are 1, 3, 4, 5, and 6"
     )]
     UnsupportedLegacyVersion { offset: u64, version: u16 },
     #[error("WAL header checksum mismatch at byte {offset}")]
@@ -1541,6 +1696,18 @@ pub enum RecoveryWork {
     FinalizeVerifiedCommit {
         transaction: TransactionId,
     },
+    /// Continue a separately admitted verified undo using exact staged-side FDs.
+    ResumeVerifiedUndo {
+        transaction: TransactionId,
+        permissions: Vec<DurablePermission>,
+    },
+    FinalizeVerifiedUndo {
+        transaction: TransactionId,
+        outcome: DurableUndoRenameOutcome,
+    },
+    PreserveUndoConflict {
+        transaction: TransactionId,
+    },
     RecoveryRequired {
         transaction: TransactionId,
         reason: RecoveryRequiredReason,
@@ -1569,6 +1736,7 @@ fn staging_recovery_needs_mount_authority(transaction: &ReplayedTransaction) -> 
         | TransactionState::RolledBack
         | TransactionState::Purged
         | TransactionState::Purgeable
+        | TransactionState::UndoConflict
         | TransactionState::RecoveryRequired => false,
         TransactionState::Quarantined => {
             quarantined_transaction_retains_active_permission_seals(transaction)
@@ -1608,6 +1776,11 @@ where
             state: transaction.state,
         };
     }
+    if transaction.state == TransactionState::UndoConflict {
+        return RecoveryWork::PreserveUndoConflict {
+            transaction: transaction.id,
+        };
+    }
     if matches!(
         transaction.state,
         TransactionState::Restored | TransactionState::RolledBack
@@ -1643,6 +1816,29 @@ where
             .cloned()
             .collect::<Vec<_>>()
     };
+    if transaction.state == TransactionState::UndoRenameIntent {
+        return match transaction.undo_rename_outcome {
+            Some(outcome) => RecoveryWork::FinalizeVerifiedUndo {
+                transaction: transaction.id,
+                outcome,
+            },
+            None => RecoveryWork::RecoveryRequired {
+                transaction: transaction.id,
+                reason: RecoveryRequiredReason::RenameOutcomeUnknown,
+            },
+        };
+    }
+    if matches!(
+        transaction.state,
+        TransactionState::UndoIntent | TransactionState::UndoModesRestored
+    ) {
+        let mut permissions = transaction.permissions.clone();
+        sort_permissions_deepest_first(&mut permissions);
+        return RecoveryWork::ResumeVerifiedUndo {
+            transaction: transaction.id,
+            permissions,
+        };
+    }
     if transaction.state == TransactionState::Quarantined {
         let mut permissions = active_permissions();
         if permissions.is_empty() {
@@ -1802,7 +1998,7 @@ fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
             });
         }
         let version = u16::from_le_bytes([header[4], header[5]]);
-        if !matches!(version, 1 | 3 | 4 | VERSION) {
+        if !matches!(version, 1 | 3 | 4 | 5 | 6 | VERSION) {
             return Err(ReplayError::UnsupportedLegacyVersion {
                 offset: offset as u64,
                 version,
@@ -1853,10 +2049,12 @@ struct ReplayBuilding {
     staging: Option<StagingTransactionMetadata>,
     tree_manifest: Option<DurableTreeManifest>,
     rename_outcome: Option<DurableRenameOutcome>,
+    undo_rename_outcome: Option<DurableUndoRenameOutcome>,
 }
 
 fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, ReplayError> {
     let mut transactions: BTreeMap<TransactionId, ReplayBuilding> = BTreeMap::new();
+    let mut transaction_order = Vec::new();
     for record in records {
         let versioned = record.into_versioned();
         let record = versioned.record;
@@ -1865,6 +2063,7 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
         match record {
             SealRecord::StagingBegin { metadata, .. } => {
                 tx.staging_schema_version = Some(versioned.version);
+                transaction_order.push(id);
                 if tx.state.is_some() || tx.staging.is_some() {
                     return Err(ReplayError::InvalidHistory(
                         "staging transaction has a duplicate or noninitial begin",
@@ -1874,6 +2073,11 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                 tx.staging = Some(metadata);
             }
             SealRecord::TreeManifestComplete { manifest, .. } => {
+                if !matches!(manifest.schema_version, 1 | CONTENT_PROOF_MANIFEST_VERSION) {
+                    return Err(ReplayError::InvalidHistory(
+                        "tree manifest uses an unsupported proof schema",
+                    ));
+                }
                 if tx.state != Some(TransactionState::TreeSealIntent)
                     || tx.tree_manifest.is_some()
                     || tx.permissions.iter().any(|permission| {
@@ -1998,6 +2202,31 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                             }
                         }
                     }
+                    if previous == TransactionState::UndoRenameIntent {
+                        match (tx.undo_rename_outcome, state) {
+                            (
+                                Some(DurableUndoRenameOutcome::AppliedAndParentsSynced(_)),
+                                TransactionState::Restored,
+                            )
+                            | (
+                                Some(DurableUndoRenameOutcome::ConfirmedCollisionAtStaged(_)),
+                                TransactionState::UndoConflict,
+                            )
+                            | (_, TransactionState::RecoveryRequired) => {}
+                            _ => {
+                                return Err(ReplayError::InvalidHistory(
+                                    "undo terminal lacks a matching durable rename outcome",
+                                ));
+                            }
+                        }
+                    }
+                    if state == TransactionState::UndoModesRestored
+                        && !all_applied_tree_seals_have_applied_inverse(tx.permissions.iter())
+                    {
+                        return Err(ReplayError::InvalidHistory(
+                            "verified undo mode restoration lacks applied tree inverses",
+                        ));
+                    }
                     if !valid_transition(previous, state) {
                         return Err(ReplayError::InvalidHistory(
                             "invalid transaction transition",
@@ -2030,6 +2259,7 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                         | TransactionState::RestoreIntent
                         | TransactionState::SourceParentRestoreIntent
                         | TransactionState::RollbackIntent
+                        | TransactionState::UndoIntent
                         | TransactionState::Quarantined
                 ) {
                     return Err(ReplayError::InvalidHistory(
@@ -2085,6 +2315,32 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                     application: ApplicationStatus::IntentDurableApplicationUnknown,
                 });
             }
+            SealRecord::UndoRenameOutcome { outcome, .. } => {
+                if tx.state != Some(TransactionState::UndoRenameIntent)
+                    || tx.undo_rename_outcome.is_some()
+                {
+                    return Err(ReplayError::InvalidHistory(
+                        "undo rename outcome is duplicate or outside undo rename intent",
+                    ));
+                }
+                let expected = tx
+                    .staging
+                    .as_ref()
+                    .ok_or(ReplayError::InvalidHistory(
+                        "undo rename outcome has no staging metadata",
+                    ))?
+                    .root_identity;
+                let actual = match outcome {
+                    DurableUndoRenameOutcome::AppliedAndParentsSynced(identity)
+                    | DurableUndoRenameOutcome::ConfirmedCollisionAtStaged(identity) => identity,
+                };
+                if actual != expected {
+                    return Err(ReplayError::InvalidHistory(
+                        "undo rename outcome identity differs from the bound root",
+                    ));
+                }
+                tx.undo_rename_outcome = Some(outcome);
+            }
             SealRecord::PermissionApplied { mutation_id, .. } => {
                 resolve_replayed_permission(tx, mutation_id, ApplicationStatus::Applied)?
             }
@@ -2095,7 +2351,7 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
             )?,
         }
     }
-    let transactions = transactions
+    let transactions: BTreeMap<TransactionId, ReplayedTransaction> = transactions
         .into_iter()
         .map(|(id, tx)| {
             let state = tx
@@ -2111,12 +2367,22 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                     staging: tx.staging,
                     tree_manifest: tx.tree_manifest,
                     rename_outcome: tx.rename_outcome,
+                    undo_rename_outcome: tx.undo_rename_outcome,
                 },
             ))
         })
         .collect::<Result<_, ReplayError>>()?;
+    if transaction_order.len() != transactions.len() {
+        // Authority-neutral legacy transactions begin with a State record.
+        for id in transactions.keys() {
+            if !transaction_order.contains(id) {
+                transaction_order.push(*id);
+            }
+        }
+    }
     Ok(Replay {
         transactions,
+        transaction_order,
         tail_repair: None,
         committed_len: 0,
     })
@@ -2139,6 +2405,7 @@ fn validate_replayed_inverse(
             TransactionState::RestoreIntent
             | TransactionState::SourceParentRestoreIntent
             | TransactionState::RollbackIntent
+            | TransactionState::UndoIntent
             | TransactionState::Quarantined,
             Some(original_id),
         ) => {
@@ -2152,6 +2419,8 @@ fn validate_replayed_inverse(
                 || original.reverses_mutation_id.is_some()
                 || (phase == TransactionState::SourceParentRestoreIntent
                     && original.phase != TransactionState::ParentSealIntent)
+                || (phase == TransactionState::UndoIntent
+                    && original.phase != TransactionState::TreeSealIntent)
                 || !same_recovery_object(&original.evidence, evidence)
                 || (original.phase == TransactionState::ParentSealIntent
                     && staging.is_some_and(|metadata| {
@@ -2264,12 +2533,21 @@ fn phase_completion_is_valid<'a>(
         (TransactionState::SourceParentRestoreIntent, TransactionState::SourceParentRestored) => {
             Some(TransactionState::SourceParentRestoreIntent)
         }
+        (TransactionState::UndoIntent, TransactionState::UndoModesRestored) => {
+            Some(TransactionState::UndoIntent)
+        }
         _ => None,
     };
     completed_phase.is_none_or(|phase| {
         permissions
             .filter(|permission| permission.phase == phase)
-            .all(|permission| permission.application == ApplicationStatus::Applied)
+            .all(|permission| {
+                permission.application == ApplicationStatus::Applied
+                    || (matches!(
+                        phase,
+                        TransactionState::SourceParentRestoreIntent | TransactionState::UndoIntent
+                    ) && permission.application == ApplicationStatus::ConfirmedNotApplied)
+            })
     })
 }
 
@@ -2292,6 +2570,21 @@ fn retains_active_permission_seals<'a>(
     permissions: impl Iterator<Item = &'a DurablePermission>,
 ) -> bool {
     !all_applied_seals_have_applied_inverse(permissions)
+}
+
+fn all_applied_tree_seals_have_applied_inverse<'a>(
+    permissions: impl Iterator<Item = &'a DurablePermission>,
+) -> bool {
+    let permissions = permissions.collect::<Vec<_>>();
+    permissions.iter().all(|seal| {
+        seal.application != ApplicationStatus::Applied
+            || seal.phase != TransactionState::TreeSealIntent
+            || permissions.iter().any(|inverse| {
+                inverse.application == ApplicationStatus::Applied
+                    && inverse.phase == TransactionState::UndoIntent
+                    && inverse.reverses_mutation_id == Some(seal.mutation_id)
+            })
+    })
 }
 
 fn all_applied_seals_have_applied_inverse<'a>(
@@ -2326,6 +2619,11 @@ fn valid_transition(from: TransactionState, to: TransactionState) -> bool {
             | (S::StagedSealed, S::SourceParentRestoreIntent)
             | (S::SourceParentRestoreIntent, S::SourceParentRestored)
             | (S::SourceParentRestored, S::VerifiedCommitted)
+            // Verified undo is an independent committed-tree protocol.
+            | (S::VerifiedCommitted, S::UndoIntent)
+            | (S::UndoIntent, S::UndoModesRestored)
+            | (S::UndoModesRestored, S::UndoRenameIntent)
+            | (S::UndoRenameIntent, S::Restored | S::UndoConflict)
             // Rollback is meaningful only after rename may have happened.
             | (S::StagedUnverified | S::StagedSealed, S::RollbackIntent)
             | (S::RollbackIntent, S::RolledBack)
@@ -2364,7 +2662,10 @@ fn valid_transition(from: TransactionState, to: TransactionState) -> bool {
                     | S::SourceParentRestored
                     | S::RollbackIntent
                     | S::RestoreIntent
-                    | S::Quarantined,
+                    | S::Quarantined
+                    | S::UndoIntent
+                    | S::UndoModesRestored
+                    | S::UndoRenameIntent,
                 S::RecoveryRequired
             )
     )
@@ -2454,6 +2755,7 @@ fn encode_record(record: &SealRecord) -> Result<Vec<u8>, FrameError> {
         } => {
             bytes.push(6);
             bytes.extend_from_slice(&transaction.0);
+            bytes.extend_from_slice(&manifest.schema_version.to_le_bytes());
             bytes.extend_from_slice(&manifest.entry_count.to_le_bytes());
             bytes.extend_from_slice(&manifest.sha256);
         }
@@ -2478,6 +2780,23 @@ fn encode_record(record: &SealRecord) -> Result<Vec<u8>, FrameError> {
                 }
             }
         }
+        SealRecord::UndoRenameOutcome {
+            transaction,
+            outcome,
+        } => {
+            bytes.push(9);
+            bytes.extend_from_slice(&transaction.0);
+            match outcome {
+                DurableUndoRenameOutcome::AppliedAndParentsSynced(identity) => {
+                    bytes.push(1);
+                    encode_strong_identity(&mut bytes, *identity);
+                }
+                DurableUndoRenameOutcome::ConfirmedCollisionAtStaged(identity) => {
+                    bytes.push(2);
+                    encode_strong_identity(&mut bytes, *identity);
+                }
+            }
+        }
     }
     if bytes.len() > MAX_PAYLOAD_LEN {
         return Err(FrameError::PayloadTooLarge {
@@ -2494,7 +2813,7 @@ fn decode_record(payload: &[u8], offset: u64, version: u16) -> Result<SealRecord
     let record = match tag {
         1 => SealRecord::State {
             transaction,
-            state: decode_state(cursor.u8()?, offset)?,
+            state: decode_state(cursor.u8()?, offset, version)?,
         },
         2 => {
             let mutation_id = cursor.u64()?;
@@ -2562,6 +2881,7 @@ fn decode_record(payload: &[u8], offset: u64, version: u16) -> Result<SealRecord
         6 if version >= 3 => SealRecord::TreeManifestComplete {
             transaction,
             manifest: DurableTreeManifest {
+                schema_version: if version >= 7 { cursor.u16()? } else { 1 },
                 entry_count: cursor.u64()?,
                 sha256: cursor.array_32()?,
             },
@@ -2581,6 +2901,24 @@ fn decode_record(payload: &[u8], offset: u64, version: u16) -> Result<SealRecord
                 }
             };
             SealRecord::RenameOutcome {
+                transaction,
+                outcome,
+            }
+        }
+        9 if version >= 6 => {
+            let kind = cursor.u8()?;
+            let identity = decode_strong_identity(&mut cursor, version)?;
+            let outcome = match kind {
+                1 => DurableUndoRenameOutcome::AppliedAndParentsSynced(identity),
+                2 => DurableUndoRenameOutcome::ConfirmedCollisionAtStaged(identity),
+                _ => {
+                    return Err(ReplayError::Malformed {
+                        offset,
+                        reason: "unknown undo rename outcome",
+                    });
+                }
+            };
+            SealRecord::UndoRenameOutcome {
                 transaction,
                 outcome,
             }
@@ -2840,6 +3178,10 @@ impl<'a> Cursor<'a> {
         Ok(self.take(1)?[0])
     }
 
+    fn u16(&mut self) -> Result<u16, ReplayError> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+
     fn u32(&mut self) -> Result<u32, ReplayError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
@@ -2916,36 +3258,51 @@ fn encode_state(state: TransactionState) -> u8 {
         S::RecoveryRequired => 16,
         S::SourceParentRestoreIntent => 17,
         S::SourceParentRestored => 18,
+        S::UndoIntent => 19,
+        S::UndoModesRestored => 20,
+        S::UndoRenameIntent => 21,
+        S::UndoConflict => 22,
     }
 }
 
-fn decode_state(value: u8, offset: u64) -> Result<TransactionState, ReplayError> {
+fn decode_state(
+    value: u8,
+    offset: u64,
+    frame_version: u16,
+) -> Result<TransactionState, ReplayError> {
     use TransactionState as S;
-    match value {
-        0 => Ok(S::Prepared),
-        1 => Ok(S::ParentSealIntent),
-        2 => Ok(S::ParentSealed),
-        3 => Ok(S::TreeSealIntent),
-        4 => Ok(S::TreeSealed),
-        5 => Ok(S::RenameIntent),
-        6 => Ok(S::StagedUnverified),
-        7 => Ok(S::StagedSealed),
-        8 => Ok(S::VerifiedCommitted),
-        9 => Ok(S::Purgeable),
-        10 => Ok(S::Purged),
-        11 => Ok(S::RollbackIntent),
-        12 => Ok(S::RolledBack),
-        13 => Ok(S::RestoreIntent),
-        14 => Ok(S::Restored),
-        15 => Ok(S::Quarantined),
-        16 => Ok(S::RecoveryRequired),
-        17 => Ok(S::SourceParentRestoreIntent),
-        18 => Ok(S::SourceParentRestored),
-        _ => Err(ReplayError::Malformed {
-            offset,
-            reason: "unknown transaction state",
-        }),
-    }
+    let state = match value {
+        0 => S::Prepared,
+        1 => S::ParentSealIntent,
+        2 => S::ParentSealed,
+        3 => S::TreeSealIntent,
+        4 => S::TreeSealed,
+        5 => S::RenameIntent,
+        6 => S::StagedUnverified,
+        7 => S::StagedSealed,
+        8 => S::VerifiedCommitted,
+        9 => S::Purgeable,
+        10 => S::Purged,
+        11 => S::RollbackIntent,
+        12 => S::RolledBack,
+        13 => S::RestoreIntent,
+        14 => S::Restored,
+        15 => S::Quarantined,
+        16 => S::RecoveryRequired,
+        17 if frame_version >= 5 => S::SourceParentRestoreIntent,
+        18 if frame_version >= 5 => S::SourceParentRestored,
+        19 if frame_version >= 6 => S::UndoIntent,
+        20 if frame_version >= 6 => S::UndoModesRestored,
+        21 if frame_version >= 6 => S::UndoRenameIntent,
+        22 if frame_version >= 6 => S::UndoConflict,
+        _ => {
+            return Err(ReplayError::Malformed {
+                offset,
+                reason: "transaction state is unknown for this frame version",
+            });
+        }
+    };
+    Ok(state)
 }
 
 fn crc32(bytes: &[u8]) -> u32 {

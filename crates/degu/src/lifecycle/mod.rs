@@ -197,9 +197,31 @@ impl MutationSession {
         purge::execute_expiry_plan(&self.lifecycle.ctx, plan, &blocker)
     }
 
-    pub(crate) fn undo_latest(&self) -> Result<Option<UndoReport>> {
-        let blocker = |path: &Path| self.sealed_entry_block(path);
-        undo::undo_latest(&self.lifecycle.ctx, &blocker)
+    pub(crate) fn undo_latest(&mut self) -> Result<Option<UndoReport>> {
+        // Snapshot only the legacy namespace blocker before mutably borrowing
+        // the exact engine. Verified undo consumes WAL-minted tokens, never
+        // this path projection.
+        let canonical_home = std::fs::canonicalize(&self.lifecycle.ctx.home).ok();
+        let sealed_destinations = self
+            .sealed_staging
+            .as_ref()
+            .into_iter()
+            .flat_map(ReadyStagingEngine::production_entries)
+            .filter(|entry| sealed_mutation_authority_active(entry.state()))
+            .map(|entry| {
+                (
+                    canonical_home.as_ref().map(|home| {
+                        home.join(entry.destination_parent().relative_path())
+                            .join(entry.destination_basename())
+                    }),
+                    entry.root_identity(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let home_authenticated = canonical_home.is_some();
+        let blocker =
+            |path: &Path| sealed_legacy_undo_block(path, &sealed_destinations, home_authenticated);
+        undo::undo_latest(&self.lifecycle.ctx, self.sealed_staging.as_mut(), &blocker)
     }
 
     /// Returns a reason only when the exact leased WAL prevents this legacy
@@ -235,7 +257,10 @@ impl MutationSession {
             }
         };
 
-        for entry in entries {
+        for entry in entries
+            .into_iter()
+            .filter(|entry| sealed_mutation_authority_active(entry.state()))
+        {
             let expected = canonical_home
                 .join(entry.destination_parent().relative_path())
                 .join(entry.destination_basename());
@@ -262,6 +287,61 @@ impl MutationSession {
                 }
             }
         }
+        None
+    }
+}
+
+fn sealed_mutation_authority_active(state: degu_core::authority::TransactionState) -> bool {
+    !matches!(
+        state,
+        degu_core::authority::TransactionState::Restored
+            | degu_core::authority::TransactionState::RolledBack
+            | degu_core::authority::TransactionState::Purged
+    )
+}
+
+fn sealed_legacy_undo_block(
+    path: &Path,
+    sealed_destinations: &[(Option<PathBuf>, degu_core::seal_wal::StrongObjectIdentity)],
+    home_authenticated: bool,
+) -> Option<String> {
+    let normalized = path
+        .parent()
+        .zip(path.file_name())
+        .and_then(|(parent, name)| {
+            std::fs::canonicalize(parent)
+                .ok()
+                .map(|parent| parent.join(name))
+        });
+    if let Some(path) = normalized.as_ref()
+        && sealed_destinations
+            .iter()
+            .any(|(expected, _)| expected.as_ref() == Some(path))
+    {
+        return Some("sealed staging WAL retains exclusive authority for this entry".to_string());
+    }
+    for (_, identity) in sealed_destinations {
+        match probe_forward_directory_identity(path, *identity) {
+            ForwardDirectoryIdentityProbe::Match => {
+                return Some(
+                    "sealed staging WAL retains exclusive authority for this exact object"
+                        .to_string(),
+                );
+            }
+            ForwardDirectoryIdentityProbe::Mismatch => {}
+            ForwardDirectoryIdentityProbe::Uncertain(error) => {
+                return Some(format!(
+                    "sealed staging authority could not strongly inspect this legacy undo path: {error}"
+                ));
+            }
+        }
+    }
+    if (!home_authenticated || normalized.is_none()) && !sealed_destinations.is_empty() {
+        Some(
+            "sealed staging authority could not authenticate HOME or this legacy undo path"
+                .to_string(),
+        )
+    } else {
         None
     }
 }

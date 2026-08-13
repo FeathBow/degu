@@ -65,6 +65,7 @@ for command_name in degu dg; do
   done
 done
 write_man_page degu.1
+write_man_page degu-doctor.1 doctor
 write_man_page degu-quota.1 quota
 write_man_page degu-scan.1 scan
 write_man_page degu-clean.1 clean

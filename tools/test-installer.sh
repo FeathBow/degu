@@ -94,6 +94,10 @@ check "$rc" "0" "S0 exit status"
 check "$(content "$scen/bin/degu")" "NEW-degu" "S0 installs degu"
 check "$(content "$scen/bin/dg")" "NEW-dg" "S0 installs dg"
 check "$(txn_dirs)" "0" "S0 no transaction dir left"
+if grep -Fq "run 'degu doctor'" "$scen/out"; then doctor_hint=yes; else doctor_hint=no; fi
+check "$doctor_hint" "yes" "S0 teaches the short read-only readiness command"
+if grep -Eq 'sudo|/var/lib/degu|/private/var/db/degu' "$scen/out" "$scen/err"; then privileged_hint=yes; else privileged_hint=no; fi
+check "$privileged_hint" "no" "S0 installer neither runs nor prescribes an inline privileged write"
 
 echo "--- S1 upgrade succeeds"
 new_scenario; preexisting degu dg; run_installer

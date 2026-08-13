@@ -37,6 +37,14 @@ const QUOTA_EXAMPLES: &str = "Examples:
   degu quota --json | jq .
       Emit authoritative quota data as JSON";
 
+const DOCTOR_EXAMPLES: &str = "Examples:
+  degu doctor
+      Check whether this account is ready for future sealed staging
+  degu doctor --json | jq .
+      Emit the same readiness result as JSON
+
+This command is read-only. It never creates or repairs system state.";
+
 const RELOCATE_EXAMPLES: &str = "Examples:
   degu relocate /scratch/$USER
       Print shell exports for future cache writes";
@@ -138,6 +146,12 @@ pub(crate) enum Command {
     /// Report known cache sources and, when project roots are available, build artifacts (read-only)
     #[command(after_help = SCAN_EXAMPLES)]
     Scan(ScanArgs),
+    /// Check whether this account is ready for future sealed staging (read-only)
+    #[command(after_help = DOCTOR_EXAMPLES)]
+    Doctor {
+        #[command(flatten)]
+        output: JsonArgs,
+    },
     /// Report the current user's authoritative filesystem quota for one path
     #[command(after_help = QUOTA_EXAMPLES)]
     Quota(QuotaArgs),

@@ -45,6 +45,81 @@ impl Fixture {
 }
 
 #[test]
+fn readiness_authenticates_the_existing_anchor_without_creating_state() {
+    let fixture = Fixture::new();
+    let readiness = check_activation_anchor_readiness(&fixture.anchor).unwrap();
+    assert_eq!(
+        readiness.backend(),
+        crate::local_backend::certify_held_fd_backend(
+            std::fs::File::open(fixture.anchor.as_path()).unwrap(),
+        )
+        .unwrap()
+    );
+    assert!(fixture.authority().is_dir());
+    assert!(
+        std::fs::read_dir(fixture.authority())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert!(!fixture.store.exists());
+}
+
+#[test]
+fn readiness_missing_anchor_is_non_creating_and_fail_closed() {
+    let fixture = Fixture::without_anchor();
+    assert!(matches!(
+        check_activation_anchor_readiness(&fixture.anchor),
+        Err(ActivationAnchorReadinessError::Missing { path })
+            if path == fixture.authority()
+    ));
+    assert!(!fixture.authority().exists());
+    assert!(!fixture.store.exists());
+}
+
+#[test]
+fn readiness_preserves_definite_and_uncertain_certification_classes() {
+    let locator = Path::new("/fixed/system/anchor");
+    let cases = [
+        (
+            StoreActivationError::UnsafeAnchor(StoreError::UnsafeDirectory {
+                path: PathBuf::from("/fixed/system"),
+                reason: crate::seal_store::DIRECTORY_UNSUPPORTED_BACKEND_REASON,
+            }),
+            "unsupported",
+        ),
+        (
+            StoreActivationError::UnsafeAnchor(StoreError::UnsafeDirectory {
+                path: PathBuf::from("/fixed/system"),
+                reason: crate::seal_store::DIRECTORY_ACL_PRESENT_REASON,
+            }),
+            "unsafe",
+        ),
+        (
+            StoreActivationError::UnsafeAnchor(StoreError::BackendInspection {
+                path: PathBuf::from("/fixed/system"),
+                reason: CertificationError::AclProbeUnknown,
+            }),
+            "uncertain",
+        ),
+        (
+            StoreActivationError::Backend(CertificationError::FilesystemMagicMismatch),
+            "unsafe",
+        ),
+    ];
+    for (error, expected) in cases {
+        let classified = classify_readiness_error(locator, error);
+        let actual = match classified {
+            ActivationAnchorReadinessError::Missing { .. } => "missing",
+            ActivationAnchorReadinessError::Unsafe { .. } => "unsafe",
+            ActivationAnchorReadinessError::Unsupported { .. } => "unsupported",
+            ActivationAnchorReadinessError::Uncertain { .. } => "uncertain",
+        };
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
 fn record_empty_anchor_support_probe_does_not_create_a_store() {
     let fixture = Fixture::new();
     assert_eq!(

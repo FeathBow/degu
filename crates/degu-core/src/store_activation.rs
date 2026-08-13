@@ -88,6 +88,109 @@ impl ActivationAnchorLocator {
     }
 }
 
+/// Read-only readiness evidence for the exact current-EUID activation anchor.
+///
+/// This carries no store, record, staging, or mutation capability. Constructing
+/// it authenticates, locks, binding-checks, and syncs the same existing-only
+/// anchor that activation will later use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivationAnchorReadiness {
+    backend: CertifiedLocalBackend,
+}
+
+impl ActivationAnchorReadiness {
+    pub fn backend(self) -> CertifiedLocalBackend {
+        self.backend
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ActivationAnchorReadinessError {
+    #[error("activation anchor is not provisioned at {path}")]
+    Missing { path: PathBuf },
+    #[error("activation anchor is unsafe at {path}: {source}")]
+    Unsafe {
+        path: PathBuf,
+        #[source]
+        source: StoreActivationError,
+    },
+    #[error("activation anchor is unsupported at {path}: {source}")]
+    Unsupported {
+        path: PathBuf,
+        #[source]
+        source: StoreActivationError,
+    },
+    #[error("activation anchor inspection is uncertain at {path}: {source}")]
+    Uncertain {
+        path: PathBuf,
+        #[source]
+        source: StoreActivationError,
+    },
+}
+
+/// Validate that the fixed platform/EUID activation anchor is provisioned and
+/// safe without creating an anchor, store, or activation record.
+pub fn check_activation_anchor_readiness(
+    locator: &ActivationAnchorLocator,
+) -> Result<ActivationAnchorReadiness, ActivationAnchorReadinessError> {
+    let authority = open_activation_anchor(locator)
+        .map_err(|error| classify_readiness_error(locator.as_path(), error))?;
+    Ok(ActivationAnchorReadiness {
+        backend: authority.backend,
+    })
+}
+
+fn classify_readiness_error(
+    locator: &Path,
+    error: StoreActivationError,
+) -> ActivationAnchorReadinessError {
+    let path = locator.to_path_buf();
+    match &error {
+        StoreActivationError::AnchorNotProvisioned { path } => {
+            ActivationAnchorReadinessError::Missing { path: path.clone() }
+        }
+        StoreActivationError::UnsafeAnchor(StoreError::UnsafeDirectory { reason, .. })
+            if *reason == crate::seal_store::DIRECTORY_UNSUPPORTED_BACKEND_REASON =>
+        {
+            ActivationAnchorReadinessError::Unsupported {
+                path,
+                source: error,
+            }
+        }
+        StoreActivationError::UnsafeAnchor(
+            StoreError::Io { .. }
+            | StoreError::ParentBackend { .. }
+            | StoreError::BackendInspection { .. }
+            | StoreError::Lease(_),
+        ) => ActivationAnchorReadinessError::Uncertain {
+            path,
+            source: error,
+        },
+        StoreActivationError::UnsafeAnchor(_) => ActivationAnchorReadinessError::Unsafe {
+            path,
+            source: error,
+        },
+        StoreActivationError::Backend(
+            CertificationError::UnsupportedPlatform | CertificationError::UnsupportedFilesystem,
+        ) => ActivationAnchorReadinessError::Unsupported {
+            path,
+            source: error,
+        },
+        StoreActivationError::Backend(
+            CertificationError::FilesystemMagicMismatch
+            | CertificationError::NotDirectory
+            | CertificationError::AclPresent,
+        ) => ActivationAnchorReadinessError::Unsafe {
+            path,
+            source: error,
+        },
+        _ => ActivationAnchorReadinessError::Uncertain {
+            path,
+            source: error,
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreActivationKind {
     NeverActivated,

@@ -2,6 +2,7 @@ use assert_cmd::Command;
 
 const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[
     &["scan"],
+    &["doctor"],
     &["quota"],
     &["reclaim"],
     &["clean"],
@@ -160,6 +161,7 @@ fn assert_top_help_order() {
         &output,
         &[
             "\n  scan",
+            "\n  doctor",
             "\n  quota",
             "\n  reclaim",
             "\n  clean",
@@ -182,6 +184,7 @@ fn assert_man_order() {
         &output,
         &[
             "degu\\-scan(1)",
+            "degu\\-doctor(1)",
             "degu\\-quota(1)",
             "degu\\-reclaim(1)",
             "degu\\-clean(1)",
@@ -204,7 +207,7 @@ fn assert_completion_order(shell: &str) {
     if shell == "bash" {
         assert!(output.contains("complete -F") || output.contains("_degu"));
         assert!(output.contains(
-            "scan quota reclaim clean undo trash relocate ops adapters completions man help"
+            "scan doctor quota reclaim clean undo trash relocate ops adapters completions man help"
         ));
         assert!(!output.contains("degu,usage)"));
         return;
@@ -214,6 +217,7 @@ fn assert_completion_order(shell: &str) {
             assert!(output.contains("#compdef") || output.contains("_degu"));
             &[
                 "(scan)",
+                "(doctor)",
                 "(quota)",
                 "(reclaim)",
                 "(clean)",
@@ -230,6 +234,7 @@ fn assert_completion_order(shell: &str) {
             assert!(output.contains("complete"));
             &[
                 "-a \"scan\"",
+                "-a \"doctor\"",
                 "-a \"quota\"",
                 "-a \"reclaim\"",
                 "-a \"clean\"",

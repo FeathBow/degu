@@ -6,6 +6,7 @@ use std::time::Duration;
 pub(crate) mod adapters;
 pub(crate) mod clean;
 pub(crate) mod completions;
+pub(crate) mod doctor;
 pub(crate) mod guidance;
 pub(crate) mod man;
 pub(crate) mod ops;

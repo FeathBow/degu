@@ -76,6 +76,7 @@ fn run(verbose: u8, command: Command, policy: ColorPolicy) -> Result<()> {
 fn dispatch(command: Command, ui: runtime::Ui) -> Result<()> {
     match command {
         Command::Scan(args) => commands::scan::run(args, ui),
+        Command::Doctor { output } => commands::doctor::run(output.json),
         Command::Quota(args) => commands::quota::run(args, ui),
         Command::Reclaim { command } => commands::reclaim::run(command, ui),
         Command::Clean(args) => commands::clean::run(args, ui),

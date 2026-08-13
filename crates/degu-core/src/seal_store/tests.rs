@@ -290,7 +290,7 @@ fn rejects_store_acl_drift_before_lease() {
     assert!(matches!(
         store.try_lease(),
         Err(StoreError::UnsafeDirectory {
-            reason: "directory ACL is present or could not be verified absent",
+            reason: super::DIRECTORY_ACL_PRESENT_REASON,
             ..
         })
     ));

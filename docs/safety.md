@@ -31,6 +31,31 @@ Initialization opens directories and tags with descriptor-relative, no-follow op
 
 The full set of relocation subdirectories is component-validated and preflighted before mutation. If a later initialization step or the final target-binding revalidation fails, rollback works in reverse through held parent descriptors and removes only this invocation's identity-matched tags and empty directories. Identity changes, non-empty directories, and other rollback failures are left in place and reported as residue rather than risking deletion of a replacement or pre-existing object. Once initialization and that revalidation both succeed the transaction is committed and rollback is released; a failure while writing the report or script afterward therefore leaves the completed, valid roots in place (a re-run reports them already initialized), and a closed output pipe still exits successfully by convention.
 
+## Sealed-staging account readiness
+
+`degu doctor` is the single user-facing readiness check for future sealed
+staging. It derives one anchor only from the platform and current effective UID,
+then applies the same existing-only, descriptor-relative, no-follow
+owner/mode/ACL/backend/identity/binding/lock/durability validation used by the
+activation core. The check creates or writes no degu anchor, store, record, or
+lifecycle state. Validation briefly takes the protocol's existing nonblocking
+lock and calls durability sync on the already-provisioned anchor and parent. It
+does not consult HOME, XDG variables, configuration, environment overrides, or
+a caller-provided path.
+
+The result is `ready`, `missing`, `unsafe`, `unsupported`, or `uncertain`.
+Anything except `ready` fails closed and prints administrator remediation.
+Missing does not mean first activation and never permits a HOME or legacy
+fallback. Unsafe entries are not automatically chmodded, replaced, or repaired;
+inspection uncertainty is not compressed into missing or ready. Root and a
+malicious same-EUID process remain outside the Unix trust boundary.
+
+The current unprivileged installers install binaries only and merely suggest
+running `degu doctor`. They do not invoke sudo or write `/var/lib` or
+`/private/var/db`. Explicit administrator provisioning and later production
+lifecycle wiring remain separate review boundaries, so this command does not
+change current clean, undo, purge, or expiry behavior.
+
 ## Staging, undo, and purge
 
 `degu clean` normally stages findings under `$XDG_STATE_HOME/degu/trash`, or `~/.local/state/degu/trash` when `XDG_STATE_HOME` is unset. Staging keeps the operation undoable with `degu undo`, but staged data continues to consume filesystem quota.

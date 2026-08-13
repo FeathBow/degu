@@ -6,7 +6,9 @@
 //! and rechecks that binding immediately before any held-FD mode restoration.
 
 use crate::authority::TransactionState;
-use crate::local_backend::held_tree::{HeldTreeError, HeldTreeInventory, HeldTreeLimits};
+use crate::local_backend::held_tree::{
+    HeldTreeError, HeldTreeInventory, HeldTreeLimits, HeldTreePurgeError,
+};
 use crate::local_backend::{
     CertificationError, CertifiedLocalBackend, HeldLocalBackendEvidence,
     LocalModeRevalidationFailure, certify_held_fd, certify_held_fd_backend,
@@ -37,6 +39,10 @@ std::thread_local! {
         const { std::cell::Cell::new(None) };
     pub(crate) static BEFORE_UNDO_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    pub(crate) static PURGE_FAIL_AFTER_CLAIM: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    pub(crate) static PURGE_FAIL_PROGRESS_AT: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
     pub(crate) static PURGE_FAIL_AFTER_OUTCOME: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
@@ -744,10 +750,27 @@ impl VerifiedPurgeAuthorityMaterial {
         // guessing from a potentially partial namespace.
         wal.record_purge_intent(transaction)?;
         *startup_blocked = true;
+        #[cfg(test)]
+        if PURGE_FAIL_AFTER_CLAIM.with(std::cell::Cell::get) {
+            return Err(RecoveryRebindError::Io(io::Error::other(
+                "injected crash after durable purge claim",
+            )));
+        }
         let removed = self
             .inventory
-            .purge_postorder()
-            .map_err(RecoveryRebindError::PurgeExecution)?;
+            .purge_postorder(|removed, path| {
+                #[cfg(test)]
+                if PURGE_FAIL_PROGRESS_AT.with(|at| at.get() == Some(removed)) {
+                    return Err(AppendError::InvalidState(
+                        "injected crash before durable purge progress",
+                    ));
+                }
+                wal.record_purge_progress(transaction, removed, path)
+            })
+            .map_err(|error| match error {
+                HeldTreePurgeError::Tree(error) => RecoveryRebindError::PurgeExecution(error),
+                HeldTreePurgeError::Journal(error) => RecoveryRebindError::Wal(error),
+            })?;
         wal.record_purge_outcome(transaction)?;
         #[cfg(test)]
         if PURGE_FAIL_AFTER_OUTCOME.with(std::cell::Cell::get) {

@@ -30,6 +30,8 @@ const HARD_DIRECTORY_CAP: u64 = 1_024;
 const MANIFEST_DOMAIN_V1: &[u8] = b"degu-held-tree-manifest-v1\0";
 const MANIFEST_DOMAIN_V2: &[u8] = b"degu-held-tree-manifest-v2-content\0";
 const CONTENT_PROOF_VERSION: u16 = 2;
+/// A transient EINTR is retried, but every namespace operation remains bounded.
+const PURGE_IO_ATTEMPTS: usize = 3;
 #[cfg(test)]
 std::thread_local! {
     pub(crate) static PURGE_FAIL_AFTER_REMOVALS: std::cell::Cell<Option<u64>> =
@@ -70,6 +72,18 @@ pub(crate) enum HeldTreeLimit {
     PathBytes,
     ManifestBytes,
     ContentBytes,
+}
+
+#[derive(Debug)]
+pub(crate) enum HeldTreePurgeError<E> {
+    Tree(HeldTreeError),
+    Journal(E),
+}
+
+impl<E> From<HeldTreeError> for HeldTreePurgeError<E> {
+    fn from(error: HeldTreeError) -> Self {
+        Self::Tree(error)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -425,7 +439,10 @@ impl HeldTreeInventory {
     /// bounded postorder, symlinks are never followed, and the retained trash
     /// parent is synced only after the exact root name has been removed.
     #[allow(clippy::disallowed_methods)] // this method is the verified fd-relative deletion engine
-    pub(crate) fn purge_postorder(self) -> Result<u64, HeldTreeError> {
+    pub(crate) fn purge_postorder<E>(
+        self,
+        mut record_progress: impl FnMut(u64, &Path) -> Result<(), E>,
+    ) -> Result<u64, HeldTreePurgeError<E>> {
         self.verify_root_binding()?;
         let mut entries = self
             .manifest
@@ -445,7 +462,7 @@ impl HeldTreeInventory {
         for expected in entries {
             #[cfg(test)]
             if PURGE_FAIL_AFTER_REMOVALS.with(|limit| limit.get() == Some(removed)) {
-                return Err(io_error(&expected.path, rustix::io::Errno::IO));
+                return Err(io_error(&expected.path, rustix::io::Errno::IO).into());
             }
             let parent_path = expected.path.parent().unwrap_or_else(|| Path::new(""));
             let name = expected
@@ -474,19 +491,20 @@ impl HeldTreeInventory {
             )?;
             let actual = before.into_manifest(expected.path.clone(), content);
             if &actual != expected {
-                return Err(HeldTreeError::IdentityChanged(expected.path.clone()));
+                return Err(HeldTreeError::IdentityChanged(expected.path.clone()).into());
             }
             let flags = if expected.identity.kind == NodeKind::Directory {
                 AtFlags::REMOVEDIR
             } else {
                 AtFlags::empty()
             };
-            with_fd(&parent.held, |fd| rustix::fs::unlinkat(fd, name, flags))
+            retry_interrupted(|| with_fd(&parent.held, |fd| rustix::fs::unlinkat(fd, name, flags)))
                 .map_err(|error| io_error(&expected.path, error))?;
             removed = removed.checked_add(1).ok_or(HeldTreeError::Limit {
                 kind: HeldTreeLimit::Entries,
                 limit: self.limits.max_entries,
             })?;
+            record_progress(removed, &expected.path).map_err(HeldTreePurgeError::Journal)?;
         }
 
         // Child removal changes directory timestamps, but not the strong root
@@ -498,19 +516,22 @@ impl HeldTreeInventory {
         let held_root = inspect_held(&self.directories[0].held, Path::new(""))?;
         require_same_identity(Path::new(""), self.root_identity, named_root.identity)?;
         require_same_identity(Path::new(""), self.root_identity, held_root.identity)?;
-        with_fd(&self.parent, |fd| {
-            rustix::fs::unlinkat(fd, &self.root_name, AtFlags::REMOVEDIR)
+        retry_interrupted(|| {
+            with_fd(&self.parent, |fd| {
+                rustix::fs::unlinkat(fd, &self.root_name, AtFlags::REMOVEDIR)
+            })
         })
         .map_err(|error| io_error(Path::new(""), error))?;
         removed = removed.checked_add(1).ok_or(HeldTreeError::Limit {
             kind: HeldTreeLimit::Entries,
             limit: self.limits.max_entries,
         })?;
+        record_progress(removed, Path::new("")).map_err(HeldTreePurgeError::Journal)?;
         #[cfg(test)]
         if PURGE_FAIL_PARENT_FSYNC.with(std::cell::Cell::get) {
-            return Err(io_error(Path::new(""), rustix::io::Errno::IO));
+            return Err(io_error(Path::new(""), rustix::io::Errno::IO).into());
         }
-        with_fd(&self.parent, |fd| rustix::fs::fsync(fd))
+        retry_interrupted(|| with_fd(&self.parent, |fd| rustix::fs::fsync(fd)))
             .map_err(|error| io_error(Path::new(""), error))?;
         Ok(removed)
     }
@@ -771,6 +792,18 @@ struct Inspection {
     content_fields_available: bool,
     mount_id: u64,
     backend: CertifiedLocalBackend,
+}
+
+fn retry_interrupted<T>(
+    mut operation: impl FnMut() -> rustix::io::Result<T>,
+) -> rustix::io::Result<T> {
+    for attempt in 0..PURGE_IO_ATTEMPTS {
+        match operation() {
+            Err(rustix::io::Errno::INTR) if attempt + 1 < PURGE_IO_ATTEMPTS => continue,
+            result => return result,
+        }
+    }
+    unreachable!("bounded retry loop always returns")
 }
 
 impl Inspection {

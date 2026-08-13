@@ -737,6 +737,8 @@ fn replayed(state: TransactionState) -> ReplayedTransaction {
         tree_manifest: None,
         rename_outcome: None,
         undo_rename_outcome: None,
+        purge_removed_entries: 0,
+        purge_last_path: None,
     }
 }
 
@@ -2478,6 +2480,110 @@ fn purgeable_has_only_the_explicit_v8_authorization_record() {
         replay_records(forged),
         Err(ReplayError::InvalidHistory(
             "purge authorization does not bind the exact committed object"
+        ))
+    ));
+}
+
+#[test]
+fn v10_purge_claim_and_progress_replay_fail_closed_on_every_invalid_shape() {
+    let transaction = tx(0xc7);
+    let metadata = staging_metadata().with_production_association(
+        ProductionAssociation::new("progress-group".to_string()).unwrap(),
+    );
+    let manifest = DurableTreeManifest {
+        schema_version: CONTENT_PROOF_MANIFEST_VERSION,
+        entry_count: 2,
+        sha256: [0x6b; 32],
+    };
+    let authorized = || {
+        vec![
+            SealRecord::StagingBegin {
+                transaction,
+                metadata: metadata.clone(),
+            },
+            state(transaction, TransactionState::ParentSealIntent),
+            state(transaction, TransactionState::ParentSealed),
+            state(transaction, TransactionState::TreeSealIntent),
+            SealRecord::TreeManifestComplete {
+                transaction,
+                manifest,
+            },
+            state(transaction, TransactionState::TreeSealed),
+            SealRecord::RenameIntent { transaction },
+            SealRecord::RenameOutcome {
+                transaction,
+                outcome: DurableRenameOutcome::AppliedAndParentsSynced(metadata.root_identity()),
+            },
+            state(transaction, TransactionState::StagedUnverified),
+            state(transaction, TransactionState::StagedSealed),
+            state(transaction, TransactionState::SourceParentRestoreIntent),
+            state(transaction, TransactionState::SourceParentRestored),
+            state(transaction, TransactionState::VerifiedCommitted),
+            SealRecord::PurgeAuthorized {
+                transaction,
+                commitment: DurablePurgeCommitment::exact(&metadata, manifest),
+            },
+        ]
+    };
+    let claim = || SealRecord::PurgeClaimed {
+        transaction,
+        commitment: DurablePurgeCommitment::exact(&metadata, manifest),
+    };
+    let progress = |removed_entries, last_path: &str| SealRecord::PurgeProgress {
+        transaction,
+        removed_entries,
+        last_path: PathBuf::from(last_path),
+    };
+
+    let cases = [
+        {
+            let mut records = authorized();
+            records.push(progress(1, "child"));
+            records
+        },
+        {
+            let mut records = authorized();
+            records.extend([claim(), progress(2, "child")]);
+            records
+        },
+        {
+            let mut records = authorized();
+            records.extend([claim(), progress(1, "../escape")]);
+            records
+        },
+        {
+            let mut records = authorized();
+            records.extend([claim(), progress(1, "child"), progress(1, "child")]);
+            records
+        },
+        {
+            let mut records = authorized();
+            records.extend([
+                claim(),
+                progress(1, "child"),
+                state(transaction, TransactionState::PurgeOutcome),
+            ]);
+            records
+        },
+    ];
+    for records in cases {
+        assert!(matches!(
+            replay_records(records),
+            Err(ReplayError::InvalidHistory(_))
+        ));
+    }
+
+    let mut forged_claim = authorized();
+    let mut commitment = DurablePurgeCommitment::exact(&metadata, manifest);
+    commitment.destination_basename = std::ffi::OsString::from("other-root");
+    forged_claim.push(SealRecord::PurgeClaimed {
+        transaction,
+        commitment,
+    });
+    assert!(matches!(
+        replay_records(forged_claim),
+        Err(ReplayError::InvalidHistory(
+            "purge claim is not bound to the exact authorized object"
         ))
     ));
 }

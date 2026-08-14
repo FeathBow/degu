@@ -9,6 +9,9 @@
 <p align="center"><img src="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/demo.svg" alt="degu scan output: Ready to clean, Needs review, and Not managed tiers with sizes, reasons, and a copyable preview command" width="92%"></p>
 <p align="center"><sub>Real output from a small demo tree; on a working ML node, model and package caches routinely reach tens of gigabytes.</sub></p>
 
+> [!IMPORTANT]
+> The latest published release is **v0.1.4**. This `main` README documents the next release, including account readiness, sealed staging, and `reclaim uv`; those commands are not in the published v0.1.4 tag. Until the next version is chosen and bumped, a source build from `main` also prints `degu 0.1.4`, so verify the commit as well as `--version`. Use the [v0.1.4 README](https://github.com/FeathBow/degu/blob/v0.1.4/README.md) with the published binary, or build the exact commit you reviewed to test the behavior below.
+
 <details>
 <summary>The same scan, redirected — copy-pasteable and pinned byte-exact by a contract test</summary>
 
@@ -30,7 +33,7 @@ Reported only; degu never cleans these locations.
  source  on disk   idle  inodes  reason         path
  uv      4.0 MiB  today       2  managed by uv  ~/.cache/uv
 
-Preview the largest Needs review location (no changes): degu clean --details --dry-run --include-review --path ~/.cache/huggingface/hub/models--bert--base
+Preview the largest Needs review location (no changes): degu clean -dn --review ~/.cache/huggingface/hub/models--bert--base
 Run this preview in a terminal to receive a Next command with the same path and filters.
 Scan build artifacts under this project, or any parent directory: degu scan .
 ```
@@ -43,7 +46,7 @@ Scan build artifacts under this project, or any parent directory: degu scan .
 - **Reclaims what actually fills your quota.** Built-in sources across the ML/HPC stack — pip, conda, HuggingFace, vLLM, Triton, cargo, and more (`degu adapters` lists them all) — plus build artifacts under any project tree, found in a single read-only pass; two node-runtime diagnostics stay scan-time opt-in.
 - **Safe by default.** Only verified, cheap-to-regenerate findings enter the default plan and are staged for undo.
 - **Honest accounting.** `degu quota` reads authoritative filesystem usage and limits, kept separate from degu-detected storage.
-- **Linux and macOS, offline, unprivileged normal use.** Normal scan and cleanup need no root and never self-elevate; a separate administrator-controlled step performs the one-time per-UID activation-anchor bootstrap.
+- **Linux and macOS, offline, unprivileged daily use.** Scan, preview, and day-to-day cleanup never self-elevate. On the next release, `degu doctor` checks one-time account setup; `missing` has a defined administrator provisioning path, while unsafe or uncertain state requires investigation.
 
 ## Why you can trust it to delete
 
@@ -66,7 +69,7 @@ For datasets, checkpoints, and unknown large files, pair degu with a disk-usage 
 
 ## Installation
 
-Install the latest release (static binaries; Linux x86_64/aarch64 and macOS):
+Install the latest published release, currently **v0.1.4** (static binaries; Linux x86_64/aarch64 and macOS):
 
 ```sh
 installer=$(mktemp "${TMPDIR:-/tmp}/degu-install.XXXXXX") &&
@@ -88,21 +91,31 @@ cargo install --path crates/degu --locked --root "$HOME/.local"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Both `degu` and its short alias, `dg`, install into `~/.local/bin` by default. The installer never invokes `sudo`, reads `SUDO_UID`, or creates an activation anchor; `DEGU_INSTALL_DIR` may select another binary destination when the caller already has permission. Before the first production mutation, an administrator must use a separately verified, administrator-owned binary for the fixed numeric-UID bootstrap documented in the [installation guide](https://github.com/FeathBow/degu/blob/main/docs/installation.md), which also covers published releases, checksum verification, and build provenance.
+Both `degu` and its short alias, `dg`, install into `~/.local/bin` by default. `DEGU_INSTALL_DIR` may select another binary destination when the caller already has permission. See the [v0.1.4 installation guide](https://github.com/FeathBow/degu/blob/v0.1.4/docs/installation.md) for the published release.
+
+The remainder of this README describes `main`. A source build installs the unreleased code at the checked-out commit. Its installer and account-setup contract are documented in the [next-release installation guide](https://github.com/FeathBow/degu/blob/main/docs/installation.md).
 
 ## Quick start
 
-The whole lifecycle is five commands:
+For `main` and the next release, check setup once before the first mutation:
+
+```sh
+degu doctor
+```
+
+`ready` means continue. If it reports `missing`, give its path and your numeric UID (`id -u`) to your administrator; the user command never creates system authority. Unsafe or uncertain state requires investigation, not automatic repair.
+
+After setup, the daily lifecycle remains five short commands:
 
 ```sh
 degu scan            # read-only: what exists, what is safe to clean
-degu clean --dry-run # preview the exact plan; changes nothing
+degu clean -n        # preview the exact plan; changes nothing
 degu clean           # stage Ready-to-clean findings into undoable trash
 degu undo            # restore the latest clean operation
 degu trash purge     # or permanently delete what you reviewed
 ```
 
-Only **Ready to clean** enters the default plan; the scan prints a copyable preview command for the largest **Needs review** location.
+Only **Ready to clean** enters the default plan. For one **Needs review** location, the scan prints a shorter `degu clean -dn --review PATH` preview; the resulting `Next` command keeps the same exact selection.
 
 Staged data stays reversible and still counts against quota until purged; choose one recovery branch per clean operation. A confirmed mutating clean also permanently purges trash entries at least seven days old. On very large shared filesystems a full first scan can take minutes:
 
@@ -130,6 +143,16 @@ degu quota
 ```
 
 Validated on Linux ext4 and field-validated on a Lustre 2.15 client; other filesystems and macOS report unsupported instead of guessing. See the [user guide](https://github.com/FeathBow/degu/blob/main/docs/usage.md) for supported providers and failure behavior.
+
+### Advanced: reclaim a uv-managed cache
+
+`uv` caches stay **Not managed** by normal `clean`. The next release can validate and run uv 0.12.3's own irreversible ordinary prune while keeping both authority inputs explicit:
+
+```sh
+degu reclaim uv -x /absolute/path/to/uv -c /absolute/path/to/uv-cache -n
+```
+
+After reviewing the preview, rerun without `-n` and type `prune`. This bypasses degu trash and cannot be undone; degu never guesses the executable or cache root. See [Tool-native reclaim](docs/usage.md#tool-native-reclaim-advanced).
 
 Run `degu <command> --help` or `degu man <command>` for complete command details.
 

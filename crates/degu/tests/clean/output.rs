@@ -237,7 +237,7 @@ fn clean_human_dry_run_explicitly_reports_no_mutation() {
     );
     assert!(!stdout.contains("if the preview looks right"), "{stdout}");
     assert!(
-        stdout.contains("review details: degu clean --details --dry-run"),
+        stdout.contains("review details: degu clean -dn"),
         "{stdout}"
     );
 }

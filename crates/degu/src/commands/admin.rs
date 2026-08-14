@@ -1,4 +1,4 @@
-use crate::cli::{ActivationAnchorCommand, AdminCommand};
+use crate::cli::AdminCommand;
 use crate::output::stdoutln;
 use anyhow::{Context, Result, bail};
 use degu_core::activation_anchor_provisioning::{
@@ -10,7 +10,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 const SCHEMA_VERSION: u32 = 1;
-const ACTION: &str = "activation_anchor_provision";
+const ACTION: &str = "account_setup";
 
 #[derive(Debug, Serialize)]
 struct ProvisionReport {
@@ -49,35 +49,28 @@ pub(crate) fn run(command: AdminCommand) -> Result<()> {
     // This dispatch is deliberately outside the generic root policy. It does
     // not accept the container marker or DEGU_ALLOW_ROOT as a substitute.
     if !rustix::process::geteuid().is_root() {
-        bail!("activation-anchor provisioning requires effective UID 0");
+        bail!("account setup requires effective UID 0");
     }
-    match command {
-        AdminCommand::ActivationAnchor { command } => match command {
-            ActivationAnchorCommand::Provision(args) => {
-                let report: ProvisionReport = provision_activation_anchor(args.uid, args.initial)
-                    .with_context(|| {
-                        format!(
-                            "refused create-only activation-anchor provisioning for numeric UID {}",
-                            args.uid
-                        )
-                    })?
-                    .into();
-                if args.output.json {
-                    stdoutln!("{}", serde_json::to_string_pretty(&report)?)
-                } else {
-                    stdoutln!(
-                        "Activation anchor {} for UID {} at {} ({}, mutated={})",
-                        report.status,
-                        report.uid,
-                        crate::presentation::escape_terminal_text(
-                            &report.path.display().to_string()
-                        ),
-                        report.backend,
-                        report.mutated
-                    )
-                }
-            }
-        },
+    let AdminCommand::Setup(args) = command;
+    let report: ProvisionReport = provision_activation_anchor(args.uid, args.initial)
+        .with_context(|| {
+            format!(
+                "refused create-only account setup for numeric UID {}",
+                args.uid
+            )
+        })?
+        .into();
+    if args.output.json {
+        stdoutln!("{}", serde_json::to_string_pretty(&report)?)
+    } else {
+        stdoutln!(
+            "Account setup {} for UID {} at {} ({}, mutated={})",
+            report.status,
+            report.uid,
+            crate::presentation::escape_terminal_text(&report.path.display().to_string()),
+            report.backend,
+            report.mutated
+        )
     }
 }
 

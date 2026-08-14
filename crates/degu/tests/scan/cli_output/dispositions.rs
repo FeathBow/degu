@@ -61,7 +61,7 @@ fn scan_color_reinforces_each_action_state_without_changing_text() {
     // Standard yellow (palette 3): bright yellow (palette 11) is
     // near-invisible on light terminal themes.
     assert_sgr_color(&colored_text, "Needs review", "38;5;3");
-    assert_sgr_color(&colored_text, "degu clean --details", "38;5;14");
+    assert_sgr_color(&colored_text, "degu clean -dn --review", "38;5;14");
     assert_label_has_no_color(&colored_text, "Not managed", "38;5;9");
     assert_eq!(strip_sgr(&colored.stdout), plain.stdout);
 }
@@ -107,7 +107,7 @@ fn assert_bucket_hierarchy(stdout: &str) {
 // The review target sits under HOME with an unquoted-safe rest, so the
 // suggested command abbreviates it to an expandable, unquoted ~ path.
 fn assert_review_command(stdout: &str) {
-    let review_command = "degu clean --details --dry-run --include-review --path ~/.cache/huggingface/hub/models--org--name";
+    let review_command = "degu clean -dn --review ~/.cache/huggingface/hub/models--org--name";
     assert!(stdout.contains(review_command), "{stdout}");
     assert!(
         !stdout.contains("degu clean --include-review --path"),

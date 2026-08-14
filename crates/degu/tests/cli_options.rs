@@ -6,6 +6,7 @@ const BUDGET: &str = "--budget";
 const MAX_CONCURRENCY: &str = "--max-concurrency";
 const LONG: &str = "--long";
 const OPT_IN: &str = "--opt-in";
+const REVIEW: &str = "--review";
 
 #[derive(Clone, Copy)]
 struct HelpCase {
@@ -230,8 +231,40 @@ fn human_review_options_use_task_oriented_names() {
     let clean = String::from_utf8(run(&["clean", "--help"]).stdout).unwrap();
     assert!(declares_option(&clean, "--details"), "{clean}");
     assert!(declares_option(&clean, "--include-review"), "{clean}");
+    assert!(declares_option(&clean, REVIEW), "{clean}");
+    assert!(clean.contains("-n, --dry-run"), "{clean}");
+    assert!(clean.contains("-y, --yes"), "{clean}");
     assert!(!declares_option(&clean, "--long"), "{clean}");
     assert!(!declares_option(&clean, "--opt-in"), "{clean}");
+}
+
+#[test]
+fn short_forms_preserve_explicit_authority_inputs() {
+    let reclaim = String::from_utf8(run(&["reclaim", "uv", "--help"]).stdout).unwrap();
+    for declaration in [
+        "-x, --executable",
+        "-c, --cache-dir",
+        "-n, --dry-run",
+        "-y, --yes",
+    ] {
+        assert!(
+            reclaim.contains(declaration),
+            "missing {declaration:?}: {reclaim}"
+        );
+    }
+}
+
+#[test]
+fn review_shorthand_cannot_be_combined_to_widen_selection() {
+    for args in [
+        &["clean", REVIEW, "/one", "--path", "/two", "-n"][..],
+        &["clean", REVIEW, "/one", "--include-review", "-n"][..],
+    ] {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(2), "accepted {args:?}");
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
+    }
 }
 
 #[test]

@@ -218,9 +218,7 @@ fn clean_review_first_path_can_preview_the_same_scope() {
     );
     assert!(!stdout.contains("myenv"), "{stdout}");
     assert!(
-        stdout.contains(
-            "degu clean --details --dry-run --include-review --path ~/.cache/huggingface/hub/models--org--name"
-        ),
+        stdout.contains("degu clean -dn --review ~/.cache/huggingface/hub/models--org--name"),
         "{stdout}"
     );
 }

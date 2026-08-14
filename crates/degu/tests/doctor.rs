@@ -36,7 +36,7 @@ fn doctor_is_one_short_read_only_command_with_stable_json() {
     let second_json: Value = serde_json::from_slice(&second.stdout).unwrap();
 
     assert_eq!(first_json["schema_version"], 1);
-    assert_eq!(first_json["check"], "sealed_staging_anchor");
+    assert_eq!(first_json["check"], "account_readiness");
     assert_eq!(first_json["mutated"], false);
     assert_eq!(first_json["path"], second_json["path"]);
     assert_eq!(first_json["status"], second_json["status"]);

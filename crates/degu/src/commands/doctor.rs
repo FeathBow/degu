@@ -9,7 +9,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 const SCHEMA_VERSION: u32 = 1;
-const CHECK_ID: &str = "sealed_staging_anchor";
+const CHECK_ID: &str = "account_readiness";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,7 +102,7 @@ fn finish_report(report: &DoctorReport, print_result: Result<()>) -> Result<()> 
         return Err(error);
     }
     Err(anyhow!(
-        "doctor found sealed-staging readiness status '{}'",
+        "doctor found account readiness status '{}'",
         report.status.as_str()
     ))
 }
@@ -118,7 +118,7 @@ fn print_report(report: &DoctorReport, json: bool) -> Result<()> {
 fn render_human(report: &DoctorReport) -> String {
     let path = escape_terminal_text(&report.path.display().to_string());
     let mut output = format!(
-        "Account readiness\n\nSealed staging  {}\nSystem anchor   {path}\nWrites degu state no",
+        "Account readiness\n\nSetup status    {}\nSystem path     {path}\nWrites degu state no",
         report.status.as_str()
     );
     if let Some(backend) = report.backend {
@@ -145,8 +145,8 @@ fn classify_error(
     match error {
         ActivationAnchorReadinessError::Missing { .. } => (
             ReadinessStatus::Missing,
-            "the fixed current-user system anchor is not provisioned",
-            "ask an administrator to provision the exact path above; degu will not create it",
+            "required setup for this account is not provisioned",
+            "send the path above and your numeric UID from 'id -u' to an administrator; degu will not create it",
         ),
         ActivationAnchorReadinessError::Unsupported { .. } => (
             ReadinessStatus::Unsupported,
@@ -261,7 +261,7 @@ mod tests {
         let readiness = ActivationAnchorReadinessError::Missing { path: path() };
         let report = DoctorReport::failed(path(), &readiness);
         let output = render_human(&report);
-        assert!(output.contains("Sealed staging  missing"));
+        assert!(output.contains("Setup status    missing"));
         assert!(output.contains("Writes degu state no"));
         assert!(output.contains("Next step"));
         assert!(!output.contains("activation-anchor"));

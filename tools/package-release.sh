@@ -67,8 +67,7 @@ done
 write_man_page degu.1
 write_man_page degu-doctor.1 doctor
 write_man_page degu-admin.1 admin
-write_man_page degu-admin-activation-anchor.1 admin activation-anchor
-write_man_page degu-admin-activation-anchor-provision.1 admin activation-anchor provision
+write_man_page degu-admin-setup.1 admin setup
 write_man_page degu-quota.1 quota
 write_man_page degu-scan.1 scan
 write_man_page degu-clean.1 clean
@@ -76,6 +75,8 @@ write_man_page degu-undo.1 undo
 write_man_page degu-trash.1 trash
 write_man_page degu-trash-list.1 trash list
 write_man_page degu-trash-purge.1 trash purge
+write_man_page degu-reclaim.1 reclaim
+write_man_page degu-reclaim-uv.1 reclaim uv
 write_man_page degu-relocate.1 relocate
 write_man_page degu-ops.1 ops
 write_man_page degu-adapters.1 adapters

@@ -3,20 +3,22 @@ pub(super) const TOP_LEVEL_HELP_TEMPLATE: &str = "{about-with-newline}
 
 Inspect:
   scan         Inspect known caches and selected project roots
-  doctor       Check account readiness for sealed staging
+  doctor       Check whether required account setup is ready
   quota        Report authoritative filesystem quota for one path
 
 Clean and recover:
-  reclaim      Preview an explicitly selected tool-native cache action
   clean        Preview or execute a cleanup plan
   undo         Restore the latest staged clean operation
   trash        Inspect or permanently purge trash entries
+
+Advanced irreversible actions:
+  reclaim      Preview an explicitly selected tool-native cache action
 
 Configure:
   relocate     Print shell config for future cache writes
 
 Administration:
-  admin        Perform an explicit root-only administrative operation
+  admin        Provision explicit root-only account setup
 
 Reference:
   ops          Show recorded clean, restore, and purge operations

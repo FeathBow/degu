@@ -4,10 +4,10 @@ const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[
     &["scan"],
     &["doctor"],
     &["quota"],
-    &["reclaim"],
     &["clean"],
     &["undo"],
     &["trash"],
+    &["reclaim"],
     &["relocate"],
     &["admin"],
     &["ops"],
@@ -16,11 +16,7 @@ const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[
     &["man"],
 ];
 const NESTED_MAN_COMMANDS: &[&[&str]] = &[&["trash", "list"], &["trash", "purge"]];
-const ADMIN_MAN_COMMANDS: &[&[&str]] = &[
-    &["admin"],
-    &["admin", "activation-anchor"],
-    &["admin", "activation-anchor", "provision"],
-];
+const ADMIN_MAN_COMMANDS: &[&[&str]] = &[&["admin"], &["admin", "setup"]];
 const RECLAIM_MAN_COMMANDS: &[&[&str]] = &[&["reclaim", "uv"]];
 
 fn degu() -> Command {
@@ -146,11 +142,7 @@ fn man_references_only_pages_in_the_release_contract() {
     );
     assert_eq!(
         man_references(&generated_man(&["admin"])),
-        expected_man_references(&ADMIN_MAN_COMMANDS[1..2])
-    );
-    assert_eq!(
-        man_references(&generated_man(&["admin", "activation-anchor"])),
-        expected_man_references(&ADMIN_MAN_COMMANDS[2..])
+        expected_man_references(&ADMIN_MAN_COMMANDS[1..])
     );
 }
 
@@ -172,6 +164,7 @@ fn assert_top_help_order() {
         &[
             "Inspect:",
             "Clean and recover:",
+            "Advanced irreversible actions:",
             "Configure:",
             "Administration:",
             "Reference:",
@@ -184,10 +177,10 @@ fn assert_top_help_order() {
             "\n  scan",
             "\n  doctor",
             "\n  quota",
-            "\n  reclaim",
             "\n  clean",
             "\n  undo",
             "\n  trash",
+            "\n  reclaim",
             "\n  relocate",
             "\n  admin",
             "\n  ops",
@@ -208,10 +201,10 @@ fn assert_man_order() {
             "degu\\-scan(1)",
             "degu\\-doctor(1)",
             "degu\\-quota(1)",
-            "degu\\-reclaim(1)",
             "degu\\-clean(1)",
             "degu\\-undo(1)",
             "degu\\-trash(1)",
+            "degu\\-reclaim(1)",
             "degu\\-relocate(1)",
             "degu\\-admin(1)",
             "degu\\-ops(1)",
@@ -230,7 +223,7 @@ fn assert_completion_order(shell: &str) {
     if shell == "bash" {
         assert!(output.contains("complete -F") || output.contains("_degu"));
         assert!(output.contains(
-            "scan doctor quota reclaim clean undo trash relocate admin ops adapters completions man help"
+            "scan doctor quota clean undo trash reclaim relocate admin ops adapters completions man help"
         ));
         assert!(!output.contains("degu,usage)"));
         return;
@@ -242,10 +235,10 @@ fn assert_completion_order(shell: &str) {
                 "(scan)",
                 "(doctor)",
                 "(quota)",
-                "(reclaim)",
                 "(clean)",
                 "(undo)",
                 "(trash)",
+                "(reclaim)",
                 "(relocate)",
                 "(admin)",
                 "(ops)",
@@ -260,10 +253,10 @@ fn assert_completion_order(shell: &str) {
                 "-a \"scan\"",
                 "-a \"doctor\"",
                 "-a \"quota\"",
-                "-a \"reclaim\"",
                 "-a \"clean\"",
                 "-a \"undo\"",
                 "-a \"trash\"",
+                "-a \"reclaim\"",
                 "-a \"relocate\"",
                 "-a \"admin\"",
                 "-a \"ops\"",

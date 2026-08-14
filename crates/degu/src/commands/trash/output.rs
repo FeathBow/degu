@@ -106,7 +106,7 @@ fn render_outcomes(rows: &[TrashEntry], ui: Ui) -> String {
         outcomes.push("Restore the latest clean:\n  degu undo".to_owned());
     }
     let delete_label = if has_interrupted {
-        "Permanently delete all listed entries, including interrupted purge claims (confirm again):"
+        "Delete all listed entries, including legacy interrupted claims (confirm again):"
     } else {
         "Permanently delete all listed entries:"
     };
@@ -388,7 +388,7 @@ mod tests {
         interrupted.interrupted_purge = true;
         let mixed = render_outcomes(&[row(), interrupted], Ui::test_terminal(32));
         assert!(mixed.contains("degu undo"));
-        assert!(mixed.contains("including interrupted"));
+        assert!(mixed.contains("including legacy interrupted"));
         let mut interrupted_only = row();
         interrupted_only.original = None;
         interrupted_only.interrupted_purge = true;

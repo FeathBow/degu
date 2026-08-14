@@ -41,6 +41,71 @@ fn successful_stdout(output: std::process::Output) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+#[test]
+fn review_shorthand_requires_one_exact_needs_review_finding() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let hub = home.path().join(".cache/huggingface/hub");
+    for name in ["models--org--one", "models--org--two"] {
+        let repo = hub.join(name).join("snapshots/main");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("model.bin"), [0u8; 8192]).unwrap();
+    }
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+
+    let parent = run_clean(
+        &home,
+        &state,
+        &["clean", "-n", "--review", hub.to_str().unwrap()],
+    );
+    assert!(!parent.status.success());
+    let stderr = String::from_utf8_lossy(&parent.stderr);
+    assert!(
+        stderr.contains("must name exactly one Needs review finding"),
+        "stderr: {stderr}"
+    );
+
+    let exact = hub.join("models--org--one");
+    let body = r#"
+spawn -noecho $env(DEGU_BIN) clean -dn --review $env(REVIEW_PATH)
+"#;
+    let extra_env = [("REVIEW_PATH", exact.as_os_str())];
+    let preview = crate::pty::run(crate::pty::PtyRun {
+        body,
+        home: home.path(),
+        config_home: test_config_home(),
+        state_home: state.path(),
+        extra_env: &extra_env,
+    });
+    assert!(
+        preview.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let stdout = String::from_utf8(preview.stdout).unwrap();
+    let next = stdout
+        .lines()
+        .skip_while(|line| line.trim_end() != "Next:")
+        .nth(1)
+        .unwrap_or_else(|| panic!("missing Next command: {stdout}"))
+        .trim();
+    let selected = next
+        .strip_prefix("degu clean --review ")
+        .unwrap_or_else(|| panic!("exact review authority was not preserved: {next}"));
+    let resolved = match selected.strip_prefix("~/") {
+        Some(rest) => home.path().join(rest),
+        None => std::path::PathBuf::from(selected),
+    };
+    assert_eq!(
+        resolved.canonicalize().unwrap(),
+        exact.canonicalize().unwrap(),
+        "Next command selected a different finding"
+    );
+    assert!(!next.contains("--include-review --path"), "Next: {next}");
+    assert!(exact.join("snapshots/main/model.bin").exists());
+    assert!(!state.path().join("degu/trash").exists());
+}
+
 fn assert_preview_withheld(stdout: &str) {
     assert!(
         stdout.contains("Scan incomplete"),
@@ -72,7 +137,7 @@ fn scan_review_preview_executes_with_mixed_cache_and_runtime_sources() {
     let scan_stdout = successful_stdout(scan);
     let preview_args = review_preview_args(
         &scan_stdout,
-        "degu clean --details --dry-run --include-review --only huggingface --path ~/.cache/huggingface/hub/models--org--name",
+        "degu clean -dn --only huggingface --review ~/.cache/huggingface/hub/models--org--name",
         home.path(),
     );
     let preview = run_clean(
@@ -112,7 +177,7 @@ fn scan_review_preview_command_runs_despite_unrelated_incomplete_source() {
     let scan_stdout = successful_stdout(scan);
     let preview_args = review_preview_args(
         &scan_stdout,
-        "degu clean --details --dry-run --include-review --path ~/.cache/huggingface/hub/models--org--name",
+        "degu clean -dn --review ~/.cache/huggingface/hub/models--org--name",
         home.path(),
     );
     let preview = run_clean(
@@ -176,7 +241,7 @@ fn scan_withholds_the_review_preview_when_executing_it_would_be_refused() {
     let single_stdout = successful_stdout(single_spelling);
     let preview_args = review_preview_args(
         &single_stdout,
-        "degu clean --details --dry-run --include-review --only huggingface --only npm --path ~/.cache/huggingface/hub/models--org--name",
+        "degu clean -dn --only huggingface --only npm --review ~/.cache/huggingface/hub/models--org--name",
         home.path(),
     );
     let preview = degu()

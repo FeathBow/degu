@@ -62,18 +62,23 @@ fn render_clean(
     options: CleanRenderOptions,
 ) -> Option<String> {
     let mut words = vec!["degu".to_string(), "clean".to_string()];
-    if options.details {
-        words.push("--details".to_string());
+    match (options.details, options.dry_run) {
+        (true, true) => words.push("-dn".to_string()),
+        (true, false) => words.push("-d".to_string()),
+        (false, true) => words.push("-n".to_string()),
+        (false, false) => {}
     }
-    if options.dry_run {
-        words.push("--dry-run".to_string());
-    }
-    if scope.include_review {
+    let one_review_path = scope.exact_review && scope.paths.len() == 1;
+    if scope.include_review && !one_review_path {
         words.push("--include-review".to_string());
     }
     push_filters(&mut words, &scope.filters)?;
     for path in &scope.paths {
-        words.push("--path".to_string());
+        words.push(if one_review_path {
+            "--review".to_string()
+        } else {
+            "--path".to_string()
+        });
         words.push(render_path(path, home)?);
     }
     push_roots(&mut words, &scope.filters.roots, home)?;

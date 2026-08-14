@@ -10,15 +10,16 @@ mod parsers;
 pub(crate) use color::{ColorPolicy, ColorWhen};
 use help::TOP_LEVEL_HELP_TEMPLATE;
 
-const TOP_LEVEL_EXAMPLES: &str = "Workflow:
+const TOP_LEVEL_EXAMPLES: &str = "Daily workflow after account setup:
   degu scan
-  degu clean --dry-run
+  degu clean -n
   degu clean
 
 After staging, choose one outcome:
   degu undo
   degu trash purge
 
+First mutation on this account? Run 'degu doctor'.
 Run 'degu <command> --help' for command details.";
 
 const SCAN_EXAMPLES: &str = "Examples:
@@ -50,11 +51,11 @@ const RELOCATE_EXAMPLES: &str = "Examples:
       Print shell exports for future cache writes";
 
 const RECLAIM_EXAMPLES: &str = "Examples:
-  degu reclaim uv --executable /usr/local/bin/uv --cache-dir /scratch/$USER/uv --dry-run
+  degu reclaim uv -x /usr/local/bin/uv -c /scratch/$USER/uv -n
       Validate exact uv 0.12.3 and the selected cache namespace, then preview the fixed prune action
-  degu reclaim uv --executable /usr/local/bin/uv --cache-dir /scratch/$USER/uv
+  degu reclaim uv -x /usr/local/bin/uv -c /scratch/$USER/uv
       Show the irreversible plan, then require typing 'prune' on a terminal
-  degu reclaim uv --executable /usr/local/bin/uv --cache-dir /scratch/$USER/uv --yes --json
+  degu reclaim uv -x /usr/local/bin/uv -c /scratch/$USER/uv -y --json
       Execute without prompting and emit one final JSON result
 
 Safety note:
@@ -62,9 +63,9 @@ Safety note:
   with only -V. The fixed ordinary prune bypasses degu trash and cannot be undone.
   The selected binary is not sandboxed.";
 
-const ADMIN_ANCHOR_EXAMPLES: &str = "Example:
-  /usr/local/sbin/degu admin activation-anchor provision --uid 1000 --initial
-      Provision from an administrator-owned, separately verified binary
+const ADMIN_SETUP_EXAMPLES: &str = "Example:
+  /usr/local/sbin/degu admin setup --uid 1000 --initial
+      Provision initial account setup from an administrator-owned, separately verified binary
 
 This command must run with effective UID 0. Never elevate a binary under the
 target user's home or another user-writable prefix. --initial asserts that the
@@ -85,11 +86,11 @@ const CLEAN_HELP: &str = "Safety:
   plan before deleting it.
 
 Examples:
-  degu clean --dry-run
+  degu clean -n
       Preview cleanup without changing files
-  degu clean --details --dry-run --include-review --path ~/.cache/huggingface/datasets
-      Preview one reviewed location
-  degu clean ~/code --dry-run
+  degu clean -dn --review ~/.cache/huggingface/datasets
+      Preview one Needs review location
+  degu clean ~/code -n
       Include project build artifacts";
 
 const MAX_CONCURRENCY_HELP: &str = "Override the per-filesystem directory-read limit (1-256)";
@@ -154,7 +155,7 @@ pub(crate) enum Command {
     /// Report known cache sources and, when project roots are available, build artifacts (read-only)
     #[command(after_help = SCAN_EXAMPLES)]
     Scan(ScanArgs),
-    /// Check whether this account is ready for sealed staging (read-only)
+    /// Check whether required account setup is ready (read-only)
     #[command(after_help = DOCTOR_EXAMPLES)]
     Doctor {
         #[command(flatten)]
@@ -163,12 +164,6 @@ pub(crate) enum Command {
     /// Report the current user's authoritative filesystem quota for one path
     #[command(after_help = QUOTA_EXAMPLES)]
     Quota(QuotaArgs),
-    /// Preview or execute an explicitly selected tool-native cache reclaim action
-    #[command(after_help = RECLAIM_EXAMPLES)]
-    Reclaim {
-        #[command(subcommand)]
-        command: ReclaimCommand,
-    },
     /// Preview or execute a cleanup plan
     #[command(after_help = CLEAN_HELP)]
     Clean(CleanArgs),
@@ -181,6 +176,12 @@ pub(crate) enum Command {
     Trash {
         #[command(subcommand)]
         command: TrashCommand,
+    },
+    /// Preview or execute an advanced irreversible tool-native cache action
+    #[command(after_help = RECLAIM_EXAMPLES)]
+    Reclaim {
+        #[command(subcommand)]
+        command: ReclaimCommand,
     },
     /// Print shell config directing future cache writes at TARGET; existing data stays in place, no shell profile is modified
     #[command(after_help = RELOCATE_EXAMPLES)]
@@ -213,22 +214,13 @@ pub(crate) enum Command {
 
 #[derive(Subcommand)]
 pub(crate) enum AdminCommand {
-    /// Manage the platform-fixed per-UID activation anchor
-    ActivationAnchor {
-        #[command(subcommand)]
-        command: ActivationAnchorCommand,
-    },
-}
-
-#[derive(Subcommand)]
-pub(crate) enum ActivationAnchorCommand {
-    /// Initially provision a numeric UID's fixed activation anchor (not repair or recovery)
-    #[command(after_help = ADMIN_ANCHOR_EXAMPLES)]
-    Provision(ActivationAnchorProvisionArgs),
+    /// Provision initial account setup for one numeric UID
+    #[command(after_help = ADMIN_SETUP_EXAMPLES)]
+    Setup(AccountSetupArgs),
 }
 
 #[derive(Args)]
-pub(crate) struct ActivationAnchorProvisionArgs {
+pub(crate) struct AccountSetupArgs {
     /// Decimal numeric UID that has never activated a degu store
     #[arg(long, value_name = "DECIMAL_UID", value_parser = parse_decimal_uid)]
     pub(crate) uid: u32,
@@ -248,7 +240,7 @@ fn parse_decimal_uid(value: &str) -> Result<u32, String> {
         .map_err(|_| "UID is outside the supported numeric range".to_owned())?;
     if uid == 0 || uid == u32::MAX {
         return Err(
-            "UID 0 and the reserved maximum UID are not valid activation-anchor targets".to_owned(),
+            "UID 0 and the reserved maximum UID are not valid account setup targets".to_owned(),
         );
     }
     Ok(uid)
@@ -304,13 +296,16 @@ pub(crate) struct CleanArgs {
     /// Project roots explicitly authorized for this clean; configured scan roots are excluded
     pub(crate) roots: Vec<PathBuf>,
     /// Include Needs review findings in the clean plan after inspecting them
-    #[arg(long)]
+    #[arg(long, conflicts_with = "review")]
     pub(crate) include_review: bool,
+    /// Select one Needs review path; shorthand for --include-review --path PATH
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["include_review", "path"])]
+    pub(crate) review: Option<PathBuf>,
     /// Proceed without prompting
-    #[arg(long)]
+    #[arg(short = 'y', long)]
     pub(crate) yes: bool,
     /// Show the plan without staging findings or purging expired trash
-    #[arg(long)]
+    #[arg(short = 'n', long)]
     pub(crate) dry_run: bool,
     /// Stage then immediately purge clean items; use with --yes in non-interactive runs
     #[arg(long)]
@@ -344,16 +339,16 @@ pub(crate) struct ReclaimUvArgs {
     #[command(flatten)]
     pub(crate) output: JsonArgs,
     /// Absolute, lexically normalized path to the exact uv native binary to probe
-    #[arg(long, value_name = "ABSOLUTE_UV")]
+    #[arg(short = 'x', long, value_name = "ABSOLUTE_UV")]
     pub(crate) executable: PathBuf,
     /// Absolute, lexically normalized path to the active uv cache root
-    #[arg(long, value_name = "ABSOLUTE_CACHE_DIR")]
+    #[arg(short = 'c', long, value_name = "ABSOLUTE_CACHE_DIR")]
     pub(crate) cache_dir: PathBuf,
     /// Validate and preview without running prune; creates a private snapshot and starts the selected binary with -V
-    #[arg(long)]
+    #[arg(short = 'n', long)]
     pub(crate) dry_run: bool,
     /// Execute the irreversible fixed prune action without prompting; has no effect in a dry run
-    #[arg(long)]
+    #[arg(short = 'y', long)]
     pub(crate) yes: bool,
 }
 

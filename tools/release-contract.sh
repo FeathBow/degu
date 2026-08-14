@@ -5,8 +5,7 @@ man_pages="
 degu.1
 degu-doctor.1
 degu-admin.1
-degu-admin-activation-anchor.1
-degu-admin-activation-anchor-provision.1
+degu-admin-setup.1
 degu-quota.1
 degu-scan.1
 degu-clean.1
@@ -14,6 +13,8 @@ degu-undo.1
 degu-trash.1
 degu-trash-list.1
 degu-trash-purge.1
+degu-reclaim.1
+degu-reclaim-uv.1
 degu-relocate.1
 degu-ops.1
 degu-adapters.1

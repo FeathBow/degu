@@ -154,7 +154,7 @@ fn interrupted_purge_claim_is_visible_without_undo_guidance() {
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("Available outcome:"));
-    assert!(stdout.contains("including interrupted"));
+    assert!(stdout.contains("including legacy interrupted"));
     assert!(stdout.contains("confirm again"));
     assert!(stdout.contains("degu trash purge"));
     assert!(!stdout.contains("degu undo"));

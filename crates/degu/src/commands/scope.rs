@@ -61,6 +61,7 @@ impl ScanScope {
             filters,
             paths: Vec::new(),
             include_review: false,
+            exact_review: false,
         }
     }
 
@@ -79,10 +80,17 @@ pub(crate) struct CleanScope {
     pub(super) filters: Filters,
     pub(super) paths: Vec<PathBuf>,
     pub(super) include_review: bool,
+    pub(super) exact_review: bool,
 }
 
 impl CleanScope {
     pub(crate) fn from_args(args: &CleanArgs) -> Self {
+        let paths = args
+            .review
+            .iter()
+            .cloned()
+            .chain(args.path.iter().cloned())
+            .collect();
         Self {
             filters: Filters {
                 roots: args.roots.clone(),
@@ -91,8 +99,9 @@ impl CleanScope {
                 min_size: args.min_size,
                 top: args.top,
             },
-            paths: args.path.clone(),
-            include_review: args.include_review,
+            paths,
+            include_review: args.include_review || args.review.is_some(),
+            exact_review: args.review.is_some(),
         }
     }
 
@@ -124,6 +133,7 @@ impl CleanScope {
         Self {
             paths: vec![path.to_path_buf()],
             include_review: true,
+            exact_review: true,
             ..self.clone()
         }
     }

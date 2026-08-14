@@ -1,72 +1,41 @@
 # Installation
 
-## Check account readiness
+> [!IMPORTANT]
+> The latest published release is **v0.1.4**. This `main` guide documents the unreleased v0.1.5. Account readiness, sealed staging, and `admin setup` are not in v0.1.4; use the [v0.1.4 guide](https://github.com/FeathBow/degu/blob/v0.1.4/docs/installation.md) with that binary.
 
-After installing the binary, run one read-only check:
+## Install first, then check setup
 
-```sh
-$ degu doctor
-```
-
-`doctor` reports whether the current account's fixed sealed-staging system
-anchor is ready. It never creates, repairs, or writes a degu anchor, state
-store, or activation record. Validation briefly takes the protocol's existing
-nonblocking lock and durability-syncs the already-provisioned anchor and its
-parent. Changing `HOME`, XDG variables, configuration, or the
-working directory cannot select another anchor. Use `degu doctor --json` for a
-stable machine-readable result.
-
-`ready` covers only the activation anchor. It does not attest to the activated
-store's WAL or recovery health. Mutating commands use this exact anchor as their
-only sealed-staging activation/discovery authority. On first supported use they
-durably activate the current state-store locator; later XDG drift cannot select
-a new empty store. Missing, unsafe, uncertain, lost, or corrupt authority blocks
-mutation. Only an authenticated record-empty anchor whose desired store backend
-is explicitly unsupported retains the strict legacy lifecycle, and that session
-holds the anchor lock so concurrent activation cannot cross the decision.
-Production forward cleanup is wired through the activation/recovery gate; a
-`RecoveryRequired` WAL remains blocked and must be investigated. Never try to
-clear it by reprovisioning the anchor.
-
-The expected per-account path is fixed:
-
-- Linux: `/var/lib/degu/store-activation/<decimal-euid>`
-- macOS: `/private/var/db/degu/store-activation/<decimal-euid>`
-
-For a numeric UID that has never activated degu, an administrator provisions
-the leaf explicitly. Do **not** elevate a copy under the target user's home or
-another user-writable prefix. First install a checksum/provenance-verified
-release binary at an administrator-owned absolute path whose ancestors the
-target user cannot modify; then invoke that exact path, for example:
+Install the user binary with one of the methods below. Before its first mutating command, run:
 
 ```sh
-sudo /usr/local/sbin/degu admin activation-anchor provision --uid 1000 --initial
-# or add --json for automation
+degu doctor
 ```
 
-`/usr/local/sbin/degu` above represents a separately verified,
-administrator-controlled installation; the ordinary user installer does not
-put it there. The command requires real effective UID 0; `DEGU_ALLOW_ROOT`,
-container markers, usernames, paths, environment locators, and configuration
-cannot substitute. `--initial` is the administrator's assertion that this
-numeric UID has never activated a store. This operation is not repair or
-recovery.
+This check is read-only. It never creates or repairs system state.
 
-The OS base (`/var/lib` on Linux or `/private/var/db` on macOS) must already
-exist and be safe. The command creates missing root-owned product directories
-with exact mode `0755` and the target-UID-owned leaf with exact mode `0700`;
-all must have no ACL and reside on certified ext4/XFS/APFS storage. Safe
-existing entries are accepted without modification. An unsafe, unsupported,
-busy, or uncertain entry fails closed and is never chmodded, replaced, or
-repaired.
+- **`ready`** — continue with `degu clean -n`.
+- **`missing`** — send the displayed path and `id -u` output to your administrator.
+- **`unsafe`, `unsupported`, or `uncertain`** — stop and investigate; do not recreate or chmod the path automatically.
 
-The generic installer, `cargo install`, cargo-binstall, and manual archives are
-unprivileged binary-install routes. They do not run `sudo`, infer a target user
-from `SUDO_UID`, or write the system anchor. Use an administrator-controlled
-package step or configuration-management policy to provision each intended
-numeric EUID. Do not place authority under HOME/XDG/config, and do not
-implicitly recreate or "repair" an existing entry: loss or replacement may be
-activation evidence that requires operator investigation.
+Most users need know only `degu doctor`. The installer never runs `sudo`, reads `SUDO_UID`, or provisions another account.
+
+## Administrator setup for a missing account
+
+For a numeric UID that has never activated degu, use a separately verified binary from an administrator-owned absolute path:
+
+```sh
+sudo /usr/local/sbin/degu admin setup --uid "$(id -u USERNAME)" --initial
+```
+
+Replace `USERNAME`; do not run the user-owned copy under `~/.local/bin` with `sudo`. The command is create-only and requires real effective UID 0. `--initial` asserts that the UID has never activated a store; this is not repair or recovery.
+
+The fixed leaf is `/var/lib/degu/store-activation/<uid>` on Linux and `/private/var/db/degu/store-activation/<uid>` on macOS. Provisioning accepts only authenticated ext4/XFS/APFS namespaces, creates root-owned product directories as `0755` and the UID-owned leaf as `0700`, and never repairs unsafe existing entries. Use an administrator-controlled package or configuration-management step for every intended UID.
+
+### Why this setup is separate
+
+Mutating commands use the fixed current-UID anchor as the only store activation and discovery authority. `HOME`, XDG variables, configuration, the working directory, and caller-provided paths cannot select it. On first supported mutation, degu records the exact state-store locator; later XDG drift cannot select a new empty store.
+
+`doctor ready` authenticates only the anchor, not the activated store, WAL, or recovery state. A `RecoveryRequired` transaction remains blocked and must be investigated; reprovisioning cannot clear it. The full runtime contract is in [Operational safety](safety.md#sealed-staging-account-readiness).
 
 ## Install with Cargo
 

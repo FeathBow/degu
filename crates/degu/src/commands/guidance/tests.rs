@@ -52,7 +52,7 @@ fn scan_review_preview_preserves_scope_and_selects_one_path() {
 
     assert_eq!(
         line.as_str(),
-        "degu clean --details --dry-run --include-review --only huggingface --only pip --older-than 30 --min-size 4096 --top 2 --path 'review path' -- 'first root' second/root"
+        "degu clean -dn --only huggingface --only pip --older-than 30 --min-size 4096 --top 2 --review 'review path' -- 'first root' second/root"
     );
 }
 
@@ -68,6 +68,7 @@ fn next_action_clean_preserves_safe_selection_without_purge_or_yes() {
         },
         paths: vec![PathBuf::from("cache path")],
         include_review: true,
+        exact_review: false,
     };
     let line = line(terminal(Workflow::CleanPreview(CleanPreviewState {
         scope: &scope,
@@ -94,6 +95,7 @@ fn clean_review_preview_replaces_paths_and_quotes_the_target() {
         },
         paths: vec![PathBuf::from("old one"), PathBuf::from("old two")],
         include_review: false,
+        exact_review: false,
     };
 
     let line = review_preview_from_clean(
@@ -105,7 +107,7 @@ fn clean_review_preview_replaces_paths_and_quotes_the_target() {
 
     assert_eq!(
         line.as_str(),
-        "degu clean --details --dry-run --include-review --only huggingface --older-than 7 --min-size 1024 --top 3 --path 'chosen cache/it'\\''s here' -- 'work tree'"
+        "degu clean -dn --only huggingface --older-than 7 --min-size 1024 --top 3 --review 'chosen cache/it'\\''s here' -- 'work tree'"
     );
 }
 
@@ -121,13 +123,14 @@ fn clean_details_preview_preserves_the_current_scope() {
         },
         paths: vec![PathBuf::from("chosen cache")],
         include_review: true,
+        exact_review: true,
     };
 
     let line = details_preview_from_clean(&scope, Path::new(TEST_HOME)).unwrap();
 
     assert_eq!(
         line.as_str(),
-        "degu clean --details --dry-run --include-review --only huggingface --older-than 7 --min-size 1024 --top 3 --path 'chosen cache' -- 'work tree'"
+        "degu clean -dn --only huggingface --older-than 7 --min-size 1024 --top 3 --review 'chosen cache' -- 'work tree'"
     );
 }
 
@@ -190,6 +193,7 @@ fn next_action_marks_control_characters_as_an_unsafe_scope() {
         },
         paths: Vec::new(),
         include_review: false,
+        exact_review: false,
     };
     assert!(matches!(
         resolve(terminal(Workflow::CleanPreview(CleanPreviewState {

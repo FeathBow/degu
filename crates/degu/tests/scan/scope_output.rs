@@ -188,5 +188,5 @@ spawn -noecho $env(DEGU_BIN) --color never scan
         stdout.contains("contains protected credentials"),
         "stdout: {stdout}"
     );
-    assert_next_command(&stdout, "Next:", "degu clean --dry-run");
+    assert_next_command(&stdout, "Next:", "degu clean -n");
 }

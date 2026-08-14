@@ -1,5 +1,8 @@
 # Operational safety
 
+> [!IMPORTANT]
+> This `main` safety model documents the unreleased v0.1.5. The latest published release is **v0.1.4**, which does not implement the sealed-staging, readiness, or tool-native reclaim boundaries below. Use the [v0.1.4 safety model](https://github.com/FeathBow/degu/blob/v0.1.4/docs/safety.md) with that binary.
+
 This document defines degu's runtime discovery, cleaning, staging, and purge semantics. It is distinct from the project [security policy](../SECURITY.md), which explains how to report vulnerabilities privately.
 
 ## Cleanup states and underlying facts
@@ -7,7 +10,7 @@ This document defines degu's runtime discovery, cleaning, staging, and purge sem
 degu never deletes a finding in place. Human output starts with the action available to the user:
 
 - **Ready to clean** findings are cleaned by default. These are cheap-to-regenerate caches such as pip.
-- **Needs review** findings are regenerable but costly or carry a declared deletion hazard. Compile caches cost rebuild time, model caches cost download transfer, and removing Conda package caches can break environments installed with softlinks. Review the reported reason, rationale, and exact path with the displayed `degu clean --details --dry-run --include-review --path ...` command.
+- **Needs review** findings are regenerable but costly or carry a declared deletion hazard. Compile caches cost rebuild time, model caches cost download transfer, and removing Conda package caches can break environments installed with softlinks. Review the reported reason, rationale, and exact path with the displayed `degu clean -dn --review PATH` command. This is shorthand for `--details --dry-run --include-review --path PATH`; it does not broaden authority.
 - **Not managed** findings are informational and are never staged or purged. They include user assets such as conda environments and training checkpoints, shared-memory segments, tool-coordinated caches, protected mixed-state directories, trees containing entries owned by another UID or group/world-writable directories, and caches known only from `CACHEDIR.TAG` when recovery and ownership are unknown.
 
 Every finding also carries independent machine facts: recovery and ownership may be known or unknown, regeneration may be cheap or costly, locations may be verified or unverified, and deletion may carry hazards. JSON derives the stable `eligible`, `opt_in`, or `report_only` disposition from those facts while human output uses the action-oriented names above.
@@ -33,8 +36,9 @@ The full set of relocation subdirectories is component-validated and preflighted
 
 ## Sealed-staging account readiness
 
-`degu doctor` is the single user-facing readiness check for future sealed
-staging. It derives one anchor only from the platform and current effective UID,
+`degu doctor` is the single user-facing check that the current account's fixed
+anchor is ready for sealed staging. It checks only the anchor, not an activated
+store, WAL, or recovery state. It derives that anchor only from the platform and current effective UID,
 then applies the same existing-only, descriptor-relative, no-follow
 owner/mode/ACL/backend/identity/binding/lock/durability validation used by the
 activation core. The check creates or writes no degu anchor, store, record, or
@@ -54,8 +58,8 @@ The unprivileged installers install binaries only and merely suggest running
 `degu doctor`. They do not invoke sudo, inspect `SUDO_UID`, or create an
 activation anchor. For a never-activated numeric UID, an administrator uses a
 separately verified binary from an administrator-owned absolute path to run
-`degu admin activation-anchor provision --uid <UID> --initial` with real EUID
-0. That command derives the only path from platform plus UID, creates with
+`degu admin setup --uid <UID> --initial` with real EUID 0. The command
+derives the only path from platform plus UID, creates with
 descriptor-relative/no-follow operations, and never repairs an existing object.
 
 Mutating clean, undo, purge, and expiry sessions derive the same current-EUID
@@ -71,17 +75,9 @@ full lifetime, so another process with different XDG state cannot activate a
 store concurrently. Activated sessions instead retain and replay the exact WAL
 lease for the full mutation session.
 
-When that WAL already contains a production-associated staging object, legacy
-undo, explicit trash purge, and expiry purge retain it rather than claiming,
-renaming, or deleting it. The check uses the WAL destination plus held-FD strong
-object identity; missing JSONL cannot remove the protection, and adding a JSONL
-record cannot grant mutation authority. Identity or namespace inspection
-uncertainty also blocks.
+A WAL-associated staged object never falls through to legacy pathname or JSONL authority. Healthy `VerifiedCommitted` transactions can mint object-bound, one-use authority for `degu undo`, explicit `degu trash purge`, or seven-day expiry. Missing JSONL cannot remove that protection, and adding a JSONL record cannot grant authority. Association, identity, namespace, or recovery uncertainty blocks mutation.
 
-Production forward cleanup is connected to activation and startup recovery.
-`doctor ready` proves only anchor readiness, not WAL or recovery health. In
-particular, `RecoveryRequired` cannot be repaired by reprovisioning an anchor;
-it remains an operator-investigation state.
+Production forward cleanup is connected to activation and startup recovery. `doctor ready` proves only anchor readiness, not WAL or recovery health. A sealed purge durably records its exact claim before deletion and syncs monotonic progress after every successful unlink or rmdir. An interruption before durable outcome becomes `RecoveryRequired`; startup does not infer completion from paths or automatically resume deletion. A durable outcome finalizes `Purged` without a namespace lookup. `RecoveryRequired` cannot be cleared by reprovisioning an anchor and remains an operator-investigation state.
 
 ## Staging, undo, and purge
 
@@ -121,10 +117,10 @@ Immediately before staging, degu validates the complete no-follow tree before wr
 
 Mutating operations reject a finding or trash entry that is itself a mount point or whose tree contains a mount boundary. Permanent deletion traverses through opened directory descriptors, revalidates each discovered directory before entering it, and rechecks names before unlinking them. A measurement with skipped or unvisited entries is an incomplete lower bound and never receives cleanup authority.
 
-If permanent deletion is interrupted after an entry has been claimed, the claim remains visible in `degu trash list`. Interrupted purge claims never expire automatically and can be deleted only by including them in a new fixed `degu trash purge` plan and confirming that plan again.
+Legacy `.claims` entries remain visible in `degu trash list`, never expire automatically, and require inclusion in a newly confirmed purge plan. Sealed purges do not create `.claims` paths: the exact WAL lease, held inventory, durable claim, and progress records are authoritative. Interruption before the sealed outcome enters `RecoveryRequired` and blocks mutation rather than falling back to legacy retry.
 
 degu refuses to run as root unless it detects a container through `/.dockerenv` or `/run/.containerenv`, or the operator explicitly sets `DEGU_ALLOW_ROOT=1`.
 
 If degu moves or permanently removes data outside the confirmed clean or purge set, or if a protected-path, symlink, or filesystem-boundary check can be bypassed, stop using the affected operation and follow the private process in the [security policy](../SECURITY.md).
 
-degu detects ordinary concurrent path replacement with object-identity snapshots and verified no-replace claims before permanent deletion. The shared-write check currently covers Unix group/world mode bits; it does not interpret POSIX or NFSv4 ACL grants. Configure ACL-shared locations as protected and do not authorize them for cleanup. Unix also does not provide a security boundary against a malicious process running with the same effective user ID; such a process can manipulate the user's files and processes directly. Run mutating commands only in a trusted user session.
+degu detects ordinary concurrent path replacement with object-identity snapshots and verified no-replace claims before permanent deletion. Scan classification and the legacy owned-tree gate use Unix ownership and mode bits and do not interpret arbitrary ACL grants; configure ACL-shared legacy locations as protected. Sealed activation and staging fail closed unless ACL absence can be established on certified ext4/XFS/APFS objects. `reclaim uv` applies a separate audited policy: Linux POSIX ACLs are rejected, while macOS deny-only or read-only ACLs are allowed but mutation-granting or unknown entries are rejected. Unix still provides no security boundary against a malicious process running with the same effective user ID; run mutating commands only in a trusted user session.

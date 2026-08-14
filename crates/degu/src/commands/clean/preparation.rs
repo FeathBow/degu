@@ -101,11 +101,13 @@ struct CleanRequest {
     run: CollectionRunOptions,
     settings: CleanSettings,
     scope: CleanScope,
+    exact_review: Option<PathBuf>,
 }
 
 impl CleanRequest {
     fn new(args: CleanArgs, ui: Ui) -> Self {
         let scope = CleanScope::from_args(&args);
+        let exact_review = args.review.clone();
         let run = CollectionRunOptions::new(args.output, args.limits, ui.colors);
         Self {
             settings: CleanSettings {
@@ -118,6 +120,7 @@ impl CleanRequest {
             },
             run,
             scope,
+            exact_review,
         }
     }
 }
@@ -148,6 +151,7 @@ pub(super) fn prepare(args: CleanArgs, ui: Ui) -> Result<PreparedClean> {
     let ctx = ctx.with_deadline(deadline_from_budget(request.run.budget)?);
     let collection = collect_profiled(&ctx, &config, collection_request)?;
     let (findings, scan_status, incomplete_regions) = collection.findings.into_parts();
+    validate_exact_review(request.exact_review.as_deref(), &findings)?;
     let FilteredCleanFindings {
         planned,
         exclusions,
@@ -200,6 +204,44 @@ fn partition_representable(findings: Vec<Finding>) -> (Vec<Finding>, usize) {
         }
     }
     (representable, dropped)
+}
+
+fn validate_exact_review(review: Option<&Path>, findings: &[Finding]) -> Result<()> {
+    let Some(review) = review else {
+        return Ok(());
+    };
+    let canonical_review = std::fs::canonicalize(review).map_err(|source| {
+        anyhow::Error::new(source).context(format!(
+            "failed to canonicalize --review {}",
+            review.display()
+        ))
+    })?;
+    let mut matches = Vec::new();
+    for finding in findings
+        .iter()
+        .filter(|finding| finding.disposition().mode == DispositionMode::OptIn)
+    {
+        let canonical_finding = std::fs::canonicalize(finding.path()).map_err(|source| {
+            anyhow::Error::new(source).context(format!(
+                "failed to canonicalize Needs review finding {}",
+                finding.path().display()
+            ))
+        })?;
+        if canonical_finding == canonical_review {
+            matches.push(finding);
+        }
+    }
+    match matches.as_slice() {
+        [_] => Ok(()),
+        [] => anyhow::bail!(
+            "--review {} must name exactly one Needs review finding; parent directories and Ready to clean or Not managed locations are not accepted",
+            review.display()
+        ),
+        _ => anyhow::bail!(
+            "--review {} is ambiguous across multiple Needs review findings",
+            review.display()
+        ),
+    }
 }
 
 struct FilteredCleanFindings {

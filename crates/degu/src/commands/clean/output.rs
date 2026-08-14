@@ -62,9 +62,9 @@ fn print_mechanism(prepared: &PreparedClean, sealed_staging: bool) -> Result<()>
             Tone::Destructive,
         )
     } else if sealed_staging {
-        ui.prose(
-            "Sealed staging retains exclusive recovery authority; degu undo and automatic trash purge will not mutate these entries.",
-        )
+        ui.prose(&format!(
+            "Restorable with degu undo; a later clean may purge it after {TRASH_RETENTION_DAYS} days. Legacy path-based cleanup cannot delete it."
+        ))
     } else {
         ui.prose(&format!(
             "Restorable with degu undo; a later clean may purge it after {TRASH_RETENTION_DAYS} days."
@@ -85,7 +85,9 @@ fn print_mechanism_sentence(
             prepared.settings.ui.colors.stdout,
         )
     } else if sealed_staging {
-        "sealed staging retains exclusive recovery authority; degu undo and automatic trash purge will not mutate these entries.".to_string()
+        format!(
+            "restorable with degu undo; a later clean may purge it after {TRASH_RETENTION_DAYS} days. Legacy path-based cleanup cannot delete it."
+        )
     } else {
         format!(
             "restorable with degu undo; a later clean may purge it after {TRASH_RETENTION_DAYS} days."
@@ -196,7 +198,7 @@ pub(super) fn print_execution(
             stdoutln!(
                 "{}",
                 ui.prose(
-                    "Still counts against quota while sealed staging retains recovery authority; 'degu undo' will not mutate these entries."
+                    "Still counts against quota while staged; restore with 'degu undo'. A later clean may purge it after seven days; legacy path-based cleanup cannot delete it."
                 )
             )?;
         } else if executed.iter().all(|item| !item.requires_manual_recovery()) {

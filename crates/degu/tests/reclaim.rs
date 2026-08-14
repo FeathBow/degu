@@ -131,15 +131,7 @@ fn json_mutation_requires_yes_before_any_preflight() {
 
 #[test]
 fn explicit_paths_are_lexically_validated_without_path_lookup() {
-    let relative_executable = run(&[
-        "reclaim",
-        "uv",
-        "--executable",
-        "uv",
-        "--cache-dir",
-        "/cache/uv",
-        "--yes",
-    ]);
+    let relative_executable = run(&["reclaim", "uv", "-x", "uv", "-c", "/cache/uv", "-y"]);
     assert_eq!(relative_executable.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&relative_executable.stderr);
     assert!(
@@ -150,11 +142,11 @@ fn explicit_paths_are_lexically_validated_without_path_lookup() {
     let relative_root = run(&[
         "reclaim",
         "uv",
-        "--executable",
+        "-x",
         "/opt/uv/bin/uv",
-        "--cache-dir",
+        "-c",
         "cache/uv",
-        "--yes",
+        "-y",
     ]);
     assert_eq!(relative_root.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&relative_root.stderr);
@@ -204,11 +196,11 @@ fn dry_run_attempts_only_the_bounded_preview_preflight() {
     let output = run(&[
         "reclaim",
         "uv",
-        "--executable",
+        "-x",
         "/definitely/missing/uv",
-        "--cache-dir",
+        "-c",
         "/definitely/missing/cache",
-        "--dry-run",
+        "-n",
         "--json",
     ]);
     assert_eq!(output.status.code(), Some(1));

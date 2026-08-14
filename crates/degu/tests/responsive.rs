@@ -47,7 +47,7 @@ fn narrow_scan_splits_group_stats_and_keeps_the_next_command_whole() {
         size.starts_with("  1") && size.ends_with(" KiB"),
         "expected a third stats line with the size, got {size:?}: {stdout}"
     );
-    assert_consecutive_lines(&stdout, &["Next:", "  degu clean --dry-run"]);
+    assert_consecutive_lines(&stdout, &["Next:", "  degu clean -n"]);
 }
 
 #[test]

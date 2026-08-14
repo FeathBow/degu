@@ -11,10 +11,14 @@ OUT="${2:-docs/assets/demo.svg}"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 HOME_DIR="$WORK/home"; CFG="$WORK/cfg"; STATE="$WORK/state"
-mkdir -p "$HOME_DIR/.cache/pip" "$CFG/degu" "$STATE"
+case "$(uname -s)" in
+  Darwin) PIP_CACHE="$HOME_DIR/Library/Caches/pip" ;;
+  *) PIP_CACHE="$HOME_DIR/.cache/pip" ;;
+esac
+mkdir -p "$PIP_CACHE" "$CFG/degu" "$STATE"
 : > "$CFG/degu/config.toml"
 MIB=$((1024 * 1024))
-head -c $((6 * MIB)) /dev/zero > "$HOME_DIR/.cache/pip/wheel-cache.bin"
+head -c $((6 * MIB)) /dev/zero > "$PIP_CACHE/wheel-cache.bin"
 mkdir -p "$HOME_DIR/.cache/huggingface/hub/models--bert--base/blobs"
 head -c $((12 * MIB)) /dev/zero > "$HOME_DIR/.cache/huggingface/hub/models--bert--base/blobs/model.bin"
 mkdir -p "$HOME_DIR/.cache/uv"

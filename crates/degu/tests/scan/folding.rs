@@ -136,9 +136,7 @@ fn folded_review_tier_keeps_the_largest_preview_target() {
     // Ranking is global and bytes-descending, so the preview still points
     // at the largest Needs review location when its tier folds.
     assert!(
-        stdout.contains(
-            "degu clean --details --dry-run --include-review --path ~/.cache/huggingface/hub/models--org--big"
-        ),
+        stdout.contains("degu clean -dn --review ~/.cache/huggingface/hub/models--org--big"),
         "stdout: {stdout}"
     );
 }

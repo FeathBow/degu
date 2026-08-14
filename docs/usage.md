@@ -1,5 +1,8 @@
 # User guide
 
+> [!IMPORTANT]
+> This `main` guide documents the unreleased v0.1.5. The latest published release is **v0.1.4**, which does not include account readiness, sealed staging, `--review`, or `reclaim uv`. Use the [v0.1.4 user guide](https://github.com/FeathBow/degu/blob/v0.1.4/docs/usage.md) with that binary.
+
 ## Scan and quota
 
 Start read-only. `scan` shows individual findings, while `scan --summary` groups the same detected bytes and inodes by source.
@@ -72,7 +75,7 @@ Missing, unreadable, non-directory, and protected mixed-state project roots fail
 Preview the **Ready to clean** plan before staging it in degu's undoable trash:
 
 ```sh
-degu clean --dry-run
+degu clean -n
 ```
 
 The preview does not modify data. Running `degu clean` without `--purge` stages the current **Ready to clean** findings; staged entries later expire under the [seven-day purge policy](safety.md#staging-undo-and-purge).
@@ -85,7 +88,7 @@ After reviewing the plan, run:
 degu clean
 ```
 
-**Needs review** findings remain excluded, and the output explains why. It highlights the largest review location with its exact path and a copyable `degu clean --details --dry-run --include-review --path ...` command. Run that exact preview first; its `Next` command preserves the same path and filters for execution. **Not managed** findings cannot enter a clean plan. See [cleanup states and their underlying facts](safety.md#cleanup-states-and-underlying-facts) for the full policy.
+**Needs review** findings remain excluded, and the output explains why. It highlights the largest review location with its exact path and a copyable `degu clean -dn --review PATH` command. `--review PATH` is only shorthand for the existing `--include-review --path PATH` combination: it opts in one exact location without changing eligibility rules. Run that preview first; its `Next` command preserves the same path and filters for execution. **Not managed** findings cannot enter a clean plan. See [cleanup states and their underlying facts](safety.md#cleanup-states-and-underlying-facts) for the full policy.
 
 Newly staged entries remain reversible and continue to count against your quota. `degu undo` restores them to their original paths without releasing quota; only purging permanently deletes them.
 
@@ -97,14 +100,34 @@ Restore the latest clean operation:
 degu undo
 ```
 
-Or inspect every trash entry, including interrupted purge claims and entries from earlier clean operations, then permanently delete all of them:
+Or inspect every trash entry, including legacy interrupted claims and entries from earlier clean operations, then permanently delete the fixed reviewed plan:
 
 ```sh
 degu trash list
 degu trash purge
 ```
 
+A sealed purge interrupted after its durable WAL claim is different: startup marks it `RecoveryRequired`; it does not become a legacy claim that `trash purge` may guess or retry.
+
 For immediate permanent deletion, use `degu clean --purge`. Successfully purged entries cannot be restored. The [staging, undo, and purge policy](safety.md#staging-undo-and-purge) defines the confirmations and fixed-plan guarantees for both purge commands.
+
+## Tool-native reclaim (advanced)
+
+Normal `clean` reports uv caches as **Not managed** because uv owns their internal cleanup rules. For exactly uv 0.12.3, degu can validate and run the tool's fixed ordinary prune while keeping both authority inputs explicit:
+
+```sh
+degu reclaim uv -x /absolute/path/to/uv -c /absolute/path/to/uv-cache -n
+```
+
+`-x`/`--executable` selects the exact uv binary; `-c`/`--cache-dir` selects its active cache root. The `-n`/`--dry-run` preview creates a private executable snapshot, starts only that snapshot with `-V`, and validates the selected cache namespace. It does not run prune, but the selected binary is not sandboxed.
+
+After reviewing the preview, rerun without `-n` and type `prune`:
+
+```sh
+degu reclaim uv -x /absolute/path/to/uv -c /absolute/path/to/uv-cache
+```
+
+This action revalidates the held executable and cache namespace immediately before spawning a fixed ordinary `uv cache prune`. It bypasses degu trash, has no exact item or byte preview, and cannot be undone. Degu deliberately does not search `PATH`, infer a cache root, accept another uv version, or provide a one-flag shortcut: shortening those authority inputs would make a different object eligible for deletion. Reviewed automation may use `-y`; mutating JSON requires `-y`.
 
 ## Relocate future caches
 

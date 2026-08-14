@@ -10,7 +10,7 @@
 <p align="center"><sub>Real output from a small demo tree; on a working ML node, model and package caches routinely reach tens of gigabytes.</sub></p>
 
 > [!IMPORTANT]
-> The latest published release is **v0.1.4**. This `main` README documents the next release, including account readiness, sealed staging, and `reclaim uv`; those commands are not in the published v0.1.4 tag. Until the next version is chosen and bumped, a source build from `main` also prints `degu 0.1.4`, so verify the commit as well as `--version`. Use the [v0.1.4 README](https://github.com/FeathBow/degu/blob/v0.1.4/README.md) with the published binary, or build the exact commit you reviewed to test the behavior below.
+> The latest published release is **v0.1.4**. This `main` README documents the unreleased v0.1.5, including account readiness, sealed staging, and `reclaim uv`; those commands are not in the published v0.1.4 tag. A source build from `main` prints `degu 0.1.5`, but the version alone does not identify the exact reviewed commit, so verify the commit as well as `--version`. Use the [v0.1.4 README](https://github.com/FeathBow/degu/blob/v0.1.4/README.md) with the published binary, or build the exact commit you reviewed to test the behavior below.
 
 <details>
 <summary>The same scan, redirected — copy-pasteable and pinned byte-exact by a contract test</summary>

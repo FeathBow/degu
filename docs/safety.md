@@ -1,7 +1,7 @@
 # Operational safety
 
 > [!IMPORTANT]
-> This `main` safety model documents the next release. The latest published release is **v0.1.4**, which does not implement the sealed-staging, readiness, or tool-native reclaim boundaries below. Use the [v0.1.4 safety model](https://github.com/FeathBow/degu/blob/v0.1.4/docs/safety.md) with that binary.
+> This `main` safety model documents the unreleased v0.1.5. The latest published release is **v0.1.4**, which does not implement the sealed-staging, readiness, or tool-native reclaim boundaries below. Use the [v0.1.4 safety model](https://github.com/FeathBow/degu/blob/v0.1.4/docs/safety.md) with that binary.
 
 This document defines degu's runtime discovery, cleaning, staging, and purge semantics. It is distinct from the project [security policy](../SECURITY.md), which explains how to report vulnerabilities privately.
 

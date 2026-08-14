@@ -1,7 +1,7 @@
 # Installation
 
 > [!IMPORTANT]
-> The latest published release is **v0.1.4**. This `main` guide documents the next release. Account readiness, sealed staging, and `admin setup` are not in v0.1.4; use the [v0.1.4 guide](https://github.com/FeathBow/degu/blob/v0.1.4/docs/installation.md) with that binary.
+> The latest published release is **v0.1.4**. This `main` guide documents the unreleased v0.1.5. Account readiness, sealed staging, and `admin setup` are not in v0.1.4; use the [v0.1.4 guide](https://github.com/FeathBow/degu/blob/v0.1.4/docs/installation.md) with that binary.
 
 ## Install first, then check setup
 

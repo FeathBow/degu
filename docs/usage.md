@@ -1,7 +1,7 @@
 # User guide
 
 > [!IMPORTANT]
-> This `main` guide documents the next release. The latest published release is **v0.1.4**, which does not include account readiness, sealed staging, `--review`, or `reclaim uv`. Use the [v0.1.4 user guide](https://github.com/FeathBow/degu/blob/v0.1.4/docs/usage.md) with that binary.
+> This `main` guide documents the unreleased v0.1.5. The latest published release is **v0.1.4**, which does not include account readiness, sealed staging, `--review`, or `reclaim uv`. Use the [v0.1.4 user guide](https://github.com/FeathBow/degu/blob/v0.1.4/docs/usage.md) with that binary.
 
 ## Scan and quota
 

@@ -10,7 +10,7 @@
 <p align="center"><sub>Real output from a small demo tree; on a working ML node, model and package caches routinely reach tens of gigabytes.</sub></p>
 
 > [!IMPORTANT]
-> The latest published release is **v0.1.4**. This `main` README documents the unreleased v0.1.5, including account readiness, sealed staging, and `reclaim uv`; those commands are not in the published v0.1.4 tag. A source build from `main` prints `degu 0.1.5`, but the version alone does not identify the exact reviewed commit, so verify the commit as well as `--version`. Use the [v0.1.4 README](https://github.com/FeathBow/degu/blob/v0.1.4/README.md) with the published binary, or build the exact commit you reviewed to test the behavior below.
+> This README documents degu **v0.1.5**, including account readiness, sealed staging, and `reclaim uv`. Install it with the command below or `cargo install degu --locked`. If `degu --version` reports a different version, read the documentation tagged for that version.
 
 <details>
 <summary>The same scan, redirected — copy-pasteable and pinned byte-exact by a contract test</summary>
@@ -46,7 +46,7 @@ Scan build artifacts under this project, or any parent directory: degu scan .
 - **Reclaims what actually fills your quota.** Built-in sources across the ML/HPC stack — pip, conda, HuggingFace, vLLM, Triton, cargo, and more (`degu adapters` lists them all) — plus build artifacts under any project tree, found in a single read-only pass; two node-runtime diagnostics stay scan-time opt-in.
 - **Safe by default.** Only verified, cheap-to-regenerate findings enter the default plan and are staged for undo.
 - **Honest accounting.** `degu quota` reads authoritative filesystem usage and limits, kept separate from degu-detected storage.
-- **Linux and macOS, offline, unprivileged daily use.** Scan, preview, and day-to-day cleanup never self-elevate. On the next release, `degu doctor` checks one-time account setup; `missing` has a defined administrator provisioning path, while unsafe or uncertain state requires investigation.
+- **Linux and macOS, offline, unprivileged daily use.** Scan, preview, and day-to-day cleanup never self-elevate. `degu doctor` checks one-time account setup; `missing` has a defined administrator provisioning path, while unsafe or uncertain state requires investigation.
 
 ## Why you can trust it to delete
 
@@ -69,7 +69,7 @@ For datasets, checkpoints, and unknown large files, pair degu with a disk-usage 
 
 ## Installation
 
-Install the latest published release, currently **v0.1.4** (static binaries; Linux x86_64/aarch64 and macOS):
+Install the latest release (static binaries; Linux x86_64/aarch64 and macOS):
 
 ```sh
 installer=$(mktemp "${TMPDIR:-/tmp}/degu-install.XXXXXX") &&
@@ -91,13 +91,11 @@ cargo install --path crates/degu --locked --root "$HOME/.local"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Both `degu` and its short alias, `dg`, install into `~/.local/bin` by default. `DEGU_INSTALL_DIR` may select another binary destination when the caller already has permission. See the [v0.1.4 installation guide](https://github.com/FeathBow/degu/blob/v0.1.4/docs/installation.md) for the published release.
-
-The remainder of this README describes `main`. A source build installs the unreleased code at the checked-out commit. Its installer and account-setup contract are documented in the [next-release installation guide](https://github.com/FeathBow/degu/blob/main/docs/installation.md).
+Both `degu` and its short alias, `dg`, install into `~/.local/bin` by default. `DEGU_INSTALL_DIR` may select another binary destination when the caller already has permission. A source build installs degu at the checked-out commit. Its installer and account-setup contract are documented in the [installation guide](docs/installation.md).
 
 ## Quick start
 
-For `main` and the next release, check setup once before the first mutation:
+Check setup once before the first mutation:
 
 ```sh
 degu doctor
@@ -146,7 +144,7 @@ Validated on Linux ext4 and field-validated on a Lustre 2.15 client; other files
 
 ### Advanced: reclaim a uv-managed cache
 
-`uv` caches stay **Not managed** by normal `clean`. The next release can validate and run uv 0.12.3's own irreversible ordinary prune while keeping both authority inputs explicit:
+`uv` caches stay **Not managed** by normal `clean`. degu can validate and run uv 0.12.3's own irreversible ordinary prune while keeping both authority inputs explicit:
 
 ```sh
 degu reclaim uv -x /absolute/path/to/uv -c /absolute/path/to/uv-cache -n

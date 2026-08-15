@@ -2,17 +2,14 @@ use anyhow::{Context, Result};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
 use serde::Serialize;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 const CACHEDIR_TAG: &str = "CACHEDIR.TAG";
 const TAG_CONTENT: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n";
 const SHARED_WRITE_MASK: rustix::fs::RawMode = 0o022;
-const STICKY_BIT: u32 = 0o1000;
-const SYMLINK_BUDGET: u32 = 40;
 const PERMISSION_MASK: rustix::fs::RawMode = 0o777;
 const PRIVATE_UMASK: Mode = Mode::from_raw_mode(0o077);
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
@@ -179,152 +176,8 @@ fn open_trusted_parent(target: &Path) -> Result<(OwnedFd, PathBuf, OsString)> {
             target.display()
         )
     })?;
-    let parent = resolve_trusted_directory(parent_path)?;
+    let parent = degu_walk::resolve_trusted_directory(parent_path, "relocate target ancestor")?;
     Ok((parent, parent_path.to_path_buf(), name.to_os_string()))
-}
-
-/// Walk `path` from `/` one component at a time on held descriptors, requiring
-/// every directory it descends into to be a trusted namespace and following a
-/// symlink only from a trusted namespace when the link is owned by the effective
-/// user or root. Returns the descriptor for the fully validated directory.
-fn resolve_trusted_directory(path: &Path) -> Result<OwnedFd> {
-    let euid = rustix::process::geteuid().as_raw();
-    let root = Path::new("/");
-    let mut current = open_directory_at(rustix::fs::CWD, "/", root)?;
-    require_trusted_namespace(&stat_fd(&current, root)?, root)?;
-    let mut pending = lexical_components(path)?;
-    let mut walked = PathBuf::from("/");
-    let mut symlink_budget = SYMLINK_BUDGET;
-    while let Some(component) = pending.pop_front() {
-        if component == *OsStr::new(".") {
-            continue;
-        }
-        if component == *OsStr::new("..") {
-            let candidate = walked.parent().unwrap_or(root).to_path_buf();
-            let next = open_directory_at(&current, "..", &candidate)?;
-            require_trusted_namespace(&stat_fd(&next, &candidate)?, &candidate)?;
-            require_stable_filesystem(&next, &candidate)?;
-            current = next;
-            walked = candidate;
-            continue;
-        }
-        let candidate = walked.join(&component);
-        let parent_sticky = is_sticky(&stat_fd(&current, &walked)?);
-        let entry = stat_at(&current, component.as_os_str())
-            .map_err(|error| fs_error("resolve relocate target ancestor", &candidate, error))?;
-        if FileType::from_raw_mode(entry.st_mode) == FileType::Symlink {
-            require_owner_is_local(
-                &entry,
-                &candidate,
-                euid,
-                "symlinked relocate target ancestor",
-            )?;
-            symlink_budget = symlink_budget.checked_sub(1).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "too many symbolic links resolving relocate target {}",
-                    path.display()
-                )
-            })?;
-            let link = rustix::fs::readlinkat(&current, component.as_os_str(), Vec::new())
-                .map_err(|error| {
-                    fs_error("read symlinked relocate target ancestor", &candidate, error)
-                })?;
-            let link = PathBuf::from(OsString::from_vec(link.into_bytes()));
-            if link.is_absolute() {
-                current = open_directory_at(rustix::fs::CWD, "/", root)?;
-                require_trusted_namespace(&stat_fd(&current, root)?, root)?;
-                walked = PathBuf::from("/");
-            }
-            push_front_components(&mut pending, &link);
-        } else if FileType::from_raw_mode(entry.st_mode) == FileType::Directory {
-            if parent_sticky {
-                require_owner_is_local(&entry, &candidate, euid, "relocate target ancestor")?;
-            }
-            let next = open_directory_at(&current, component.as_os_str(), &candidate)?;
-            let opened = stat_fd(&next, &candidate)?;
-            require_same_identity(&entry, &opened, &candidate)?;
-            require_trusted_namespace(&opened, &candidate)?;
-            require_stable_filesystem(&next, &candidate)?;
-            current = next;
-            walked = candidate;
-        } else {
-            anyhow::bail!(
-                "relocate target ancestor {} is not a directory",
-                candidate.display()
-            );
-        }
-    }
-    Ok(current)
-}
-
-fn lexical_components(path: &Path) -> Result<VecDeque<OsString>> {
-    let mut components = path.components();
-    if components.next() != Some(Component::RootDir) {
-        anyhow::bail!("relocate target parent {} must be absolute", path.display());
-    }
-    let mut pending = VecDeque::new();
-    for component in components {
-        match component {
-            Component::Normal(name) => pending.push_back(name.to_os_string()),
-            Component::ParentDir => pending.push_back(OsString::from("..")),
-            Component::CurDir => {}
-            Component::RootDir | Component::Prefix(_) => anyhow::bail!(
-                "relocate target parent {} has an unexpected path component",
-                path.display()
-            ),
-        }
-    }
-    Ok(pending)
-}
-
-fn push_front_components(pending: &mut VecDeque<OsString>, link: &Path) {
-    for component in link.components().rev() {
-        match component {
-            Component::Normal(name) => pending.push_front(name.to_os_string()),
-            Component::ParentDir => pending.push_front(OsString::from("..")),
-            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
-        }
-    }
-}
-
-fn is_sticky(stat: &Stat) -> bool {
-    raw_mode_u32(stat.st_mode) & STICKY_BIT != 0
-}
-
-fn require_owner_is_local(stat: &Stat, path: &Path, euid: u32, label: &str) -> Result<()> {
-    if stat.st_uid != euid && stat.st_uid != 0 {
-        anyhow::bail!(
-            "{label} {} is owned by UID {}, which could rename or re-point it",
-            path.display(),
-            stat.st_uid
-        );
-    }
-    Ok(())
-}
-
-/// Reject a directory on procfs. Its magic links (`/proc/self/cwd`,
-/// `/proc/self/root`, `/proc/self/fd/N`, `/proc/thread-self`, and `/dev/fd`
-/// aliases that resolve through it) are process-dependent, so a lexical export
-/// naming one would resolve to a different directory in the sourcing shell than
-/// the one degu validated and initialized. Refuse any path that traverses procfs
-/// rather than emit an export whose meaning depends on who reads it.
-#[cfg(target_os = "linux")]
-fn require_stable_filesystem(fd: &OwnedFd, path: &Path) -> Result<()> {
-    const PROC_SUPER_MAGIC: u64 = 0x9fa0;
-    let statfs = rustix::fs::fstatfs(fd)
-        .map_err(|error| fs_error("inspect relocate target filesystem", path, error))?;
-    if statfs.f_type as u64 == PROC_SUPER_MAGIC {
-        anyhow::bail!(
-            "relocate target ancestor {} is on procfs, whose magic links resolve differently per process",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn require_stable_filesystem(_fd: &OwnedFd, _path: &Path) -> Result<()> {
-    Ok(())
 }
 
 /// Open (existing) or create (missing) the target directory through its
@@ -669,23 +522,6 @@ fn require_existing_directory(stat: &Stat, path: &Path, label: &str) -> Result<(
     require_owned_safe(stat, path, label)
 }
 
-fn require_trusted_namespace(stat: &Stat, path: &Path) -> Result<()> {
-    require_kind(
-        stat,
-        CreatedKind::Directory,
-        path,
-        "relocate target ancestor",
-    )?;
-    let euid = rustix::process::geteuid().as_raw();
-    if degu_walk::directory_grants_foreign_mutation(stat.st_uid, raw_mode_u32(stat.st_mode), euid) {
-        anyhow::bail!(
-            "relocate target ancestor {} is not a trusted namespace for effective UID {euid}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
 fn require_owned_safe(stat: &Stat, path: &Path, label: &str) -> Result<()> {
     let euid = rustix::process::geteuid().as_raw();
     if stat.st_uid != euid {
@@ -750,16 +586,6 @@ fn identity(stat: &Stat, kind: CreatedKind) -> Identity {
         inode: stat.st_ino,
         kind,
     }
-}
-
-#[cfg(target_vendor = "apple")]
-fn raw_mode_u32(mode: rustix::fs::RawMode) -> u32 {
-    u32::from(mode)
-}
-
-#[cfg(not(target_vendor = "apple"))]
-fn raw_mode_u32(mode: rustix::fs::RawMode) -> u32 {
-    mode
 }
 
 fn normal_components(path: &Path) -> Vec<&OsStr> {

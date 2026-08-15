@@ -32,6 +32,9 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use crate::anchor_layout::SelfAnchorRootError;
+
 pub const PREPARING_RECORD_NAME: &str = "sealed-staging.prepare";
 pub const ACTIVE_RECORD_NAME: &str = "sealed-staging.active";
 pub const STORE_BINDING_NAME: &str = "store.activation";
@@ -80,6 +83,16 @@ impl ActivationAnchorLocator {
                 CertificationError::UnsupportedPlatform,
             ))
         }
+    }
+
+    /// Locator for the invoking account's own self-managed anchor, derived from
+    /// account facts (getpwuid home plus the fixed XDG state suffix), never
+    /// `$HOME`/`$XDG_STATE_HOME`, so ambient environment drift cannot select it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn for_current_euid_self() -> Result<Self, SelfAnchorRootError> {
+        let path = crate::anchor_layout::self_anchor_root()?
+            .join(rustix::process::geteuid().as_raw().to_string());
+        Ok(Self { path })
     }
 
     pub fn as_path(&self) -> &Path {

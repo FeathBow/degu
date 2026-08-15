@@ -27,12 +27,8 @@ const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
-#[cfg(target_os = "linux")]
-const BASE_COMPONENTS: &[&str] = &["var", "lib"];
-#[cfg(target_os = "macos")]
-const BASE_COMPONENTS: &[&str] = &["private", "var", "db"];
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-const PRODUCT_COMPONENTS: &[&str] = &["degu", "store-activation"];
+use crate::anchor_layout::{OS_PREFIX_COMPONENTS as BASE_COMPONENTS, PRODUCT_COMPONENTS};
 
 /// Result of provisioning the platform-fixed activation anchor for one UID.
 #[derive(Debug, Clone, PartialEq, Eq)]

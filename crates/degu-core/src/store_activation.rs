@@ -32,11 +32,6 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(target_os = "linux")]
-const SYSTEM_ANCHOR_ROOT: &str = "/var/lib/degu/store-activation";
-#[cfg(target_os = "macos")]
-const SYSTEM_ANCHOR_ROOT: &str = "/private/var/db/degu/store-activation";
-
 pub const PREPARING_RECORD_NAME: &str = "sealed-staging.prepare";
 pub const ACTIVE_RECORD_NAME: &str = "sealed-staging.active";
 pub const STORE_BINDING_NAME: &str = "store.activation";
@@ -75,8 +70,8 @@ impl ActivationAnchorLocator {
     pub fn for_current_euid() -> Result<Self, StoreActivationError> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let path =
-                Path::new(SYSTEM_ANCHOR_ROOT).join(rustix::process::geteuid().as_raw().to_string());
+            let path = crate::anchor_layout::system_anchor_root()
+                .join(rustix::process::geteuid().as_raw().to_string());
             Ok(Self { path })
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]

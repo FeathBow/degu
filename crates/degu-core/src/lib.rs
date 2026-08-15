@@ -8,6 +8,7 @@
 //!    plan**, never skips the item — silent skipping hides planner bugs.
 
 pub mod activation_anchor_provisioning;
+mod anchor_layout;
 pub mod authority;
 pub mod config;
 pub mod disposition;

@@ -64,6 +64,14 @@ const INTEGRATION_TEST_ANCHOR_ENV: &str = "DEGU_INTEGRATION_TEST_ANCHOR";
 /// from HOME, XDG, configuration, the environment, or a CLI flag could drift to
 /// an empty directory and forget an earlier activation. Installers provision
 /// [`Self::for_current_euid`] before degu is allowed to activate a store.
+///
+/// The self-managed provisioning slice intentionally exposes no locator until
+/// the later selector/lifecycle slice defines how it becomes active:
+///
+/// ```compile_fail,E0599
+/// use degu_core::store_activation::ActivationAnchorLocator;
+/// let _ = ActivationAnchorLocator::for_current_euid_self();
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationAnchorLocator {
     path: PathBuf,
@@ -85,11 +93,11 @@ impl ActivationAnchorLocator {
         }
     }
 
-    /// Locator for the invoking account's own self-managed anchor, derived from
-    /// account facts (getpwuid home plus the fixed XDG state suffix), never
-    /// `$HOME`/`$XDG_STATE_HOME`, so ambient environment drift cannot select it.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub fn for_current_euid_self() -> Result<Self, SelfAnchorRootError> {
+    /// Test-only locator for checking layout agreement. Production code cannot
+    /// compose a self-managed anchor with readiness, discovery, or activation
+    /// before the later selector/lifecycle slice.
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn for_current_euid_self() -> Result<Self, SelfAnchorRootError> {
         let path = crate::anchor_layout::self_anchor_root()?
             .join(rustix::process::geteuid().as_raw().to_string());
         Ok(Self { path })

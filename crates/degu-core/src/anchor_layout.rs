@@ -14,21 +14,24 @@ use std::path::PathBuf;
 /// account home. It is a fixed convention, never read from `$XDG_STATE_HOME`,
 /// so ambient environment drift cannot select a different anchor.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-const SELF_STATE_COMPONENTS: &[&str] = &[".local", "state"];
+pub(crate) const SELF_STATE_COMPONENTS: &[&str] = &[".local", "state"];
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MIN_PASSWD_BUFFER_BYTES: usize = 1024;
 
 /// Why a self-managed anchor root could not be derived from account facts.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SelfAnchorRootError {
     /// `getpwuid_r` failed with this errno.
+    #[error("account lookup failed with errno {0}")]
     Lookup(i32),
     /// The account database has no entry for the effective UID.
+    #[error("the effective UID has no account database entry")]
     AccountMissing,
     /// The account home is empty or not absolute, so joining it would depend on
     /// the working directory.
+    #[error("the account home is empty or not absolute")]
     HomeNotAbsolute,
 }
 
@@ -61,16 +64,9 @@ pub(crate) fn system_anchor_root() -> PathBuf {
 /// Absolute root that holds the invoking account's own anchor leaf, derived from
 /// the account database home (never `$HOME`/`$XDG_STATE_HOME`) plus the fixed XDG
 /// state suffix and the same product components the system layout uses.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn self_anchor_root() -> Result<PathBuf, SelfAnchorRootError> {
-    let uid = rustix::process::geteuid().as_raw();
-    let home = passwd_home_dir(uid)
-        .map_err(SelfAnchorRootError::Lookup)?
-        .ok_or(SelfAnchorRootError::AccountMissing)?;
-    if !home.is_absolute() {
-        return Err(SelfAnchorRootError::HomeNotAbsolute);
-    }
-    let mut path = home;
+    let mut path = self_anchor_base()?;
     for component in SELF_STATE_COMPONENTS {
         path.push(component);
     }
@@ -78,6 +74,20 @@ pub(crate) fn self_anchor_root() -> Result<PathBuf, SelfAnchorRootError> {
         path.push(component);
     }
     Ok(path)
+}
+
+/// Existing account-owned base beneath which the self-managed scaffold is
+/// created. This is an account fact, never an environment-selected path.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn self_anchor_base() -> Result<PathBuf, SelfAnchorRootError> {
+    let uid = rustix::process::geteuid().as_raw();
+    let home = passwd_home_dir(uid)
+        .map_err(SelfAnchorRootError::Lookup)?
+        .ok_or(SelfAnchorRootError::AccountMissing)?;
+    if !home.is_absolute() {
+        return Err(SelfAnchorRootError::HomeNotAbsolute);
+    }
+    Ok(home)
 }
 
 /// Home directory of `uid` from the account database. Uses `getpwuid_r`, not

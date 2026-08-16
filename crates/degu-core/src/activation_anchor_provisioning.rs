@@ -1,12 +1,14 @@
-//! Root-only, create-only provisioning for the fixed per-UID activation anchor.
+//! Create-only provisioning for fixed system-managed and self-managed activation anchors.
 //!
-//! Production callers supply only a numeric UID. The platform fixes the system
-//! base and every product component. Existing objects are authenticated and are
-//! never repaired or replaced.
+//! The system entry point remains root-only and accepts a numeric UID. The
+//! self-managed entry point derives both its UID and account base internally and
+//! rejects root. Layout, ownership, and path selection are never caller supplied;
+//! existing objects are authenticated and never repaired or replaced.
 
 use crate::local_backend::{
     CertificationError, CertifiedLocalBackend, certify_held_fd_backend, require_held_fd_acl_absent,
 };
+use crate::seal_store::{StoreError, open_authenticated_parent};
 use crate::seal_wal::{ExclusiveFileLock, RecoveryLockError, StrongObjectIdentity};
 use crate::staging_recovery::strong_identity_fd;
 use rustix::fd::OwnedFd;
@@ -21,6 +23,9 @@ const LEAF_MODE: u32 = 0o700;
 const PUBLIC_MODE: u32 = 0o755;
 const PRIVATE_LOCK_MODE: u32 = 0o700;
 const PROVISIONING_LOCK_NAME: &str = ".anchor-provisioning-lock";
+const PRIVATE_TEMP_PREFIX: &str = ".degu-anchor-initializing-";
+#[cfg(test)]
+const TEST_CLEANUP_BLOCKER_NAME: &str = ".test-cleanup-blocker";
 const PRIVATE_CREATE_MODE: Mode = Mode::RWXU;
 const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
@@ -28,7 +33,10 @@ const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::anchor_layout::{OS_PREFIX_COMPONENTS as BASE_COMPONENTS, PRODUCT_COMPONENTS};
+use crate::anchor_layout::{
+    OS_PREFIX_COMPONENTS as BASE_COMPONENTS, PRODUCT_COMPONENTS, SELF_STATE_COMPONENTS,
+    SelfAnchorRootError,
+};
 
 /// Result of provisioning the platform-fixed activation anchor for one UID.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +63,11 @@ pub enum ActivationAnchorProvisioningStatus {
 pub enum ActivationAnchorProvisioningError {
     #[error("activation-anchor provisioning requires effective UID 0")]
     NotRoot,
+    #[error("self-managed activation-anchor provisioning refuses effective UID 0")]
+    RootCannotSelfProvision,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[error("self-managed activation-anchor account base is unavailable: {0}")]
+    AccountBase(#[from] SelfAnchorRootError),
     #[error("UID {uid} cannot be an activation-anchor target")]
     InvalidUid { uid: u32 },
     #[error("activation-anchor provisioning is unsupported on this platform")]
@@ -79,6 +92,14 @@ pub enum ActivationAnchorProvisioningError {
     },
     #[error("activation-anchor provisioning is busy at {path}")]
     Busy { path: PathBuf },
+    #[error(
+        "activation-anchor path cannot be consumed by the runtime contract at {path}: {source}"
+    )]
+    RuntimeIncompatible {
+        path: PathBuf,
+        #[source]
+        source: StoreError,
+    },
     #[error(
         "activation-anchor provisioning failed: {failure}; rollback is uncertain or left residue at {residue:?}"
     )]
@@ -112,6 +133,82 @@ pub fn provision_activation_anchor(
     )
 }
 
+/// Provision the self-managed activation anchor for the current effective UID.
+///
+/// The target is derived exclusively from the account database and the fixed
+/// self-managed layout. Callers cannot select a UID or path. Root is rejected:
+/// administrators must use [`provision_activation_anchor`] instead.
+pub fn provision_current_euid_self_activation_anchor()
+-> Result<ActivationAnchorProvisioningOutcome, ActivationAnchorProvisioningError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let euid = rustix::process::geteuid().as_raw();
+        if euid == 0 {
+            return Err(ActivationAnchorProvisioningError::RootCannotSelfProvision);
+        }
+        provision_current_euid_self_with_lookup(euid, crate::anchor_layout::self_anchor_base)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(ActivationAnchorProvisioningError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn provision_current_euid_self_with_lookup<F>(
+    euid: u32,
+    mut account_home_lookup: F,
+) -> Result<ActivationAnchorProvisioningOutcome, ActivationAnchorProvisioningError>
+where
+    F: FnMut() -> Result<PathBuf, SelfAnchorRootError>,
+{
+    let account_home = account_home_lookup()?;
+    provision_flavor(
+        ProvisioningFlavor::SelfManaged(&account_home),
+        euid,
+        Credentials {
+            controller_uid: euid,
+            enforce_root: false,
+        },
+        BackendProbe::Real,
+        Some(&mut account_home_lookup),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy)]
+enum ProvisioningFlavor<'a> {
+    System(&'a Path),
+    SelfManaged(&'a Path),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<'a> ProvisioningFlavor<'a> {
+    fn base(self) -> &'a Path {
+        match self {
+            Self::System(path) | Self::SelfManaged(path) => path,
+        }
+    }
+
+    fn existing_prefix(self) -> &'static [&'static str] {
+        match self {
+            Self::System(_) => BASE_COMPONENTS,
+            Self::SelfManaged(_) => &[],
+        }
+    }
+
+    fn scaffold_prefix(self) -> &'static [&'static str] {
+        match self {
+            Self::System(_) => &[],
+            Self::SelfManaged(_) => SELF_STATE_COMPONENTS,
+        }
+    }
+
+    fn uses_trusted_account_base(self) -> bool {
+        matches!(self, Self::SelfManaged(_))
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Credentials {
     controller_uid: u32,
@@ -125,6 +222,8 @@ enum BackendProbe {
     Fixed(CertifiedLocalBackend),
     #[cfg(test)]
     FailAt(&'static str),
+    #[cfg(test)]
+    LoseNoreplaceRaceAndBlockCleanupAt(&'static str),
 }
 
 struct ValidatedDirectory {
@@ -172,7 +271,7 @@ fn provision(
     }
     if !initial {
         return Err(ActivationAnchorProvisioningError::Unsafe {
-            path: fixed_path(filesystem_root, uid),
+            path: fixed_path(ProvisioningFlavor::System(filesystem_root), uid),
             reason: "the administrator must assert --initial; provisioning is not repair or recovery",
         });
     }
@@ -182,31 +281,61 @@ fn provision(
         Err(ActivationAnchorProvisioningError::UnsupportedPlatform)
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    provision_supported(filesystem_root, uid, credentials, backend_probe)
+    provision_flavor(
+        ProvisioningFlavor::System(filesystem_root),
+        uid,
+        credentials,
+        backend_probe,
+        None,
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn provision_supported(
-    filesystem_root: &Path,
+fn provision_flavor(
+    flavor: ProvisioningFlavor<'_>,
     uid: u32,
     credentials: Credentials,
     backend_probe: BackendProbe,
+    mut account_home_lookup: Option<&mut dyn FnMut() -> Result<PathBuf, SelfAnchorRootError>>,
 ) -> Result<ActivationAnchorProvisioningOutcome, ActivationAnchorProvisioningError> {
+    let filesystem_root = flavor.base();
     let mut path = filesystem_root.to_path_buf();
-    let mut current = rustix::fs::open(filesystem_root, OPEN_DIRECTORY, Mode::empty())
-        .map_err(|error| io_error(filesystem_root, error.into()))?;
-    let root = validate_directory(
-        &current,
-        &path,
-        credentials.controller_uid,
-        DirectoryKind::System,
-        backend_probe,
-    )?;
+    let mut current = if flavor.uses_trusted_account_base() {
+        degu_walk::resolve_trusted_directory(filesystem_root, "self-managed account base")
+            .map_err(|source| io_error(filesystem_root, source))?
+    } else {
+        rustix::fs::open(filesystem_root, OPEN_DIRECTORY, Mode::empty())
+            .map_err(|error| io_error(filesystem_root, error.into()))?
+    };
+    // trusted_path makes the initial self-managed walk descriptor-relative. A
+    // later runtime-contract preflight additionally requires the lexical account
+    // ancestry to be no-follow, ACL-free, and on a certified local backend before
+    // a leaf can be published. The system base retains its existing checks.
+    let trusted_base_identity = if flavor.uses_trusted_account_base() {
+        let identity = directory_identity(&current, filesystem_root)?;
+        // Reject a lexical passwd-home path that runtime could never consume
+        // before creating even the shared self-managed scaffold.
+        preflight_runtime_parent(&filesystem_root.join(SELF_STATE_COMPONENTS[0]), &current)?;
+        Some(identity)
+    } else {
+        None
+    };
+    let root = if flavor.uses_trusted_account_base() {
+        None
+    } else {
+        Some(validate_directory(
+            &current,
+            &path,
+            credentials.controller_uid,
+            DirectoryKind::System,
+            backend_probe,
+        )?)
+    };
     let mut chain = Vec::new();
 
     // The operating-system prefix is existing-only. Provisioning never invents
     // `/var/lib` or `/private/var/db` and never repairs it.
-    for component in BASE_COMPONENTS {
+    for component in flavor.existing_prefix() {
         path.push(component);
         let child = open_directory(&current, OsStr::new(component), &path)?;
         let validated = validate_directory(
@@ -234,6 +363,38 @@ fn provision_supported(
         current = child;
     }
 
+    // Self-managed `.local/state` components are flavor data. Existing entries
+    // are never repaired; missing entries are privately initialized, certified,
+    // strongly identified, synced, and atomically published by the shared driver.
+    let mut flavor_scaffold_created = Vec::new();
+    for component in flavor.scaffold_prefix() {
+        path.push(component);
+        let (directory, created) = open_or_publish_directory(
+            &current,
+            OsStr::new(component),
+            &path,
+            credentials.controller_uid,
+            DirectoryKind::System,
+            backend_probe,
+        )
+        .map_err(|error| report_created_scaffold_failure(error, &flavor_scaffold_created))?;
+        if created.is_some() {
+            flavor_scaffold_created.push(path.clone());
+        }
+        chain.push(
+            chain_entry(
+                &current,
+                OsStr::new(component),
+                &directory.fd,
+                &path,
+                directory.identity,
+                DirectoryKind::System,
+            )
+            .map_err(|error| report_created_scaffold_failure(error, &flavor_scaffold_created))?,
+        );
+        current = directory.fd;
+    }
+
     // Publish the degu-owned serialization namespace first. A safe, empty
     // scaffold may remain after a later failure; it carries no per-UID
     // authority and is accepted idempotently. We never lock the shared OS base.
@@ -246,7 +407,8 @@ fn provision_supported(
         credentials.controller_uid,
         DirectoryKind::Public,
         backend_probe,
-    )?;
+    )
+    .map_err(|error| report_created_scaffold_failure(error, &flavor_scaffold_created))?;
     let degu_chain = chain_entry(
         &current,
         degu_name,
@@ -256,7 +418,13 @@ fn provision_supported(
         DirectoryKind::Public,
     )
     .map_err(|error| {
-        report_scaffold_failure(error, filesystem_root, degu_created.is_some(), false)
+        report_all_scaffold_failure(
+            error,
+            flavor,
+            &flavor_scaffold_created,
+            degu_created.is_some(),
+            false,
+        )
     })?;
     chain.push(degu_chain);
     current = degu.fd;
@@ -275,15 +443,22 @@ fn provision_supported(
         backend_probe,
     )
     .map_err(|error| {
-        report_scaffold_failure(error, filesystem_root, degu_created.is_some(), false)
+        report_all_scaffold_failure(
+            error,
+            flavor,
+            &flavor_scaffold_created,
+            degu_created.is_some(),
+            false,
+        )
     })?;
     let scaffold_created = (degu_created.is_some(), lock_created.is_some());
     let lock_fd = rustix::io::fcntl_dupfd_cloexec(&lock_directory.fd, 0)
         .map_err(|error| io_error(&lock_path, error.into()))
         .map_err(|error| {
-            report_scaffold_failure(
+            report_all_scaffold_failure(
                 error,
-                filesystem_root,
+                flavor,
+                &flavor_scaffold_created,
                 scaffold_created.0,
                 scaffold_created.1,
             )
@@ -299,9 +474,10 @@ fn provision_supported(
             },
         })
         .map_err(|error| {
-            report_scaffold_failure(
+            report_all_scaffold_failure(
                 error,
-                filesystem_root,
+                flavor,
+                &flavor_scaffold_created,
                 scaffold_created.0,
                 scaffold_created.1,
             )
@@ -324,9 +500,10 @@ fn provision_supported(
         .map(|_| ())
     })
     .map_err(|error| {
-        report_scaffold_failure(
+        report_all_scaffold_failure(
             error,
-            filesystem_root,
+            flavor,
+            &flavor_scaffold_created,
             scaffold_created.0,
             scaffold_created.1,
         )
@@ -364,6 +541,12 @@ fn provision_supported(
         } else {
             credentials.controller_uid
         };
+        if let (Some(expected), Some(lookup)) =
+            (trusted_base_identity, account_home_lookup.as_deref_mut())
+        {
+            revalidate_account_base(filesystem_root, expected, lookup)?;
+            preflight_runtime_parent(&leaf_path, &current)?;
+        }
         let (leaf, leaf_created) = open_or_publish_directory(
             &current,
             OsStr::new(&leaf_name),
@@ -385,14 +568,24 @@ fn provision_supported(
             DirectoryKind::Leaf(leaf_owner),
         )?);
 
-        // Re-authenticate the complete held chain immediately before commit.
-        validate_directory(
-            &root.fd,
-            filesystem_root,
-            credentials.controller_uid,
-            DirectoryKind::System,
-            backend_probe,
-        )?;
+        // Re-authenticate after leaf publication, before the complete held
+        // chain and its durability boundaries are validated. The same account
+        // and runtime checks run again at the final commit gate below.
+        if let (Some(expected), Some(lookup)) =
+            (trusted_base_identity, account_home_lookup.as_deref_mut())
+        {
+            revalidate_account_base(filesystem_root, expected, lookup)?;
+            preflight_runtime_parent(&leaf_path, &current)?;
+        }
+        if let Some(root) = &root {
+            validate_directory(
+                &root.fd,
+                filesystem_root,
+                credentials.controller_uid,
+                DirectoryKind::System,
+                backend_probe,
+            )?;
+        }
         for entry in &chain {
             validate_binding(
                 &entry.parent,
@@ -421,9 +614,18 @@ fn provision_supported(
                 entry.path.parent().unwrap_or(filesystem_root),
             )?;
         }
+        // This is the commit gate: re-read account facts and re-open the exact
+        // runtime ancestry after all validation and fsync work, immediately
+        // before relinquishing rollback authority over the published leaf.
+        if let (Some(expected), Some(lookup)) =
+            (trusted_base_identity, account_home_lookup.as_deref_mut())
+        {
+            revalidate_account_base(filesystem_root, expected, lookup)?;
+            preflight_runtime_parent(&leaf_path, &current)?;
+        }
         created.clear();
         Ok(ActivationAnchorProvisioningOutcome {
-            path: fixed_path(filesystem_root, uid),
+            path: fixed_path(flavor, uid),
             uid,
             backend: leaf.backend,
             status: if was_created {
@@ -443,32 +645,32 @@ fn provision_supported(
             // concurrent/retry invocation and are therefore never rolled back.
             // Report their creation honestly if this invocation later fails.
             if degu_created.is_some() {
-                residue.push(path_from_components(
-                    filesystem_root,
-                    BASE_COMPONENTS
-                        .iter()
-                        .chain(std::iter::once(&PRODUCT_COMPONENTS[0])),
-                ));
+                let mut degu_path = filesystem_root.to_path_buf();
+                for component in flavor
+                    .existing_prefix()
+                    .iter()
+                    .chain(flavor.scaffold_prefix())
+                    .chain(std::iter::once(&PRODUCT_COMPONENTS[0]))
+                {
+                    degu_path.push(component);
+                }
+                residue.push(degu_path);
             }
             if lock_created.is_some() {
-                residue.push(path_from_components(
-                    filesystem_root,
-                    BASE_COMPONENTS
-                        .iter()
-                        .chain(std::iter::once(&PRODUCT_COMPONENTS[0]))
-                        .chain(std::iter::once(&PROVISIONING_LOCK_NAME)),
-                ));
+                let mut lock_path = filesystem_root.to_path_buf();
+                for component in flavor
+                    .existing_prefix()
+                    .iter()
+                    .chain(flavor.scaffold_prefix())
+                    .chain(std::iter::once(&PRODUCT_COMPONENTS[0]))
+                    .chain(std::iter::once(&PROVISIONING_LOCK_NAME))
+                {
+                    lock_path.push(component);
+                }
+                residue.push(lock_path);
             }
-            if residue.is_empty() {
-                Err(error)
-            } else {
-                residue.sort();
-                residue.dedup();
-                Err(ActivationAnchorProvisioningError::RollbackResidue {
-                    failure: error.to_string(),
-                    residue,
-                })
-            }
+            residue.extend(flavor_scaffold_created);
+            Err(merge_rollback_residue(error, &residue))
         }
     }
 }
@@ -517,8 +719,9 @@ fn open_or_publish_directory(
     let initialize = (|| {
         let mode = match kind {
             DirectoryKind::Public => PUBLIC_MODE,
-            DirectoryKind::Leaf(_) | DirectoryKind::PrivateLock => PRIVATE_LOCK_MODE,
-            DirectoryKind::System => unreachable!("system directories are existing-only"),
+            DirectoryKind::System | DirectoryKind::Leaf(_) | DirectoryKind::PrivateLock => {
+                PRIVATE_LOCK_MODE
+            }
         };
         rustix::fs::fchmod(&temp_fd, Mode::from_raw_mode(mode as _))
             .map_err(|error| io_error(&temp_path, error.into()))?;
@@ -549,6 +752,22 @@ fn open_or_publish_directory(
             }
         };
 
+    #[cfg(test)]
+    if let BackendProbe::LoseNoreplaceRaceAndBlockCleanupAt(target) = backend_probe
+        && final_name == OsStr::new(target)
+    {
+        // Deterministically model a concurrent winner, then make this
+        // invocation's initializer non-empty so collision cleanup fails.
+        rustix::fs::mkdirat(parent, final_name, PRIVATE_CREATE_MODE)
+            .map_err(|error| io_error(final_path, error.into()))?;
+        rustix::fs::mkdirat(
+            &temp_fd,
+            OsStr::new(TEST_CLEANUP_BLOCKER_NAME),
+            PRIVATE_CREATE_MODE,
+        )
+        .map_err(|error| io_error(&temp_path, error.into()))?;
+    }
+
     match rustix::fs::renameat_with(
         parent,
         &temp_name,
@@ -574,7 +793,14 @@ fn open_or_publish_directory(
             }
         }
         Err(rustix::io::Errno::EXIST) => {
-            remove_identity_matched_empty(parent, &temp_name, &temp_path, birth_identity)?;
+            if let Err(failure) =
+                remove_identity_matched_empty(parent, &temp_name, &temp_path, birth_identity)
+            {
+                return Err(ActivationAnchorProvisioningError::RollbackResidue {
+                    failure: failure.to_string(),
+                    residue: vec![temp_path],
+                });
+            }
             let fd = open_directory(parent, final_name, final_path)?;
             let validated = validate_directory(&fd, final_path, owner, kind, backend_probe)?;
             validate_binding(parent, final_name, &fd, final_path, validated.identity)?;
@@ -633,7 +859,7 @@ fn private_temp_name() -> Result<OsString, ActivationAnchorProvisioningError> {
         path: PathBuf::from("platform random source"),
         source: io::Error::other(source),
     })?;
-    let mut name = String::from(".degu-anchor-initializing-");
+    let mut name = String::from(PRIVATE_TEMP_PREFIX);
     for byte in random {
         use std::fmt::Write as _;
         write!(&mut name, "{byte:02x}").expect("writing to String cannot fail");
@@ -676,6 +902,11 @@ fn validate_directory(
             path: path.to_path_buf(),
             reason: match kind {
                 DirectoryKind::Leaf(_) => "activation-anchor leaf has the wrong owner",
+                DirectoryKind::System | DirectoryKind::Public | DirectoryKind::PrivateLock
+                    if owner != 0 =>
+                {
+                    "self-managed activation-anchor namespace component has the wrong owner"
+                }
                 DirectoryKind::System | DirectoryKind::Public | DirectoryKind::PrivateLock => {
                     "activation-anchor namespace component is not root-owned"
                 }
@@ -724,6 +955,8 @@ fn validate_directory(
         }
         #[cfg(test)]
         BackendProbe::FailAt(_) => Ok(CertifiedLocalBackend::Ext4),
+        #[cfg(test)]
+        BackendProbe::LoseNoreplaceRaceAndBlockCleanupAt(_) => certify_held_fd_backend(fd),
     }
     .map_err(|reason| certification_error(path, reason))?;
     let identity =
@@ -736,6 +969,63 @@ fn validate_directory(
         identity,
         backend,
     })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn revalidate_account_base(
+    initial_home: &Path,
+    expected_identity: (u64, u64),
+    account_home_lookup: &mut dyn FnMut() -> Result<PathBuf, SelfAnchorRootError>,
+) -> Result<(), ActivationAnchorProvisioningError> {
+    let current_home = account_home_lookup()?;
+    if current_home != initial_home {
+        return Err(ActivationAnchorProvisioningError::Unsafe {
+            path: initial_home.to_path_buf(),
+            reason: "account database home changed during self-managed provisioning",
+        });
+    }
+    let rebound = degu_walk::resolve_trusted_directory(&current_home, "self-managed account base")
+        .map_err(|source| io_error(&current_home, source))?;
+    if directory_identity(&rebound, &current_home)? != expected_identity {
+        return Err(ActivationAnchorProvisioningError::Unsafe {
+            path: current_home,
+            reason: "self-managed account base binding changed during provisioning",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn preflight_runtime_parent(
+    leaf_path: &Path,
+    held_parent: &OwnedFd,
+) -> Result<(), ActivationAnchorProvisioningError> {
+    let (runtime_parent, runtime_name, runtime_parent_path) = open_authenticated_parent(leaf_path)
+        .map_err(
+            |source| ActivationAnchorProvisioningError::RuntimeIncompatible {
+                path: leaf_path.to_path_buf(),
+                source,
+            },
+        )?;
+    if runtime_name != leaf_path.file_name().unwrap_or_default()
+        || runtime_parent_path != leaf_path.parent().unwrap_or(Path::new("/"))
+        || directory_identity(&runtime_parent, &runtime_parent_path)?
+            != directory_identity(held_parent, &runtime_parent_path)?
+    {
+        return Err(ActivationAnchorProvisioningError::Unsafe {
+            path: leaf_path.to_path_buf(),
+            reason: "runtime ancestry does not bind the provisioning parent",
+        });
+    }
+    Ok(())
+}
+
+fn directory_identity(
+    fd: &OwnedFd,
+    path: &Path,
+) -> Result<(u64, u64), ActivationAnchorProvisioningError> {
+    let stat = rustix::fs::fstat(fd).map_err(|error| io_error(path, error.into()))?;
+    Ok((stat.st_dev as u64, stat.st_ino as u64))
 }
 
 fn validate_binding(
@@ -860,62 +1150,97 @@ fn io_error(path: &Path, source: io::Error) -> ActivationAnchorProvisioningError
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn report_scaffold_failure(
+fn report_created_scaffold_failure(
     error: ActivationAnchorProvisioningError,
-    filesystem_root: &Path,
-    degu_created: bool,
-    lock_created: bool,
+    created: &[PathBuf],
 ) -> ActivationAnchorProvisioningError {
-    let mut residue = Vec::new();
-    if degu_created {
-        residue.push(path_from_components(
-            filesystem_root,
-            BASE_COMPONENTS
-                .iter()
-                .chain(std::iter::once(&PRODUCT_COMPONENTS[0])),
-        ));
+    merge_rollback_residue(error, created)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn merge_rollback_residue(
+    error: ActivationAnchorProvisioningError,
+    additional: &[PathBuf],
+) -> ActivationAnchorProvisioningError {
+    if additional.is_empty() {
+        return error;
     }
-    if lock_created {
-        residue.push(path_from_components(
-            filesystem_root,
-            BASE_COMPONENTS
-                .iter()
-                .chain(std::iter::once(&PRODUCT_COMPONENTS[0]))
-                .chain(std::iter::once(&PROVISIONING_LOCK_NAME)),
-        ));
-    }
-    if residue.is_empty() {
-        error
-    } else {
+    match error {
         ActivationAnchorProvisioningError::RollbackResidue {
-            failure: error.to_string(),
-            residue,
+            failure,
+            mut residue,
+        } => {
+            residue.extend_from_slice(additional);
+            residue.sort();
+            residue.dedup();
+            ActivationAnchorProvisioningError::RollbackResidue { failure, residue }
+        }
+        error => {
+            let mut residue = additional.to_vec();
+            residue.sort();
+            residue.dedup();
+            ActivationAnchorProvisioningError::RollbackResidue {
+                failure: error.to_string(),
+                residue,
+            }
         }
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn path_from_components<'a>(
-    filesystem_root: &Path,
-    components: impl IntoIterator<Item = &'a &'static str>,
-) -> PathBuf {
-    let mut path = filesystem_root.to_path_buf();
-    for component in components {
-        path.push(component);
-    }
-    path
+fn report_all_scaffold_failure(
+    error: ActivationAnchorProvisioningError,
+    flavor: ProvisioningFlavor<'_>,
+    flavor_created: &[PathBuf],
+    degu_created: bool,
+    lock_created: bool,
+) -> ActivationAnchorProvisioningError {
+    let error = report_scaffold_failure(error, flavor, degu_created, lock_created);
+    report_created_scaffold_failure(error, flavor_created)
 }
 
-fn fixed_path(filesystem_root: &Path, uid: u32) -> PathBuf {
-    let mut path = filesystem_root.to_path_buf();
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn report_scaffold_failure(
+    error: ActivationAnchorProvisioningError,
+    flavor: ProvisioningFlavor<'_>,
+    degu_created: bool,
+    lock_created: bool,
+) -> ActivationAnchorProvisioningError {
+    let mut residue = Vec::new();
+    let scaffold_path = |include_lock: bool| {
+        let mut path = flavor.base().to_path_buf();
+        for component in flavor
+            .existing_prefix()
+            .iter()
+            .chain(flavor.scaffold_prefix())
+            .chain(std::iter::once(&PRODUCT_COMPONENTS[0]))
+        {
+            path.push(component);
+        }
+        if include_lock {
+            path.push(PROVISIONING_LOCK_NAME);
+        }
+        path
+    };
+    if degu_created {
+        residue.push(scaffold_path(false));
+    }
+    if lock_created {
+        residue.push(scaffold_path(true));
+    }
+    merge_rollback_residue(error, &residue)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn fixed_path(flavor: ProvisioningFlavor<'_>, uid: u32) -> PathBuf {
+    let mut path = flavor.base().to_path_buf();
+    for component in flavor
+        .existing_prefix()
+        .iter()
+        .chain(flavor.scaffold_prefix())
+        .chain(PRODUCT_COMPONENTS)
     {
-        for component in BASE_COMPONENTS {
-            path.push(component);
-        }
-        for component in PRODUCT_COMPONENTS {
-            path.push(component);
-        }
+        path.push(component);
     }
     path.push(uid.to_string());
     path
@@ -964,7 +1289,7 @@ mod tests {
 
     #[test]
     fn fixed_path_contains_only_platform_and_decimal_uid() {
-        let path = fixed_path(Path::new("/"), 12345);
+        let path = fixed_path(ProvisioningFlavor::System(Path::new("/")), 12345);
         #[cfg(target_os = "linux")]
         assert_eq!(path, Path::new("/var/lib/degu/store-activation/12345"));
         #[cfg(target_os = "macos")]
@@ -1031,7 +1356,7 @@ mod tests {
     fn existing_file_and_symlink_are_never_replaced() {
         for symlink in [false, true] {
             let root = fixture();
-            let leaf = fixed_path(root.path(), test_uid());
+            let leaf = fixed_path(ProvisioningFlavor::System(root.path()), test_uid());
             std::fs::create_dir_all(leaf.parent().unwrap()).unwrap();
             std::fs::set_permissions(
                 leaf.parent().unwrap().parent().unwrap(),
@@ -1105,7 +1430,7 @@ mod tests {
             .map(|thread| thread.join().unwrap())
             .collect::<Vec<_>>();
         assert!(results.iter().any(Result::is_ok));
-        assert!(fixed_path(root.path(), test_uid()).is_dir());
+        assert!(fixed_path(ProvisioningFlavor::System(root.path()), test_uid()).is_dir());
         assert!(provision_test(root.path(), test_uid()).is_ok());
     }
 
@@ -1134,6 +1459,366 @@ mod tests {
                 Err(ActivationAnchorProvisioningError::InvalidUid { uid: rejected }) if rejected == uid
             ));
         }
+    }
+
+    fn provision_self_test(
+        account_home: &Path,
+    ) -> Result<ActivationAnchorProvisioningOutcome, ActivationAnchorProvisioningError> {
+        let euid = rustix::process::geteuid().as_raw();
+        let home = account_home.to_path_buf();
+        let mut lookup = || Ok(home.clone());
+        provision_flavor(
+            ProvisioningFlavor::SelfManaged(account_home),
+            euid,
+            Credentials {
+                controller_uid: euid,
+                enforce_root: false,
+            },
+            BackendProbe::Real,
+            Some(&mut lookup),
+        )
+    }
+
+    #[test]
+    fn self_flavor_uses_trusted_account_base_and_real_backend_certification() {
+        let home = crate::secure_test_tempdir().unwrap();
+        let canonical_home = home.path().canonicalize().unwrap();
+        let euid = rustix::process::geteuid().as_raw();
+        if euid == 0 {
+            // The public API rejects root, but the shared driver is still covered
+            // under its exact current-EUID ownership policy.
+        }
+        let created = provision_self_test(&canonical_home).unwrap();
+        assert_eq!(created.uid, euid);
+        assert_eq!(created.status, ActivationAnchorProvisioningStatus::Created);
+        assert_eq!(
+            created.path,
+            canonical_home
+                .join(".local/state/degu/store-activation")
+                .join(euid.to_string())
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(canonical_home.join(".local"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&created.path).unwrap().uid(),
+            euid
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&created.path).unwrap().mode() & 0o7777,
+            LEAF_MODE
+        );
+        let again = provision_self_test(&canonical_home).unwrap();
+        assert_eq!(
+            again.status,
+            ActivationAnchorProvisioningStatus::AlreadyProvisioned
+        );
+        assert_eq!(again.backend, created.backend);
+    }
+
+    #[test]
+    fn self_flavor_rejects_untrusted_home_ancestry_before_creation() {
+        let outer = crate::secure_test_tempdir().unwrap();
+        let home = outer.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(outer.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
+        let error = provision_self_test(&home).unwrap_err();
+        assert!(matches!(
+            error,
+            ActivationAnchorProvisioningError::Io { .. }
+        ));
+        assert!(!home.join(".local").exists());
+    }
+
+    #[test]
+    fn self_flavor_never_repairs_an_existing_scaffold() {
+        let home = crate::secure_test_tempdir().unwrap();
+        let canonical_home = home.path().canonicalize().unwrap();
+        let local = canonical_home.join(".local");
+        std::fs::create_dir(&local).unwrap();
+        std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let error = provision_self_test(&canonical_home).unwrap_err();
+        assert!(error.to_string().contains("grants group or other write"));
+        assert_eq!(
+            std::fs::symlink_metadata(&local).unwrap().mode() & 0o7777,
+            0o770
+        );
+        assert!(!local.join("state").exists());
+    }
+
+    #[test]
+    fn self_flavor_concurrency_keeps_one_valid_current_euid_anchor() {
+        let home = crate::secure_test_tempdir().unwrap();
+        let path = home.path().canonicalize().unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                provision_self_test(&path)
+            }));
+        }
+        barrier.wait();
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(results.iter().any(Result::is_ok));
+        let final_result = provision_self_test(&path).unwrap();
+        assert_eq!(
+            final_result.status,
+            ActivationAnchorProvisioningStatus::AlreadyProvisioned
+        );
+    }
+
+    #[test]
+    fn noreplace_loser_reports_unremoved_initializer_as_residue() {
+        let home = crate::secure_test_tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let euid = rustix::process::geteuid().as_raw();
+        let lookup_home = home.clone();
+        let mut lookup = || Ok(lookup_home.clone());
+        let error = provision_flavor(
+            ProvisioningFlavor::SelfManaged(&home),
+            euid,
+            Credentials {
+                controller_uid: euid,
+                enforce_root: false,
+            },
+            BackendProbe::LoseNoreplaceRaceAndBlockCleanupAt(SELF_STATE_COMPONENTS[0]),
+            Some(&mut lookup),
+        )
+        .unwrap_err();
+
+        let (failure, residue) = match error {
+            ActivationAnchorProvisioningError::RollbackResidue { failure, residue } => {
+                (failure, residue)
+            }
+            other => panic!("expected machine-readable initializer residue, got {other:?}"),
+        };
+        assert!(!failure.is_empty());
+        assert_eq!(residue.len(), 1);
+        let initializer = &residue[0];
+        assert_eq!(initializer.parent(), Some(home.as_path()));
+        assert!(
+            initializer
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with(PRIVATE_TEMP_PREFIX))
+        );
+        assert!(initializer.join(TEST_CLEANUP_BLOCKER_NAME).is_dir());
+        let remaining_initializers = std::fs::read_dir(&home)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(PRIVATE_TEMP_PREFIX))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(remaining_initializers, residue);
+        assert!(home.join(SELF_STATE_COMPONENTS[0]).is_dir());
+        assert!(!home.join(".local/state").exists());
+    }
+
+    #[test]
+    fn all_scaffold_wrappers_preserve_original_failure_and_every_residue_path() {
+        let home = PathBuf::from("/account-home");
+        let local = home.join(".local");
+        let state = local.join("state");
+        let degu = state.join("degu");
+        let lock = degu.join(PROVISIONING_LOCK_NAME);
+        let initializer = degu.join(".degu-anchor-initializing-test");
+        let merged = report_all_scaffold_failure(
+            ActivationAnchorProvisioningError::RollbackResidue {
+                failure: "original failure".into(),
+                residue: vec![initializer.clone()],
+            },
+            ProvisioningFlavor::SelfManaged(&home),
+            &[state.clone(), local.clone()],
+            true,
+            true,
+        );
+        match merged {
+            ActivationAnchorProvisioningError::RollbackResidue { failure, residue } => {
+                let mut expected = vec![local, state, degu, lock, initializer];
+                expected.sort();
+                assert_eq!(failure, "original failure");
+                assert_eq!(residue, expected);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    fn assert_self_scaffold_residue(
+        error: ActivationAnchorProvisioningError,
+        home: &Path,
+    ) -> String {
+        let local = home.join(".local");
+        let state = local.join("state");
+        let degu = state.join("degu");
+        let lock = degu.join(PROVISIONING_LOCK_NAME);
+        let mut expected = vec![local, state, degu, lock];
+        expected.sort();
+        match error {
+            ActivationAnchorProvisioningError::RollbackResidue { failure, residue } => {
+                assert_eq!(residue, expected);
+                failure
+            }
+            other => panic!("expected machine-readable scaffold residue, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn plant_ineffective_access_acl(path: &Path) {
+        use std::os::fd::AsRawFd;
+
+        let file = File::open(path).unwrap();
+        let euid = rustix::process::geteuid().as_raw();
+        let named_uid = if euid < u32::MAX - 1 { euid + 1 } else { 1 };
+        let mut acl = Vec::new();
+        acl.extend_from_slice(&2_u32.to_le_bytes());
+        for (tag, permissions, qualifier) in [
+            (1_u16, 7_u16, u32::MAX),
+            (2_u16, 4_u16, named_uid),
+            (4_u16, 0_u16, u32::MAX),
+            (0x10_u16, 0_u16, u32::MAX),
+            (0x20_u16, 0_u16, u32::MAX),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&permissions.to_le_bytes());
+            acl.extend_from_slice(&qualifier.to_le_bytes());
+        }
+        // SAFETY: the held directory FD, xattr name, and ACL bytes remain live
+        // for the syscall. The zero mask makes the named entry ineffective, so
+        // mode-only trusted ancestry still accepts the directory.
+        let result = unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                c"system.posix_acl_access".as_ptr(),
+                acl.as_ptr().cast(),
+                acl.len(),
+                0,
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "failed to plant test ACL: {}",
+            io::Error::last_os_error()
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(path).unwrap().mode() & 0o7777,
+            0o700
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn plant_ineffective_access_acl(path: &Path) {
+        let status = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow readattr"])
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to plant test ACL");
+        assert_eq!(
+            std::fs::symlink_metadata(path).unwrap().mode() & 0o7777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn trusted_symlink_is_rejected_by_runtime_preflight_before_leaf_publication() {
+        let outer = crate::secure_test_tempdir().unwrap();
+        let outer = outer.path().canonicalize().unwrap();
+        let real_home = outer.join("real-home");
+        let alias_home = outer.join("alias-home");
+        std::fs::create_dir(&real_home).unwrap();
+        std::fs::set_permissions(&real_home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&real_home, &alias_home).unwrap();
+
+        let error = provision_self_test(&alias_home).unwrap_err();
+        assert!(matches!(
+            error,
+            ActivationAnchorProvisioningError::RuntimeIncompatible { .. }
+        ));
+        assert!(
+            !real_home.join(".local").exists(),
+            "runtime-incompatible account path created a scaffold"
+        );
+        let leaf = real_home
+            .join(".local/state/degu/store-activation")
+            .join(rustix::process::geteuid().as_raw().to_string());
+        assert!(
+            !leaf.exists(),
+            "runtime-incompatible ancestry published a leaf"
+        );
+    }
+
+    #[test]
+    fn account_acl_is_rejected_by_the_shared_runtime_contract() {
+        let home = crate::secure_test_tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        plant_ineffective_access_acl(&home);
+
+        let error = provision_self_test(&home).unwrap_err();
+        assert!(error.to_string().contains("runtime contract"));
+        assert!(error.to_string().contains("ACL"));
+        assert!(
+            !home.join(".local").exists(),
+            "ACL-incompatible account path created a scaffold"
+        );
+        let leaf = home
+            .join(".local/state/degu/store-activation")
+            .join(rustix::process::geteuid().as_raw().to_string());
+        assert!(!leaf.exists(), "ACL-incompatible ancestry published a leaf");
+    }
+
+    #[test]
+    fn account_home_a_to_b_drift_blocks_commit_and_rolls_back_leaf() {
+        let a = crate::secure_test_tempdir().unwrap();
+        let b = crate::secure_test_tempdir().unwrap();
+        let a = a.path().canonicalize().unwrap();
+        let b = b.path().canonicalize().unwrap();
+        let mut answers = std::collections::VecDeque::from([a.clone(), a.clone(), a.clone(), b]);
+        let euid = rustix::process::geteuid().as_raw();
+        let error = provision_current_euid_self_with_lookup(euid, || {
+            Ok(answers
+                .pop_front()
+                .expect("bounded account lookup sequence"))
+        })
+        .unwrap_err();
+        let failure = assert_self_scaffold_residue(error, &a);
+        assert!(failure.contains("account database home changed"));
+        let leaf = a
+            .join(".local/state/degu/store-activation")
+            .join(euid.to_string());
+        assert!(
+            !leaf.exists(),
+            "account drift left a published authority leaf"
+        );
+        assert!(
+            answers.is_empty(),
+            "final commit gate did not re-read account facts"
+        );
+    }
+
+    #[test]
+    fn public_self_entry_rejects_root_and_exposes_no_uid_or_path_selector() {
+        if rustix::process::geteuid().is_root() {
+            assert!(matches!(
+                provision_current_euid_self_activation_anchor(),
+                Err(ActivationAnchorProvisioningError::RootCannotSelfProvision)
+            ));
+        }
+        let entry: fn() -> Result<_, _> = provision_current_euid_self_activation_anchor;
+        let _ = entry;
     }
 
     #[test]

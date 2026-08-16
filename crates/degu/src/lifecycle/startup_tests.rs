@@ -1,4 +1,5 @@
 use super::*;
+use degu_core::activation::StoreActivationError;
 use degu_core::finding::{
     FindingCandidate, FindingKind, FindingSource, Ownership, Recovery, RegenCost, finalize_findings,
 };
@@ -6,7 +7,6 @@ use degu_core::oplog::{ObjectIdentity, OpOutcome};
 use degu_core::seal_store::SealWalStore;
 use degu_core::seal_wal::{ProductionAssociation, StagingLocator, TransactionId};
 use degu_core::sealed_staging::{ForwardStagingRequest, forward_filesystem_id};
-use degu_core::store_activation::StoreActivationError;
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -92,7 +92,7 @@ fn restored_association_no_longer_blocks_legacy_mutation() {
 
 #[test]
 fn production_locator_selection_has_no_home_or_xdg_input() {
-    let first = degu_core::store_activation::ActivationAnchorLocator::for_current_euid().unwrap();
+    let first = degu_core::activation::ActivationAnchorLocator::for_current_euid().unwrap();
     let changed_home = Path::new("/tmp/degu-home-trap");
     let changed_state = Path::new("/tmp/degu-xdg-trap");
     let ctx = DetectCtx::for_test(
@@ -104,7 +104,7 @@ fn production_locator_selection_has_no_home_or_xdg_input() {
     );
     assert_ne!(storage::sealed_staging_store_path(&ctx), first.as_path());
     assert_eq!(
-        degu_core::store_activation::ActivationAnchorLocator::for_current_euid()
+        degu_core::activation::ActivationAnchorLocator::for_current_euid()
             .unwrap()
             .as_path(),
         first.as_path()

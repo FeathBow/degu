@@ -263,20 +263,6 @@ fn platform_anchor_is_derived_only_from_platform_and_euid() {
     assert_eq!(anchor.as_path(), expected);
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn self_locator_is_derived_from_account_home_and_euid() {
-    let locator = ActivationAnchorLocator::for_current_euid_self()
-        .expect("test account has a home directory");
-    let uid = rustix::process::geteuid().as_raw().to_string();
-    assert!(locator.as_path().is_absolute());
-    assert!(
-        locator
-            .as_path()
-            .ends_with(Path::new(".local/state/degu/store-activation").join(&uid))
-    );
-}
-
 #[test]
 fn a_home_relative_authority_trap_is_ignored() {
     let fixture = Fixture::new();

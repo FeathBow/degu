@@ -16,6 +16,7 @@ mod undo;
 mod startup_tests;
 
 use anyhow::{Context, Result};
+use degu_core::activation::{MutationStoreActivation, UnsupportedNeverActivatedLease};
 use degu_core::ecosystem::DetectCtx;
 use degu_core::finding::Finding;
 use degu_core::safety::Guard;
@@ -23,7 +24,6 @@ use degu_core::sealed_staging::{
     ForwardDirectoryIdentityProbe, ReadyStagingEngine, SealedStagingEngine, StartupRecoveryAnchors,
     VerifiedPurgeRequest, probe_forward_directory_identity,
 };
-use degu_core::store_activation::{MutationStoreActivation, UnsupportedNeverActivatedLease};
 use std::path::{Path, PathBuf};
 
 pub(crate) use entries::TrashEntry;

@@ -32,9 +32,6 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use crate::anchor_layout::SelfAnchorRootError;
-
 pub const PREPARING_RECORD_NAME: &str = "sealed-staging.prepare";
 pub const ACTIVE_RECORD_NAME: &str = "sealed-staging.active";
 pub const STORE_BINDING_NAME: &str = "store.activation";
@@ -65,11 +62,11 @@ const INTEGRATION_TEST_ANCHOR_ENV: &str = "DEGU_INTEGRATION_TEST_ANCHOR";
 /// an empty directory and forget an earlier activation. Installers provision
 /// [`Self::for_current_euid`] before degu is allowed to activate a store.
 ///
-/// The self-managed provisioning slice intentionally exposes no locator until
-/// the later selector/lifecycle slice defines how it becomes active:
+/// Self-managed provisioning returns only a provisioning outcome; it exposes
+/// no locator that can be composed with readiness, discovery, or activation:
 ///
 /// ```compile_fail,E0599
-/// use degu_core::store_activation::ActivationAnchorLocator;
+/// use degu_core::activation::ActivationAnchorLocator;
 /// let _ = ActivationAnchorLocator::for_current_euid_self();
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,7 +78,7 @@ impl ActivationAnchorLocator {
     pub fn for_current_euid() -> Result<Self, StoreActivationError> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let path = crate::anchor_layout::system_anchor_root()
+            let path = crate::provision::system_anchor_root()
                 .join(rustix::process::geteuid().as_raw().to_string());
             Ok(Self { path })
         }
@@ -91,16 +88,6 @@ impl ActivationAnchorLocator {
                 CertificationError::UnsupportedPlatform,
             ))
         }
-    }
-
-    /// Test-only locator for checking layout agreement. Production code cannot
-    /// compose a self-managed anchor with readiness, discovery, or activation
-    /// before the later selector/lifecycle slice.
-    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-    pub(crate) fn for_current_euid_self() -> Result<Self, SelfAnchorRootError> {
-        let path = crate::anchor_layout::self_anchor_root()?
-            .join(rustix::process::geteuid().as_raw().to_string());
-        Ok(Self { path })
     }
 
     pub fn as_path(&self) -> &Path {

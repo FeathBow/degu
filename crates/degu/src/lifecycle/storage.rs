@@ -86,23 +86,20 @@ pub(crate) fn sealed_staging_store_path(ctx: &DetectCtx) -> PathBuf {
 /// explicitly unsupported may keep the strict legacy lifecycle dormant.
 pub(crate) fn sealed_staging_store_for_mutation(
     ctx: &DetectCtx,
-) -> Result<degu_core::store_activation::MutationStoreActivation> {
-    sealed_staging_store_for_mutation_with(
-        ctx,
-        degu_core::store_activation::activate_current_euid_store,
-    )
+) -> Result<degu_core::activation::MutationStoreActivation> {
+    sealed_staging_store_for_mutation_with(ctx, degu_core::activation::activate_current_euid_store)
 }
 
 pub(super) fn sealed_staging_store_for_mutation_with<F>(
     ctx: &DetectCtx,
     activate: F,
-) -> Result<degu_core::store_activation::MutationStoreActivation>
+) -> Result<degu_core::activation::MutationStoreActivation>
 where
     F: FnOnce(
         &Path,
     ) -> std::result::Result<
-        degu_core::store_activation::MutationStoreActivation,
-        degu_core::store_activation::StoreActivationError,
+        degu_core::activation::MutationStoreActivation,
+        degu_core::activation::StoreActivationError,
     >,
 {
     let lexical = sealed_staging_store_path(ctx);

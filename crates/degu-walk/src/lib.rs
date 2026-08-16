@@ -10,7 +10,7 @@ mod metadata;
 pub mod mount;
 mod mutation_guard;
 mod safe_read;
-mod trusted_path;
+mod trusted;
 mod walker;
 
 pub use mutation_guard::{
@@ -22,7 +22,7 @@ pub use safe_read::{
     CappedBytes, open_regular_capped, open_regular_capped_nofollow, read_regular_capped,
     read_regular_capped_nofollow,
 };
-pub use trusted_path::resolve_trusted_directory;
+pub use trusted::resolve_trusted_directory;
 pub use walker::measure;
 
 use std::num::NonZeroUsize;

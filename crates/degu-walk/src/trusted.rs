@@ -1,15 +1,4 @@
-//! Shared trusted-ancestry path resolver.
-//!
-//! Walks an absolute path from `/` one component at a time on held descriptors,
-//! requiring every directory it descends into to be a trusted namespace
-//! ([`crate::directory_grants_foreign_mutation`] must be false) and following a
-//! symlink only from a trusted namespace when the link is owned by the effective
-//! user or root. Returns the descriptor for the fully validated final directory.
-//!
-//! This is the single resolver behind both `degu relocate --init` (validating a
-//! cache-relocation target's ancestry) and self-managed activation-anchor
-//! provisioning (validating the account home's ancestry). The `label` names the
-//! subject in error messages so each caller reads naturally.
+//! Trusted-ancestry path resolution on held descriptors.
 
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};

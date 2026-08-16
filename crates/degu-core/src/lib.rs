@@ -7,8 +7,7 @@
 //! 2. When [`safety::Guard`] hits a protected path it **rejects the whole
 //!    plan**, never skips the item — silent skipping hides planner bugs.
 
-pub mod activation_anchor_provisioning;
-mod anchor_layout;
+pub mod activation;
 pub mod authority;
 pub mod config;
 pub mod disposition;
@@ -17,6 +16,7 @@ pub mod finding;
 pub mod local_backend;
 pub mod oplog;
 pub mod plan;
+pub mod provision;
 pub mod safety;
 pub mod seal_executor;
 pub mod seal_store;
@@ -26,7 +26,6 @@ pub mod sealed_staging;
 mod staging_recovery;
 #[allow(dead_code)] // crate-private held-rename implementation; no public entry point
 mod staging_rename;
-pub mod store_activation;
 
 #[cfg(test)]
 pub(crate) fn secure_test_tempdir() -> std::io::Result<tempfile::TempDir> {

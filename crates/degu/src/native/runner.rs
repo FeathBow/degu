@@ -1582,11 +1582,34 @@ mod tests {
 
         let refreshed_limit = descriptor_scan_limit().unwrap();
         assert!(refreshed_limit > raw);
-        mark_nonstdio_cloexec_fallback(refreshed_limit).unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", HELPER_TEST, "--nocapture"])
+            .env_clear()
+            .env(HELPER_MODE, "descriptor-policy")
+            .env(HELPER_FD, raw.to_string());
+        // Run the fallback in its production execution context: after fork and
+        // before exec, where no sibling test thread can mutate the child's table.
+        // SAFETY: the closure performs only the same async-signal-safe fallback
+        // used by the production pre-exec descriptor policy.
+        unsafe {
+            command.pre_exec(move || mark_nonstdio_cloexec_fallback(refreshed_limit));
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("DESCRIPTORS_CLOSED"));
+
+        // The fallback ran only in the forked child, so the parent's descriptor
+        // stays live and retains its original flags.
         // SAFETY: high_fd remains live for the query.
-        let flags = unsafe { libc::fcntl(high_fd.as_raw_fd(), libc::F_GETFD) };
-        assert_ne!(flags, -1);
-        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        assert_eq!(
+            unsafe { libc::fcntl(high_fd.as_raw_fd(), libc::F_GETFD) },
+            0
+        );
     }
 
     #[test]

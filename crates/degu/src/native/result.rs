@@ -40,7 +40,7 @@ pub(crate) enum ActionResultOwner {
     NativeAdapter { adapter_id: ActionId },
 }
 
-/// Closed normalization shared by current direct batches and future native work.
+/// Closed normalization shared by direct and native action batches.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ActionKind {
     DirectPurge,
@@ -371,7 +371,7 @@ struct ActionDescriptor {
 ///
 /// Direct purge means the selected direct-clean purge batch, expiry means one
 /// captured expiry plan, trash purge means one explicitly confirmed purge-all
-/// plan, and native means one future validated process invocation. Owner plus ID
+/// plan, and native means one validated process invocation. Owner plus ID
 /// identifies that batch independently of its kind.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct PlannedActionBatch {

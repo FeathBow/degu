@@ -23,7 +23,7 @@ pub mod seal_wal;
 pub mod sealed_staging;
 #[allow(dead_code)] // crate-private lifecycle/held-core integration seam
 mod staging_recovery;
-#[allow(dead_code)] // crate-private, unwired A3c2 held-rename foundation
+#[allow(dead_code)] // crate-private held-rename implementation; no public entry point
 mod staging_rename;
 pub mod store_activation;
 

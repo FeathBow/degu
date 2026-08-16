@@ -1,8 +1,7 @@
 //! Secure, exact-file storage for the seal transaction WAL.
 //!
-//! This foundation deliberately has no lifecycle integration. It owns one fixed
-//! WAL entry in one private directory and returns a lease whose descriptor is the
-//! descriptor used for replay, repair, and subsequent append.
+//! This module owns one fixed WAL entry in one private directory and returns a
+//! lease over the same descriptor used for replay, repair, and subsequent append.
 //!
 //! The authority boundary excludes malicious same-EUID and root processes: they
 //! can already enter 0700/0600 state and modify it. Descriptor-relative ancestor

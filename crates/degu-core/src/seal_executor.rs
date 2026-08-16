@@ -1,8 +1,8 @@
 //! Held-FD-only local mode seal/restore execution.
 //!
-//! This module is deliberately not connected to lifecycle code. Recovery paths
-//! are durable evidence only; every mutation is `fchmod` on the already-held,
-//! certified descriptor owned by `HeldLocalBackendEvidence`.
+//! Recovery paths are durable evidence only; every mutation is `fchmod` on the
+//! already-held, certified descriptor owned by `HeldLocalBackendEvidence`. This
+//! module exposes no path-based permission or namespace mutation.
 
 use crate::authority::{PersistentRecoveryEvidence, TransactionState};
 use crate::local_backend::{
@@ -24,7 +24,7 @@ pub struct RecoveryLocator {
 }
 
 impl RecoveryLocator {
-    /// Authority-neutral A1/A3 locator. It carries no strong incarnation and
+    /// Authority-neutral recovery locator. It carries no strong incarnation and
     /// cannot satisfy the staging WAL's stronger evidence checks.
     pub fn authority_neutral(relative_path: PathBuf, filesystem_id: Option<String>) -> Self {
         Self {
@@ -156,8 +156,8 @@ fn execute_local_mode_mutation_inner<W: DurableWrite>(
                     "restore must reference an applied original seal",
                 ));
             }
-            // The checks above establish an Applied original seal; A1 validates
-            // the resulting inverse again before invoking mutation.
+            // The checks above establish an Applied original seal; the held-FD
+            // preparation validates the resulting inverse again before mutation.
             let prepared = held
                 .prepare_wal_bound_restore(
                     request.transaction,
@@ -216,8 +216,8 @@ fn execute_local_mode_mutation_inner<W: DurableWrite>(
     #[cfg(test)]
     let is_inverse = reverses_mutation_id.is_some();
     let mutate = || {
-        // A1 invokes this closure only after synchronizing the exact permission
-        // intent constructed from `prepared` above.
+        // This closure runs only after synchronizing the exact permission intent
+        // constructed from `prepared` above.
         #[cfg(test)]
         if is_inverse
             && crate::staging_recovery::UNDO_FAIL_STEP
@@ -330,8 +330,8 @@ fn execute_local_mode_mutation_inner<W: DurableWrite>(
     }
 }
 
-// Compile-time witness for the unwired foundation: the only executor entry is
-// same-crate, while its generic writer remains available to fault-injection tests.
+// Compile-time visibility witness: the only executor entry is same-crate, while
+// its generic writer remains available to fault-injection tests.
 const _: fn(
     &mut SealWal<std::fs::File>,
     &mut HeldLocalBackendEvidence,
@@ -399,7 +399,7 @@ mod tests {
         };
         let prepared = held.prepare_minimal_seal(false).unwrap();
         // Force a precondition failure. Uncertain postconditions use the same
-        // invalidation bit before the token can reach any A2 reader.
+        // invalidation bit before the token can reach any later assessment.
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(
             held.apply_wal_bound_mode_change(prepared),

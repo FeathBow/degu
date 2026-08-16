@@ -421,9 +421,9 @@ fn stage_rejects_a_shared_writable_directory_before_pending() {
     assert!(reason.contains("group- or world-writable"), "{reason}");
 }
 
-// P1-A: a protected directory name planted inside the source tree is refused by
-// the SINGLE combined final traversal -- with a no-op recheck, so the refusal
-// comes from the owned-tree validator itself, not a separate protection pass.
+// A protected directory name planted inside the source tree is refused by the
+// combined final traversal. The no-op recheck proves the refusal comes from the
+// owned-tree validator itself, not a separate protection pass.
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 #[test]
 fn stage_rejects_a_protected_descendant_name_via_the_combined_traversal() {

@@ -69,8 +69,8 @@ impl NativeEnvironment {
     }
 }
 
-/// Fully fixed declaration for one future native adapter invocation.
-/// Explicit process-topology policy required from every future adapter.
+/// Fully fixed declaration for one native adapter invocation.
+/// Explicit process-topology policy required from every native adapter.
 ///
 /// This is an audit assertion, not a kernel containment capability. It may be
 /// selected only for a tool whose invoked action and descendants are known not

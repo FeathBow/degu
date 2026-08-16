@@ -691,8 +691,7 @@ mod tests {
 
     // The held-parent-FD open is no-follow, owner- and sticky-aware: a group/
     // world-writable, non-sticky parent is refused before any rename, and an
-    // EUID-owned sticky (1777) parent -- the crux P1-B regression case -- is
-    // still accepted.
+    // EUID-owned sticky (1777) parent is still accepted.
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
     fn open_source_parent_refuses_an_untrusted_parent() {

@@ -1,8 +1,8 @@
-//! Durable, authority-neutral WAL for future seal transactions.
+//! Durable, authority-neutral WAL for seal transactions.
 //!
-//! This module is intentionally not connected to clean, stage, undo, or purge.
-//! It records recovery evidence and emits typed recovery work; neither a path nor
-//! `(device, inode)` evidence is an authority token and this module performs no
+//! This module records recovery evidence and emits typed recovery work; neither
+//! a path nor `(device, inode)` evidence is an authority token, and this module
+//! performs no
 //! permission or namespace mutation.
 
 use crate::authority::{PersistentRecoveryEvidence, TransactionState};
@@ -147,7 +147,7 @@ fn purge_progress_path_is_confined(path: &std::path::Path) -> bool {
 }
 
 /// Immutable evidence for an already-exclusive source parent. There is no
-/// public constructor: the future held-parent executor must mint this only from
+/// public constructor: held-parent preparation must mint this only from
 /// an authenticated live parent capability. Replay can decode the durable proof,
 /// but durable evidence never recreates execution authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,7 +164,7 @@ pub enum DurableSourceParentStrategy {
     /// seal and a matching applied inverse before source-parent restoration.
     PermissionSeal,
     /// Zero parent mutation is permitted only with a non-vacuous, exact-parent
-    /// proof minted by the future held-parent executor.
+    /// proof minted by held-parent preparation.
     AlreadyExclusive(DurableAlreadyExclusiveParent),
 }
 
@@ -312,8 +312,8 @@ fn mode_is_exclusive_parent(mode: u32) -> bool {
     mode & !0o7777 == 0 && mode & 0o300 == 0o300 && mode & 0o030 != 0o030 && mode & 0o003 != 0o003
 }
 
-/// Completion marker for the exact sealed tree selected by the future held-tree
-/// engine. The digest algorithm is fixed by this schema to SHA-256.
+/// Completion marker for the exact sealed tree selected by held-tree inventory.
+/// The digest algorithm is fixed by this schema to SHA-256.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableTreeManifest {
     /// Version 1 committed only namespace metadata. Version 2 additionally
@@ -507,7 +507,7 @@ pub struct SealWal<W> {
 }
 
 impl<W: DurableWrite> SealWal<W> {
-    #[allow(dead_code)] // authority-neutral A1 constructor retained for future coordinator
+    #[allow(dead_code)] // crate-private empty-WAL constructor; no production caller
     pub(crate) fn new(mut writer: W) -> Result<Self, AppendError> {
         let committed_len = writer.prepare_append().map_err(AppendError::Io)?;
         if committed_len != 0 {
@@ -759,7 +759,7 @@ impl<W: DurableWrite> SealWal<W> {
             })
     }
 
-    /// Authority-neutral A1 transition. Staging transactions are deliberately
+    /// Authority-neutral transition. Staging transactions are deliberately
     /// excluded and can be advanced only by the crate-private high-level engine.
     pub fn transition(
         &mut self,
@@ -785,8 +785,8 @@ impl<W: DurableWrite> SealWal<W> {
         self.transition_inner(transaction, next)
     }
 
-    /// Narrow A3 foundation transitions. Verification, source-parent commit,
-    /// verified commit, and purge states require separate unforgeable proofs.
+    /// Restricted staging transitions. Verification, source-parent commit,
+    /// verified commit, and purge states require separate unforgeable evidence.
     pub(crate) fn transition_staging_foundation(
         &mut self,
         transaction: TransactionId,
@@ -1210,8 +1210,9 @@ impl<W: DurableWrite> SealWal<W> {
     }
 
     /// Durably completes the exact tree manifest after all tree seal intents
-    /// have resolved Applied. The future held-tree implementation computes the
-    /// digest; this WAL method only enforces ordering and uniqueness.
+    /// have resolved Applied. The held-tree implementation computes the
+    /// digest; this WAL method also enforces the content-proof schema,
+    /// permission completion, ordering, and uniqueness.
     #[allow(dead_code)] // consumed by the held-tree coordinator seam
     pub(crate) fn complete_tree_manifest(
         &mut self,
@@ -1363,7 +1364,7 @@ impl<W: DurableWrite> SealWal<W> {
         self.apply_permission_mutation_inner(intent, mutate)
     }
 
-    #[allow(dead_code)] // future held-tree coordinator only
+    #[allow(dead_code)] // crate-private held-tree execution seam
     pub(crate) fn apply_staging_permission_mutation<F>(
         &mut self,
         intent: PermissionIntent,
@@ -1553,7 +1554,7 @@ impl<W: DurableWrite> SealWal<W> {
         self.resolve_unresolved_permission_inner(transaction, mutation_id, resolve)
     }
 
-    #[allow(dead_code)] // future authorized staging recovery only
+    #[allow(dead_code)] // crate-private authorized staging-recovery seam
     pub(crate) fn resolve_staging_permission<F>(
         &mut self,
         transaction: TransactionId,
@@ -1685,7 +1686,7 @@ pub struct ReplayedTransaction {
     pub id: TransactionId,
     pub state: TransactionState,
     /// Schema version of the transaction's atomic `StagingBegin` frame.
-    /// Later legacy-version state fixtures do not weaken v4 staging metadata.
+    /// Legacy-version state fixtures do not weaken v4 staging metadata.
     pub staging_schema_version: Option<u16>,
     pub permissions: Vec<DurablePermission>,
     pub staging: Option<StagingTransactionMetadata>,
@@ -1861,7 +1862,7 @@ impl RecoverySession {
     }
 
     /// Starts a writer for a newly created, empty WAL while retaining this lease.
-    #[allow(dead_code)] // authority-neutral A1 constructor retained for future coordinator
+    #[allow(dead_code)] // crate-private empty-WAL constructor; no production caller
     pub(crate) fn into_new_wal(self) -> Result<SealWal<Self>, AppendError> {
         SealWal::new(self)
     }
@@ -1982,7 +1983,7 @@ pub enum RecoveryRequiredReason {
         version: u16,
     },
     /// Purge may have partially removed the bounded tree. No pathname-side
-    /// inference is permitted; a later recovery tool must use durable progress
+    /// inference is permitted; recovery must use durable progress
     /// evidence or quarantine the remainder.
     InterruptedPurge,
 }

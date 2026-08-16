@@ -1,11 +1,11 @@
 use crate::cli::AdminCommand;
 use crate::output::stdoutln;
 use anyhow::{Context, Result, bail};
-use degu_core::activation_anchor_provisioning::{
+use degu_core::local_backend::CertifiedLocalBackend;
+use degu_core::provision::{
     ActivationAnchorProvisioningOutcome, ActivationAnchorProvisioningStatus,
     provision_activation_anchor,
 };
-use degu_core::local_backend::CertifiedLocalBackend;
 use serde::Serialize;
 use std::path::PathBuf;
 

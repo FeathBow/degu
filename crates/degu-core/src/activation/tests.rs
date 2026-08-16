@@ -254,8 +254,12 @@ fn activation_records_bypass_the_desired_store_support_probe() {
 #[test]
 fn platform_anchor_is_derived_only_from_platform_and_euid() {
     let anchor = ActivationAnchorLocator::for_current_euid().unwrap();
-    let expected =
-        Path::new(SYSTEM_ANCHOR_ROOT).join(rustix::process::geteuid().as_raw().to_string());
+    let expected = Path::new(if cfg!(target_os = "linux") {
+        "/var/lib/degu/store-activation"
+    } else {
+        "/private/var/db/degu/store-activation"
+    })
+    .join(rustix::process::geteuid().as_raw().to_string());
     assert_eq!(anchor.as_path(), expected);
 }
 

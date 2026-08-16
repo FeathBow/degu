@@ -32,11 +32,6 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(target_os = "linux")]
-const SYSTEM_ANCHOR_ROOT: &str = "/var/lib/degu/store-activation";
-#[cfg(target_os = "macos")]
-const SYSTEM_ANCHOR_ROOT: &str = "/private/var/db/degu/store-activation";
-
 pub const PREPARING_RECORD_NAME: &str = "sealed-staging.prepare";
 pub const ACTIVE_RECORD_NAME: &str = "sealed-staging.active";
 pub const STORE_BINDING_NAME: &str = "store.activation";
@@ -66,6 +61,14 @@ const INTEGRATION_TEST_ANCHOR_ENV: &str = "DEGU_INTEGRATION_TEST_ANCHOR";
 /// from HOME, XDG, configuration, the environment, or a CLI flag could drift to
 /// an empty directory and forget an earlier activation. Installers provision
 /// [`Self::for_current_euid`] before degu is allowed to activate a store.
+///
+/// Self-managed provisioning returns only a provisioning outcome; it exposes
+/// no locator that can be composed with readiness, discovery, or activation:
+///
+/// ```compile_fail,E0599
+/// use degu_core::activation::ActivationAnchorLocator;
+/// let _ = ActivationAnchorLocator::for_current_euid_self();
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationAnchorLocator {
     path: PathBuf,
@@ -75,8 +78,8 @@ impl ActivationAnchorLocator {
     pub fn for_current_euid() -> Result<Self, StoreActivationError> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let path =
-                Path::new(SYSTEM_ANCHOR_ROOT).join(rustix::process::geteuid().as_raw().to_string());
+            let path = crate::provision::system_anchor_root()
+                .join(rustix::process::geteuid().as_raw().to_string());
             Ok(Self { path })
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]

@@ -1,10 +1,10 @@
 use crate::output::stdoutln;
 use crate::presentation::escape_terminal_text;
 use anyhow::{Result, anyhow};
-use degu_core::local_backend::CertifiedLocalBackend;
-use degu_core::store_activation::{
+use degu_core::activation::{
     ActivationAnchorLocator, ActivationAnchorReadinessError, check_activation_anchor_readiness,
 };
+use degu_core::local_backend::CertifiedLocalBackend;
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -177,8 +177,8 @@ fn backend_name(backend: CertifiedLocalBackend) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use degu_core::activation::StoreActivationError;
     use degu_core::local_backend::CertificationError;
-    use degu_core::store_activation::StoreActivationError;
     use std::io;
     use std::path::Path;
 

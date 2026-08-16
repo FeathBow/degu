@@ -604,7 +604,7 @@ fn require_exact_tree_seal_coverage(
 
 pub(crate) enum StartupRecoveryCapability<'a> {
     Restore(RecoveryRestoreSession<'a>),
-    /// Nonforgeable continuation for a future staged-tree verifier. Merely
+    /// Nonforgeable continuation requiring staged-tree verification. Merely
     /// checking liveness never clears the startup mutation block.
     PendingVerification(Box<CertifiedStagedRecovery<'a>>),
     /// Object-bound continuation for a previously admitted verified undo.

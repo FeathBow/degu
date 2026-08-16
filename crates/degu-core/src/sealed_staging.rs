@@ -1,11 +1,11 @@
 //! High-level boundary for the sealed-staging transaction stack.
 //!
-//! A3c3 owns the exact WAL lease, exhausts startup recovery through freshly
+//! The engine owns the exact WAL lease, exhausts startup recovery through freshly
 //! certified filesystem anchors, and mints readiness only after every recovery
-//! candidate reaches a safe durable terminal state. A3c4 adds one narrow forward
-//! coordinator on that readiness capability. It consumes raw held descriptors,
+//! candidate reaches a safe durable terminal state. Its narrow forward coordinator
+//! consumes that readiness capability plus raw held descriptors,
 //! completes seal/rename/verification/source-parent restoration under the same
-//! lease, and returns only after `VerifiedCommitted`. An explicit later request
+//! lease, and returns only after `VerifiedCommitted`. A separate explicit request
 //! may freshly verify that exact held object, durably admit `Purgeable`, and
 //! consume one-shot authority for bounded FD-relative deletion through `Purged`.
 
@@ -1703,8 +1703,8 @@ impl SealedStagingEngine {
     }
 
     /// Consumes one descriptor-derived root binding and performs the complete
-    /// A3c2 seal/rename sequence. Success reaches only `StagedUnverified` and
-    /// retains this engine's exact WAL lease for the A3c4 coordinator.
+    /// held-FD seal/rename sequence. Success reaches only `StagedUnverified` and
+    /// retains this engine's exact WAL lease for verification and commit.
     pub(crate) fn stage_prepared_root(
         &mut self,
         transaction: TransactionId,

@@ -2335,7 +2335,7 @@ fn authority_neutral_public_methods_cannot_drive_a_staging_transaction() {
                 expected_mode: 0o500,
                 reverses_mutation_id: None,
             },
-            || panic!("public A1 seam must not mutate staging"),
+            || panic!("public authority-neutral seam must not mutate staging"),
         ),
         Err(MutationAppendError::IntentWal(AppendError::InvalidState(
             "staging permission mutation requires the high-level engine"

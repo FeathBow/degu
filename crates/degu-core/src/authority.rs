@@ -1,8 +1,8 @@
-//! Phase-0 vocabulary for proving mutation authority.
+//! Vocabulary for proving mutation authority.
 //!
-//! Nothing in this module is wired into the current planner or executor. The
-//! types keep content policy, writer risk, OS capability, evidence freshness,
-//! identity, and transaction state separate before later work expands cleanup.
+//! These types keep content policy, writer risk, OS capability, evidence
+//! freshness, identity, and transaction state separate so no one dimension is
+//! mistaken for permission to mutate.
 
 pub mod local_mode;
 
@@ -574,7 +574,7 @@ pub struct MutationUnitAssessment {
     pub authority: MutationUnitAuthority,
 }
 
-/// Versioned future payload; current CLI and JSON documents do not include it.
+/// Versioned assessment payload; current CLI and JSON documents do not emit it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CleanupAssessmentV1 {
     pub schema_version: u16,

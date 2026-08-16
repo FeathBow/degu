@@ -210,7 +210,7 @@ fn exact_held_tree_reaches_only_staged_unverified() {
     };
     let outcome = pending.verify_or_quarantine().unwrap();
     let StagedVerificationOutcome::StagedSealed(verified) = outcome else {
-        panic!("exact A3c2 output must satisfy the A3c1 verifier")
+        panic!("exact sealed-rename output must satisfy the staged-tree verifier")
     };
     assert_eq!(verified.transaction(), transaction);
     assert_eq!(verified.wal_state(), Some(TransactionState::StagedSealed));
@@ -1864,7 +1864,7 @@ fn staged_state_append_boundary_keeps_durable_applied_outcome() {
     );
     let StagedVerificationOutcome::StagedSealed(verified) = pending.verify_or_quarantine().unwrap()
     else {
-        panic!("exact recovered A3c2 tree must verify")
+        panic!("exact recovered sealed tree must verify")
     };
     assert_eq!(verified.wal_state(), Some(TransactionState::StagedSealed));
     assert!(verified.startup_is_blocked());
@@ -2049,7 +2049,7 @@ fn preparation_rejects_foreign_writer_destination_before_wal_mutation() {
 #[cfg(target_os = "macos")]
 #[test]
 fn apfs_noreplace_and_both_parent_fsync_contract_is_mandatory() {
-    let fixture = Fixture::new().expect("macOS A3c2 tests require a certified APFS fixture");
+    let fixture = Fixture::new().expect("macOS held-rename tests require a certified APFS fixture");
     let binding = fixture.prepare();
     let transaction = TransactionId([0xab; 16]);
     let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();

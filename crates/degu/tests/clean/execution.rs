@@ -104,14 +104,27 @@ fn assert_purge_sequence(records: &[serde_json::Value]) {
 }
 
 #[test]
-fn clean_dry_run_json_reports_plan_without_mutating_or_logging() {
+fn clean_dry_run_needs_no_anchor_and_creates_no_state() {
     let home = tempfile::tempdir().unwrap();
-    let (cache, state) = fake_pip_cache(&home, ".cache/pip");
-    let out = run_clean(&home, &state, &["clean", "--dry-run", "--json"]);
-    assert!(out.status.success());
-    assert!(cache.exists());
-    assert!(!state.path().join("degu/trash").exists());
-    assert!(!state.path().join("degu/ops.jsonl").exists());
+    let cache = crate::common::platform_cache_dir(home.path(), "pip");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("wheel.whl"), [0u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+
+    let out = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", "")
+        .args(["clean", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(cache.join("wheel.whl")).unwrap(), [0u8; 2048]);
+    assert!(!home.path().join(".local/state/degu").exists());
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["planned"].as_array().unwrap().len(), 1);
     assert!(report["executed"].as_array().unwrap().is_empty());

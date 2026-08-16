@@ -1,6 +1,6 @@
 <h1 align="center">degu 🐭</h1>
 
-<p align="center">Safely reclaim disk quota from caches and build artifacts on shared HPC and GPU clusters — unprivileged day-to-day cleanup, conservative cleanup, reversible staging by default.</p>
+<p align="center">Safely inspect and reclaim disk quota from caches and build artifacts on shared HPC and GPU clusters — conservative classification and reversible staging by default.</p>
 
 <p align="center"><em>For ML researchers on login nodes, drowning in pip, conda, HuggingFace, and compile caches.</em></p>
 
@@ -8,9 +8,6 @@
 
 <p align="center"><img src="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/demo.svg" alt="degu scan output: Ready to clean, Needs review, and Not managed tiers with sizes, reasons, and a copyable preview command" width="92%"></p>
 <p align="center"><sub>Real output from a small demo tree; on a working ML node, model and package caches routinely reach tens of gigabytes.</sub></p>
-
-> [!IMPORTANT]
-> This README documents degu **v0.1.5**, including account readiness, sealed staging, and `reclaim uv`. Install it with the command below or `cargo install degu --locked`. If `degu --version` reports a different version, read the documentation tagged for that version.
 
 <details>
 <summary>The same scan, redirected — copy-pasteable and pinned byte-exact by a contract test</summary>
@@ -46,7 +43,6 @@ Scan build artifacts under this project, or any parent directory: degu scan .
 - **Reclaims what actually fills your quota.** Built-in sources across the ML/HPC stack — pip, conda, HuggingFace, vLLM, Triton, cargo, and more (`degu adapters` lists them all) — plus build artifacts under any project tree, found in a single read-only pass; two node-runtime diagnostics stay scan-time opt-in.
 - **Safe by default.** Only verified, cheap-to-regenerate findings enter the default plan and are staged for undo.
 - **Honest accounting.** `degu quota` reads authoritative filesystem usage and limits, kept separate from degu-detected storage.
-- **Linux and macOS, offline, unprivileged daily use.** Scan, preview, and day-to-day cleanup never self-elevate. `degu doctor` checks one-time account setup; `missing` has a defined administrator provisioning path, while unsafe or uncertain state requires investigation.
 
 ## Why you can trust it to delete
 
@@ -66,6 +62,16 @@ Deleting the wrong files is the core risk, so degu earns every deletion:
 | Cross-tool view | yes | no | no | sizes only |
 
 For datasets, checkpoints, and unknown large files, pair degu with a disk-usage viewer.
+
+## Setup at a glance
+
+| Operation | Setup | Boundary |
+|---|---|---|
+| `scan`, `quota`, `clean -n` | none | read-only; dry-run creates no degu state |
+| degu-managed `clean`, `undo`, `trash purge` | administrator-provisioned system anchor | runs without elevation; sealed staging stays below canonical HOME on one certified ext4/XFS/APFS mount |
+| `reclaim uv` | explicit executable and cache root | irreversible tool-native mutation; no account anchor, degu trash, or undo |
+
+Unsupported filesystems never gain sealed authority. See the [safety model](docs/safety.md) for compatibility and recovery behavior.
 
 ## Installation
 
@@ -95,7 +101,7 @@ Both `degu` and its short alias, `dg`, install into `~/.local/bin` by default. `
 
 ## Quick start
 
-Check setup once before the first mutation:
+Check account setup once before the first degu-managed `clean` / `undo` / `trash purge` lifecycle mutation:
 
 ```sh
 degu doctor
@@ -141,16 +147,6 @@ degu quota
 ```
 
 Validated on Linux ext4 and field-validated on a Lustre 2.15 client; other filesystems and macOS report unsupported instead of guessing. See the [user guide](https://github.com/FeathBow/degu/blob/main/docs/usage.md) for supported providers and failure behavior.
-
-### Advanced: reclaim a uv-managed cache
-
-`uv` caches stay **Not managed** by normal `clean`. degu can validate and run uv 0.12.3's own irreversible ordinary prune while keeping both authority inputs explicit:
-
-```sh
-degu reclaim uv -x /absolute/path/to/uv -c /absolute/path/to/uv-cache -n
-```
-
-After reviewing the preview, rerun without `-n` and type `prune`. This bypasses degu trash and cannot be undone; degu never guesses the executable or cache root. See [Tool-native reclaim](docs/usage.md#tool-native-reclaim-advanced).
 
 Run `degu <command> --help` or `degu man <command>` for complete command details.
 

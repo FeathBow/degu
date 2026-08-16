@@ -8,7 +8,7 @@
 
 use crate::seal_wal::TransactionId;
 
-#[allow(dead_code)] // closed, authority-neutral traversal foundation
+#[allow(dead_code)] // closed, authority-neutral traversal API
 pub(crate) mod held_tree;
 use rustix::fd::{AsFd, OwnedFd};
 use std::collections::BTreeSet;
@@ -336,7 +336,7 @@ impl HeldLocalBackendEvidence {
         rustix::fs::fcntl_getfl(&self.fd).is_ok()
     }
 
-    /// Parent-private adapter for the child held-tree foundation. Sibling
+    /// Parent-private adapter for the child held-tree implementation. Sibling
     /// modules cannot obtain this descriptor, and the borrow cannot escape the
     /// operation's lifetime.
     fn with_authority_fd<R>(&self, operation: impl FnOnce(rustix::fd::BorrowedFd<'_>) -> R) -> R {

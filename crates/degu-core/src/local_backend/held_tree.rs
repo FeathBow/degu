@@ -1,7 +1,7 @@
-//! Core-private bounded held-FD traversal, sealing, and exact rewalk foundation.
+//! Core-private bounded held-FD traversal, sealing, and exact rewalk.
 //!
-//! Collection and rewalk are authority-neutral. A3c2 adds one narrow method that
-//! can apply minimal directory seals only when given an exact leased staging WAL
+//! Collection and rewalk are authority-neutral. One narrow method can apply
+//! minimal directory seals only when given an exact leased staging WAL
 //! and descriptor-derived incarnations. This module performs no rename, restore,
 //! purge, unlink, or deletion and returns no lifecycle authority token.
 
@@ -217,7 +217,7 @@ pub(crate) struct HeldTreeFingerprint {
     pub(crate) sha256: [u8; 32],
 }
 
-/// Data-only ordering for a future recovery coordinator. It carries neither an
+/// Data-only ordering for deterministic recovery. It carries neither an
 /// FD nor WAL/lease/transaction authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HeldDirectoryOrder {

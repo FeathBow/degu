@@ -82,7 +82,7 @@ impl Lifecycle {
 
     pub(crate) fn lock_for_clean(self, _direct_purge: bool) -> Result<MutationSession> {
         // Both restorable clean and explicit clean --purge must enter the exact
-        // forward coordinator. A3c6 may mint PurgeAuthority but cannot consume it.
+        // forward coordinator. It may mint PurgeAuthority but cannot consume it.
         self.lock_with_forward_clean(true)
     }
 
@@ -102,7 +102,7 @@ impl Lifecycle {
                     // The first production anchor policy is deliberately narrow:
                     // locators must have been recorded relative to canonical HOME
                     // on one certified local mount. Redirected/cross-mount roots stay
-                    // blocked until a later association slice consumes a mount-root policy.
+                    // blocked because this path consumes no mount-root association policy.
                     let recovery_home = self.ctx.home.clone();
                     let (ready, _) = engine
                 .recover_startup(report, |_, _| {

@@ -1,6 +1,6 @@
-//! Lease-bound held-FD staging rename foundation.
+//! Lease-bound held-FD staging rename implementation.
 //!
-//! This module is deliberately unwired from the CLI and lifecycle. It may move
+//! This module has no direct CLI or lifecycle entry point. It may move
 //! one exact, fully sealed local tree from an authenticated source parent to an
 //! authenticated destination parent. It cannot restore, commit, purge, unlink,
 //! or delete, and its only success state is `StagedUnverified`.
@@ -347,8 +347,9 @@ pub(crate) enum StagingRenameError {
     StagedStateNotDurable(#[source] AppendError),
 }
 
-/// Nonforgeable live result of A3c2. It retains the exact leased WAL, both
-/// parents, staged root, and sealed directory descriptors, but exposes no
+/// Nonforgeable live result of the held-FD seal/rename sequence. It retains
+/// the exact leased WAL, both parents, the staged root, and sealed directory
+/// descriptors, but exposes no
 /// namespace, restore, commit, purge, unlink, or deletion operation.
 pub(crate) struct StagedUnverifiedTree<'a> {
     wal: &'a mut SealWal<RecoverySession>,

@@ -85,13 +85,26 @@ pub struct SealWalStore {
 
 impl SealWalStore {
     /// Opens `path`, creating only its final directory component when absent.
-    pub fn open_or_create(path: &Path) -> Result<Self, StoreError> {
+    /// Production construction stays inside the activation selector.
+    ///
+    /// ```compile_fail,E0624
+    /// let _ = degu_core::seal_store::SealWalStore::open_or_create(
+    ///     std::path::Path::new("/tmp/unbound-store"),
+    /// );
+    /// ```
+    pub(crate) fn open_or_create(path: &Path) -> Result<Self, StoreError> {
         Self::open_or_create_with_sync(path, |fd| rustix::fs::fsync(fd).map_err(io::Error::from))
+    }
+
+    #[cfg(feature = "integration-test-anchor")]
+    #[doc(hidden)]
+    pub fn open_or_create_for_integration_test(path: &Path) -> Result<Self, StoreError> {
+        Self::open_or_create(path)
     }
 
     /// Opens already-published store authority without ever recreating it.
     /// This is the only safe discovery operation after whole-store activation.
-    pub fn open_existing(path: &Path) -> Result<Self, StoreError> {
+    pub(crate) fn open_existing(path: &Path) -> Result<Self, StoreError> {
         Self::open_with_sync(path, false, |fd| {
             rustix::fs::fsync(fd).map_err(io::Error::from)
         })

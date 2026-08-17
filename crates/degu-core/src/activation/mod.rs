@@ -1,15 +1,18 @@
 //! Durable, whole-store activation and discovery authority.
 //!
-//! The seal WAL cannot prove its own continued existence. This module places
-//! activation records in one platform/EUID-derived, administrator-provisioned
-//! system anchor outside HOME, XDG, configuration, and the relocatable state
-//! store. Degu opens that anchor but never creates or replaces it. A missing or
-//! unsafe anchor blocks rather than becoming first use or a legacy escape.
+//! The seal WAL cannot prove its own continued existence. Runtime selection
+//! therefore authenticates two fixed current-account candidates: the optional
+//! platform/EUID system anchor and the account-database-derived self-managed
+//! anchor. Neither candidate is selected by ambient HOME, XDG, configuration,
+//! cwd, or caller input. Unsafe or uncertain state blocks; an empty peer never
+//! overrides existing activation evidence, and evidence in both roots is split
+//! authority rather than a preference decision.
 //!
 //! Stable state retains matching `prepare` and `active` locator/identity records
 //! plus a reciprocal marker in the exact store, so loss of `active` alone resumes
 //! from `prepare`. A missing recorded store is lost authority, never permission
-//! to create an empty one under a changed XDG.
+//! to create an empty one under a changed XDG. Mutation sessions retain every
+//! existing candidate lock as well as the selected WAL lease.
 //!
 //! The trust boundary is the same as `seal_store`: root and malicious same-EUID
 //! processes are out of scope. Foreign users are excluded by no-follow,
@@ -21,19 +24,28 @@ use crate::seal_store::{
     SealWalStore, StoreError, open_authenticated_parent,
     probe_store_parent_backend_for_activation_support, validate_directory,
 };
-use crate::seal_wal::{ExclusiveFileLock, RecoveryLockError, StrongObjectIdentity};
+use crate::seal_wal::{
+    ExclusiveFileLock, RecoveryLockError, StagingTransactionMetadata, StrongObjectIdentity,
+    TransactionId,
+};
+use crate::sealed_staging::{
+    ReadyStagingEngine, SealedStagingEngine, StagingEngineError, StartupRecoveryAnchors,
+    StartupRecoveryError, StartupRecoveryReport, StartupRecoverySummary,
+};
 use crate::staging_recovery::strong_identity_fd;
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::ops::{Deref, DerefMut};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const PREPARING_RECORD_NAME: &str = "sealed-staging.prepare";
 pub const ACTIVE_RECORD_NAME: &str = "sealed-staging.active";
+const AUTHORITY_RECORD_NAME: &str = "sealed-staging.authority";
 pub const STORE_BINDING_NAME: &str = "store.activation";
 
 const RECORD_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
@@ -46,6 +58,7 @@ const OPEN_RECORD: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC);
 const MAGIC_PREPARE: &[u8; 8] = b"DGUAPRP1";
 const MAGIC_ACTIVE: &[u8; 8] = b"DGUACTV1";
+const MAGIC_AUTHORITY: &[u8; 8] = b"DGUAUTH1";
 const ACTIVATION_ID_LEN: usize = 32;
 const MAX_RECORD_BYTES: usize = 128 * 1024;
 const MAX_LOCATOR_BYTES: usize = 64 * 1024;
@@ -55,153 +68,25 @@ compile_error!("integration-test-anchor must never be enabled in a release build
 #[cfg(feature = "integration-test-anchor")]
 const INTEGRATION_TEST_ANCHOR_ENV: &str = "DEGU_INTEGRATION_TEST_ANCHOR";
 
-/// The one activation anchor selected by platform and effective user.
-///
-/// There is deliberately no public arbitrary-path constructor: a locator read
-/// from HOME, XDG, configuration, the environment, or a CLI flag could drift to
-/// an empty directory and forget an earlier activation. Installers provision
-/// [`Self::for_current_euid`] before degu is allowed to activate a store.
-///
-/// Self-managed provisioning returns only a provisioning outcome; it exposes
-/// no locator that can be composed with readiness, discovery, or activation:
-///
-/// ```compile_fail,E0599
-/// use degu_core::activation::ActivationAnchorLocator;
-/// let _ = ActivationAnchorLocator::for_current_euid_self();
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActivationAnchorLocator {
-    path: PathBuf,
-}
-
-impl ActivationAnchorLocator {
-    pub fn for_current_euid() -> Result<Self, StoreActivationError> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            let path = crate::provision::system_anchor_root()
-                .join(rustix::process::geteuid().as_raw().to_string());
-            Ok(Self { path })
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            Err(StoreActivationError::Backend(
-                CertificationError::UnsupportedPlatform,
-            ))
-        }
-    }
-
-    pub fn as_path(&self) -> &Path {
-        &self.path
-    }
-}
-
-/// Read-only readiness evidence for the exact current-EUID activation anchor.
-///
-/// This carries no store, record, staging, or mutation capability. Constructing
-/// it authenticates, locks, binding-checks, and syncs the same existing-only
-/// anchor that activation will later use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ActivationAnchorReadiness {
-    backend: CertifiedLocalBackend,
-}
-
-impl ActivationAnchorReadiness {
-    pub fn backend(self) -> CertifiedLocalBackend {
-        self.backend
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ActivationAnchorReadinessError {
-    #[error("activation anchor is not provisioned at {path}")]
-    Missing { path: PathBuf },
-    #[error("activation anchor is unsafe at {path}: {source}")]
-    Unsafe {
-        path: PathBuf,
-        #[source]
-        source: StoreActivationError,
-    },
-    #[error("activation anchor is unsupported at {path}: {source}")]
-    Unsupported {
-        path: PathBuf,
-        #[source]
-        source: StoreActivationError,
-    },
-    #[error("activation anchor inspection is uncertain at {path}: {source}")]
-    Uncertain {
-        path: PathBuf,
-        #[source]
-        source: StoreActivationError,
-    },
-}
-
-/// Validate that the fixed platform/EUID activation anchor is provisioned and
-/// safe without creating an anchor, store, or activation record.
-pub fn check_activation_anchor_readiness(
-    locator: &ActivationAnchorLocator,
-) -> Result<ActivationAnchorReadiness, ActivationAnchorReadinessError> {
-    let authority = open_activation_anchor(locator)
-        .map_err(|error| classify_readiness_error(locator.as_path(), error))?;
-    Ok(ActivationAnchorReadiness {
-        backend: authority.backend,
-    })
-}
-
-fn classify_readiness_error(
-    locator: &Path,
-    error: StoreActivationError,
-) -> ActivationAnchorReadinessError {
-    let path = locator.to_path_buf();
-    match &error {
-        StoreActivationError::AnchorNotProvisioned { path } => {
-            ActivationAnchorReadinessError::Missing { path: path.clone() }
-        }
-        StoreActivationError::UnsafeAnchor(StoreError::UnsafeDirectory { reason, .. })
-            if *reason == crate::seal_store::DIRECTORY_UNSUPPORTED_BACKEND_REASON =>
-        {
-            ActivationAnchorReadinessError::Unsupported {
-                path,
-                source: error,
-            }
-        }
-        StoreActivationError::UnsafeAnchor(
-            StoreError::Io { .. }
-            | StoreError::ParentBackend { .. }
-            | StoreError::BackendInspection { .. }
-            | StoreError::Lease(_),
-        ) => ActivationAnchorReadinessError::Uncertain {
-            path,
-            source: error,
-        },
-        StoreActivationError::UnsafeAnchor(_) => ActivationAnchorReadinessError::Unsafe {
-            path,
-            source: error,
-        },
-        StoreActivationError::Backend(
-            CertificationError::UnsupportedPlatform | CertificationError::UnsupportedFilesystem,
-        ) => ActivationAnchorReadinessError::Unsupported {
-            path,
-            source: error,
-        },
-        StoreActivationError::Backend(
-            CertificationError::FilesystemMagicMismatch
-            | CertificationError::NotDirectory
-            | CertificationError::AclPresent,
-        ) => ActivationAnchorReadinessError::Unsafe {
-            path,
-            source: error,
-        },
-        _ => ActivationAnchorReadinessError::Uncertain {
-            path,
-            source: error,
-        },
-    }
-}
+mod selection;
+use selection::{
+    ActivationAnchorLocator, AnchorKind, AuthorityCandidate, AuthoritySelection,
+    ensure_authority_claim,
+};
+pub use selection::{
+    ActivationAuthorityMode, CurrentEuidAuthorityReadiness, SelfAuthorityInitializationError,
+    SelfAuthorityInitializationOutcome, activate_current_euid_store,
+    check_current_euid_authority_readiness, initialize_current_euid_self_authority,
+};
+#[cfg(test)]
+use selection::{
+    AuthorityChoice, choose_authority, open_authority_candidate, require_current_self_path_with,
+    select_authority_pair, selection_for_locator,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreActivationKind {
     NeverActivated,
-    UnsupportedNeverActivated,
     Preparing,
     Activated,
     Lost,
@@ -209,12 +94,8 @@ pub enum StoreActivationKind {
 }
 
 /// Result of fixed-root discovery. Only `Activated` carries a store handle.
-pub enum StoreActivationState {
+enum StoreActivationState {
     NeverActivated,
-    /// The authenticated anchor is record-empty and the desired store backend
-    /// is explicitly outside the certified platform/filesystem set. This state
-    /// grants no activation or mutation authority.
-    UnsupportedNeverActivated,
     Preparing,
     Activated(ActivatedSealWalStore),
     Lost,
@@ -225,7 +106,6 @@ impl StoreActivationState {
     pub fn kind(&self) -> StoreActivationKind {
         match self {
             Self::NeverActivated => StoreActivationKind::NeverActivated,
-            Self::UnsupportedNeverActivated => StoreActivationKind::UnsupportedNeverActivated,
             Self::Preparing => StoreActivationKind::Preparing,
             Self::Activated(_) => StoreActivationKind::Activated,
             Self::Lost => StoreActivationKind::Lost,
@@ -239,6 +119,9 @@ impl StoreActivationState {
 pub struct ActivatedSealWalStore {
     store: SealWalStore,
     locator: PathBuf,
+    // Discovery may construct a read-only handle without retaining an anchor.
+    // Every mutation entrypoint fills this lease before returning the handle.
+    _authority: Option<Box<AuthorityLease>>,
 }
 
 impl ActivatedSealWalStore {
@@ -246,16 +129,97 @@ impl ActivatedSealWalStore {
         &self.locator
     }
 
-    pub fn store(&self) -> &SealWalStore {
-        &self.store
+    /// Consume the activation handle into a WAL engine that cannot outlive the
+    /// selected and peer authority locks.
+    ///
+    /// ```compile_fail,E0382
+    /// fn cannot_detach(activated: degu_core::activation::ActivatedSealWalStore) {
+    ///     let (_engine, _report) = activated.open_staging().unwrap();
+    ///     drop(activated); // moved into the authority-bound engine
+    /// }
+    /// ```
+    pub fn open_staging(
+        self,
+    ) -> Result<(ActivatedStagingEngine, StartupRecoveryReport), StagingEngineError> {
+        let (engine, report) = SealedStagingEngine::open(&self.store)?;
+        Ok((
+            ActivatedStagingEngine {
+                activation: self,
+                engine,
+            },
+            report,
+        ))
+    }
+}
+
+pub struct ActivatedStagingEngine {
+    activation: ActivatedSealWalStore,
+    engine: SealedStagingEngine,
+}
+
+impl ActivatedStagingEngine {
+    pub fn recover_startup<F>(
+        self,
+        report: StartupRecoveryReport,
+        provide_anchors: F,
+    ) -> Result<(ActivatedReadyStagingEngine, StartupRecoverySummary), StartupRecoveryError>
+    where
+        F: FnMut(TransactionId, &StagingTransactionMetadata) -> io::Result<StartupRecoveryAnchors>,
+    {
+        let (engine, summary) = self.engine.recover_startup(report, provide_anchors)?;
+        Ok((
+            ActivatedReadyStagingEngine {
+                _activation: Some(self.activation),
+                engine,
+            },
+            summary,
+        ))
+    }
+}
+
+/// Ready staging authority whose type owns both the WAL lease and every
+/// selector lock. Deref exposes the existing engine operations without
+/// allowing the authority lifetime to be detached.
+pub struct ActivatedReadyStagingEngine {
+    _activation: Option<ActivatedSealWalStore>,
+    engine: ReadyStagingEngine,
+}
+
+impl ActivatedReadyStagingEngine {
+    #[cfg(feature = "integration-test-anchor")]
+    #[doc(hidden)]
+    pub fn from_ready_for_integration_test(engine: ReadyStagingEngine) -> Self {
+        Self {
+            _activation: None,
+            engine,
+        }
+    }
+}
+
+impl Deref for ActivatedReadyStagingEngine {
+    type Target = ReadyStagingEngine;
+
+    fn deref(&self) -> &Self::Target {
+        &self.engine
+    }
+}
+
+impl DerefMut for ActivatedReadyStagingEngine {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.engine
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreActivationError {
-    #[error("system activation anchor is not provisioned at {path}")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[error("current account activation-anchor base is unavailable: {0}")]
+    AccountBase(#[from] crate::provision::AccountBaseError),
+    #[error("current account activation-anchor path changed from {expected} to {actual}")]
+    AccountBaseChanged { expected: PathBuf, actual: PathBuf },
+    #[error("activation anchor is not provisioned at {path}")]
     AnchorNotProvisioned { path: PathBuf },
-    #[error("system activation anchor is unsafe: {0}")]
+    #[error("activation anchor is unsafe: {0}")]
     UnsafeAnchor(#[source] StoreError),
     #[error("store activation I/O failed at {path}: {source}")]
     Io {
@@ -271,6 +235,32 @@ pub enum StoreActivationError {
     Store(#[source] StoreError),
     #[error("activation is not in a resumable never/preparing state")]
     NotResumable,
+    #[error(
+        "neither activation authority is provisioned (system: {system}; self-managed: {self_managed})"
+    )]
+    NoAuthority {
+        system: PathBuf,
+        self_managed: PathBuf,
+    },
+    #[error(
+        "system and self-managed anchors both carry activation evidence (system: {system}; self-managed: {self_managed})"
+    )]
+    SplitAuthority {
+        system: PathBuf,
+        self_managed: PathBuf,
+    },
+    #[error("authority claim is invalid or conflicts with activation evidence at {path}")]
+    AuthorityClaimInvalid { path: PathBuf },
+    #[error(
+        "authority selected by the durable witness is missing (selected: {selected}; witness: {witness})"
+    )]
+    SelectedAuthorityLost { selected: PathBuf, witness: PathBuf },
+    #[error("self-managed activation requires an explicit initial declaration")]
+    SelfInitializationRequired,
+    #[error("self-managed initialization requires an explicit initial-use assertion")]
+    InitialAssertionRequired,
+    #[error("self-managed initialization is blocked by an existing system authority at {path}")]
+    SystemAuthorityPresent { path: PathBuf },
     #[error("activation record locator is invalid")]
     InvalidLocator,
     #[error("activation record inspection was uncertain at {path}: {reason:?}")]
@@ -284,7 +274,7 @@ pub enum StoreActivationError {
     Random(#[source] getrandom::Error),
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PrepareRecord {
     activation_id: [u8; ACTIVATION_ID_LEN],
     authority_locator: PathBuf,
@@ -295,12 +285,27 @@ struct PrepareRecord {
     store_backend: CertifiedLocalBackend,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveRecord {
     prepare: PrepareRecord,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthorityRecord {
+    selection_id: [u8; ACTIVATION_ID_LEN],
+    selected_locator: PathBuf,
+    selected_identity: StrongObjectIdentity,
+    selected_backend: CertifiedLocalBackend,
+}
+
+struct AuthorityLease {
+    _selected: AuthorityRoot,
+    _peer: Option<AuthorityRoot>,
+}
+
 struct AuthorityRoot {
+    kind: AnchorKind,
+    _provisioning_lock: Option<ExclusiveFileLock>,
     parent: OwnedFd,
     name: OsString,
     directory: OwnedFd,
@@ -315,11 +320,13 @@ struct AuthorityRoot {
 /// The desired store is inspected only when that authenticated anchor is
 /// record-empty. Existing activation evidence always selects its recorded store
 /// and every anchor/open/inspection uncertainty blocks.
-pub fn discover_store_activation(
+#[cfg(test)]
+fn discover_store_activation(
     anchor: &ActivationAnchorLocator,
-    desired_store: &Path,
+    _desired_store: &Path,
 ) -> Result<StoreActivationState, StoreActivationError> {
-    discover_store_activation_with_probe(anchor, desired_store, probe_desired_store_support)
+    let authority = open_activation_anchor(anchor)?;
+    discover_with_authority(&authority)
 }
 
 /// Production mutation result. Both variants retain the authority that makes
@@ -329,37 +336,15 @@ pub enum MutationStoreActivation {
     UnsupportedNeverActivated(UnsupportedNeverActivatedLease),
 }
 
-/// Opaque proof that the authenticated anchor is record-empty and the desired
-/// backend is explicitly unsupported. Retaining it keeps the anchor lock held,
-/// so another process cannot activate a different XDG store while legacy
-/// mutation is in progress.
+/// Opaque proof that every authenticated candidate is record-empty and the
+/// desired backend is explicitly unsupported. Retaining it keeps both selector
+/// locks held, so no competing authority can activate while the legacy
+/// lifecycle is in progress.
 pub struct UnsupportedNeverActivatedLease {
-    _authority: AuthorityRoot,
+    _authorities: AuthorityLease,
 }
 
-/// Discover the fixed current-EUID whole-store authority and activate or resume
-/// `desired_store` only when the authenticated record state permits it.
-///
-/// This is the production adapter boundary: callers can select the desired
-/// relocatable store for genuine first use, but cannot supply or redirect the
-/// external activation authority.
-pub fn activate_current_euid_store(
-    desired_store: &Path,
-) -> Result<MutationStoreActivation, StoreActivationError> {
-    let anchor = production_activation_anchor()?;
-    activate_store_for_mutation(&anchor, desired_store)
-}
-
-fn production_activation_anchor() -> Result<ActivationAnchorLocator, StoreActivationError> {
-    #[cfg(feature = "integration-test-anchor")]
-    if let Some(path) = std::env::var_os(INTEGRATION_TEST_ANCHOR_ENV) {
-        return Ok(ActivationAnchorLocator {
-            path: PathBuf::from(path),
-        });
-    }
-    ActivationAnchorLocator::for_current_euid()
-}
-
+#[cfg(test)]
 fn activate_store_for_mutation(
     anchor: &ActivationAnchorLocator,
     desired_store: &Path,
@@ -367,6 +352,7 @@ fn activate_store_for_mutation(
     activate_store_for_mutation_with_probe(anchor, desired_store, probe_desired_store_support)
 }
 
+#[cfg(test)]
 fn activate_store_for_mutation_with_probe<F>(
     anchor: &ActivationAnchorLocator,
     desired_store: &Path,
@@ -375,75 +361,122 @@ fn activate_store_for_mutation_with_probe<F>(
 where
     F: FnOnce(&Path) -> Result<(), StoreActivationError>,
 {
-    let authority = open_activation_anchor(anchor)?;
-    match discover_with_authority(&authority)? {
-        StoreActivationState::Activated(store) => Ok(MutationStoreActivation::Activated(store)),
-        StoreActivationState::Lost | StoreActivationState::CorruptOrReplaced => {
-            Err(StoreActivationError::NotResumable)
-        }
-        StoreActivationState::NeverActivated => match support_probe(desired_store) {
-            Ok(()) => {
-                drop(authority);
-                activate_or_resume_store(anchor, desired_store)
-                    .map(MutationStoreActivation::Activated)
-            }
-            Err(StoreActivationError::Backend(
-                CertificationError::UnsupportedPlatform | CertificationError::UnsupportedFilesystem,
-            )) => Ok(MutationStoreActivation::UnsupportedNeverActivated(
-                UnsupportedNeverActivatedLease {
-                    _authority: authority,
-                },
-            )),
-            Err(error) => Err(error),
-        },
-        StoreActivationState::Preparing => {
-            drop(authority);
-            activate_or_resume_store(anchor, desired_store).map(MutationStoreActivation::Activated)
-        }
-        StoreActivationState::UnsupportedNeverActivated => {
-            unreachable!("discover_with_authority never performs the desired-store support probe")
-        }
-    }
+    activate_authority_selection_with_probe(
+        selection_for_locator(anchor)?,
+        desired_store,
+        support_probe,
+    )
 }
 
-fn discover_store_activation_with_probe<F>(
-    anchor: &ActivationAnchorLocator,
+fn activate_authority_selection_with_probe<F>(
+    selection: AuthoritySelection,
     desired_store: &Path,
     support_probe: F,
-) -> Result<StoreActivationState, StoreActivationError>
+) -> Result<MutationStoreActivation, StoreActivationError>
 where
     F: FnOnce(&Path) -> Result<(), StoreActivationError>,
 {
-    let authority = open_activation_anchor(anchor)?;
-    match discover_with_authority(&authority)? {
-        StoreActivationState::NeverActivated => match support_probe(desired_store) {
-            Ok(()) => Ok(StoreActivationState::NeverActivated),
-            Err(StoreActivationError::Backend(
-                CertificationError::UnsupportedPlatform | CertificationError::UnsupportedFilesystem,
-            )) => Ok(StoreActivationState::UnsupportedNeverActivated),
-            Err(error) => Err(error),
-        },
-        state => Ok(state),
+    let AuthoritySelection {
+        mode,
+        selected:
+            AuthorityCandidate {
+                authority,
+                state,
+                claim,
+            },
+        peer,
+    } = selection;
+    match state {
+        StoreActivationState::Activated(mut store) => {
+            ensure_authority_claim(&authority, peer.as_ref(), claim.as_ref())?;
+            store._authority = Some(Box::new(AuthorityLease {
+                _selected: authority,
+                _peer: peer.map(|candidate| candidate.authority),
+            }));
+            Ok(MutationStoreActivation::Activated(store))
+        }
+        StoreActivationState::Lost | StoreActivationState::CorruptOrReplaced => {
+            Err(StoreActivationError::NotResumable)
+        }
+        StoreActivationState::NeverActivated => {
+            if mode == ActivationAuthorityMode::SelfManaged && claim.is_none() {
+                return Err(StoreActivationError::SelfInitializationRequired);
+            }
+            match support_probe(desired_store) {
+                Ok(()) => {
+                    activate_or_resume_with_authorities(authority, peer, claim, desired_store, true)
+                        .map(MutationStoreActivation::Activated)
+                }
+                Err(StoreActivationError::Backend(
+                    CertificationError::UnsupportedPlatform
+                    | CertificationError::UnsupportedFilesystem,
+                )) => {
+                    if claim.is_some() {
+                        ensure_authority_claim(&authority, peer.as_ref(), claim.as_ref())?;
+                    }
+                    Ok(MutationStoreActivation::UnsupportedNeverActivated(
+                        UnsupportedNeverActivatedLease {
+                            _authorities: AuthorityLease {
+                                _selected: authority,
+                                _peer: peer.map(|candidate| candidate.authority),
+                            },
+                        },
+                    ))
+                }
+                Err(error) => Err(error),
+            }
+        }
+        StoreActivationState::Preparing => {
+            activate_or_resume_with_authorities(authority, peer, claim, desired_store, false)
+                .map(MutationStoreActivation::Activated)
+        }
     }
 }
 
-/// Begin or resume crash-safe activation. `desired_store` is consulted only in
-/// `NeverActivated`; a durable preparing record always wins over changed XDG.
-pub fn activate_or_resume_store(
+/// Begin or resume crash-safe activation for test and internal single-anchor
+/// callers. Production uses the selector-only [`activate_current_euid_store`].
+#[cfg(test)]
+fn activate_or_resume_store(
     anchor: &ActivationAnchorLocator,
     desired_store: &Path,
 ) -> Result<ActivatedSealWalStore, StoreActivationError> {
-    let authority = open_activation_anchor(anchor)?;
-    match discover_with_authority(&authority)? {
-        StoreActivationState::Activated(store) => return Ok(store),
-        StoreActivationState::Lost | StoreActivationState::CorruptOrReplaced => {
-            return Err(StoreActivationError::NotResumable);
+    let selection = selection_for_locator(anchor)?;
+    let AuthoritySelection {
+        selected:
+            AuthorityCandidate {
+                authority,
+                state,
+                claim,
+            },
+        peer,
+        ..
+    } = selection;
+    match state {
+        StoreActivationState::Activated(mut store) => {
+            ensure_authority_claim(&authority, peer.as_ref(), claim.as_ref())?;
+            store._authority = Some(Box::new(AuthorityLease {
+                _selected: authority,
+                _peer: peer.map(|candidate| candidate.authority),
+            }));
+            Ok(store)
         }
-        StoreActivationState::NeverActivated
-        | StoreActivationState::UnsupportedNeverActivated
-        | StoreActivationState::Preparing => {}
+        StoreActivationState::Lost | StoreActivationState::CorruptOrReplaced => {
+            Err(StoreActivationError::NotResumable)
+        }
+        StoreActivationState::NeverActivated | StoreActivationState::Preparing => {
+            activate_or_resume_with_authorities(authority, peer, claim, desired_store, false)
+        }
     }
+}
 
+fn activate_or_resume_with_authorities(
+    authority: AuthorityRoot,
+    peer: Option<AuthorityCandidate>,
+    existing_claim: Option<AuthorityRecord>,
+    desired_store: &Path,
+    store_support_proven: bool,
+) -> Result<ActivatedSealWalStore, StoreActivationError> {
+    let claim = ensure_authority_claim(&authority, peer.as_ref(), existing_claim.as_ref())?;
     let (prepare, store) = match read_optional_prepare(&authority)
         .map_err(store_error_from_record_read)?
     {
@@ -460,18 +493,18 @@ pub fn activate_or_resume_store(
             (record, store)
         }
         None => {
-            // Probe while holding the anchor lock. Unsupported or uncertain
+            // Probe while holding every selector lock. Unsupported or uncertain
             // storage must not gain activation authority or create a store.
-            probe_desired_store_support(desired_store)?;
+            if !store_support_proven {
+                probe_desired_store_support(desired_store)?;
+            }
             let store =
                 SealWalStore::open_or_create(desired_store).map_err(StoreActivationError::Store)?;
             store
                 .revalidate_binding()
                 .map_err(StoreActivationError::Store)?;
-            let mut activation_id = [0_u8; ACTIVATION_ID_LEN];
-            getrandom::fill(&mut activation_id).map_err(StoreActivationError::Random)?;
             let record = PrepareRecord {
-                activation_id,
+                activation_id: claim.selection_id,
                 authority_locator: authority.path.clone(),
                 authority_identity: authority.identity,
                 authority_backend: authority.backend,
@@ -506,9 +539,14 @@ pub fn activate_or_resume_store(
     // alone can therefore resume without consulting a changed desired locator.
 
     match validate_activated(&authority, active)? {
-        StoreActivationState::Activated(store) => Ok(store),
+        StoreActivationState::Activated(mut store) => {
+            store._authority = Some(Box::new(AuthorityLease {
+                _selected: authority,
+                _peer: peer.map(|candidate| candidate.authority),
+            }));
+            Ok(store)
+        }
         StoreActivationState::NeverActivated
-        | StoreActivationState::UnsupportedNeverActivated
         | StoreActivationState::Preparing
         | StoreActivationState::Lost
         | StoreActivationState::CorruptOrReplaced => Err(StoreActivationError::NotResumable),
@@ -624,6 +662,26 @@ fn classify_store_binding(
     }
 }
 
+fn preparing_store_binding_is_resumable(
+    store: &SealWalStore,
+    prepare: &PrepareRecord,
+) -> Result<bool, StoreActivationError> {
+    let expected = encode_active(&ActiveRecord {
+        prepare: prepare.clone(),
+    })?;
+    match read_exact_record(
+        store.directory_fd(),
+        &prepare.store_locator,
+        STORE_BINDING_NAME,
+    ) {
+        Ok(bytes) => Ok(bytes == expected),
+        Err(RecordReadError::Io(_, source)) if source.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(RecordReadError::Corrupt) => Ok(false),
+        Err(RecordReadError::Io(path, source)) => Err(StoreActivationError::Io { path, source }),
+        Err(error @ RecordReadError::Inspection(_, _)) => Err(store_error_from_record_read(error)),
+    }
+}
+
 fn classify_preparing(
     authority: &AuthorityRoot,
     prepare: &PrepareRecord,
@@ -639,7 +697,9 @@ fn classify_preparing(
         RecordedStore::Lost => return Ok(StoreActivationState::Lost),
         RecordedStore::Corrupt => return Ok(StoreActivationState::CorruptOrReplaced),
     };
-    if !classify_store_binding(&store, prepare)? {
+    if !classify_store_binding(&store, prepare)?
+        || !preparing_store_binding_is_resumable(&store, prepare)?
+    {
         return Ok(StoreActivationState::CorruptOrReplaced);
     }
     Ok(StoreActivationState::Preparing)
@@ -690,20 +750,126 @@ fn validate_activated(
         &authority.path,
         authority.identity,
         authority.backend,
+        authority.kind,
     )?;
     sync_fd(store.directory_fd(), "activated store directory")?;
     sync_fd(&authority.directory, "activation anchor directory")?;
     Ok(StoreActivationState::Activated(ActivatedSealWalStore {
         locator: active.prepare.store_locator,
         store,
+        _authority: None,
     }))
+}
+
+fn lock_activation_provisioning(
+    locator: &ActivationAnchorLocator,
+) -> Result<Option<ExclusiveFileLock>, StoreActivationError> {
+    #[cfg(test)]
+    if locator.kind == AnchorKind::Test {
+        return Ok(None);
+    }
+    #[cfg(feature = "integration-test-anchor")]
+    if locator.kind == AnchorKind::IntegrationTest {
+        return Ok(None);
+    }
+
+    let store_parent = locator
+        .path
+        .parent()
+        .ok_or(StoreActivationError::InvalidLocator)?;
+    let product_root = store_parent
+        .parent()
+        .ok_or(StoreActivationError::InvalidLocator)?;
+    let lock_path = product_root.join(crate::provision::PROVISIONING_LOCK_NAME);
+    match std::fs::symlink_metadata(&lock_path) {
+        Ok(_) => {}
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(StoreActivationError::Io {
+                path: lock_path,
+                source,
+            });
+        }
+    }
+    let (parent, name, opened_parent_path) =
+        open_authenticated_parent(&lock_path).map_err(StoreActivationError::UnsafeAnchor)?;
+    if opened_parent_path != product_root {
+        return Err(StoreActivationError::InvalidLocator);
+    }
+    let directory = rustix::fs::openat(&parent, &name, OPEN_DIRECTORY, Mode::empty())
+        .map_err(io::Error::from)
+        .map_err(|source| StoreActivationError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+    let stat = rustix::fs::fstat(&directory)
+        .map_err(io::Error::from)
+        .map_err(|source| StoreActivationError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+    let euid = rustix::process::geteuid().as_raw();
+    let owner_matches = match locator.kind {
+        AnchorKind::System => stat.st_uid == 0,
+        AnchorKind::SelfManaged => stat.st_uid == euid,
+        #[cfg(test)]
+        AnchorKind::Test => true,
+        #[cfg(feature = "integration-test-anchor")]
+        AnchorKind::IntegrationTest => true,
+    };
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+        || raw_mode_u32(stat.st_mode) & 0o7777 != 0o700
+        || !owner_matches
+    {
+        return Err(unsafe_anchor(
+            &lock_path,
+            "activation provisioning lock has the wrong type, owner, or mode",
+        ));
+    }
+    require_held_fd_acl_absent(&directory).map_err(StoreActivationError::Backend)?;
+    crate::local_backend::certify_held_fd_backend(&directory)
+        .map_err(StoreActivationError::Backend)?;
+    let entry = rustix::fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(io::Error::from)
+        .map_err(|source| StoreActivationError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+    if entry.st_dev != stat.st_dev
+        || entry.st_ino != stat.st_ino
+        || FileType::from_raw_mode(entry.st_mode) != FileType::Directory
+    {
+        return Err(unsafe_anchor(
+            &lock_path,
+            "activation provisioning lock is not its exact parent entry",
+        ));
+    }
+    let lock = try_lock_directory(&directory).map_err(|source| StoreActivationError::Io {
+        path: lock_path,
+        source,
+    })?;
+    Ok(Some(lock))
 }
 
 fn open_activation_anchor(
     locator: &ActivationAnchorLocator,
 ) -> Result<AuthorityRoot, StoreActivationError> {
+    // Provisioning publishes the leaf before its final account/binding/fsync
+    // commit gate. Taking the flavor's separate provisioning lock first makes
+    // that interval invisible to runtime selection and activation.
+    let provisioning_lock = lock_activation_provisioning(locator)?;
     let authority_path = locator.as_path();
     validate_absolute_locator(authority_path)?;
+    if provisioning_lock.is_none()
+        && matches!(
+            std::fs::symlink_metadata(authority_path),
+            Err(source) if source.kind() == io::ErrorKind::NotFound
+        )
+    {
+        return Err(StoreActivationError::AnchorNotProvisioned {
+            path: authority_path.to_path_buf(),
+        });
+    }
     let expected_parent = authority_path
         .parent()
         .ok_or(StoreActivationError::InvalidLocator)?;
@@ -740,6 +906,31 @@ fn open_activation_anchor(
             });
         }
     };
+    let lock_may_be_absent = {
+        #[cfg(test)]
+        {
+            locator.kind == AnchorKind::Test
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    } || {
+        #[cfg(feature = "integration-test-anchor")]
+        {
+            locator.kind == AnchorKind::IntegrationTest
+        }
+        #[cfg(not(feature = "integration-test-anchor"))]
+        {
+            false
+        }
+    };
+    if provisioning_lock.is_none() && !lock_may_be_absent {
+        return Err(unsafe_anchor(
+            authority_path,
+            "activation anchor appeared without its provisioning commit lock",
+        ));
+    }
     validate_directory(&directory, authority_path).map_err(StoreActivationError::UnsafeAnchor)?;
     let identity = strong_identity_fd(&directory).map_err(|_| StoreActivationError::Identity)?;
     let backend = crate::local_backend::certify_held_fd_backend(&directory)
@@ -756,6 +947,7 @@ fn open_activation_anchor(
         authority_path,
         identity,
         backend,
+        locator.kind,
     )?;
     // The anchor is provisioned out of process. Re-establish durability of both
     // its exact contents and its parent binding on every successful open/retry.
@@ -763,6 +955,8 @@ fn open_activation_anchor(
     sync_fd(&parent, "activation anchor parent after validation")?;
 
     Ok(AuthorityRoot {
+        kind: locator.kind,
+        _provisioning_lock: provisioning_lock,
         parent,
         name,
         directory,
@@ -780,6 +974,7 @@ fn validate_activation_anchor_binding(
     path: &Path,
     expected_identity: StrongObjectIdentity,
     expected_backend: CertifiedLocalBackend,
+    kind: AnchorKind,
 ) -> Result<(), StoreActivationError> {
     validate_directory(directory, path).map_err(StoreActivationError::UnsafeAnchor)?;
     let backend = crate::local_backend::certify_held_fd_backend(directory)
@@ -800,10 +995,19 @@ fn validate_activation_anchor_binding(
             source,
         })?;
     let parent_mode = parent_stat.st_mode as u32;
-    if parent_stat.st_uid != 0 && parent_stat.st_uid != rustix::process::geteuid().as_raw() {
+    let euid = rustix::process::geteuid().as_raw();
+    let owner_matches = match kind {
+        AnchorKind::System => parent_stat.st_uid == 0,
+        AnchorKind::SelfManaged => parent_stat.st_uid == euid,
+        #[cfg(test)]
+        AnchorKind::Test => parent_stat.st_uid == 0 || parent_stat.st_uid == euid,
+        #[cfg(feature = "integration-test-anchor")]
+        AnchorKind::IntegrationTest => parent_stat.st_uid == 0 || parent_stat.st_uid == euid,
+    };
+    if !owner_matches {
         return Err(unsafe_anchor(
             parent_path,
-            "activation anchor parent has a foreign non-root owner",
+            "activation anchor parent owner does not match its authority mode",
         ));
     }
     if parent_mode & 0o030 == 0o030 || parent_mode & 0o003 == 0o003 {
@@ -1002,6 +1206,18 @@ fn store_error_from_record_read(error: RecordReadError) -> StoreActivationError 
     }
 }
 
+fn read_optional_authority(
+    authority: &AuthorityRoot,
+) -> Result<Option<AuthorityRecord>, RecordReadError> {
+    match read_exact_record(&authority.directory, &authority.path, AUTHORITY_RECORD_NAME) {
+        Ok(bytes) => decode_authority(&bytes)
+            .map(Some)
+            .ok_or(RecordReadError::Corrupt),
+        Err(RecordReadError::Io(_, source)) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn read_optional_prepare(
     authority: &AuthorityRoot,
 ) -> Result<Option<PrepareRecord>, RecordReadError> {
@@ -1114,6 +1330,31 @@ fn record_acl_probe<Fd: AsFd>(fd: Fd) -> Result<(), CertificationError> {
         return Err(CertificationError::AclProbeUnknown);
     }
     require_held_fd_acl_absent(fd)
+}
+
+fn encode_authority(record: &AuthorityRecord) -> Result<Vec<u8>, StoreActivationError> {
+    let mut out = Vec::new();
+    out.extend_from_slice(MAGIC_AUTHORITY);
+    out.extend_from_slice(&record.selection_id);
+    put_path(&mut out, &record.selected_locator)?;
+    put_identity(&mut out, record.selected_identity);
+    out.push(encode_backend(record.selected_backend));
+    Ok(out)
+}
+
+fn decode_authority(bytes: &[u8]) -> Option<AuthorityRecord> {
+    let mut input = bytes;
+    take_magic(&mut input, MAGIC_AUTHORITY)?;
+    let selection_id = take_array::<ACTIVATION_ID_LEN>(&mut input)?;
+    let selected_locator = take_path(&mut input)?;
+    let selected_identity = take_identity(&mut input)?;
+    let selected_backend = decode_backend(*take(&mut input, 1)?.first()?)?;
+    input.is_empty().then_some(AuthorityRecord {
+        selection_id,
+        selected_locator,
+        selected_identity,
+        selected_backend,
+    })
 }
 
 fn encode_prepare(record: &PrepareRecord) -> Result<Vec<u8>, StoreActivationError> {

@@ -68,6 +68,40 @@ pub(super) fn self_anchor_base() -> Result<PathBuf, AccountBaseError> {
     Ok(home)
 }
 
+/// Fixed self-managed activation-anchor path for the current effective UID.
+///
+/// Runtime selection and provisioning deliberately share this account-database
+/// derivation. Ambient HOME, XDG, cwd, configuration, and CLI input cannot
+/// redirect either side of the protocol.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn current_self_anchor_path() -> Result<PathBuf, AccountBaseError> {
+    let uid = rustix::process::geteuid().as_raw();
+    self_anchor_path_for_uid(uid)?.ok_or(AccountBaseError::AccountMissing)
+}
+
+/// Fixed self-managed candidate for `uid`, when the account database contains
+/// that UID. Administrator setup uses this only to refuse a competing system
+/// initialization; it never creates or selects the path.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn self_anchor_path_for_uid(
+    uid: libc::uid_t,
+) -> Result<Option<PathBuf>, AccountBaseError> {
+    let Some(mut path) = passwd_home_dir(uid).map_err(AccountBaseError::Lookup)? else {
+        return Ok(None);
+    };
+    if !path.is_absolute() {
+        return Err(AccountBaseError::HomeNotAbsolute);
+    }
+    for component in SELF_STATE_COMPONENTS {
+        path.push(component);
+    }
+    for component in PRODUCT_COMPONENTS {
+        path.push(component);
+    }
+    path.push(uid.to_string());
+    Ok(Some(path))
+}
+
 /// Home directory of `uid` from the account database. Uses `getpwuid_r`, not
 /// `$HOME`, so the result is a stable account fact rather than ambient state.
 #[cfg(any(target_os = "linux", target_os = "macos"))]

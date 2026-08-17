@@ -573,3 +573,15 @@ fn production_entry_requires_real_root() {
         ));
     }
 }
+
+#[test]
+fn system_initialization_refuses_an_existing_self_candidate() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let candidate = temp.path().join("self-candidate");
+    assert!(refuse_existing_self_candidate_path(candidate.clone()).is_ok());
+    std::fs::create_dir(&candidate).unwrap();
+    assert!(matches!(
+        refuse_existing_self_candidate_path(candidate.clone()),
+        Err(ActivationAnchorProvisioningError::Unsafe { path, .. }) if path == candidate
+    ));
+}

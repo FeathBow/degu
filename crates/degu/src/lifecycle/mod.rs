@@ -16,13 +16,15 @@ mod undo;
 mod startup_tests;
 
 use anyhow::{Context, Result};
-use degu_core::activation::{MutationStoreActivation, UnsupportedNeverActivatedLease};
+use degu_core::activation::{
+    ActivatedReadyStagingEngine, MutationStoreActivation, UnsupportedNeverActivatedLease,
+};
 use degu_core::ecosystem::DetectCtx;
 use degu_core::finding::Finding;
 use degu_core::safety::Guard;
 use degu_core::sealed_staging::{
-    ForwardDirectoryIdentityProbe, ReadyStagingEngine, SealedStagingEngine, StartupRecoveryAnchors,
-    VerifiedPurgeRequest, probe_forward_directory_identity,
+    ForwardDirectoryIdentityProbe, StartupRecoveryAnchors, VerifiedPurgeRequest,
+    probe_forward_directory_identity,
 };
 use std::path::{Path, PathBuf};
 
@@ -92,8 +94,7 @@ impl Lifecycle {
             match storage::sealed_staging_store_for_mutation(&self.ctx)? {
                 MutationStoreActivation::Activated(activated) => {
                     let store_path = activated.locator().to_path_buf();
-                    let (engine, report) =
-                    SealedStagingEngine::open(activated.store()).with_context(|| {
+                    let (engine, report) = activated.open_staging().with_context(|| {
                         format!(
                             "failed to lease and replay activated sealed-staging recovery store {}",
                             store_path.display()
@@ -147,7 +148,7 @@ pub(crate) struct MutationSession {
     // mutation session. `None` is allowed only for authenticated
     // UnsupportedNeverActivated. Direct purge keeps the lease for conflict
     // checks but deliberately does not grant the forward coordinator deletion.
-    sealed_staging: Option<ReadyStagingEngine>,
+    sealed_staging: Option<ActivatedReadyStagingEngine>,
     forward_clean: bool,
     // Exact sealed entries already removed through held authority. Legacy code
     // reports these complete and never claims the now-absent pathname.
@@ -178,7 +179,7 @@ impl MutationSession {
     ) -> Result<Vec<CleanExecution>> {
         let uses_sealed_staging = self.uses_sealed_staging_for_clean();
         let sealed_staging = if uses_sealed_staging {
-            self.sealed_staging.as_mut()
+            self.sealed_staging.as_deref_mut()
         } else {
             None
         };
@@ -265,7 +266,7 @@ impl MutationSession {
             .sealed_staging
             .as_ref()
             .into_iter()
-            .flat_map(ReadyStagingEngine::production_entries)
+            .flat_map(|engine| engine.production_entries())
             .filter(|entry| sealed_mutation_authority_active(entry.state()))
             .map(|entry| {
                 (
@@ -280,7 +281,11 @@ impl MutationSession {
         let home_authenticated = canonical_home.is_some();
         let blocker =
             |path: &Path| sealed_legacy_undo_block(path, &sealed_destinations, home_authenticated);
-        undo::undo_latest(&self.lifecycle.ctx, self.sealed_staging.as_mut(), &blocker)
+        undo::undo_latest(
+            &self.lifecycle.ctx,
+            self.sealed_staging.as_deref_mut(),
+            &blocker,
+        )
     }
 
     /// Returns a blocker for any sealed candidate that was not durably purged.

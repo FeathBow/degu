@@ -68,7 +68,7 @@ For datasets, checkpoints, and unknown large files, pair degu with a disk-usage 
 | Operation | Setup | Boundary |
 |---|---|---|
 | `scan`, `quota`, `clean -n` | none | read-only; dry-run creates no degu state |
-| degu-managed `clean`, `undo`, `trash purge` | administrator-provisioned system anchor | runs without elevation; sealed staging stays below canonical HOME on one certified ext4/XFS/APFS mount |
+| degu-managed `clean`, `undo`, `trash purge` | `degu init --initial` for first-use self-managed authority, or optional administrator setup | runs without elevation; anchor, WAL, and canonical-HOME staging roles each require a certified ext4/XFS/APFS backend |
 | `reclaim uv` | explicit executable and cache root | irreversible tool-native mutation; no account anchor, degu trash, or undo |
 
 Unsupported filesystems never gain sealed authority. See the [safety model](docs/safety.md) for compatibility and recovery behavior.
@@ -107,7 +107,13 @@ Check account setup once before the first degu-managed `clean` / `undo` / `trash
 degu doctor
 ```
 
-`ready` means continue. If it reports `missing`, give its path and your numeric UID (`id -u`) to your administrator; the user command never creates system authority. Unsafe or uncertain state requires investigation, not automatic repair.
+`ready` means continue. If it reports `missing`, initialize only the fixed authority for the current non-root account:
+
+```sh
+degu init --initial
+```
+
+Use `--initial` only when no earlier degu authority or store was lost. An administrator may instead provision the optional system authority. `split_authority`, `recovery_required`, `unsafe`, `unsupported`, or `uncertain` requires investigation; `init` never repairs state, chooses a UID or path, activates an empty store, or clears recovery.
 
 After setup, the daily lifecycle remains five short commands:
 

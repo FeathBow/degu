@@ -1,8 +1,5 @@
 # Operational safety
 
-> [!IMPORTANT]
-> This safety model documents degu **v0.1.5**, including the sealed-staging, readiness, and tool-native reclaim boundaries below. If `degu --version` reports a different version, use the safety model tagged for that version.
-
 This document defines degu's runtime discovery, cleaning, staging, and purge semantics. It is distinct from the project [security policy](../SECURITY.md), which explains how to report vulnerabilities privately.
 
 ## Cleanup states and underlying facts
@@ -36,48 +33,29 @@ The full set of relocation subdirectories is component-validated and preflighted
 
 ## Sealed-staging account readiness
 
-`degu doctor` is the single user-facing check that the current account's fixed
-anchor is ready for sealed staging. It checks only the anchor, not an activated
-store, WAL, or recovery state. It derives that anchor only from the platform and current effective UID,
-then applies the same existing-only, descriptor-relative, no-follow
-owner/mode/ACL/backend/identity/binding/lock/durability validation used by the
-activation core. The check creates or writes no degu anchor, store, record, or
-lifecycle state. Validation briefly takes the protocol's existing nonblocking
-lock and calls durability sync on the already-provisioned anchor and parent. It
-does not consult HOME, XDG variables, configuration, environment overrides, or
-a caller-provided path.
+`degu doctor` is the read-only user-facing view of the current account's authority selector. The two candidates are fixed: the administrator-hardened platform/EUID path and the self-managed account-database home plus `.local/state/degu/store-activation/<uid>`. HOME, XDG variables, configuration, cwd, test overrides, CLI input, and caller-provided paths select neither candidate.
 
-The result is `ready`, `missing`, `unsafe`, `unsupported`, or `uncertain`.
-Anything except `ready` fails closed and prints administrator remediation.
-Missing does not mean first activation and never permits a HOME or legacy
-fallback. Unsafe entries are not automatically chmodded, replaced, or repaired;
-inspection uncertainty is not compressed into missing or ready. Root and a
-malicious same-EUID process remain outside the Unix trust boundary.
+The selector opens existing candidates descriptor-relatively and authenticates ownership, modes, ACL absence, certified backend, strong identity, parent binding, lock, and durability. It then inspects activation records and the exact recorded store. It never creates an anchor, store, activation record, or lifecycle state.
 
-The unprivileged installers install binaries only and merely suggest running
-`degu doctor`. They do not invoke sudo, inspect `SUDO_UID`, or create an
-activation anchor. For a never-activated numeric UID, an administrator uses a
-separately verified binary from an administrator-owned absolute path to run
-`degu admin setup --uid <UID> --initial` with real EUID 0. The command
-derives the only path from platform plus UID, creates with
-descriptor-relative/no-follow operations, and never repairs an existing object.
+Selection is deterministic and fail-closed:
 
-Mutating clean, undo, purge, and expiry sessions derive the same current-EUID
-anchor and use it as the only whole-store activation/discovery authority. A
-supported record-empty anchor activates the canonical current state-store
-locator. Once activation evidence exists, the recorded exact locator wins over
-HOME/XDG drift; a lost, replaced, corrupt, unsafe, missing, busy, or uncertain
-anchor/store blocks mutation and never creates a substitute store. The sole
-legacy escape is `UnsupportedNeverActivated`: the anchor was authenticated and
-record-empty, and the desired store backend was positively classified outside
-the certified set. That legacy session retains the exact anchor lock for its
-full lifetime, so another process with different XDG state cannot activate a
-store concurrently. Activated sessions instead retain and replay the exact WAL
-lease for the full mutation session.
+1. one existing candidate is selected;
+2. two record-empty candidates select the administrator-hardened one;
+3. activation evidence in exactly one candidate selects that candidate, even when its peer exists but is empty;
+4. evidence in both candidates is `split_authority` and blocks;
+5. an unsafe, corrupt, busy, unsupported, or uncertain candidate blocks inspection instead of being treated as absent;
+6. a lost or replaced recorded store is `recovery_required`, never first use;
+7. no existing candidate is `missing`.
 
-A WAL-associated staged object never falls through to legacy pathname or JSONL authority. Healthy `VerifiedCommitted` transactions can mint object-bound, one-use authority for `degu undo`, explicit `degu trash purge`, or seven-day expiry. Missing JSONL cannot remove that protection, and adding a JSONL record cannot grant authority. Association, identity, namespace, or recovery uncertainty blocks mutation.
+`degu init --initial` is the explicit first-use path for a missing self-managed candidate. It derives the non-root effective UID and account home from account database facts, accepts no UID or path, and uses the same no-follow runtime contract. `--initial` asserts that no earlier authority was lost; it is never migration or recovery permission. Existing entries are validated but never repaired or replaced. The account-database path is rechecked across the provision-to-declaration handoff so a home change cannot declare one leaf while reporting another. Initialization publishes a durable authority claim but does not create a WAL store or prepare/activate that store. Administrator provisioning remains optional and is likewise create-only. It refuses an existing self candidate, and its `--initial` contract requires every setup and lifecycle process for the target UID to be quiescent. Concurrent root system setup is outside the self-managed protocol; an administrator must never run it as a live migration or recovery mechanism.
 
-Production forward cleanup is connected to activation and startup recovery. `doctor ready` proves only anchor readiness, not WAL or recovery health. A sealed purge durably records its exact claim before deletion and syncs monotonic progress after every successful unlink or rmdir. An interruption before durable outcome becomes `RecoveryRequired`; startup does not infer completion from paths or automatically resume deletion. A durable outcome finalizes `Purged` without a namespace lookup. `RecoveryRequired` cannot be cleared by reprovisioning an anchor and remains an operator-investigation state.
+Before store activation, degu durably publishes the identical peer witness first, then the selected authority claim. A crash therefore leaves either no new claim or a witness that names the selected root, never an unwitnessed newly selected root when a peer already exists. A surviving witness that names a missing selected root is `recovery_required`, not permission to use the empty peer. Matching witnesses select one root; mismatched claims are `split_authority`. When no peer exists, runtime still never resets authority automatically: recreating an absent self root requires the user's explicit `--initial` assertion, which must not be used after loss.
+
+A supported first mutation may activate the canonical current state-store locator only while both visible candidate decisions remain locked. A visible provisioning lock is honored even before its leaf is published, so runtime cannot consume a pre-commit candidate. The selected and existing peer locks are retained for the full lifecycle session, along with the exact WAL lease. Once activation evidence exists, its recorded locator wins over XDG drift. Lost, replaced, corrupt, unsafe, missing, busy, or uncertain authority/store state never creates a substitute store.
+
+The only dormant legacy result is `UnsupportedNeverActivated`: every authenticated candidate is record-empty and the desired WAL backend is positively outside the certified set. Its opaque session lease retains all selector locks. A WAL-associated staged object never falls through to legacy pathname or JSONL authority. Healthy transactions mint object-bound, one-use undo or purge authority; association, identity, namespace, or recovery uncertainty blocks mutation.
+
+For a record-empty authority, `doctor ready` means the authority declaration is usable; the future XDG-selected WAL backend is certified only when first mutation probes it. An activated authority additionally authenticates its exact recorded store. Production cleanup enters this selector before startup recovery and retains the selected authority until the mutation session ends. Sealed purge records its exact claim before deletion and syncs monotonic progress after each successful unlink or rmdir. An interruption before durable outcome becomes `RecoveryRequired`; initialization or reprovisioning cannot clear it.
 
 ## Staging, undo, and purge
 

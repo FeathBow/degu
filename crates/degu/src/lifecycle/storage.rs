@@ -37,9 +37,10 @@ pub(crate) fn is_state_trash_root(ctx: &DetectCtx, root: &Path) -> bool {
                 .ok()
                 .map(|parent| parent.join(name))
         });
-    std::fs::canonicalize(ctx.xdg_state())
-        .map(|state| Some(state.join("degu/trash")) == canonical_root)
-        .unwrap_or_else(|_| trash_dir_state(ctx) == root)
+    match (std::fs::canonicalize(ctx.xdg_state()), canonical_root) {
+        (Ok(state), Some(root)) => state.join("degu/trash") == root,
+        _ => trash_dir_state(ctx) == root,
+    }
 }
 
 pub(crate) fn add_resolved_trash_roots_to_guard(
@@ -164,15 +165,18 @@ pub(crate) fn acquire_mutation_lock(ctx: &DetectCtx) -> Result<std::fs::File> {
 }
 
 pub(crate) fn path_mount_id(path: &Path) -> std::result::Result<u64, String> {
-    let fd = rustix::fs::open(
-        path,
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::DIRECTORY
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )
-    .map_err(|error| {
+    #[cfg(target_os = "linux")]
+    let flags = rustix::fs::OFlags::PATH
+        | rustix::fs::OFlags::DIRECTORY
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::DIRECTORY
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::CLOEXEC;
+
+    let fd = rustix::fs::open(path, flags, rustix::fs::Mode::empty()).map_err(|error| {
         format!(
             "failed to open mount identity path {}: {error}",
             path.display()
@@ -190,6 +194,17 @@ pub(crate) fn resolve_mount_owner_anchor(
     path: &Path,
     mount_id: u64,
 ) -> std::result::Result<PathBuf, String> {
+    resolve_mount_owner_anchor_with(path, mount_id, path_mount_id)
+}
+
+fn resolve_mount_owner_anchor_with<F>(
+    path: &Path,
+    mount_id: u64,
+    mut inspect_mount: F,
+) -> std::result::Result<PathBuf, String>
+where
+    F: FnMut(&Path) -> std::result::Result<u64, String>,
+{
     let euid = rustix::process::geteuid().as_raw();
     let mut current = path.parent().ok_or_else(|| {
         format!(
@@ -200,8 +215,15 @@ pub(crate) fn resolve_mount_owner_anchor(
     let mut anchor = None;
 
     while let Ok(meta) = std::fs::symlink_metadata(current) {
-        if !meta.is_dir()
-            || path_mount_id(current)? != mount_id
+        if !meta.is_dir() {
+            break;
+        }
+        let current_mount = match inspect_mount(current) {
+            Ok(mount) => mount,
+            Err(_) if anchor.is_some() => break,
+            Err(error) => return Err(error),
+        };
+        if current_mount != mount_id
             || meta.uid() != euid
             || rustix::fs::access(current, rustix::fs::Access::WRITE_OK).is_err()
         {

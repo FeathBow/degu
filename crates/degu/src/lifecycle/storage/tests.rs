@@ -1,9 +1,65 @@
+#[cfg(target_os = "linux")]
+use super::path_mount_id;
 use super::{
     TRASHROOTS_FILE, ensure_managed_trash_root, ensure_managed_trash_root_with_sync,
-    read_registered_trash_roots, register_trash_root, register_trash_root_with_sync, trash_roots,
+    is_state_trash_root, read_registered_trash_roots, register_trash_root,
+    register_trash_root_with_sync, resolve_mount_owner_anchor_with, trash_dir_state, trash_roots,
 };
 use degu_core::ecosystem::DetectCtx;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+#[test]
+fn fresh_state_trash_root_uses_lexical_identity_until_its_parent_exists() {
+    let home = tempfile::tempdir().unwrap();
+    let base = tempfile::tempdir().unwrap();
+    let state = base.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    let ctx = DetectCtx::for_test(
+        home.path().to_path_buf(),
+        [("XDG_STATE_HOME".to_owned(), state.as_os_str().to_owned())],
+    );
+    let root = trash_dir_state(&ctx);
+
+    assert!(!root.parent().unwrap().exists());
+    assert!(is_state_trash_root(&ctx, &root));
+}
+
+#[test]
+fn mount_anchor_walk_keeps_the_last_confirmed_anchor_after_probe_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let accepted = dir.path().join("accepted");
+    let source = accepted.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::set_permissions(&accepted, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut probed = Vec::new();
+
+    let anchor = resolve_mount_owner_anchor_with(&source, 77, |current| {
+        probed.push(current.to_path_buf());
+        if current == accepted {
+            Ok(77)
+        } else {
+            Err("injected mount inspection failure".to_string())
+        }
+    })
+    .unwrap();
+
+    assert_eq!(anchor, accepted);
+    assert_eq!(probed, vec![accepted, dir.path().to_path_buf()]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mount_identity_probe_does_not_require_directory_read_permission() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("identity");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = path_mount_id(&path);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(result.is_ok(), "{result:?}");
+}
 
 #[test]
 fn managed_trash_root_is_private() {

@@ -1097,6 +1097,7 @@ fn production_association_is_read_back_only_from_the_exact_leased_wal() {
     );
     assert_eq!(entry.destination_basename(), "staged");
     assert_eq!(entry.reclamation_id(), "reclamation-c1");
+    assert_eq!(entry.recovery_anchor(), Some(fixture.base.as_path()));
     let destination: OwnedFd = std::fs::File::open(&fixture.destination_root)
         .unwrap()
         .into();

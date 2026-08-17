@@ -999,8 +999,9 @@ fn runtime_rejects_an_anchor_without_its_flavor_provisioning_lock() {
 #[test]
 fn preparing_with_a_mismatched_reciprocal_binding_is_corrupt() {
     let fixture = Fixture::new();
-    // Anchor/parent validation syncs are 0/1; prepare publication becomes
-    // visible at boundary 3 and leaves the transaction resumably preparing.
+    // Authority-claim validation syncs are 0/1 and anchor/parent validation
+    // syncs are 2/3; prepare publication becomes visible at boundary 5 and
+    // leaves the transaction resumably preparing.
     inject_sync_failure(Some(5));
     assert!(activate_or_resume_store(&fixture.anchor, &fixture.store).is_err());
     inject_sync_failure(None);
@@ -1131,6 +1132,192 @@ fn self_initialization_reports_a_new_declaration_as_mutation() {
         declared: true,
     };
     assert!(outcome.mutated());
+}
+
+fn test_provisioning_outcome(
+    path: PathBuf,
+) -> crate::provision::ActivationAnchorProvisioningOutcome {
+    crate::provision::ActivationAnchorProvisioningOutcome {
+        path,
+        uid: 1000,
+        backend: CertifiedLocalBackend::Ext4,
+        status: crate::provision::ActivationAnchorProvisioningStatus::Created,
+    }
+}
+
+#[test]
+fn post_provision_system_race_retains_the_committed_anchor_outcome() {
+    let fixture = SelectorFixture::new(true, true);
+    let provisioning = test_provisioning_outcome(fixture.self_managed.path.clone());
+    let error = complete_provisioned_self_authority_with(
+        provisioning.clone(),
+        &fixture.system,
+        &fixture.self_managed,
+        |_| Ok(()),
+        |_, _| panic!("claim publication must not run after the system recheck fails"),
+    )
+    .unwrap_err();
+    let SelfAuthorityInitializationError::PostProvision(error) = error else {
+        panic!("expected a post-provision error");
+    };
+    assert_eq!(error.provisioning(), &provisioning);
+    assert_eq!(
+        error.authority_claim(),
+        AuthorityClaimPublicationState::NotAttempted
+    );
+    assert!(matches!(
+        error.authority_error(),
+        StoreActivationError::SystemAuthorityPresent { path }
+            if path == &fixture.system.path
+    ));
+    assert!(fixture.self_managed.path.is_dir());
+}
+
+#[test]
+fn real_claim_publication_boundary_classifies_post_provision_failure() {
+    for (fail_at, expected_state, expected_visible) in [
+        (0, AuthorityClaimPublicationState::NotAttempted, false),
+        (1, AuthorityClaimPublicationState::MayHavePublished, true),
+    ] {
+        let fixture = SelectorFixture::new(false, true);
+        let provisioning = test_provisioning_outcome(fixture.self_managed.path.clone());
+        let error = complete_provisioned_self_authority_with(
+            provisioning,
+            &fixture.system,
+            &fixture.self_managed,
+            |_| Ok(()),
+            |candidate, on_published| {
+                inject_sync_failure(Some(fail_at));
+                let result = ensure_authority_claim_observed(
+                    &candidate.authority,
+                    None,
+                    candidate.claim.as_ref(),
+                    on_published,
+                )
+                .map(drop);
+                inject_sync_failure(None);
+                result
+            },
+        )
+        .unwrap_err();
+        let SelfAuthorityInitializationError::PostProvision(error) = error else {
+            panic!("expected a post-provision error");
+        };
+        assert_eq!(error.authority_claim(), expected_state);
+        assert!(matches!(
+            error.authority_error(),
+            StoreActivationError::SyncUncertain("selected authority claim")
+        ));
+        assert_eq!(
+            fixture
+                .self_managed
+                .path
+                .join(AUTHORITY_RECORD_NAME)
+                .is_file(),
+            expected_visible
+        );
+    }
+}
+
+#[test]
+fn existing_claim_remains_published_when_revalidation_sync_fails() {
+    let fixture = SelectorFixture::new(false, true);
+    let candidate = open_authority_candidate(&fixture.self_managed)
+        .unwrap()
+        .unwrap();
+    ensure_authority_claim(&candidate.authority, None, None).unwrap();
+    drop(candidate);
+
+    let provisioning = test_provisioning_outcome(fixture.self_managed.path.clone());
+    let error = complete_provisioned_self_authority_with(
+        provisioning,
+        &fixture.system,
+        &fixture.self_managed,
+        |_| Ok(()),
+        |candidate, on_published| {
+            inject_sync_failure(Some(0));
+            let result = ensure_authority_claim_observed(
+                &candidate.authority,
+                None,
+                candidate.claim.as_ref(),
+                on_published,
+            )
+            .map(drop);
+            inject_sync_failure(None);
+            result
+        },
+    )
+    .unwrap_err();
+    let SelfAuthorityInitializationError::PostProvision(error) = error else {
+        panic!("expected a post-provision error");
+    };
+    assert_eq!(
+        error.authority_claim(),
+        AuthorityClaimPublicationState::Published
+    );
+    assert!(
+        fixture
+            .self_managed
+            .path
+            .join(AUTHORITY_RECORD_NAME)
+            .is_file()
+    );
+}
+
+#[test]
+fn post_claim_account_drift_retains_published_disposition() {
+    let fixture = SelectorFixture::new(false, true);
+    let provisioning = test_provisioning_outcome(fixture.self_managed.path.clone());
+    let checks = std::cell::Cell::new(0_u8);
+    let error = complete_provisioned_self_authority_with(
+        provisioning.clone(),
+        &fixture.system,
+        &fixture.self_managed,
+        |expected| {
+            let check = checks.get();
+            checks.set(check + 1);
+            if check == 2 {
+                return Err(StoreActivationError::AccountBaseChanged {
+                    expected: expected.to_path_buf(),
+                    actual: PathBuf::from("/changed/self/anchor"),
+                });
+            }
+            Ok(())
+        },
+        |candidate, on_published| {
+            ensure_authority_claim_observed(
+                &candidate.authority,
+                None,
+                candidate.claim.as_ref(),
+                on_published,
+            )
+            .map(drop)
+        },
+    )
+    .unwrap_err();
+    let SelfAuthorityInitializationError::PostProvision(error) = error else {
+        panic!("expected a post-provision error");
+    };
+    assert_eq!(checks.get(), 3);
+    assert_eq!(error.provisioning(), &provisioning);
+    assert_eq!(
+        error.authority_claim(),
+        AuthorityClaimPublicationState::Published
+    );
+    assert!(matches!(
+        error.authority_error(),
+        StoreActivationError::AccountBaseChanged { expected, actual }
+            if expected == &fixture.self_managed.path
+                && actual == Path::new("/changed/self/anchor")
+    ));
+    assert!(fixture.self_managed.path.is_dir());
+    assert!(
+        fixture
+            .self_managed
+            .path
+            .join(AUTHORITY_RECORD_NAME)
+            .is_file()
+    );
 }
 
 #[test]

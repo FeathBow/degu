@@ -328,12 +328,62 @@ impl SelfAuthorityInitializationOutcome {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorityClaimPublicationState {
+    NotAttempted,
+    MayHavePublished,
+    Published,
+}
+
+impl AuthorityClaimPublicationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAttempted => "not_attempted",
+            Self::MayHavePublished => "may_have_published",
+            Self::Published => "published",
+        }
+    }
+}
+
+impl std::fmt::Display for AuthorityClaimPublicationState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "self-managed authority initialization failed after activation-anchor provisioning committed; authority claim publication is {authority_claim}: {source}"
+)]
+pub struct SelfAuthorityInitializationPostProvisionError {
+    provisioning: crate::provision::ActivationAnchorProvisioningOutcome,
+    authority_claim: AuthorityClaimPublicationState,
+    #[source]
+    source: StoreActivationError,
+}
+
+impl SelfAuthorityInitializationPostProvisionError {
+    pub fn provisioning(&self) -> &crate::provision::ActivationAnchorProvisioningOutcome {
+        &self.provisioning
+    }
+
+    pub fn authority_claim(&self) -> AuthorityClaimPublicationState {
+        self.authority_claim
+    }
+
+    pub fn authority_error(&self) -> &StoreActivationError {
+        &self.source
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SelfAuthorityInitializationError {
     #[error(transparent)]
     Provision(#[from] crate::provision::ActivationAnchorProvisioningError),
     #[error(transparent)]
     Authority(#[from] StoreActivationError),
+    #[error(transparent)]
+    PostProvision(#[from] SelfAuthorityInitializationPostProvisionError),
 }
 
 pub(super) fn require_current_self_path_with<F>(
@@ -375,48 +425,99 @@ pub fn initialize_current_euid_self_authority(
     }
 
     let outcome = crate::provision::provision_current_euid_self_activation_anchor()?;
-    let expected_self_path = outcome.path.clone();
-    require_current_self_path(&expected_self_path)?;
     let self_locator = ActivationAnchorLocator {
-        path: expected_self_path.clone(),
+        path: outcome.path.clone(),
         kind: AnchorKind::SelfManaged,
     };
-    // Recheck system after publication. A concurrently provisioned system root
-    // prevents the self claim; the safe, empty self leaf remains non-authoritative.
-    if let Some(system) = open_authority_candidate(&system_locator)? {
-        return Err(StoreActivationError::SystemAuthorityPresent {
-            path: system.authority.path,
+    complete_provisioned_self_authority_with(
+        outcome,
+        &system_locator,
+        &self_locator,
+        require_current_self_path,
+        |candidate, on_published| {
+            ensure_authority_claim_observed(
+                &candidate.authority,
+                None,
+                candidate.claim.as_ref(),
+                on_published,
+            )
+            .map(drop)
+        },
+    )
+}
+
+pub(super) fn complete_provisioned_self_authority_with<F, P>(
+    provisioning: crate::provision::ActivationAnchorProvisioningOutcome,
+    system_locator: &ActivationAnchorLocator,
+    self_locator: &ActivationAnchorLocator,
+    mut revalidate_self_path: F,
+    publish_claim: P,
+) -> Result<SelfAuthorityInitializationOutcome, SelfAuthorityInitializationError>
+where
+    F: FnMut(&Path) -> Result<(), StoreActivationError>,
+    P: FnOnce(&AuthorityCandidate, &mut dyn FnMut()) -> Result<(), StoreActivationError>,
+{
+    let expected_self_path = provisioning.path.clone();
+    let mut authority_claim = AuthorityClaimPublicationState::NotAttempted;
+    let post_provision = (|| -> Result<bool, StoreActivationError> {
+        revalidate_self_path(&expected_self_path)?;
+        // Recheck system after publication. A concurrently provisioned system
+        // root prevents the self claim; the committed empty self leaf remains
+        // safe and non-authoritative, but must be reported to the caller.
+        if let Some(system) = open_authority_candidate(system_locator)? {
+            return Err(StoreActivationError::SystemAuthorityPresent {
+                path: system.authority.path,
+            });
         }
-        .into());
-    }
-    let Some(self_managed) = open_authority_candidate(&self_locator)? else {
-        return Err(StoreActivationError::AnchorNotProvisioned {
-            path: self_locator.path,
+        let Some(self_managed) = open_authority_candidate(self_locator)? else {
+            return Err(StoreActivationError::AnchorNotProvisioned {
+                path: self_locator.path.clone(),
+            });
+        };
+        if matches!(
+            self_managed.state,
+            StoreActivationState::Lost | StoreActivationState::CorruptOrReplaced
+        ) {
+            return Err(StoreActivationError::NotResumable);
         }
-        .into());
-    };
-    if matches!(
-        self_managed.state,
-        StoreActivationState::Lost | StoreActivationState::CorruptOrReplaced
-    ) {
-        return Err(StoreActivationError::NotResumable.into());
-    }
-    if self_managed.claim.is_none()
-        && !matches!(self_managed.state, StoreActivationState::NeverActivated)
-    {
-        return Err(StoreActivationError::AuthorityClaimInvalid {
-            path: self_managed.authority.path,
+        if self_managed.claim.is_none()
+            && !matches!(self_managed.state, StoreActivationState::NeverActivated)
+        {
+            return Err(StoreActivationError::AuthorityClaimInvalid {
+                path: self_managed.authority.path,
+            });
         }
-        .into());
+        let declared = self_managed.claim.is_none();
+        revalidate_self_path(&expected_self_path)?;
+        if !declared {
+            authority_claim = AuthorityClaimPublicationState::Published;
+        }
+        let publish_result = {
+            let mut on_published = || {
+                if declared {
+                    authority_claim = AuthorityClaimPublicationState::MayHavePublished;
+                }
+            };
+            publish_claim(&self_managed, &mut on_published)
+        };
+        publish_result?;
+        authority_claim = AuthorityClaimPublicationState::Published;
+        revalidate_self_path(&expected_self_path)?;
+        Ok(declared)
+    })();
+
+    match post_provision {
+        Ok(declared) => Ok(SelfAuthorityInitializationOutcome {
+            provisioning,
+            declared,
+        }),
+        Err(source) => Err(SelfAuthorityInitializationPostProvisionError {
+            provisioning,
+            authority_claim,
+            source,
+        }
+        .into()),
     }
-    let declared = self_managed.claim.is_none();
-    require_current_self_path(&expected_self_path)?;
-    ensure_authority_claim(&self_managed.authority, None, self_managed.claim.as_ref())?;
-    require_current_self_path(&expected_self_path)?;
-    Ok(SelfAuthorityInitializationOutcome {
-        provisioning: outcome,
-        declared,
-    })
 }
 
 /// Inspect and select the current account's existing authority without creating
@@ -491,6 +592,18 @@ pub(super) fn ensure_authority_claim(
     peer: Option<&AuthorityCandidate>,
     existing: Option<&AuthorityRecord>,
 ) -> Result<AuthorityRecord, StoreActivationError> {
+    ensure_authority_claim_observed(authority, peer, existing, || {})
+}
+
+pub(super) fn ensure_authority_claim_observed<F>(
+    authority: &AuthorityRoot,
+    peer: Option<&AuthorityCandidate>,
+    existing: Option<&AuthorityRecord>,
+    on_selected_published: F,
+) -> Result<AuthorityRecord, StoreActivationError>
+where
+    F: FnOnce(),
+{
     let prepare = read_optional_prepare(authority).map_err(store_error_from_record_read)?;
     let selection_id = match (existing, prepare.as_ref()) {
         (Some(claim), Some(prepare)) if claim.selection_id != prepare.activation_id => {
@@ -537,12 +650,13 @@ pub(super) fn ensure_authority_claim(
             "peer authority witness",
         )?;
     }
-    publish_record(
+    publish_record_observed(
         &authority.directory,
         &authority.path,
         AUTHORITY_RECORD_NAME,
         &bytes,
         "selected authority claim",
+        on_selected_published,
     )?;
     Ok(expected)
 }

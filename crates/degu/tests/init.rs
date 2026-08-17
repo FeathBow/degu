@@ -6,13 +6,20 @@ fn degu() -> Command {
 
 #[test]
 fn init_accepts_no_uid_path_or_initial_override() {
+    degu().args(["init"]).assert().failure().stdout("");
     for args in [
-        vec!["init"],
-        vec!["init", "--uid", "1000"],
-        vec!["init", "--anchor-path", "/tmp/caller-selected"],
-        vec!["init", "/tmp/caller-selected"],
+        vec!["init", "--initial", "--uid", "1000"],
+        vec!["init", "--initial", "--anchor-path", "/tmp/caller-selected"],
+        vec!["init", "--initial", "/tmp/caller-selected"],
     ] {
-        degu().args(&args).assert().failure().stdout("");
+        let output = degu().args(&args).output().unwrap();
+        assert!(!output.status.success(), "unexpected success: {args:?}");
+        assert!(output.stdout.is_empty(), "unexpected stdout: {args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unexpected argument"),
+            "unexpected stderr for {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 

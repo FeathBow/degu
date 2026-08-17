@@ -27,7 +27,13 @@ fn setup_exposes_only_the_fixed_locator_inputs() {
     let help = degu().args(["admin", "setup", "--help"]).output().unwrap();
     assert!(help.status.success());
     let stdout = String::from_utf8(help.stdout).unwrap();
-    for required in ["--uid", "--initial", "--json", "effective UID 0"] {
+    for required in [
+        "--uid",
+        "--initial",
+        "--json",
+        "effective UID 0",
+        "not repair, migration, or recovery",
+    ] {
         assert!(stdout.contains(required), "missing {required:?}: {stdout}");
     }
     for forbidden in [

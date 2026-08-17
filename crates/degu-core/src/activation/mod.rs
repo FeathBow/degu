@@ -74,13 +74,15 @@ use selection::{
     ensure_authority_claim,
 };
 pub use selection::{
-    ActivationAuthorityMode, CurrentEuidAuthorityReadiness, SelfAuthorityInitializationError,
-    SelfAuthorityInitializationOutcome, activate_current_euid_store,
+    ActivationAuthorityMode, AuthorityClaimPublicationState, CurrentEuidAuthorityReadiness,
+    SelfAuthorityInitializationError, SelfAuthorityInitializationOutcome,
+    SelfAuthorityInitializationPostProvisionError, activate_current_euid_store,
     check_current_euid_authority_readiness, initialize_current_euid_self_authority,
 };
 #[cfg(test)]
 use selection::{
-    AuthorityChoice, choose_authority, open_authority_candidate, require_current_self_path_with,
+    AuthorityChoice, choose_authority, complete_provisioned_self_authority_with,
+    ensure_authority_claim_observed, open_authority_candidate, require_current_self_path_with,
     select_authority_pair, selection_for_locator,
 };
 
@@ -1095,8 +1097,30 @@ fn publish_record(
     bytes: &[u8],
     boundary: &'static str,
 ) -> Result<(), StoreActivationError> {
+    publish_record_observed(
+        directory,
+        directory_path,
+        final_name,
+        bytes,
+        boundary,
+        || {},
+    )
+}
+
+fn publish_record_observed<F>(
+    directory: &OwnedFd,
+    directory_path: &Path,
+    final_name: &str,
+    bytes: &[u8],
+    boundary: &'static str,
+    on_published: F,
+) -> Result<(), StoreActivationError>
+where
+    F: FnOnce(),
+{
     match read_exact_record(directory, directory_path, final_name) {
         Ok(existing) if existing == bytes => {
+            on_published();
             sync_fd(directory, boundary)?;
             return Ok(());
         }
@@ -1166,6 +1190,7 @@ fn publish_record(
         path: directory_path.join(final_name),
         source,
     })?;
+    on_published();
     sync_fd(directory, boundary)
 }
 

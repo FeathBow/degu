@@ -152,6 +152,7 @@ pub fn provision_activation_anchor(
     if !rustix::process::geteuid().is_root() {
         return Err(ActivationAnchorProvisioningError::NotRoot);
     }
+    validate_provision_arguments(Path::new("/"), uid, initial)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     refuse_existing_self_candidate(uid)?;
     provision(
@@ -289,6 +290,23 @@ enum DirectoryKind {
     PrivateLock,
 }
 
+fn validate_provision_arguments(
+    filesystem_root: &Path,
+    uid: u32,
+    initial: bool,
+) -> Result<(), ActivationAnchorProvisioningError> {
+    if uid == 0 || uid == u32::MAX {
+        return Err(ActivationAnchorProvisioningError::InvalidUid { uid });
+    }
+    if !initial {
+        return Err(ActivationAnchorProvisioningError::Unsafe {
+            path: fixed_path(ProvisioningFlavor::System(filesystem_root), uid),
+            reason: "the administrator must assert --initial; provisioning is not repair or recovery",
+        });
+    }
+    Ok(())
+}
+
 fn provision(
     filesystem_root: &Path,
     uid: u32,
@@ -299,15 +317,7 @@ fn provision(
     if credentials.enforce_root && !rustix::process::geteuid().is_root() {
         return Err(ActivationAnchorProvisioningError::NotRoot);
     }
-    if uid == 0 || uid == u32::MAX {
-        return Err(ActivationAnchorProvisioningError::InvalidUid { uid });
-    }
-    if !initial {
-        return Err(ActivationAnchorProvisioningError::Unsafe {
-            path: fixed_path(ProvisioningFlavor::System(filesystem_root), uid),
-            reason: "the administrator must assert --initial; provisioning is not repair or recovery",
-        });
-    }
+    validate_provision_arguments(filesystem_root, uid, initial)?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (filesystem_root, credentials, backend_probe);

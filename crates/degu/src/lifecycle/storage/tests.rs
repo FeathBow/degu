@@ -1,6 +1,6 @@
 use super::{
-    TRASHROOTS_FILE, ensure_managed_trash_root, read_registered_trash_roots, register_trash_root,
-    trash_roots,
+    TRASHROOTS_FILE, ensure_managed_trash_root, ensure_managed_trash_root_with_sync,
+    read_registered_trash_roots, register_trash_root, register_trash_root_with_sync, trash_roots,
 };
 use degu_core::ecosystem::DetectCtx;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -140,6 +140,49 @@ fn registration_frames_line_breaks_in_a_root() {
 
     register_trash_root(&state, &root).unwrap();
 
+    assert_eq!(
+        read_registered_trash_roots(&state.join(TRASHROOTS_FILE)).unwrap(),
+        vec![root]
+    );
+}
+
+#[test]
+fn trash_root_parent_sync_failure_blocks_before_staging_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = dir.path().join(".degu-trash");
+    let mut calls = 0;
+    let error = ensure_managed_trash_root_with_sync(&root, ".degu-trash", |_| {
+        calls += 1;
+        if calls == 2 {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("trash-root parent"));
+    assert!(root.is_dir());
+}
+
+#[test]
+fn registry_parent_sync_failure_retries_without_duplicate_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let root = dir.path().join(".degu-trash");
+    let mut calls = 0;
+    let error = register_trash_root_with_sync(&state, &root, |_| {
+        calls += 1;
+        if calls == 2 {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("registry parent"));
+
+    register_trash_root(&state, &root).unwrap();
     assert_eq!(
         read_registered_trash_roots(&state.join(TRASHROOTS_FILE)).unwrap(),
         vec![root]

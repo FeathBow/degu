@@ -3,6 +3,7 @@ mod entries;
 mod expiry;
 mod identity;
 mod journal;
+mod mount;
 mod purge;
 mod reconcile;
 mod records;
@@ -23,8 +24,7 @@ use degu_core::ecosystem::DetectCtx;
 use degu_core::finding::Finding;
 use degu_core::safety::Guard;
 use degu_core::sealed_staging::{
-    ForwardDirectoryIdentityProbe, StartupRecoveryAnchors, VerifiedPurgeRequest,
-    probe_forward_directory_identity,
+    ForwardDirectoryIdentityProbe, VerifiedPurgeRequest, probe_forward_directory_identity,
 };
 use std::path::{Path, PathBuf};
 
@@ -100,26 +100,15 @@ impl Lifecycle {
                             store_path.display()
                         )
                     })?;
-                    // The first production anchor policy is deliberately narrow:
-                    // locators must have been recorded relative to canonical HOME
-                    // on one certified local mount. Redirected/cross-mount roots stay
-                    // blocked because this path consumes no mount-root association policy.
+                    // v11 transactions reopen their recorded mount-domain
+                    // anchor; v10 transactions retain the canonical-HOME arm.
+                    // In both cases the pathname only obtains candidate FDs for
+                    // the core's fresh mount, identity, ACL, and binding checks.
                     let recovery_home = self.ctx.home.clone();
                     let (ready, _) = engine
-                .recover_startup(report, |_, _| {
-                    let open_home = || {
-                        rustix::fs::open(
-                            &recovery_home,
-                            rustix::fs::OFlags::RDONLY
-                                | rustix::fs::OFlags::DIRECTORY
-                                | rustix::fs::OFlags::NOFOLLOW
-                                | rustix::fs::OFlags::CLOEXEC,
-                            rustix::fs::Mode::empty(),
-                        )
-                        .map_err(std::io::Error::from)
-                    };
-                    Ok(StartupRecoveryAnchors::new(open_home()?, open_home()?))
-                })
+                        .recover_startup(report, |_, metadata| {
+                            mount::metadata_anchors(&recovery_home, metadata)
+                        })
                 .with_context(|| {
                     format!(
                         "sealed-staging startup recovery did not reach a safe terminal state in {}",
@@ -261,7 +250,6 @@ impl MutationSession {
         // Snapshot only the legacy namespace blocker before mutably borrowing
         // the exact engine. Verified undo consumes WAL-minted tokens, never
         // this path projection.
-        let canonical_home = std::fs::canonicalize(&self.lifecycle.ctx.home).ok();
         let sealed_destinations = self
             .sealed_staging
             .as_ref()
@@ -270,17 +258,23 @@ impl MutationSession {
             .filter(|entry| sealed_mutation_authority_active(entry.state()))
             .map(|entry| {
                 (
-                    canonical_home.as_ref().map(|home| {
-                        home.join(entry.destination_parent().relative_path())
-                            .join(entry.destination_basename())
-                    }),
+                    mount::entry_anchor(&self.lifecycle.ctx.home, &entry)
+                        .ok()
+                        .map(|anchor| {
+                            anchor
+                                .join(entry.destination_parent().relative_path())
+                                .join(entry.destination_basename())
+                        }),
                     entry.root_identity(),
                 )
             })
             .collect::<Vec<_>>();
-        let home_authenticated = canonical_home.is_some();
-        let blocker =
-            |path: &Path| sealed_legacy_undo_block(path, &sealed_destinations, home_authenticated);
+        let anchors_authenticated = sealed_destinations
+            .iter()
+            .all(|(destination, _)| destination.is_some());
+        let blocker = |path: &Path| {
+            sealed_legacy_undo_block(path, &sealed_destinations, anchors_authenticated)
+        };
         undo::undo_latest(
             &self.lifecycle.ctx,
             self.sealed_staging.as_deref_mut(),
@@ -297,14 +291,6 @@ impl MutationSession {
         if entries.is_empty() {
             return None;
         }
-        let canonical_home = match std::fs::canonicalize(&self.lifecycle.ctx.home) {
-            Ok(home) => home,
-            Err(error) => {
-                return Some(format!(
-                    "sealed staging could not authenticate canonical HOME for explicit purge: {error}"
-                ));
-            }
-        };
         let normalized = match (path.parent(), path.file_name()) {
             (Some(parent), Some(name)) => match std::fs::canonicalize(parent) {
                 Ok(parent) => parent.join(name),
@@ -316,12 +302,28 @@ impl MutationSession {
             },
             _ => return Some("sealed staging rejected an unlocatable explicit purge entry".into()),
         };
-        let Some(entry) = entries.into_iter().find(|entry| {
-            canonical_home
+        let mut matched = None;
+        for entry in entries
+            .into_iter()
+            .filter(|entry| sealed_mutation_authority_active(entry.state()))
+        {
+            let anchor = match mount::entry_anchor(&self.lifecycle.ctx.home, &entry) {
+                Ok(anchor) => anchor,
+                Err(error) => {
+                    return Some(format!(
+                        "sealed staging could not authenticate a mount-domain anchor for explicit purge: {error}"
+                    ));
+                }
+            };
+            let expected = anchor
                 .join(entry.destination_parent().relative_path())
-                .join(entry.destination_basename())
-                == normalized
-        }) else {
+                .join(entry.destination_basename());
+            if expected == normalized {
+                matched = Some((entry, anchor));
+                break;
+            }
+        }
+        let Some((entry, anchor)) = matched else {
             return self.sealed_entry_block(path);
         };
         if !matches!(
@@ -336,22 +338,11 @@ impl MutationSession {
                 )
             });
         }
-        let open_home = || {
-            rustix::fs::open(
-                &canonical_home,
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::DIRECTORY
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            )
-            .map_err(std::io::Error::from)
-        };
-        let (source_anchor, destination_anchor) = match (open_home(), open_home()) {
-            (Ok(source), Ok(destination)) => (source, destination),
-            (Err(error), _) | (_, Err(error)) => {
+        let (source_anchor, destination_anchor) = match mount::open_pair_fds(&anchor) {
+            Ok(anchors) => anchors,
+            Err(error) => {
                 return Some(format!(
-                    "failed to retain explicit purge HOME anchors: {error}"
+                    "failed to retain explicit purge mount-domain anchors: {error}"
                 ));
             }
         };
@@ -395,14 +386,6 @@ impl MutationSession {
         if entries.is_empty() {
             return None;
         }
-        let canonical_home = match std::fs::canonicalize(&self.lifecycle.ctx.home) {
-            Ok(home) => home,
-            Err(error) => {
-                return Some(format!(
-                    "sealed-staging authority could not authenticate canonical HOME before mutation: {error}; no claim, rename, or deletion was attempted"
-                ));
-            }
-        };
         let normalized = match (path.parent(), path.file_name()) {
             (Some(parent), Some(name)) => match std::fs::canonicalize(parent) {
                 Ok(parent) => parent.join(name),
@@ -423,7 +406,15 @@ impl MutationSession {
             .into_iter()
             .filter(|entry| sealed_mutation_authority_active(entry.state()))
         {
-            let expected = canonical_home
+            let anchor = match mount::entry_anchor(&self.lifecycle.ctx.home, &entry) {
+                Ok(anchor) => anchor,
+                Err(error) => {
+                    return Some(format!(
+                        "sealed-staging authority could not authenticate a mount-domain anchor: {error}; no claim, rename, or deletion was attempted"
+                    ));
+                }
+            };
+            let expected = anchor
                 .join(entry.destination_parent().relative_path())
                 .join(entry.destination_basename());
             if normalized == expected {
@@ -465,7 +456,7 @@ fn sealed_mutation_authority_active(state: degu_core::authority::TransactionStat
 fn sealed_legacy_undo_block(
     path: &Path,
     sealed_destinations: &[(Option<PathBuf>, degu_core::seal_wal::StrongObjectIdentity)],
-    home_authenticated: bool,
+    anchors_authenticated: bool,
 ) -> Option<String> {
     let normalized = path
         .parent()
@@ -498,9 +489,9 @@ fn sealed_legacy_undo_block(
             }
         }
     }
-    if (!home_authenticated || normalized.is_none()) && !sealed_destinations.is_empty() {
+    if (!anchors_authenticated || normalized.is_none()) && !sealed_destinations.is_empty() {
         Some(
-            "sealed staging authority could not authenticate HOME or this legacy undo path"
+            "sealed staging authority could not authenticate a mount-domain anchor or this legacy undo path"
                 .to_string(),
         )
     } else {

@@ -16,6 +16,7 @@ use degu_core::sealed_staging::{
 };
 
 use super::journal::{OperationLog, VerifiedRestoreRecord, verified_restore_record};
+use super::mount;
 use restore::restore_selection;
 use selection::select_actionable_undo_group;
 
@@ -67,19 +68,42 @@ fn undo_latest_verified(
         return Ok(None);
     };
     let reclamation_id = latest.reclamation_id().to_owned();
-    let canonical_home = std::fs::canonicalize(&ctx.home)
-        .context("failed to authenticate canonical HOME for verified undo")?;
-    let group = entries
+    let sealed_paths = entries
         .iter()
         .filter(|entry| entry.reclamation_id() == reclamation_id)
-        .collect::<Vec<_>>();
+        .map(|entry| {
+            mount::entry_anchor(&ctx.home, entry)
+                .map(|anchor| projected_paths(&anchor, entry))
+                .with_context(|| {
+                    format!(
+                        "failed to project mount-domain mapping for transaction {:?}",
+                        entry.transaction()
+                    )
+                })
+        })
+        .collect::<Result<HashSet<_>>>()?;
+    let group = entries
+        .iter()
+        .filter(|entry| {
+            entry.reclamation_id() == reclamation_id && sealed_undo_active(entry.state())
+        })
+        .map(|entry| {
+            mount::entry_anchor(&ctx.home, entry)
+                .map(|anchor| (entry, anchor))
+                .with_context(|| {
+                    format!(
+                        "failed to reopen mount-domain anchor for verified undo transaction {:?}",
+                        entry.transaction()
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let same_group_selection =
         selection::select_actionable_undo_group_named(records, &reclamation_id);
     if let Some(blocked) = block_mixed_group(
-        &canonical_home,
         &reclamation_id,
-        &group,
+        &sealed_paths,
         same_group_selection.as_ref(),
     ) {
         trace_summary(&blocked, &reclamation_id);
@@ -88,11 +112,8 @@ fn undo_latest_verified(
 
     let mut report = UndoReport::new(Some(reclamation_id.clone()));
     let mut recovery_blocked = false;
-    for entry in group
-        .into_iter()
-        .filter(|entry| sealed_undo_active(entry.state()))
-    {
-        let (original, trash_entry) = projected_paths(&canonical_home, entry);
+    for (entry, anchor) in group {
+        let (original, trash_entry) = projected_paths(&anchor, entry);
         if entry.state() == TransactionState::UndoConflict {
             report.ambiguous.push(UndoAmbiguousEntry {
                 path: original,
@@ -119,16 +140,13 @@ fn undo_latest_verified(
             });
             continue;
         };
-        let request = match (
-            open_directory(&canonical_home),
-            open_directory(&canonical_home),
-        ) {
-            (Ok(source), Ok(destination)) => VerifiedUndoRequest::new(source, destination),
-            (Err(error), _) | (_, Err(error)) => {
+        let request = match mount::open_pair_fds(&anchor) {
+            Ok((source, destination)) => VerifiedUndoRequest::new(source, destination),
+            Err(error) => {
                 report.failed.push(UndoFailedEntry {
                     path: original,
                     trash_entry,
-                    reason: format!("failed to open verified undo HOME anchors: {error}"),
+                    reason: format!("failed to open verified undo mount-domain anchors: {error}"),
                 });
                 continue;
             }
@@ -191,19 +209,14 @@ fn undo_latest_verified(
 }
 
 fn block_mixed_group(
-    canonical_home: &Path,
     reclamation_id: &str,
-    sealed_group: &[&ProductionStagingEntry],
+    sealed_paths: &HashSet<(PathBuf, PathBuf)>,
     legacy_selection: Option<&selection::UndoSelection>,
 ) -> Option<UndoReport> {
     let selection = legacy_selection?;
     if selection.reclamation_id.as_deref() != Some(reclamation_id) {
         return None;
     }
-    let sealed_paths = sealed_group
-        .iter()
-        .map(|entry| projected_paths(canonical_home, entry))
-        .collect::<HashSet<_>>();
     let selected = selection.targets.iter().chain(&selection.ambiguous);
     if selected.clone().all(|record| {
         record
@@ -230,11 +243,11 @@ fn block_mixed_group(
             .targets
             .iter()
             .chain(&selection.ambiguous)
-            .any(|record| record.path == path && record.trash_entry.as_ref() == Some(&trash_entry))
+            .any(|record| record.path == *path && record.trash_entry.as_ref() == Some(trash_entry))
         {
             report.failed.push(UndoFailedEntry {
-                path,
-                trash_entry,
+                path: path.clone(),
+                trash_entry: trash_entry.clone(),
                 reason: reason.into(),
             });
         }
@@ -256,18 +269,6 @@ fn sealed_undo_active(state: TransactionState) -> bool {
         state,
         TransactionState::VerifiedCommitted | TransactionState::UndoConflict
     )
-}
-
-fn open_directory(path: &Path) -> std::io::Result<rustix::fd::OwnedFd> {
-    rustix::fs::open(
-        path,
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::DIRECTORY
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )
-    .map_err(std::io::Error::from)
 }
 
 fn transaction_hex(transaction: TransactionId) -> String {
@@ -294,6 +295,24 @@ fn trace_summary(report: &UndoReport, reclamation_label: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use degu_core::oplog::{OpAction, OpRecord};
+
+    fn record(path: &str, trash: &str) -> OpRecord {
+        OpRecord {
+            ts: "2026-01-01T00:00:00Z".into(),
+            tool_version: "test".into(),
+            command: "clean".into(),
+            action: OpAction::Trash,
+            path: PathBuf::from(path),
+            bytes_allocated: 1,
+            inodes: 1,
+            trash_entry: Some(PathBuf::from(trash)),
+            reclamation_id: Some("group".into()),
+            expected_identity: None,
+            destination_parent: None,
+            outcome: OpOutcome::Ok,
+        }
+    }
 
     #[test]
     fn transaction_hex_is_fixed_width_and_adapter_local() {
@@ -304,5 +323,23 @@ mod tests {
             ])),
             "00010f102a7f80ff55aa03309909d00d"
         );
+    }
+
+    #[test]
+    fn terminal_wal_mapping_does_not_make_active_same_group_look_legacy() {
+        let terminal = record("/source/old", "/trash/old");
+        let active = record("/source/current", "/trash/current");
+        let selection = selection::UndoSelection {
+            targets: vec![terminal.clone(), active.clone()],
+            ambiguous: Vec::new(),
+            reclamation_id: Some("group".into()),
+        };
+        let sealed_paths = [
+            (terminal.path.clone(), terminal.trash_entry.clone().unwrap()),
+            (active.path.clone(), active.trash_entry.clone().unwrap()),
+        ]
+        .into_iter()
+        .collect();
+        assert!(block_mixed_group("group", &sealed_paths, Some(&selection)).is_none());
     }
 }

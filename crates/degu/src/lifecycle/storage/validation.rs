@@ -11,6 +11,17 @@ const SHARED_WRITE_MASK: u32 = 0o022;
 const STICKY_BIT: u32 = 0o1000;
 
 pub(crate) fn ensure_managed_trash_root(root: &Path, expected_name: &str) -> Result<PathBuf> {
+    ensure_managed_trash_root_with_sync(root, expected_name, sync_directory)
+}
+
+pub(super) fn ensure_managed_trash_root_with_sync<F>(
+    root: &Path,
+    expected_name: &str,
+    mut sync: F,
+) -> Result<PathBuf>
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
     prepare_trash_parent(root, expected_name)?;
     let mut builder = std::fs::DirBuilder::new();
     builder.mode(PRIVATE_DIR_MODE);
@@ -21,11 +32,27 @@ pub(crate) fn ensure_managed_trash_root(root: &Path, expected_name: &str) -> Res
             return Err(error).with_context(|| format!("failed to create {}", root.display()));
         }
     }
-    Ok(validate_existing_trash_root(root, expected_name)?
-        .ok_or_else(|| {
-            anyhow::anyhow!("trash root disappeared after creation: {}", root.display())
-        })?
-        .lexical)
+    let validated = validate_existing_trash_root(root, expected_name)?.ok_or_else(|| {
+        anyhow::anyhow!("trash root disappeared after creation: {}", root.display())
+    })?;
+    // The staged rename can make the source name durably absent. Commit the
+    // trash-root binding first so a power loss cannot lose the only destination
+    // namespace after that rename.
+    sync(&validated.canonical)
+        .with_context(|| format!("failed to sync trash root {}", root.display()))?;
+    let parent = validated.canonical.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "canonical trash root has no parent: {}",
+            validated.canonical.display()
+        )
+    })?;
+    sync(parent)
+        .with_context(|| format!("failed to sync trash-root parent {}", parent.display()))?;
+    Ok(validated.lexical)
+}
+
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
 }
 
 /// A validated trash root: the lexical path as configured, kept for display, and

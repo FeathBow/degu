@@ -14,7 +14,7 @@ use super::EntryIdentity;
 use super::claims::prepare_claims_dir;
 use super::journal::OperationLog;
 use super::storage::{
-    ensure_managed_trash_root, register_trash_root, resolve_trash_dir, trash_dir_state,
+    ensure_managed_trash_root, is_state_trash_root, register_trash_root, resolve_trash_dir,
 };
 use execution::{CleanFailure, StageRequest, record_clean_failure, stage_finding_with_log};
 
@@ -116,7 +116,7 @@ fn execute_finding(
 
 fn prepare_trash_root(ctx: &DetectCtx, path: &Path) -> Result<PathBuf, String> {
     let trash_root = resolve_trash_dir(ctx, path)?;
-    let cross_device = trash_root != trash_dir_state(ctx);
+    let cross_device = !is_state_trash_root(ctx, &trash_root);
     let expected_name = if cross_device { ".degu-trash" } else { "trash" };
     let trash_root =
         ensure_managed_trash_root(&trash_root, expected_name).map_err(|error| error.to_string())?;

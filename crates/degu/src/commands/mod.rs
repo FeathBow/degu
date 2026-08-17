@@ -9,6 +9,7 @@ pub(crate) mod clean;
 pub(crate) mod completions;
 pub(crate) mod doctor;
 pub(crate) mod guidance;
+pub(crate) mod init;
 pub(crate) mod man;
 pub(crate) mod ops;
 pub(crate) mod prompt;
@@ -18,6 +19,7 @@ mod regions;
 pub(crate) mod relocate;
 pub(crate) mod scan;
 mod scope;
+mod setup;
 pub(crate) mod trash;
 pub(crate) mod undo;
 

@@ -31,6 +31,7 @@ const HELP_CASES: &[HelpCase] = &[
     HelpCase::new(&["man", "--help"], false, false),
     HelpCase::new(&["scan", "--help"], true, true),
     HelpCase::new(&["doctor", "--help"], true, false),
+    HelpCase::new(&["init", "--help"], true, false),
     HelpCase::new(&["quota", "--help"], true, false),
     HelpCase::new(&["reclaim", "uv", "--help"], true, false),
     HelpCase::new(&["clean", "--help"], true, true),
@@ -54,6 +55,7 @@ const SUPPORTED_CASES: &[&[&str]] = &[
         "1",
     ],
     &["doctor", JSON, "--help"],
+    &["init", "--initial", JSON, "--help"],
     &["quota", JSON, "--help"],
     &[
         "reclaim",
@@ -90,6 +92,8 @@ const UNSUPPORTED_CASES: &[(&[&str], &str)] = &[
     (&[BUDGET, "1s", "scan"], BUDGET),
     (&[MAX_CONCURRENCY, "1", "scan"], MAX_CONCURRENCY),
     (&["doctor", BUDGET, "1s"], BUDGET),
+    (&["init", BUDGET, "1s"], BUDGET),
+    (&["init", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
     (&["doctor", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
     (&["quota", BUDGET, "1s"], BUDGET),
     (&["quota", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
@@ -142,6 +146,7 @@ const COMPLETION_CASES: &[CompletionCase] = &[
     CompletionCase::new("__fish_degu_using_subcommand man", false, false),
     CompletionCase::new("__fish_degu_using_subcommand scan", true, true),
     CompletionCase::new("__fish_degu_using_subcommand doctor", true, false),
+    CompletionCase::new("__fish_degu_using_subcommand init", true, false),
     CompletionCase::new("__fish_degu_using_subcommand quota", true, false),
     CompletionCase::new(
         "__fish_degu_using_subcommand reclaim; and __fish_seen_subcommand_from uv",

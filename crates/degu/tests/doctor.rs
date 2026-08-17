@@ -35,28 +35,53 @@ fn doctor_is_one_short_read_only_command_with_stable_json() {
     let first_json: Value = serde_json::from_slice(&first.stdout).unwrap();
     let second_json: Value = serde_json::from_slice(&second.stdout).unwrap();
 
-    assert_eq!(first_json["schema_version"], 1);
+    assert_eq!(first_json["schema_version"], 2);
     assert_eq!(first_json["check"], "account_readiness");
     assert_eq!(first_json["mutated"], false);
-    assert_eq!(first_json["path"], second_json["path"]);
-    assert_eq!(first_json["status"], second_json["status"]);
+    for field in [
+        "status",
+        "authority_mode",
+        "activation_state",
+        "path",
+        "system_path",
+        "self_managed_path",
+        "backend",
+    ] {
+        assert_eq!(first_json[field], second_json[field], "field {field}");
+    }
     assert_eq!(first.status.success(), first_json["status"] == "ready");
     assert_eq!(second.status.success(), second_json["status"] == "ready");
 
-    let path = first_json["path"].as_str().unwrap();
     let euid = rustix::process::geteuid().as_raw().to_string();
-    assert!(path.ends_with(&format!("/{euid}")), "{path}");
-    #[cfg(target_os = "linux")]
-    assert!(
-        path.starts_with("/var/lib/degu/store-activation/"),
-        "{path}"
-    );
-    #[cfg(target_os = "macos")]
-    assert!(
-        path.starts_with("/private/var/db/degu/store-activation/"),
-        "{path}"
-    );
+    let system = first_json["system_path"].as_str().or_else(|| {
+        (first_json["authority_mode"] == "administrator_hardened")
+            .then(|| first_json["path"].as_str())
+            .flatten()
+    });
+    if let Some(system) = system {
+        assert!(system.ends_with(&format!("/{euid}")), "{system}");
+        #[cfg(target_os = "linux")]
+        assert!(
+            system.starts_with("/var/lib/degu/store-activation/"),
+            "{system}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            system.starts_with("/private/var/db/degu/store-activation/"),
+            "{system}"
+        );
+    } else {
+        assert!(
+            matches!(
+                first_json["status"].as_str(),
+                Some("unsafe" | "unsupported" | "uncertain")
+            ),
+            "a pathless report must be a blocking authentication failure: {first_json}"
+        );
+    }
 
+    // Ambient HOME, XDG state, configuration, and the integration-only
+    // mutation anchor do not select either production authority candidate.
     assert!(std::fs::read_dir(state_a.path()).unwrap().next().is_none());
     assert!(std::fs::read_dir(state_b.path()).unwrap().next().is_none());
 }

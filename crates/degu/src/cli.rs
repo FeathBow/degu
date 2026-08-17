@@ -19,7 +19,8 @@ After staging, choose one outcome:
   degu undo
   degu trash purge
 
-First mutation on this account? Run 'degu doctor'.
+First mutation on this account? Run 'degu doctor'; if setup is missing,
+run 'degu init --initial' only for first use.
 Run 'degu <command> --help' for command details.";
 
 const SCAN_EXAMPLES: &str = "Examples:
@@ -38,9 +39,19 @@ const QUOTA_EXAMPLES: &str = "Examples:
   degu quota --json | jq .
       Emit authoritative quota data as JSON";
 
+const INIT_EXAMPLES: &str = "Example:
+  degu init --initial
+      Assert first use, then provision and declare this non-root account's fixed authority
+  degu init --initial --json | jq .
+      Emit the provisioning outcome as JSON
+
+This command accepts no UID or path. --initial is an explicit assertion that no
+earlier authority was lost; it does not activate a store, repair an unsafe
+namespace, migrate authority, or clear recovery state.";
+
 const DOCTOR_EXAMPLES: &str = "Examples:
   degu doctor
-      Check whether this account is ready for sealed staging
+      Check this account's authority selection and recorded activation state
   degu doctor --json | jq .
       Emit the same readiness result as JSON
 
@@ -68,8 +79,10 @@ const ADMIN_SETUP_EXAMPLES: &str = "Example:
       Provision initial account setup from an administrator-owned, separately verified binary
 
 This command must run with effective UID 0. Never elevate a binary under the
-target user's home or another user-writable prefix. --initial asserts that the
-UID has never activated a store; this is not repair or recovery.";
+target user's home or another user-writable prefix. Quiesce every degu init and
+lifecycle process for the target UID first. --initial asserts that no self
+candidate exists, no setup is concurrent, and the UID has never declared or
+activated an authority; this is not repair, migration, or recovery.";
 
 const MAN_EXAMPLES: &str = "Examples:
   degu man
@@ -158,6 +171,15 @@ pub(crate) enum Command {
     /// Check whether required account setup is ready (read-only)
     #[command(after_help = DOCTOR_EXAMPLES)]
     Doctor {
+        #[command(flatten)]
+        output: JsonArgs,
+    },
+    /// Provision or validate this account's fixed self-managed activation anchor
+    #[command(after_help = INIT_EXAMPLES)]
+    Init {
+        /// Assert that this account has never activated a degu store
+        #[arg(long, required = true)]
+        initial: bool,
         #[command(flatten)]
         output: JsonArgs,
     },

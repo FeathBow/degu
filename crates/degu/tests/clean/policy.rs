@@ -130,7 +130,7 @@ fn assert_not_planned_or_executed(report: &serde_json::Value, path: &std::path::
 #[test]
 fn clean_opt_in_trashes_huggingface_hub_cache() {
     let home = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir_in(home.path()).unwrap();
     let hub = home.path().join(".cache/huggingface/hub");
     let repo = hub.join("models--org--name");
     std::fs::create_dir_all(repo.join("snapshots/main")).unwrap();

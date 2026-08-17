@@ -21,7 +21,7 @@ pub(super) fn fake_pip_cache(
     home: &tempfile::TempDir,
     cache_subdir: &str,
 ) -> (std::path::PathBuf, tempfile::TempDir) {
-    let state = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir_in(home.path()).unwrap();
     // The plain `.cache/pip` request means "the pip default"; seed where the
     // scanner probes on this platform. Explicit non-default subdirs pass through.
     let cache = if cache_subdir == ".cache/pip" {
@@ -98,19 +98,30 @@ pub(super) fn write_oplog(state: &tempfile::TempDir, records: &[serde_json::Valu
     std::fs::write(state.path().join("degu/ops.jsonl"), format!("{jsonl}\n")).unwrap();
 }
 
+fn displayed_nested_state_trash(state: &tempfile::TempDir) -> [String; 2] {
+    [
+        state.path().join("degu/trash").display().to_string(),
+        format!(
+            "~/{}/degu/trash",
+            state.path().file_name().unwrap().to_string_lossy()
+        ),
+    ]
+}
+
 /// Terminal form of the clean plan: a Plan headline, the trash destination
 /// on its own line under "To:", then the restorability note.
 pub(super) fn assert_plan_block(stdout: &str, state: &tempfile::TempDir) {
     assert!(stdout.contains("move 1 location"), "stdout: {stdout}");
-    let trash_dir = state.path().join("degu/trash");
+    let trash_dirs = displayed_nested_state_trash(state);
     let lines: Vec<&str> = stdout.lines().map(str::trim_end).collect();
     let to = lines
         .iter()
         .position(|line| *line == "To:")
         .unwrap_or_else(|| panic!("missing To: line in stdout: {stdout}"));
-    assert_eq!(
-        lines[to + 1],
-        format!("  {}", trash_dir.display()),
+    assert!(
+        trash_dirs
+            .iter()
+            .any(|trash_dir| lines[to + 1] == format!("  {trash_dir}")),
         "stdout: {stdout}"
     );
     assert!(
@@ -122,9 +133,13 @@ pub(super) fn assert_plan_block(stdout: &str, state: &tempfile::TempDir) {
 }
 
 pub(super) fn assert_mechanism_line(stdout: &str, state: &tempfile::TempDir, purge: bool) {
-    let trash_dir = state.path().join("degu/trash");
+    let trash_dirs = displayed_nested_state_trash(state);
     assert!(stdout.contains("Plan: move 1 location ("));
-    assert!(stdout.contains(&format!(" to {} ", trash_dir.display())));
+    assert!(
+        trash_dirs
+            .iter()
+            .any(|trash_dir| stdout.contains(&format!(" to {trash_dir} ")))
+    );
     if purge {
         assert!(stdout.contains(
             "sealed, staged, and permanently deleted through exact object-bound authority; not restorable."

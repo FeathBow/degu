@@ -216,7 +216,13 @@ fn trash_purge_rejects_non_explicit_confirmation() {
         assert!(transcript.contains("\u{1b}["));
         assert!(transcript.contains("Purge cancelled; no trash entries were deleted."));
         assert!(transcript.contains("Type 'purge' to permanently delete"));
-        assert!(transcript.contains(&trash_entry.display().to_string()));
+        let relative_entry = trash_entry.strip_prefix(home.path()).unwrap();
+        let displayed_entry = format!("~/{}", relative_entry.display());
+        assert!(
+            transcript.contains(&trash_entry.display().to_string())
+                || transcript.contains(&displayed_entry),
+            "transcript: {transcript}"
+        );
         assert!(transcript.find("Purge plan:").unwrap() < transcript.find("Type 'purge'").unwrap());
     }
 }

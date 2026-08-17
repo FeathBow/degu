@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 const MAGIC: &[u8; 4] = b"DSWL";
-const VERSION: u16 = 10;
+const VERSION: u16 = 11;
 const CONTENT_PROOF_MANIFEST_VERSION: u16 = 2;
 const HEADER_LEN: usize = 20;
 const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
@@ -132,11 +132,10 @@ impl StagingLocator {
 }
 
 fn staging_path_is_confined(path: &std::path::Path) -> bool {
-    let mut components = path.components();
-    let Some(std::path::Component::Normal(_)) = components.next() else {
-        return false;
-    };
-    components.all(|component| matches!(component, std::path::Component::Normal(_)))
+    path.as_os_str().is_empty()
+        || path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 fn purge_progress_path_is_confined(path: &std::path::Path) -> bool {
@@ -183,6 +182,7 @@ pub struct StagingTransactionMetadata {
     backend: CertifiedLocalBackend,
     source_parent_strategy: DurableSourceParentStrategy,
     production_association: Option<ProductionAssociation>,
+    recovery_anchor: Option<PathBuf>,
 }
 
 impl StagingTransactionMetadata {
@@ -209,6 +209,7 @@ impl StagingTransactionMetadata {
             backend,
             source_parent_strategy,
             production_association: None,
+            recovery_anchor: None,
         };
         metadata.invariants_hold().then_some(metadata)
     }
@@ -260,6 +261,21 @@ impl StagingTransactionMetadata {
         self.production_association.as_ref()
     }
 
+    /// Adds the canonical mount-domain pathname used only to reopen candidate
+    /// anchor descriptors after restart. Fresh held-FD identity and mount checks
+    /// remain the recovery authority.
+    pub fn with_recovery_anchor(mut self, path: PathBuf) -> Option<Self> {
+        if !recovery_anchor_path_is_normal(&path) {
+            return None;
+        }
+        self.recovery_anchor = Some(path);
+        self.invariants_hold().then_some(self)
+    }
+
+    pub fn recovery_anchor(&self) -> Option<&std::path::Path> {
+        self.recovery_anchor.as_deref()
+    }
+
     pub fn filesystem_id(&self) -> &str {
         self.source_parent.filesystem_id()
     }
@@ -294,6 +310,10 @@ impl StagingTransactionMetadata {
                 || self.source_basename != self.destination_basename)
             && strategy_is_bound
             && self
+                .recovery_anchor
+                .as_ref()
+                .is_none_or(|path| recovery_anchor_path_is_normal(path))
+            && self
                 .production_association
                 .as_ref()
                 .is_none_or(|association| {
@@ -306,6 +326,17 @@ impl StagingTransactionMetadata {
     pub(crate) fn invalidate_for_test(&mut self) {
         self.source_basename = std::ffi::OsString::from("../invalid");
     }
+}
+
+fn recovery_anchor_path_is_normal(path: &std::path::Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let mut components = path.components();
+    if !matches!(components.next(), Some(std::path::Component::RootDir)) {
+        return false;
+    }
+    components.all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 fn mode_is_exclusive_parent(mode: u32) -> bool {
@@ -660,6 +691,11 @@ impl<W: DurableWrite> SealWal<W> {
         if !metadata.invariants_hold() {
             return Err(AppendError::InvalidState(
                 "staging metadata invariants are invalid",
+            ));
+        }
+        if metadata.production_association().is_some() && metadata.recovery_anchor().is_none() {
+            return Err(AppendError::InvalidState(
+                "v11 production staging metadata requires a recovery anchor",
             ));
         }
         self.append_synced(&SealRecord::StagingBegin {
@@ -1721,7 +1757,7 @@ pub enum ReplayError {
     #[error("malformed committed WAL frame at byte {offset}: {reason}")]
     Malformed { offset: u64, reason: &'static str },
     #[error(
-        "unsupported legacy WAL version {version} at byte {offset}; supported legacy versions are 1 and 3 through 9"
+        "unsupported legacy WAL version {version} at byte {offset}; supported legacy versions are 1 and 3 through 10"
     )]
     UnsupportedLegacyVersion { offset: u64, version: u16 },
     #[error("WAL header checksum mismatch at byte {offset}")]
@@ -2276,7 +2312,7 @@ fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
             });
         }
         let version = u16::from_le_bytes([header[4], header[5]]);
-        if !matches!(version, 1 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | VERSION) {
+        if !matches!(version, 1 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | VERSION) {
             return Err(ReplayError::UnsupportedLegacyVersion {
                 offset: offset as u64,
                 version,
@@ -2649,6 +2685,27 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                     {
                         return Err(ReplayError::InvalidHistory(
                             "parent seal evidence differs from the metadata-bound source parent",
+                        ));
+                    }
+                }
+                if evidence.relative_path().as_os_str().is_empty() {
+                    let exact_v11_parent = versioned.version >= 11
+                        && tx
+                            .staging_schema_version
+                            .is_some_and(|version| version >= 11)
+                        && tx.staging.as_ref().is_some_and(|metadata| {
+                            evidence_is_exact_source_parent(&evidence, metadata)
+                        })
+                        && match reverses_mutation_id {
+                            None => phase == TransactionState::ParentSealIntent,
+                            Some(original) => tx.permissions.iter().any(|permission| {
+                                permission.mutation_id == original
+                                    && permission.phase == TransactionState::ParentSealIntent
+                            }),
+                        };
+                    if !exact_v11_parent {
+                        return Err(ReplayError::InvalidHistory(
+                            "empty permission evidence is not the exact v11 source parent",
                         ));
                     }
                 }
@@ -3254,14 +3311,25 @@ fn decode_record(payload: &[u8], offset: u64, version: u16) -> Result<SealRecord
                     reason: "permission mode exceeds the supported mode-bit schema",
                 });
             }
-            let evidence = PersistentRecoveryEvidence::new(
-                relative_path,
-                filesystem_id,
-                device,
-                inode,
-                generation_or_btime,
-                evidence_mode,
-            )
+            let evidence = if version >= 11 {
+                PersistentRecoveryEvidence::new_staging(
+                    relative_path,
+                    filesystem_id,
+                    device,
+                    inode,
+                    generation_or_btime,
+                    evidence_mode,
+                )
+            } else {
+                PersistentRecoveryEvidence::new(
+                    relative_path,
+                    filesystem_id,
+                    device,
+                    inode,
+                    generation_or_btime,
+                    evidence_mode,
+                )
+            }
             .ok_or(ReplayError::Malformed {
                 offset,
                 reason: "recovery path is not confined",
@@ -3335,7 +3403,7 @@ fn decode_record(payload: &[u8], offset: u64, version: u16) -> Result<SealRecord
         10 if version >= 8 => SealRecord::PurgeAuthorized {
             transaction,
             commitment: DurablePurgeCommitment {
-                destination_parent: decode_locator(&mut cursor, offset)?,
+                destination_parent: decode_locator(&mut cursor, offset, version)?,
                 destination_parent_identity: decode_strong_identity(&mut cursor, version)?,
                 destination_basename: std::ffi::OsString::from_vec(cursor.bytes()?),
                 root_identity: decode_strong_identity(&mut cursor, version)?,
@@ -3349,7 +3417,7 @@ fn decode_record(payload: &[u8], offset: u64, version: u16) -> Result<SealRecord
         11 if version >= 10 => SealRecord::PurgeClaimed {
             transaction,
             commitment: DurablePurgeCommitment {
-                destination_parent: decode_locator(&mut cursor, offset)?,
+                destination_parent: decode_locator(&mut cursor, offset, version)?,
                 destination_parent_identity: decode_strong_identity(&mut cursor, version)?,
                 destination_basename: std::ffi::OsString::from_vec(cursor.bytes()?),
                 root_identity: decode_strong_identity(&mut cursor, version)?,
@@ -3393,12 +3461,22 @@ fn decode_strong_identity(
     })
 }
 
-fn decode_locator(cursor: &mut Cursor<'_>, offset: u64) -> Result<StagingLocator, ReplayError> {
+fn decode_locator(
+    cursor: &mut Cursor<'_>,
+    offset: u64,
+    version: u16,
+) -> Result<StagingLocator, ReplayError> {
     let path = PathBuf::from(std::ffi::OsString::from_vec(cursor.bytes()?));
     let filesystem_id = String::from_utf8(cursor.bytes()?).map_err(|_| ReplayError::Malformed {
         offset,
         reason: "staging filesystem id is not UTF-8",
     })?;
+    if version < 11 && path.as_os_str().is_empty() {
+        return Err(ReplayError::Malformed {
+            offset,
+            reason: "legacy staging locator is empty",
+        });
+    }
     StagingLocator::new(path, filesystem_id).ok_or(ReplayError::Malformed {
         offset,
         reason: "staging locator is invalid",
@@ -3410,11 +3488,11 @@ fn decode_staging_metadata(
     offset: u64,
     version: u16,
 ) -> Result<StagingTransactionMetadata, ReplayError> {
-    let source_parent = decode_locator(cursor, offset)?;
+    let source_parent = decode_locator(cursor, offset, version)?;
     let source_parent_identity = decode_strong_identity(cursor, version)?;
     let source_basename = std::ffi::OsString::from_vec(cursor.bytes()?);
     let root_identity = decode_strong_identity(cursor, version)?;
-    let destination_parent = decode_locator(cursor, offset)?;
+    let destination_parent = decode_locator(cursor, offset, version)?;
     let destination_parent_identity = decode_strong_identity(cursor, version)?;
     let destination_basename = std::ffi::OsString::from_vec(cursor.bytes()?);
     let backend = match cursor.u8()? {
@@ -3431,7 +3509,7 @@ fn decode_staging_metadata(
     let source_parent_strategy = match cursor.u8()? {
         1 => DurableSourceParentStrategy::PermissionSeal,
         2 => DurableSourceParentStrategy::AlreadyExclusive(DurableAlreadyExclusiveParent {
-            source_parent: decode_locator(cursor, offset)?,
+            source_parent: decode_locator(cursor, offset, version)?,
             source_parent_identity: decode_strong_identity(cursor, version)?,
             observed_mode: cursor.u32()?,
         }),
@@ -3468,6 +3546,20 @@ fn decode_staging_metadata(
     } else {
         None
     };
+    let recovery_anchor = if version >= 11 {
+        match cursor.u8()? {
+            0 => None,
+            1 => Some(PathBuf::from(std::ffi::OsString::from_vec(cursor.bytes()?))),
+            _ => {
+                return Err(ReplayError::Malformed {
+                    offset,
+                    reason: "invalid recovery anchor tag",
+                });
+            }
+        }
+    } else {
+        None
+    };
     let metadata = StagingTransactionMetadata {
         source_parent,
         source_parent_identity,
@@ -3479,7 +3571,17 @@ fn decode_staging_metadata(
         backend,
         source_parent_strategy,
         production_association,
+        recovery_anchor,
     };
+    if version >= 11
+        && metadata.production_association.is_some()
+        && metadata.recovery_anchor.is_none()
+    {
+        return Err(ReplayError::Malformed {
+            offset,
+            reason: "v11 production staging metadata lacks a recovery anchor",
+        });
+    }
     let valid = if version >= 4 {
         metadata.invariants_hold()
     } else if metadata.source_parent_identity.mount_id != 0
@@ -3548,6 +3650,13 @@ fn encode_staging_metadata(
         Some(association) => {
             output.push(1);
             put_bytes(output, association.reclamation_id.as_bytes())?;
+        }
+        None => output.push(0),
+    }
+    match &metadata.recovery_anchor {
+        Some(path) => {
+            output.push(1);
+            put_bytes(output, path.as_os_str().as_bytes())?;
         }
         None => output.push(0),
     }

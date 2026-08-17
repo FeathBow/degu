@@ -59,7 +59,11 @@ For a record-empty authority, `doctor ready` means the authority declaration is 
 
 ## Staging, undo, and purge
 
-`degu clean` normally stages findings under `$XDG_STATE_HOME/degu/trash`, or `~/.local/state/degu/trash` when `XDG_STATE_HOME` is unset. Staging keeps the operation undoable with `degu undo`, but staged data continues to consume filesystem quota.
+`degu clean` stages each finding by atomic no-replace rename to trash on the same data mount. When the normal `$XDG_STATE_HOME/degu/trash` lies inside that authenticated mount domain it remains the destination. The recorded mount anchor must pass the same trusted-ancestry resolver before the first WAL frame and on every later reopen; a foreign-controlled non-sticky ancestor is refused before staging. Otherwise degu uses `.degu-trash` beneath the highest writable effective-user-owned ancestor on the source mount. The activation anchor and WAL store may each live on other mounts; neither grants data-mount certification.
+
+New staging transactions use WAL schema v11. Their first atomic frame stores one canonical mount-domain reopen pathname shared by the source and destination locators. That pathname is only a way to obtain candidate descriptors after restart: trusted-ancestry open plus the existing backend, filesystem ID, mount ID, strong parent/root identity, mode, ACL, and held-binding checks still grant recovery authority. A changed pathname, mount, or object blocks. Schema-v10 transactions remain readable and use the former canonical-HOME recovery arm; v10 never gains a synthesized external mount locator.
+
+Staging keeps the operation undoable with `degu undo`, but staged data continues to consume filesystem quota.
 
 A confirmed mutating `degu clean` permanently purges staging entries at least seven days old — even with an empty current plan — after all current clean items succeed. There is no background timer.
 

@@ -1,9 +1,65 @@
+#[cfg(target_os = "linux")]
+use super::path_mount_id;
 use super::{
-    TRASHROOTS_FILE, ensure_managed_trash_root, read_registered_trash_roots, register_trash_root,
-    trash_roots,
+    TRASHROOTS_FILE, ensure_managed_trash_root, ensure_managed_trash_root_with_sync,
+    is_state_trash_root, read_registered_trash_roots, register_trash_root,
+    register_trash_root_with_sync, resolve_mount_owner_anchor_with, trash_dir_state, trash_roots,
 };
 use degu_core::ecosystem::DetectCtx;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+#[test]
+fn fresh_state_trash_root_uses_lexical_identity_until_its_parent_exists() {
+    let home = tempfile::tempdir().unwrap();
+    let base = tempfile::tempdir().unwrap();
+    let state = base.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    let ctx = DetectCtx::for_test(
+        home.path().to_path_buf(),
+        [("XDG_STATE_HOME".to_owned(), state.as_os_str().to_owned())],
+    );
+    let root = trash_dir_state(&ctx);
+
+    assert!(!root.parent().unwrap().exists());
+    assert!(is_state_trash_root(&ctx, &root));
+}
+
+#[test]
+fn mount_anchor_walk_keeps_the_last_confirmed_anchor_after_probe_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let accepted = dir.path().join("accepted");
+    let source = accepted.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::set_permissions(&accepted, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut probed = Vec::new();
+
+    let anchor = resolve_mount_owner_anchor_with(&source, 77, |current| {
+        probed.push(current.to_path_buf());
+        if current == accepted {
+            Ok(77)
+        } else {
+            Err("injected mount inspection failure".to_string())
+        }
+    })
+    .unwrap();
+
+    assert_eq!(anchor, accepted);
+    assert_eq!(probed, vec![accepted, dir.path().to_path_buf()]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mount_identity_probe_does_not_require_directory_read_permission() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("identity");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = path_mount_id(&path);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(result.is_ok(), "{result:?}");
+}
 
 #[test]
 fn managed_trash_root_is_private() {
@@ -140,6 +196,49 @@ fn registration_frames_line_breaks_in_a_root() {
 
     register_trash_root(&state, &root).unwrap();
 
+    assert_eq!(
+        read_registered_trash_roots(&state.join(TRASHROOTS_FILE)).unwrap(),
+        vec![root]
+    );
+}
+
+#[test]
+fn trash_root_parent_sync_failure_blocks_before_staging_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = dir.path().join(".degu-trash");
+    let mut calls = 0;
+    let error = ensure_managed_trash_root_with_sync(&root, ".degu-trash", |_| {
+        calls += 1;
+        if calls == 2 {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("trash-root parent"));
+    assert!(root.is_dir());
+}
+
+#[test]
+fn registry_parent_sync_failure_retries_without_duplicate_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let root = dir.path().join(".degu-trash");
+    let mut calls = 0;
+    let error = register_trash_root_with_sync(&state, &root, |_| {
+        calls += 1;
+        if calls == 2 {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("registry parent"));
+
+    register_trash_root(&state, &root).unwrap();
     assert_eq!(
         read_registered_trash_roots(&state.join(TRASHROOTS_FILE)).unwrap(),
         vec![root]

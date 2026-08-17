@@ -27,7 +27,7 @@ use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
@@ -118,6 +118,7 @@ impl PreparedRootBinding {
             destination_parent_locator,
             destination_basename,
             None,
+            None,
         )
     }
 
@@ -132,6 +133,7 @@ impl PreparedRootBinding {
         destination_parent_locator: StagingLocator,
         destination_basename: OsString,
         production_association: Option<crate::seal_wal::ProductionAssociation>,
+        recovery_anchor: Option<PathBuf>,
     ) -> Result<Self, PreparedRootError> {
         if !normal_basename(&source_basename) || !normal_basename(&destination_basename) {
             return Err(PreparedRootError::InvalidBasename);
@@ -194,6 +196,10 @@ impl PreparedRootBinding {
         .map(|metadata| match production_association {
             Some(association) => metadata.with_production_association(association),
             None => metadata,
+        })
+        .and_then(|metadata| match recovery_anchor {
+            Some(path) => metadata.with_recovery_anchor(path),
+            None => Some(metadata),
         })
         .ok_or(PreparedRootError::InvalidMetadata)?;
 

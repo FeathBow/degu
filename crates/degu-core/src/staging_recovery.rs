@@ -237,11 +237,19 @@ impl LocatorAttachment {
 /// attachment are retained together; the value is neither Clone nor Copy and
 /// is consumed by restoration.
 #[derive(Debug)]
+enum ReboundBinding {
+    Named {
+        attachment: Option<LocatorAttachment>,
+        parent: OwnedFd,
+        basename: OsString,
+    },
+    Anchor(RecoveryFilesystemAnchor),
+}
+
+#[derive(Debug)]
 struct ReboundObject {
-    attachment: Option<LocatorAttachment>,
-    parent: OwnedFd,
+    binding: ReboundBinding,
     object_check_fd: OwnedFd,
-    basename: OsString,
     relative_path: PathBuf,
     identity: StrongObjectIdentity,
     held: HeldLocalBackendEvidence,
@@ -249,15 +257,27 @@ struct ReboundObject {
 
 impl ReboundObject {
     fn verify_fresh_binding(&self) -> Result<(), RecoveryRebindError> {
-        if let Some(attachment) = &self.attachment {
-            attachment.verify(&self.parent)?;
+        match &self.binding {
+            ReboundBinding::Named {
+                attachment,
+                parent,
+                basename,
+            } => {
+                if let Some(attachment) = attachment {
+                    attachment.verify(parent)?;
+                }
+                require_exclusive_controller(parent)?;
+                let current = open_directory_at(parent, basename)?;
+                if strong_identity_fd(&current)? != self.identity {
+                    return Err(RecoveryRebindError::BindingChanged);
+                }
+            }
+            ReboundBinding::Anchor(anchor) => {
+                require_exclusive_controller(&anchor.fd)?;
+                validate_fd(anchor, &self.object_check_fd, self.identity)?;
+            }
         }
-        require_exclusive_controller(&self.parent)?;
-        let current = open_directory_at(&self.parent, &self.basename)?;
-        if strong_identity_fd(&current)? != self.identity
-            || strong_identity_fd(&self.object_check_fd)? != self.identity
-            || !self.held.is_live()
-        {
+        if strong_identity_fd(&self.object_check_fd)? != self.identity || !self.held.is_live() {
             return Err(RecoveryRebindError::BindingChanged);
         }
         Ok(())
@@ -523,7 +543,13 @@ fn collect_rebound_staged_tree(
     manifest_schema: u16,
 ) -> Result<HeldTreeInventory, StagedVerificationFailure> {
     root.verify_fresh_binding()?;
-    let parent = rustix::io::dup(&root.parent)
+    let ReboundBinding::Named {
+        parent, basename, ..
+    } = &root.binding
+    else {
+        return Err(RecoveryRebindError::InvalidLocator.into());
+    };
+    let parent = rustix::io::dup(parent)
         .map_err(io::Error::from)
         .map_err(RecoveryRebindError::Io)?;
     let held_parent = certify_held_fd(parent).map_err(RecoveryRebindError::Certification)?;
@@ -533,7 +559,7 @@ fn collect_rebound_staged_tree(
         .collect();
     let inventory = HeldTreeInventory::collect_for_schema(
         held_parent,
-        &root.basename,
+        basename,
         protected_names,
         limits,
         manifest_schema,
@@ -1450,9 +1476,7 @@ fn resolve_uncertain_permissions(
             ),
             anchor.mount_key,
         );
-        let (parent, basename) = open_confined_parent(&anchor.fd, &path, anchor.mount_key)?;
-        let rebound =
-            rebind_named_child(anchor, parent, &basename, expected, path, metadata, None)?;
+        let rebound = rebind_permission_object(anchor, &path, expected, metadata, None)?;
         resolve_rebound_permission(wal, transaction, &permission, &rebound)?;
     }
     Ok(())
@@ -2010,13 +2034,10 @@ fn rebind_permissions(
                 ),
                 anchor.mount_key,
             );
-            let (parent, basename) = open_confined_parent(&anchor.fd, &path, anchor.mount_key)?;
-            let rebound = rebind_named_child(
+            let rebound = rebind_permission_object(
                 anchor,
-                parent,
-                &basename,
+                &path,
                 expected,
-                path,
                 metadata,
                 Some(permission.expected_mode),
             )?;
@@ -2067,13 +2088,10 @@ fn rebind_quarantined_permissions(
                 ),
                 anchor.mount_key,
             );
-            let (parent, basename) = open_confined_parent(&anchor.fd, &path, anchor.mount_key)?;
-            let rebound = rebind_named_child(
+            let rebound = rebind_permission_object(
                 anchor,
-                parent,
-                &basename,
+                &path,
                 expected,
-                path,
                 metadata,
                 Some(permission.expected_mode),
             )?;
@@ -2147,11 +2165,66 @@ fn rebind_named_child_from_held_parent(
         return Err(RecoveryRebindError::BindingChanged);
     }
     Ok(ReboundObject {
-        attachment: None,
-        parent,
+        binding: ReboundBinding::Named {
+            attachment: None,
+            parent,
+            basename: basename.to_os_string(),
+        },
         object_check_fd,
-        basename: basename.to_os_string(),
         relative_path,
+        identity: expected,
+        held,
+    })
+}
+
+fn rebind_permission_object(
+    anchor: &RecoveryFilesystemAnchor,
+    relative_path: &Path,
+    expected: StrongObjectIdentity,
+    metadata: &StagingTransactionMetadata,
+    expected_mode: Option<u32>,
+) -> Result<ReboundObject, RecoveryRebindError> {
+    if !relative_path.as_os_str().is_empty() {
+        let (parent, basename) = open_confined_parent(&anchor.fd, relative_path, anchor.mount_key)?;
+        return rebind_named_child(
+            anchor,
+            parent,
+            &basename,
+            expected,
+            relative_path.to_path_buf(),
+            metadata,
+            expected_mode,
+        );
+    }
+    if !metadata
+        .source_parent()
+        .relative_path()
+        .as_os_str()
+        .is_empty()
+        || expected != metadata.source_parent_identity()
+    {
+        return Err(RecoveryRebindError::InvalidLocator);
+    }
+    let object = rustix::io::dup(&anchor.fd)
+        .map_err(io::Error::from)
+        .map_err(RecoveryRebindError::Io)?;
+    validate_fd(anchor, &object, expected)?;
+    let object_check_fd = rustix::io::dup(&object)
+        .map_err(io::Error::from)
+        .map_err(RecoveryRebindError::Io)?;
+    let held = certify_held_fd(object)?;
+    if held.backend() != metadata.backend()
+        || held.mount_id() != expected.mount_id()
+        || held.device() != expected.device()
+        || held.inode() != expected.inode()
+        || expected_mode.is_some_and(|mode| held.mode() != mode)
+    {
+        return Err(RecoveryRebindError::BindingChanged);
+    }
+    Ok(ReboundObject {
+        binding: ReboundBinding::Anchor(anchor.duplicate_authority()?),
+        object_check_fd,
+        relative_path: PathBuf::new(),
         identity: expected,
         held,
     })
@@ -2194,10 +2267,12 @@ fn rebind_named_child(
         return Err(RecoveryRebindError::ModeChanged);
     }
     Ok(ReboundObject {
-        attachment: Some(attachment),
-        parent,
+        binding: ReboundBinding::Named {
+            attachment: Some(attachment),
+            parent,
+            basename: basename.to_os_string(),
+        },
         object_check_fd,
-        basename: basename.to_os_string(),
         relative_path,
         identity: expected,
         held,
@@ -2238,6 +2313,13 @@ fn open_confined_directory_with_exclusive_ancestors(
     let mut current = rustix::io::dup(anchor)
         .map_err(io::Error::from)
         .map_err(RecoveryRebindError::Io)?;
+    if path.as_os_str().is_empty() {
+        require_exclusive_controller(&current)?;
+        if held_mount_key(&current)? != expected_mount {
+            return Err(RecoveryRebindError::MountChanged);
+        }
+        return Ok(current);
+    }
     let mut saw_component = false;
     for component in path.components() {
         let Component::Normal(name) = component else {

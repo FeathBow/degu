@@ -12,6 +12,27 @@ fn fake_pip_cache(home: &tempfile::TempDir) -> (std::path::PathBuf, tempfile::Te
     (cache, state)
 }
 
+fn listed_trash_entries(
+    home: &tempfile::TempDir,
+    state: &tempfile::TempDir,
+) -> Vec<serde_json::Value> {
+    let out = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args(["trash", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["entries"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
 /// Holds the exclusive lock on `<state>/degu/lock` for the returned File's
 /// lifetime, exactly like a concurrent mutating degu process would.
 fn hold_mutation_lock(state: &tempfile::TempDir) -> std::fs::File {
@@ -90,6 +111,8 @@ fn trash_purge_refuses_while_mutation_lock_is_held() {
         .output()
         .unwrap();
     assert!(staged.status.success());
+    let entries_before = listed_trash_entries(&home, &state);
+    assert!(!entries_before.is_empty());
     let holder = hold_mutation_lock(&state);
 
     let out = degu()
@@ -101,6 +124,6 @@ fn trash_purge_refuses_while_mutation_lock_is_held() {
 
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("holds the mutation lock"));
-    assert!(state.path().join("degu/trash").read_dir().unwrap().count() > 0);
+    assert_eq!(listed_trash_entries(&home, &state), entries_before);
     drop(holder);
 }

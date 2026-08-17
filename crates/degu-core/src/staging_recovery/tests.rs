@@ -1392,3 +1392,24 @@ fn unsupported_or_missing_strong_incarnation_is_not_a_weak_match() {
         Err(RecoveryRebindError::StrongIdentityUnavailable)
     ));
 }
+
+#[test]
+fn v11_empty_parent_locator_rebinds_the_authenticated_mount_anchor_itself() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let path = temp.path().canonicalize().unwrap();
+    let fd = rustix::fs::open(
+        &path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .unwrap();
+    let filesystem_id = held_filesystem_id(&fd).unwrap();
+    let identity = strong_identity_fd(&fd).unwrap();
+    let anchor = RecoveryFilesystemAnchor::certify(fd, filesystem_id.clone()).unwrap();
+    let locator = StagingLocator::new(PathBuf::new(), filesystem_id).unwrap();
+    let rebound = rebind_locator(&anchor, &locator, identity).unwrap();
+    assert_eq!(strong_identity_fd(&rebound).unwrap(), identity);
+}

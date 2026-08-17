@@ -46,7 +46,11 @@ fn checked_frame(version: u16, payload: Vec<u8>) -> Vec<u8> {
 }
 
 fn legacy_frame(version: u16, record: &SealRecord) -> Vec<u8> {
-    checked_frame(version, encode_record(record).unwrap())
+    let mut payload = encode_record(record).unwrap();
+    if version < 11 && matches!(record, SealRecord::StagingBegin { .. }) {
+        assert_eq!(payload.pop(), Some(0), "v11 recovery anchor tag");
+    }
+    checked_frame(version, payload)
 }
 
 fn legacy_v3_staging_begin(
@@ -2350,7 +2354,9 @@ fn authority_neutral_public_methods_cannot_drive_a_staging_transaction() {
 fn purge_authorization_sync_failure_never_publishes_purgeable() {
     let transaction = tx(0xc6);
     let metadata = staging_metadata()
-        .with_production_association(ProductionAssociation::new("purge-sync".to_string()).unwrap());
+        .with_production_association(ProductionAssociation::new("purge-sync".to_string()).unwrap())
+        .with_recovery_anchor(PathBuf::from("/mount-domain"))
+        .unwrap();
     let manifest = DurableTreeManifest {
         schema_version: CONTENT_PROOF_MANIFEST_VERSION,
         entry_count: 0,
@@ -2591,9 +2597,12 @@ fn v10_purge_claim_and_progress_replay_fail_closed_on_every_invalid_shape() {
 #[test]
 fn production_association_round_trips_in_atomic_staging_begin() {
     let transaction = tx(0xc4);
-    let metadata = staging_metadata().with_production_association(
-        ProductionAssociation::new("reclamation-production".to_string()).unwrap(),
-    );
+    let metadata = staging_metadata()
+        .with_production_association(
+            ProductionAssociation::new("reclamation-production".to_string()).unwrap(),
+        )
+        .with_recovery_anchor(PathBuf::from("/mount-domain"))
+        .unwrap();
     let replay = replay_bytes(&frame(&SealRecord::StagingBegin {
         transaction,
         metadata,
@@ -2606,6 +2615,7 @@ fn production_association_round_trips_in_atomic_staging_begin() {
         "reclamation-production"
     );
     assert_eq!(metadata.destination_basename(), "staged-root");
+    assert_eq!(metadata.recovery_anchor(), Some(Path::new("/mount-domain")));
     assert_eq!(metadata.root_identity(), strong(1, 11, 101));
 }
 
@@ -2618,6 +2628,7 @@ fn version_four_staging_replays_without_inventing_production_authority() {
         metadata,
     })
     .unwrap();
+    assert_eq!(payload.pop(), Some(0), "v11 recovery anchor tag");
     assert_eq!(payload.pop(), Some(0), "v5 optional association tag");
     let replay = replay_bytes(&checked_frame(4, payload));
     let metadata = replay.transactions[&transaction].staging.as_ref().unwrap();
@@ -2626,4 +2637,105 @@ fn version_four_staging_replays_without_inventing_production_authority() {
         replay.transactions[&transaction].staging_schema_version,
         Some(4)
     );
+}
+
+#[test]
+fn v11_recovery_anchor_round_trips_and_rejects_non_absolute_paths() {
+    assert!(
+        staging_metadata()
+            .with_recovery_anchor(PathBuf::from("relative/mount"))
+            .is_none()
+    );
+    let transaction = tx(0xb3);
+    let anchor = PathBuf::from("/scratch/account");
+    let metadata = staging_metadata()
+        .with_recovery_anchor(anchor.clone())
+        .unwrap();
+    let parsed = parse_frames(&frame(&SealRecord::StagingBegin {
+        transaction,
+        metadata,
+    }))
+    .unwrap();
+    let SealRecord::StagingBegin { metadata, .. } = &parsed.records[0].record else {
+        panic!("expected staging begin")
+    };
+    assert_eq!(metadata.recovery_anchor(), Some(anchor.as_path()));
+}
+
+#[test]
+fn v10_staging_replays_without_inventing_a_recovery_anchor() {
+    let transaction = tx(0xb2);
+    let mut payload = encode_record(&SealRecord::StagingBegin {
+        transaction,
+        metadata: staging_metadata(),
+    })
+    .unwrap();
+    assert_eq!(payload.pop(), Some(0), "v11 recovery anchor tag");
+    let parsed = parse_frames(&checked_frame(10, payload)).unwrap();
+    let SealRecord::StagingBegin { metadata, .. } = &parsed.records[0].record else {
+        panic!("expected v10 staging begin")
+    };
+    assert_eq!(metadata.recovery_anchor(), None);
+}
+
+#[test]
+fn v11_replay_rejects_production_metadata_without_recovery_anchor() {
+    let transaction = tx(0xb1);
+    let metadata = staging_metadata().with_production_association(
+        ProductionAssociation::new("missing-anchor".to_string()).unwrap(),
+    );
+    let payload = encode_record(&SealRecord::StagingBegin {
+        transaction,
+        metadata,
+    })
+    .unwrap();
+    assert!(matches!(
+        parse_frames(&checked_frame(11, payload)),
+        Err(ReplayError::Malformed {
+            reason: "v11 production staging metadata lacks a recovery anchor",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn v11_allows_anchor_relative_parent_while_v10_rejects_empty_locator() {
+    let base = staging_metadata();
+    let metadata = StagingTransactionMetadata::new(
+        StagingLocator::new(PathBuf::new(), base.filesystem_id().to_owned()).unwrap(),
+        base.source_parent_identity(),
+        base.source_basename().to_os_string(),
+        base.root_identity(),
+        base.destination_parent().clone(),
+        base.destination_parent_identity(),
+        base.destination_basename().to_os_string(),
+        base.backend(),
+        DurableSourceParentStrategy::PermissionSeal,
+    )
+    .unwrap();
+    let transaction = tx(0xb0);
+    let v11_metadata = metadata
+        .clone()
+        .with_recovery_anchor(PathBuf::from("/mount-root"))
+        .unwrap();
+    let v11 = encode_record(&SealRecord::StagingBegin {
+        transaction,
+        metadata: v11_metadata,
+    })
+    .unwrap();
+    assert!(parse_frames(&checked_frame(11, v11)).is_ok());
+
+    let mut v10 = encode_record(&SealRecord::StagingBegin {
+        transaction,
+        metadata,
+    })
+    .unwrap();
+    assert_eq!(v10.pop(), Some(0), "v11 recovery anchor tag");
+    assert!(matches!(
+        parse_frames(&checked_frame(10, v10)),
+        Err(ReplayError::Malformed {
+            reason: "legacy staging locator is empty",
+            ..
+        })
+    ));
 }

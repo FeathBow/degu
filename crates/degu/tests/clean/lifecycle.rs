@@ -37,13 +37,21 @@ fn clean_lifecycle_stages_restores_and_releases_only_on_purge() {
 
 fn assert_stage(fixture: &Lifecycle) {
     let out = fixture.run(&["clean", "--yes"]);
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(!fixture.cache.exists());
 }
 
 fn assert_trash_list(fixture: &Lifecycle) {
     let out = fixture.run(&["trash", "list", "--json"]);
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["omitted"], 0);
     let rows = report["entries"].as_array().unwrap();
@@ -53,7 +61,11 @@ fn assert_trash_list(fixture: &Lifecycle) {
 
 fn assert_undo(fixture: &Lifecycle) {
     let out = fixture.run(&["undo", "--json"]);
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(!report["restored"].as_array().unwrap().is_empty());
     assert!(fixture.cache.exists());
@@ -61,7 +73,11 @@ fn assert_undo(fixture: &Lifecycle) {
 
 fn assert_restage(fixture: &Lifecycle) -> String {
     let out = fixture.run(&["clean", "--yes", "--json"]);
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(!fixture.cache.exists());
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["executed"].as_array().unwrap().len(), 1);
@@ -73,7 +89,11 @@ fn assert_restage(fixture: &Lifecycle) -> String {
 
 fn assert_purge(fixture: &Lifecycle, trash_entry: &str) {
     let out = fixture.run(&["trash", "purge", "--yes", "--json"]);
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(
         report["purged"]

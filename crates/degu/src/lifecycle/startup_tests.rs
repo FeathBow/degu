@@ -110,9 +110,15 @@ fn desired_store_remains_the_canonical_current_xdg_locator_before_activation() {
 }
 
 #[test]
-fn production_clean_reaches_verified_commit_and_keeps_jsonl_diagnostic_only() {
+fn production_clean_reaches_verified_commit_outside_home_on_the_same_mount() {
     let (_temp, ctx) = context();
-    let source_parent = ctx.home.join("source-parent");
+    let external = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(external.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let source_parent = external
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("source-parent");
     let source = source_parent.join("root");
     std::fs::create_dir(&source_parent).unwrap();
     std::fs::create_dir(&source).unwrap();
@@ -175,7 +181,7 @@ fn production_clean_reaches_verified_commit_and_keeps_jsonl_diagnostic_only() {
 
     let executed = session.execute_clean(&plan, false, &|_| Ok(())).unwrap();
     assert_eq!(executed.len(), 1);
-    assert!(!executed[0].failed());
+    assert!(!executed[0].failed(), "{:?}", executed[0].failure_reason());
     assert_eq!(executed[0].state_label(), "staged");
     assert!(!source.exists());
     let staged = executed[0].trash_entry().unwrap();
@@ -195,6 +201,12 @@ fn production_clean_reaches_verified_commit_and_keeps_jsonl_diagnostic_only() {
         entries[0].destination_basename(),
         staged.file_name().unwrap()
     );
+    let recovery_anchor = entries[0]
+        .recovery_anchor()
+        .expect("v11 production entry must persist its mount-domain anchor");
+    assert!(source_parent.starts_with(recovery_anchor));
+    assert!(staged.starts_with(recovery_anchor));
+    assert_ne!(recovery_anchor, ctx.home.as_path());
 
     let records = session.lifecycle.operations().unwrap();
     assert_eq!(records.len(), 1);
@@ -207,6 +219,39 @@ fn production_clean_reaches_verified_commit_and_keeps_jsonl_diagnostic_only() {
     assert!(purge.purged.is_empty());
     assert_eq!(purge.failed.len(), 1);
     assert!(staged.is_dir());
+
+    // Reopen the WAL under a different current HOME. The v11 entry's recorded
+    // mount-domain anchor, not ambient HOME, must still drive verified undo.
+    drop(session);
+    let changed_home = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(changed_home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let changed_ctx = DetectCtx::for_test(
+        changed_home.path().canonicalize().unwrap(),
+        [(
+            "XDG_STATE_HOME".to_owned(),
+            ctx.xdg_state().into_os_string(),
+        )],
+    );
+    let store = SealWalStore::open_or_create_for_integration_test(
+        &changed_ctx.xdg_state().join("degu/sealed-staging"),
+    )
+    .unwrap();
+    let (engine, startup) = SealedStagingEngine::open_for_integration_test(&store).unwrap();
+    let (ready, _) = engine
+        .recover_startup(startup, |_, metadata| {
+            mount::metadata_anchors(&changed_ctx.home, metadata)
+        })
+        .unwrap();
+    let lock =
+        std::fs::File::create(changed_ctx.xdg_state().join("degu/reopened-clean-lock")).unwrap();
+    let mut session = MutationSession {
+        lifecycle: Lifecycle::new(&changed_ctx),
+        _mutation_lock: lock,
+        sealed_staging: Some(ActivatedReadyStagingEngine::from_ready_for_integration_test(ready)),
+        forward_clean: true,
+        authority_purged: std::collections::HashSet::new(),
+        _unsupported_legacy_lease: None,
+    };
 
     // Remove the entire reporting projection. The leased WAL must still select
     // and authorize the exact group without reconstructing authority from JSONL.
@@ -350,7 +395,7 @@ fn production_clean_purge_consumes_authority_and_reaches_purged() {
 
     let executed = session.execute_clean(&plan, true, &|_| Ok(())).unwrap();
     assert_eq!(executed.len(), 1);
-    assert!(!executed[0].failed());
+    assert!(!executed[0].failed(), "{:?}", executed[0].failure_reason());
     assert!(executed[0].purged());
     assert_eq!(executed[0].state_label(), "purged");
     let staged = executed[0].trash_entry().unwrap().to_path_buf();
@@ -406,7 +451,8 @@ fn forged_jsonl_mapping_cannot_steal_wal_undo_authority() {
     )
     .with_production_association(
         ProductionAssociation::new("sealed-reclamation".to_string()).unwrap(),
-    );
+    )
+    .with_recovery_anchor(ctx.home.clone());
     let store = SealWalStore::open_or_create_for_integration_test(
         &ctx.xdg_state().join("degu/sealed-staging"),
     )

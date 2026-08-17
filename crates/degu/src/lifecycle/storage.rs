@@ -18,12 +18,29 @@ const SEALED_STAGING_STORE_NAME: &str = "sealed-staging";
 mod tests;
 mod validation;
 pub(crate) use validation::ensure_managed_trash_root;
+#[cfg(test)]
+use validation::ensure_managed_trash_root_with_sync;
 use validation::{ensure_state_parent, validate_existing_trash_root};
 
 use super::journal::isolate_partial_tail;
 
 pub(crate) fn trash_dir_state(ctx: &DetectCtx) -> PathBuf {
     ctx.xdg_state().join("degu/trash")
+}
+
+pub(crate) fn is_state_trash_root(ctx: &DetectCtx, root: &Path) -> bool {
+    let canonical_root = root
+        .parent()
+        .zip(root.file_name())
+        .and_then(|(parent, name)| {
+            std::fs::canonicalize(parent)
+                .ok()
+                .map(|parent| parent.join(name))
+        });
+    match (std::fs::canonicalize(ctx.xdg_state()), canonical_root) {
+        (Ok(state), Some(root)) => state.join("degu/trash") == root,
+        _ => trash_dir_state(ctx) == root,
+    }
 }
 
 pub(crate) fn add_resolved_trash_roots_to_guard(
@@ -50,23 +67,29 @@ pub(crate) fn resolve_trash_dir(
     ctx: &DetectCtx,
     path: &Path,
 ) -> std::result::Result<PathBuf, String> {
-    let meta = std::fs::symlink_metadata(path)
-        .map_err(|err| format!("failed to inspect {}: {err}", path.display()))?;
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|err| format!("failed to canonicalize {}: {err}", path.display()))?;
+    let source_mount = path_mount_id(&canonical)?;
+    let mount_owner_anchor = resolve_mount_owner_anchor(&canonical, source_mount)?;
     let state_dir = ensure_state_dir(ctx).map_err(|err| {
         format!(
             "failed to prepare state dir {}: {err}",
             ctx.xdg_state().display()
         )
     })?;
-    let state_meta = std::fs::symlink_metadata(&state_dir)
-        .map_err(|err| format!("failed to inspect state dir {}: {err}", state_dir.display()))?;
+    let state_dir = std::fs::canonicalize(&state_dir).map_err(|err| {
+        format!(
+            "failed to canonicalize state dir {}: {err}",
+            state_dir.display()
+        )
+    })?;
+    let state_mount = path_mount_id(&state_dir)?;
 
-    if meta.dev() == state_meta.dev() {
+    if source_mount == state_mount && state_dir.starts_with(&mount_owner_anchor) {
         return Ok(trash_dir_state(ctx));
     }
 
-    let anchor = resolve_cross_device_anchor(path, meta.dev())?;
-    Ok(anchor.join(".degu-trash"))
+    Ok(mount_owner_anchor.join(".degu-trash"))
 }
 
 fn ensure_state_dir(ctx: &DetectCtx) -> std::io::Result<PathBuf> {
@@ -141,7 +164,47 @@ pub(crate) fn acquire_mutation_lock(ctx: &DetectCtx) -> Result<std::fs::File> {
     }
 }
 
-fn resolve_cross_device_anchor(path: &Path, dev: u64) -> std::result::Result<PathBuf, String> {
+pub(crate) fn path_mount_id(path: &Path) -> std::result::Result<u64, String> {
+    #[cfg(target_os = "linux")]
+    let flags = rustix::fs::OFlags::PATH
+        | rustix::fs::OFlags::DIRECTORY
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::DIRECTORY
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::CLOEXEC;
+
+    let fd = rustix::fs::open(path, flags, rustix::fs::Mode::empty()).map_err(|error| {
+        format!(
+            "failed to open mount identity path {}: {error}",
+            path.display()
+        )
+    })?;
+    degu_core::sealed_staging::forward_mount_id(&fd).map_err(|error| {
+        format!(
+            "failed to inspect mount identity at {}: {error}",
+            path.display()
+        )
+    })
+}
+
+pub(crate) fn resolve_mount_owner_anchor(
+    path: &Path,
+    mount_id: u64,
+) -> std::result::Result<PathBuf, String> {
+    resolve_mount_owner_anchor_with(path, mount_id, path_mount_id)
+}
+
+fn resolve_mount_owner_anchor_with<F>(
+    path: &Path,
+    mount_id: u64,
+    mut inspect_mount: F,
+) -> std::result::Result<PathBuf, String>
+where
+    F: FnMut(&Path) -> std::result::Result<u64, String>,
+{
     let euid = rustix::process::geteuid().as_raw();
     let mut current = path.parent().ok_or_else(|| {
         format!(
@@ -152,8 +215,15 @@ fn resolve_cross_device_anchor(path: &Path, dev: u64) -> std::result::Result<Pat
     let mut anchor = None;
 
     while let Ok(meta) = std::fs::symlink_metadata(current) {
-        if !meta.is_dir()
-            || meta.dev() != dev
+        if !meta.is_dir() {
+            break;
+        }
+        let current_mount = match inspect_mount(current) {
+            Ok(mount) => mount,
+            Err(_) if anchor.is_some() => break,
+            Err(error) => return Err(error),
+        };
+        if current_mount != mount_id
             || meta.uid() != euid
             || rustix::fs::access(current, rustix::fs::Access::WRITE_OK).is_err()
         {
@@ -179,6 +249,15 @@ fn resolve_cross_device_anchor(path: &Path, dev: u64) -> std::result::Result<Pat
 }
 
 pub(crate) fn register_trash_root(state_dir: &Path, root: &Path) -> Result<()> {
+    register_trash_root_with_sync(state_dir, root, |path| {
+        std::fs::File::open(path)?.sync_all()
+    })
+}
+
+fn register_trash_root_with_sync<F>(state_dir: &Path, root: &Path, mut sync: F) -> Result<()>
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
     if !is_registered_trash_root(root) {
         anyhow::bail!(
             "trash root {} must be absolute and end in {CROSS_DEVICE_TRASH_NAME}",
@@ -189,9 +268,7 @@ pub(crate) fn register_trash_root(state_dir: &Path, root: &Path) -> Result<()> {
 
     let registry = state_dir.join(TRASHROOTS_FILE);
     let registered = read_registered_trash_roots(&registry)?;
-    if registered.iter().any(|registered| registered == root) {
-        return Ok(());
-    }
+    let already_registered = registered.iter().any(|registered| registered == root);
 
     if let Some(parent) = registry.parent() {
         ensure_state_parent(parent)?;
@@ -204,8 +281,18 @@ pub(crate) fn register_trash_root(state_dir: &Path, root: &Path) -> Result<()> {
         .with_context(|| format!("failed to open {}", registry.display()))?;
     isolate_partial_tail(&mut file)
         .with_context(|| format!("failed to inspect {}", registry.display()))?;
-    writeln!(file, "{root_line}")
-        .with_context(|| format!("failed to write {}", registry.display()))?;
+    if !already_registered {
+        writeln!(file, "{root_line}")
+            .with_context(|| format!("failed to write {}", registry.display()))?;
+    }
+    file.flush()
+        .with_context(|| format!("failed to flush {}", registry.display()))?;
+    sync(&registry).with_context(|| format!("failed to sync {}", registry.display()))?;
+    let parent = registry
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("trash registry has no parent: {}", registry.display()))?;
+    sync(parent)
+        .with_context(|| format!("failed to sync trash registry parent {}", parent.display()))?;
     Ok(())
 }
 

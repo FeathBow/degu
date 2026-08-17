@@ -17,7 +17,7 @@ use rustix::fs::{AtFlags, Mode, OFlags};
 
 use super::super::identity;
 use super::super::journal::{OperationLog, TrashRecord, trash_record};
-use super::super::storage;
+use super::super::{mount, storage};
 use super::EntryIdentity;
 use super::execution::CleanExecution;
 
@@ -49,7 +49,7 @@ pub(super) struct ProductionOutcome {
 }
 
 struct PreparedPolicy {
-    canonical_home: PathBuf,
+    recovery_anchor: PathBuf,
     canonical_source: PathBuf,
     trash_root: PathBuf,
 }
@@ -313,10 +313,11 @@ fn execute_reserved(
             ForwardFailureDisposition::NotStarted,
         )
     })?;
-    let source_parent_relative = confined_relative(&policy.canonical_home, source_parent)
+    let source_parent_relative = confined_relative(&policy.recovery_anchor, source_parent)
         .map_err(|reason| (reason, ForwardFailureDisposition::NotStarted))?;
-    let destination_parent_relative = confined_relative(&policy.canonical_home, destination_parent)
-        .map_err(|reason| (reason, ForwardFailureDisposition::NotStarted))?;
+    let destination_parent_relative =
+        confined_relative(&policy.recovery_anchor, destination_parent)
+            .map_err(|reason| (reason, ForwardFailureDisposition::NotStarted))?;
     let source_basename = policy
         .canonical_source
         .file_name()
@@ -337,18 +338,13 @@ fn execute_reserved(
         })?
         .to_os_string();
 
-    let source_anchor = open_directory(&policy.canonical_home).map_err(|error| {
-        (
-            format!("failed to open canonical HOME source anchor: {error}"),
-            ForwardFailureDisposition::NotStarted,
-        )
-    })?;
-    let destination_anchor = open_directory(&policy.canonical_home).map_err(|error| {
-        (
-            format!("failed to open canonical HOME destination anchor: {error}"),
-            ForwardFailureDisposition::NotStarted,
-        )
-    })?;
+    let (source_anchor, destination_anchor) = mount::open_pair_fds(&policy.recovery_anchor)
+        .map_err(|error| {
+            (
+                format!("failed to authenticate mount-domain anchors: {error}"),
+                ForwardFailureDisposition::NotStarted,
+            )
+        })?;
     let source_parent_fd = open_directory(source_parent).map_err(|error| {
         (
             format!("failed to hold sealed staging source parent: {error}"),
@@ -370,14 +366,14 @@ fn execute_reserved(
     let source_locator = StagingLocator::new(source_parent_relative, filesystem_id.clone())
         .ok_or_else(|| {
             (
-                "invalid canonical-HOME source locator".into(),
+                "invalid mount-domain source locator".into(),
                 ForwardFailureDisposition::NotStarted,
             )
         })?;
     let destination_locator = StagingLocator::new(destination_parent_relative, filesystem_id)
         .ok_or_else(|| {
             (
-                "invalid canonical-HOME destination locator".into(),
+                "invalid mount-domain destination locator".into(),
                 ForwardFailureDisposition::NotStarted,
             )
         })?;
@@ -403,7 +399,8 @@ fn execute_reserved(
         destination_locator,
         destination_basename,
     )
-    .with_production_association(association);
+    .with_production_association(association)
+    .with_recovery_anchor(policy.recovery_anchor.clone());
     let transaction = random_unused_transaction(run.engine)
         .map_err(|error| (error.to_string(), ForwardFailureDisposition::NotStarted))?;
 
@@ -438,24 +435,23 @@ fn execute_reserved(
         }
     }
 
-    // The object is already durably VerifiedCommitted. Neither reopening HOME nor
+    // The object is already durably VerifiedCommitted. Neither reopening the mount anchor nor
     // the purge admission below may be reported as a stage failure: that would skip
     // the oplog record, undercount freed space, and wedge undo. Only a poisoned WAL
     // escalates to recovery-blocked; every other purge failure degrades to "staged
     // in trash, not deleted" and still writes the durable oplog record.
     let mut purge_admission_failure: Option<String> = None;
     let purge_request = if run.purge {
-        let open_home = || open_directory(&policy.canonical_home);
-        match (open_home(), open_home()) {
-            (Ok(source_anchor), Ok(destination_anchor)) => Some(VerifiedPurgeRequest::new(
+        match mount::open_pair_fds(&policy.recovery_anchor) {
+            Ok((source_anchor, destination_anchor)) => Some(VerifiedPurgeRequest::new(
                 transaction,
                 run.reclamation_id.clone(),
                 source_anchor,
                 destination_anchor,
             )),
-            (Err(error), _) | (_, Err(error)) => {
+            Err(error) => {
                 purge_admission_failure = Some(format!(
-                    "failed to retain purge HOME anchors after VerifiedCommitted: {error}"
+                    "failed to retain purge mount-domain anchors after VerifiedCommitted: {error}"
                 ));
                 None
             }
@@ -613,16 +609,13 @@ fn preflight_policy(
     {
         return Err("clean item identity changed before sealed staging policy checks".into());
     }
-    let canonical_home = std::fs::canonicalize(&ctx.home)
-        .map_err(|error| format!("failed to canonicalize HOME for sealed staging: {error}"))?;
     let canonical_source = std::fs::canonicalize(finding.path())
         .map_err(|error| format!("failed to canonicalize sealed staging source: {error}"))?;
     let canonical_source_parent = canonical_source
         .parent()
         .ok_or_else(|| "sealed staging source has no canonical parent".to_string())?;
-    confined_relative(&canonical_home, canonical_source_parent)?;
 
-    let lexical_trash = storage::resolve_trash_dir(ctx, finding.path())?;
+    let lexical_trash = storage::resolve_trash_dir(ctx, &canonical_source)?;
     let lexical_parent = lexical_trash
         .parent()
         .ok_or_else(|| "trash root has no parent".to_string())?;
@@ -632,25 +625,42 @@ fn preflight_policy(
         .file_name()
         .ok_or_else(|| "trash root has no name".to_string())?;
     let trash_root = canonical_parent.join(trash_name);
-    confined_relative(&canonical_home, &canonical_parent)?;
 
-    use std::os::unix::fs::MetadataExt;
-    let home_device = std::fs::metadata(&canonical_home)
-        .map_err(|error| error.to_string())?
-        .dev();
-    let source_device = std::fs::metadata(&canonical_source)
-        .map_err(|error| error.to_string())?
-        .dev();
-    let destination_device = std::fs::metadata(&canonical_parent)
-        .map_err(|error| error.to_string())?
-        .dev();
-    if source_device != home_device || destination_device != home_device {
-        return Err(
-            "sealed staging requires source, destination, and canonical HOME on one mount".into(),
-        );
+    let source_mount = storage::path_mount_id(&canonical_source)?;
+    let destination_mount = storage::path_mount_id(&canonical_parent)?;
+    if source_mount != destination_mount {
+        return Err("sealed staging requires the source and trash destination on one mount".into());
     }
+    let mount_owner_anchor = storage::resolve_mount_owner_anchor(&canonical_source, source_mount)?;
+    let mount_owner_anchor = std::fs::canonicalize(&mount_owner_anchor)
+        .map_err(|error| format!("failed to canonicalize mount owner anchor: {error}"))?;
+    let owner_confines_both = confined_relative(&mount_owner_anchor, canonical_source_parent)
+        .and_then(|_| confined_relative(&mount_owner_anchor, &trash_root))
+        .is_ok();
+    let recovery_anchor = if owner_confines_both {
+        mount_owner_anchor
+    } else {
+        let parent = mount_owner_anchor.parent().ok_or_else(|| {
+            "mount-domain anchor has no parent for non-empty recovery locators".to_string()
+        })?;
+        if storage::path_mount_id(parent)
+            .map(|mount| mount != source_mount)
+            .unwrap_or(true)
+        {
+            return Err(
+                "source parent equals the writable mount root and no same-mount recovery ancestor exists"
+                    .into(),
+            );
+        }
+        std::fs::canonicalize(parent)
+            .map_err(|error| format!("failed to canonicalize mount-domain anchor: {error}"))?
+    };
+    confined_relative(&recovery_anchor, canonical_source_parent)?;
+    confined_relative(&recovery_anchor, &trash_root)?;
+    degu_walk::resolve_trusted_directory(&recovery_anchor, "sealed-staging mount-domain anchor")
+        .map_err(|error| format!("mount-domain anchor cannot be reopened safely: {error}"))?;
     Ok(PreparedPolicy {
-        canonical_home,
+        recovery_anchor,
         canonical_source,
         trash_root,
     })
@@ -676,19 +686,22 @@ fn next_sequence(destination_parent: &OwnedFd) -> io::Result<u64> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "trash sequence overflow"))
 }
 
-fn confined_relative(home: &Path, path: &Path) -> Result<PathBuf, String> {
-    let relative = path.strip_prefix(home).map_err(|_| {
+fn confined_relative(anchor: &Path, path: &Path) -> Result<PathBuf, String> {
+    let relative = path.strip_prefix(anchor).map_err(|_| {
         format!(
-            "sealed staging path is outside canonical HOME: {}",
+            "sealed staging path is outside its mount-domain anchor: {}",
             path.display()
         )
     })?;
+    if relative.as_os_str().is_empty() {
+        return Ok(PathBuf::new());
+    }
     let mut components = relative.components();
     if !matches!(components.next(), Some(std::path::Component::Normal(_)))
         || !components.all(|component| matches!(component, std::path::Component::Normal(_)))
     {
         return Err(format!(
-            "sealed staging path is not a confined canonical-HOME descendant: {}",
+            "sealed staging path is not a confined mount-domain descendant: {}",
             path.display()
         ));
     }
@@ -772,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn occupied_destination_is_not_claimed_or_overwritten_before_wal_admission() {
+    fn occupied_prior_destination_is_preserved_and_next_sequence_is_used() {
         let home = tempfile::tempdir().unwrap();
         let state = home.path().join("state");
         std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -817,9 +830,17 @@ mod tests {
         };
 
         let outcome = execute(&mut run, &finding, &identity);
-        assert!(outcome.execution.failed());
-        assert_eq!(outcome.execution.state_label(), "stage_failed");
-        assert!(source.is_dir());
+        assert!(
+            !outcome.execution.failed(),
+            "{:?}",
+            outcome.execution.failure_reason()
+        );
+        assert_eq!(outcome.execution.state_label(), "staged");
+        assert!(!source.exists());
+        assert_eq!(
+            outcome.execution.trash_entry(),
+            Some(trash_root.join("0002-cache").as_path())
+        );
         assert_eq!(
             std::fs::metadata(source.parent().unwrap())
                 .unwrap()
@@ -832,8 +853,17 @@ mod tests {
             std::fs::read(trash_root.join("0001-cache/occupant")).unwrap(),
             b"keep"
         );
-        assert!(!trash_root.join(".claims/0001").exists());
-        assert!(run.engine.production_entries().is_empty());
+        assert!(!trash_root.join(".claims/0002").exists());
+        let entries = run.engine.production_entries();
+        assert_eq!(entries.len(), 1);
+        let recovery_anchor = entries[0]
+            .recovery_anchor()
+            .expect("production staging must persist its recovery anchor");
+        source
+            .parent()
+            .unwrap()
+            .strip_prefix(recovery_anchor)
+            .expect("recovery anchor must confine the source parent");
     }
 
     #[test]
@@ -922,5 +952,15 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert!(error.to_string().contains("entropy source failed"));
+    }
+
+    #[test]
+    fn mount_root_itself_is_a_valid_v11_recovery_anchor() {
+        let anchor = Path::new("/mount-root");
+        assert_eq!(confined_relative(anchor, anchor).unwrap(), PathBuf::new());
+        assert_eq!(
+            confined_relative(anchor, &anchor.join(".degu-trash")).unwrap(),
+            PathBuf::from(".degu-trash")
+        );
     }
 }

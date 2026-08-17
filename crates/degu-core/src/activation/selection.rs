@@ -84,7 +84,7 @@ impl ActivationAnchorLocator {
 pub struct CurrentEuidAuthorityReadiness {
     mode: ActivationAuthorityMode,
     path: PathBuf,
-    backend: CertifiedLocalBackend,
+    backend: ActivationAnchorBackend,
     activation: StoreActivationKind,
 }
 
@@ -98,7 +98,7 @@ impl CurrentEuidAuthorityReadiness {
     }
 
     pub fn backend(&self) -> CertifiedLocalBackend {
-        self.backend
+        self.backend.local_backend()
     }
 
     pub fn activation(&self) -> StoreActivationKind {

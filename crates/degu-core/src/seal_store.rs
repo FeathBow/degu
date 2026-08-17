@@ -8,9 +8,9 @@
 //! validation plus fail-closed ACL absence prevents a foreign UID from gaining
 //! namespace authority and detaching the durable WAL.
 
+use crate::fs_role_backend::WalStoreBackend;
 use crate::local_backend::{
-    CertifiedLocalBackend, HeldLocalBackendEvidence, certify_held_fd, certify_held_fd_backend,
-    require_held_fd_acl_absent,
+    HeldLocalBackendEvidence, certify_held_fd, certify_held_fd_backend, require_held_fd_acl_absent,
 };
 use crate::seal_wal::{ExclusiveFileLock, RecoveryLockError, RecoverySession};
 use rustix::fd::{AsFd, OwnedFd};
@@ -78,7 +78,7 @@ pub struct SealWalStore {
     parent: OwnedFd,
     name: OsString,
     directory: OwnedFd,
-    backend: CertifiedLocalBackend,
+    backend: WalStoreBackend,
     device: u64,
     path: PathBuf,
 }
@@ -152,7 +152,7 @@ impl SealWalStore {
 
         validate_directory(&directory, path)?;
         let certified = certify_directory(&directory, path)?;
-        let backend = certified.backend();
+        let backend = WalStoreBackend::certified_local(certified.backend());
         let device = certified.device();
         validate_store_binding(
             &parent,
@@ -200,7 +200,7 @@ impl SealWalStore {
         &self.directory
     }
 
-    pub(crate) fn certified_backend(&self) -> CertifiedLocalBackend {
+    pub(crate) fn certified_backend(&self) -> WalStoreBackend {
         self.backend
     }
 
@@ -345,7 +345,7 @@ where
     rustix::fs::fchmod(&wal, WAL_MODE).map_err(|error| io_error(&init_wal_path, error.into()))?;
     validate_wal(
         &wal,
-        certified.backend(),
+        WalStoreBackend::certified_local(certified.backend()),
         certified.device(),
         &init_wal_path,
     )?;
@@ -383,14 +383,14 @@ fn try_lock_directory(directory: &OwnedFd) -> Result<ExclusiveFileLock, StoreErr
     Ok(ExclusiveFileLock::try_acquire(File::from(lock_fd))?)
 }
 
-pub(crate) fn probe_store_parent_backend(path: &Path) -> Result<CertifiedLocalBackend, StoreError> {
+pub(crate) fn probe_store_parent_backend(path: &Path) -> Result<WalStoreBackend, StoreError> {
     let (parent, _, parent_path) = open_authenticated_parent(path)?;
     validate_parent_for_creation(&parent, &parent_path)?;
     require_directory_acl_absent(&parent, &parent_path)?;
     let duplicate = rustix::io::fcntl_dupfd_cloexec(&parent, 0)
         .map_err(|error| io_error(&parent_path, error.into()))?;
     certify_held_fd(duplicate)
-        .map(|evidence| evidence.backend())
+        .map(|evidence| WalStoreBackend::certified_local(evidence.backend()))
         .map_err(|reason| StoreError::ParentBackend {
             path: parent_path,
             reason,
@@ -403,7 +403,7 @@ pub(crate) fn probe_store_parent_backend(path: &Path) -> Result<CertifiedLocalBa
 /// through the fully certified path before support is reported.
 pub(crate) fn probe_store_parent_backend_for_activation_support(
     path: &Path,
-) -> Result<CertifiedLocalBackend, StoreError> {
+) -> Result<WalStoreBackend, StoreError> {
     let (parent, _, parent_path) = open_parent(path, false)?;
     validate_parent_structure(&parent, &parent_path)?;
     match certify_held_fd_backend(&parent) {
@@ -577,7 +577,7 @@ fn validate_store_binding(
     parent: &OwnedFd,
     name: &OsString,
     directory: &OwnedFd,
-    expected_backend: CertifiedLocalBackend,
+    expected_backend: WalStoreBackend,
     expected_device: u64,
     path: &Path,
     parent_path: &Path,
@@ -585,7 +585,9 @@ fn validate_store_binding(
     validate_directory_controller(parent, parent_path)?;
     validate_directory(directory, path)?;
     let certified = certify_directory(directory, path)?;
-    if certified.backend() != expected_backend || certified.device() != expected_device {
+    if certified.backend() != expected_backend.local_backend()
+        || certified.device() != expected_device
+    {
         return Err(StoreError::UnsafeDirectory {
             path: path.to_path_buf(),
             reason: "store backend or device changed",
@@ -737,7 +739,7 @@ fn validate_entry_binding<Fd: AsFd>(
 
 fn validate_wal<Fd: AsFd>(
     fd: Fd,
-    expected_backend: CertifiedLocalBackend,
+    expected_backend: WalStoreBackend,
     expected_device: u64,
     path: &Path,
 ) -> Result<(), StoreError> {
@@ -770,7 +772,7 @@ fn validate_wal<Fd: AsFd>(
             }
         }
     })?;
-    if backend != expected_backend {
+    if backend != expected_backend.local_backend() {
         return Err(StoreError::UnsafeWal {
             path: path.to_path_buf(),
             reason: "WAL backend does not match the certified store backend",

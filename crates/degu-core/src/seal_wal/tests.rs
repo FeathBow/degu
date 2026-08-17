@@ -2129,7 +2129,7 @@ fn already_exclusive_strategy_is_explicit_exact_and_non_vacuous() {
             base.destination_parent.clone(),
             base.destination_parent_identity,
             base.destination_basename.clone(),
-            base.backend,
+            base.backend(),
             DurableSourceParentStrategy::AlreadyExclusive(proof),
         )
     };

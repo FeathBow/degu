@@ -13,6 +13,7 @@ pub mod config;
 pub mod disposition;
 pub mod ecosystem;
 pub mod finding;
+mod fs_role_backend;
 pub mod local_backend;
 pub mod oplog;
 pub mod plan;

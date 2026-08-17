@@ -6,6 +6,7 @@
 //! permission or namespace mutation.
 
 use crate::authority::{PersistentRecoveryEvidence, TransactionState};
+use crate::fs_role_backend::StagingMountBackend;
 use crate::local_backend::CertifiedLocalBackend;
 use crate::staging_recovery::{
     ExactPurgeVerification, ExactSourceParentRestoreIntent, ExactSourceParentRestored,
@@ -179,7 +180,7 @@ pub struct StagingTransactionMetadata {
     destination_parent: StagingLocator,
     destination_parent_identity: StrongObjectIdentity,
     destination_basename: std::ffi::OsString,
-    backend: CertifiedLocalBackend,
+    backend: StagingMountBackend,
     source_parent_strategy: DurableSourceParentStrategy,
     production_association: Option<ProductionAssociation>,
     recovery_anchor: Option<PathBuf>,
@@ -206,7 +207,7 @@ impl StagingTransactionMetadata {
             destination_parent,
             destination_parent_identity,
             destination_basename,
-            backend,
+            backend: StagingMountBackend::certified_local(backend),
             source_parent_strategy,
             production_association: None,
             recovery_anchor: None,
@@ -243,7 +244,7 @@ impl StagingTransactionMetadata {
     }
 
     pub fn backend(&self) -> CertifiedLocalBackend {
-        self.backend
+        self.backend.local_backend()
     }
 
     pub fn source_parent_strategy(&self) -> &DurableSourceParentStrategy {
@@ -3568,7 +3569,7 @@ fn decode_staging_metadata(
         destination_parent,
         destination_parent_identity,
         destination_basename,
-        backend,
+        backend: StagingMountBackend::certified_local(backend),
         source_parent_strategy,
         production_association,
         recovery_anchor,
@@ -3632,7 +3633,7 @@ fn encode_staging_metadata(
     encode_locator(output, &metadata.destination_parent)?;
     encode_strong_identity(output, metadata.destination_parent_identity);
     put_bytes(output, metadata.destination_basename.as_bytes())?;
-    output.push(match metadata.backend {
+    output.push(match metadata.backend.local_backend() {
         CertifiedLocalBackend::Ext4 => 1,
         CertifiedLocalBackend::Xfs => 2,
         CertifiedLocalBackend::Apfs => 3,

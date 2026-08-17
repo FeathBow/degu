@@ -19,6 +19,7 @@
 //! EUID-owned 0700 directories, EUID-owned 0600 single-link records, absent
 //! ACLs, certified local backends, strong birth identity, and held-FD checks.
 
+use crate::fs_role_backend::{ActivationAnchorBackend, WalStoreBackend};
 use crate::local_backend::{CertificationError, CertifiedLocalBackend, require_held_fd_acl_absent};
 use crate::seal_store::{
     SealWalStore, StoreError, open_authenticated_parent,
@@ -281,10 +282,10 @@ struct PrepareRecord {
     activation_id: [u8; ACTIVATION_ID_LEN],
     authority_locator: PathBuf,
     authority_identity: StrongObjectIdentity,
-    authority_backend: CertifiedLocalBackend,
+    authority_backend: ActivationAnchorBackend,
     store_locator: PathBuf,
     store_identity: StrongObjectIdentity,
-    store_backend: CertifiedLocalBackend,
+    store_backend: WalStoreBackend,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,7 +298,7 @@ struct AuthorityRecord {
     selection_id: [u8; ACTIVATION_ID_LEN],
     selected_locator: PathBuf,
     selected_identity: StrongObjectIdentity,
-    selected_backend: CertifiedLocalBackend,
+    selected_backend: ActivationAnchorBackend,
 }
 
 struct AuthorityLease {
@@ -313,7 +314,7 @@ struct AuthorityRoot {
     directory: OwnedFd,
     path: PathBuf,
     identity: StrongObjectIdentity,
-    backend: CertifiedLocalBackend,
+    backend: ActivationAnchorBackend,
     _lock: ExclusiveFileLock,
 }
 
@@ -564,7 +565,7 @@ fn probe_desired_store_support(desired_store: &Path) -> Result<(), StoreActivati
 
 fn probe_desired_store_support_with(
     desired_store: &Path,
-    probe: impl FnOnce(&Path) -> Result<CertifiedLocalBackend, StoreError>,
+    probe: impl FnOnce(&Path) -> Result<WalStoreBackend, StoreError>,
 ) -> Result<(), StoreActivationError> {
     validate_absolute_locator(desired_store)?;
     match probe(desired_store) {
@@ -935,8 +936,10 @@ fn open_activation_anchor(
     }
     validate_directory(&directory, authority_path).map_err(StoreActivationError::UnsafeAnchor)?;
     let identity = strong_identity_fd(&directory).map_err(|_| StoreActivationError::Identity)?;
-    let backend = crate::local_backend::certify_held_fd_backend(&directory)
-        .map_err(StoreActivationError::Backend)?;
+    let backend = ActivationAnchorBackend::certified_local(
+        crate::local_backend::certify_held_fd_backend(&directory)
+            .map_err(StoreActivationError::Backend)?,
+    );
     let lock = try_lock_directory(&directory).map_err(|source| StoreActivationError::Io {
         path: authority_path.to_path_buf(),
         source,
@@ -975,14 +978,14 @@ fn validate_activation_anchor_binding(
     directory: &OwnedFd,
     path: &Path,
     expected_identity: StrongObjectIdentity,
-    expected_backend: CertifiedLocalBackend,
+    expected_backend: ActivationAnchorBackend,
     kind: AnchorKind,
 ) -> Result<(), StoreActivationError> {
     validate_directory(directory, path).map_err(StoreActivationError::UnsafeAnchor)?;
     let backend = crate::local_backend::certify_held_fd_backend(directory)
         .map_err(StoreActivationError::Backend)?;
     let identity = strong_identity_fd(directory).map_err(|_| StoreActivationError::Identity)?;
-    if backend != expected_backend || identity != expected_identity {
+    if backend != expected_backend.local_backend() || identity != expected_identity {
         return Err(unsafe_anchor(
             path,
             "activation anchor backend or strong identity changed",
@@ -1363,7 +1366,7 @@ fn encode_authority(record: &AuthorityRecord) -> Result<Vec<u8>, StoreActivation
     out.extend_from_slice(&record.selection_id);
     put_path(&mut out, &record.selected_locator)?;
     put_identity(&mut out, record.selected_identity);
-    out.push(encode_backend(record.selected_backend));
+    out.push(encode_backend(record.selected_backend.local_backend()));
     Ok(out)
 }
 
@@ -1373,7 +1376,8 @@ fn decode_authority(bytes: &[u8]) -> Option<AuthorityRecord> {
     let selection_id = take_array::<ACTIVATION_ID_LEN>(&mut input)?;
     let selected_locator = take_path(&mut input)?;
     let selected_identity = take_identity(&mut input)?;
-    let selected_backend = decode_backend(*take(&mut input, 1)?.first()?)?;
+    let selected_backend =
+        ActivationAnchorBackend::certified_local(decode_backend(*take(&mut input, 1)?.first()?)?);
     input.is_empty().then_some(AuthorityRecord {
         selection_id,
         selected_locator,
@@ -1388,10 +1392,10 @@ fn encode_prepare(record: &PrepareRecord) -> Result<Vec<u8>, StoreActivationErro
     out.extend_from_slice(&record.activation_id);
     put_path(&mut out, &record.authority_locator)?;
     put_identity(&mut out, record.authority_identity);
-    out.push(encode_backend(record.authority_backend));
+    out.push(encode_backend(record.authority_backend.local_backend()));
     put_path(&mut out, &record.store_locator)?;
     put_identity(&mut out, record.store_identity);
-    out.push(encode_backend(record.store_backend));
+    out.push(encode_backend(record.store_backend.local_backend()));
     Ok(out)
 }
 
@@ -1401,10 +1405,12 @@ fn decode_prepare(bytes: &[u8]) -> Option<PrepareRecord> {
     let activation_id = take_array::<ACTIVATION_ID_LEN>(&mut input)?;
     let authority_locator = take_path(&mut input)?;
     let authority_identity = take_identity(&mut input)?;
-    let authority_backend = decode_backend(*take(&mut input, 1)?.first()?)?;
+    let authority_backend =
+        ActivationAnchorBackend::certified_local(decode_backend(*take(&mut input, 1)?.first()?)?);
     let store_locator = take_path(&mut input)?;
     let store_identity = take_identity(&mut input)?;
-    let store_backend = decode_backend(*take(&mut input, 1)?.first()?)?;
+    let store_backend =
+        WalStoreBackend::certified_local(decode_backend(*take(&mut input, 1)?.first()?)?);
     input.is_empty().then_some(PrepareRecord {
         activation_id,
         authority_locator,
@@ -1422,10 +1428,12 @@ fn encode_active(record: &ActiveRecord) -> Result<Vec<u8>, StoreActivationError>
     out.extend_from_slice(&record.prepare.activation_id);
     put_path(&mut out, &record.prepare.authority_locator)?;
     put_identity(&mut out, record.prepare.authority_identity);
-    out.push(encode_backend(record.prepare.authority_backend));
+    out.push(encode_backend(
+        record.prepare.authority_backend.local_backend(),
+    ));
     put_path(&mut out, &record.prepare.store_locator)?;
     put_identity(&mut out, record.prepare.store_identity);
-    out.push(encode_backend(record.prepare.store_backend));
+    out.push(encode_backend(record.prepare.store_backend.local_backend()));
     Ok(out)
 }
 
@@ -1435,10 +1443,12 @@ fn decode_active(bytes: &[u8]) -> Option<ActiveRecord> {
     let activation_id = take_array::<ACTIVATION_ID_LEN>(&mut input)?;
     let authority_locator = take_path(&mut input)?;
     let authority_identity = take_identity(&mut input)?;
-    let authority_backend = decode_backend(*take(&mut input, 1)?.first()?)?;
+    let authority_backend =
+        ActivationAnchorBackend::certified_local(decode_backend(*take(&mut input, 1)?.first()?)?);
     let store_locator = take_path(&mut input)?;
     let store_identity = take_identity(&mut input)?;
-    let store_backend = decode_backend(*take(&mut input, 1)?.first()?)?;
+    let store_backend =
+        WalStoreBackend::certified_local(decode_backend(*take(&mut input, 1)?.first()?)?);
     input.is_empty().then_some(ActiveRecord {
         prepare: PrepareRecord {
             activation_id,

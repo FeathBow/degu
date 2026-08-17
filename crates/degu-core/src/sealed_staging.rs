@@ -30,7 +30,7 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_RECOVERY_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -157,6 +157,14 @@ pub fn forward_filesystem_id(fd: &OwnedFd) -> io::Result<String> {
         .map_err(|error| io::Error::other(error.to_string()))
 }
 
+/// Derives the held mount identity used to keep per-mount trash discovery from
+/// crossing bind or nested mount boundaries that share a device number.
+pub fn forward_mount_id(fd: &OwnedFd) -> io::Result<u64> {
+    crate::staging_recovery::strong_identity_fd(fd)
+        .map(|identity| identity.mount_id())
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
 /// Result of comparing a named directory with WAL-held strong identity.
 ///
 /// `Mismatch` is positive evidence that the name is absent, is not a directory,
@@ -221,6 +229,7 @@ pub struct ForwardStagingRequest {
     destination_parent_locator: crate::seal_wal::StagingLocator,
     destination_basename: std::ffi::OsString,
     production_association: Option<ProductionAssociation>,
+    recovery_anchor: Option<PathBuf>,
 }
 
 impl ForwardStagingRequest {
@@ -245,6 +254,7 @@ impl ForwardStagingRequest {
             destination_parent_locator,
             destination_basename,
             production_association: None,
+            recovery_anchor: None,
         }
     }
 
@@ -252,6 +262,13 @@ impl ForwardStagingRequest {
     /// binds the exact source, destination, and object identity.
     pub fn with_production_association(mut self, association: ProductionAssociation) -> Self {
         self.production_association = Some(association);
+        self
+    }
+
+    /// Persist the canonical mount-domain reopen hint in the atomic first WAL
+    /// frame. The core later treats it only as a way to obtain candidate FDs.
+    pub fn with_recovery_anchor(mut self, path: PathBuf) -> Self {
+        self.recovery_anchor = Some(path);
         self
     }
 
@@ -275,6 +292,7 @@ impl ForwardStagingRequest {
             self.destination_parent_locator,
             self.destination_basename,
             self.production_association,
+            self.recovery_anchor,
         )?;
         Ok((binding, recovery))
     }
@@ -638,6 +656,7 @@ pub struct ProductionStagingEntry {
     destination_basename: std::ffi::OsString,
     root_identity: StrongObjectIdentity,
     reclamation_id: String,
+    recovery_anchor: Option<PathBuf>,
 }
 
 impl ProductionStagingEntry {
@@ -672,6 +691,10 @@ impl ProductionStagingEntry {
     pub fn reclamation_id(&self) -> &str {
         &self.reclamation_id
     }
+
+    pub fn recovery_anchor(&self) -> Option<&Path> {
+        self.recovery_anchor.as_deref()
+    }
 }
 
 /// The only engine form that may be retained by a production mutation session.
@@ -702,6 +725,7 @@ impl ReadyStagingEngine {
                     destination_basename: metadata.destination_basename().to_os_string(),
                     root_identity: metadata.root_identity(),
                     reclamation_id: association.reclamation_id().to_owned(),
+                    recovery_anchor: metadata.recovery_anchor().map(Path::to_path_buf),
                 })
             })
             .collect()

@@ -2238,6 +2238,13 @@ fn open_confined_directory_with_exclusive_ancestors(
     let mut current = rustix::io::dup(anchor)
         .map_err(io::Error::from)
         .map_err(RecoveryRebindError::Io)?;
+    if path.as_os_str().is_empty() {
+        require_exclusive_controller(&current)?;
+        if held_mount_key(&current)? != expected_mount {
+            return Err(RecoveryRebindError::MountChanged);
+        }
+        return Ok(current);
+    }
     let mut saw_component = false;
     for component in path.components() {
         let Component::Normal(name) = component else {

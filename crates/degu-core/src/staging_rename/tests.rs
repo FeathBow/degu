@@ -253,7 +253,8 @@ fn stage_production(
             transaction,
             fixture
                 .forward_request("root", "staged")
-                .with_production_association(association),
+                .with_production_association(association)
+                .with_recovery_anchor(fixture.base.clone()),
         )
         .unwrap();
     ready
@@ -1080,7 +1081,8 @@ fn production_association_is_read_back_only_from_the_exact_leased_wal() {
             transaction,
             fixture
                 .forward_request("root", "staged")
-                .with_production_association(association),
+                .with_production_association(association)
+                .with_recovery_anchor(fixture.base.clone()),
         )
         .unwrap();
 

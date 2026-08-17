@@ -3,6 +3,7 @@ use assert_cmd::Command;
 const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[
     &["scan"],
     &["doctor"],
+    &["init"],
     &["quota"],
     &["clean"],
     &["undo"],
@@ -163,6 +164,7 @@ fn assert_top_help_order() {
         &output,
         &[
             "Inspect:",
+            "Account setup:",
             "Clean and recover:",
             "Advanced irreversible actions:",
             "Configure:",
@@ -177,6 +179,7 @@ fn assert_top_help_order() {
             "\n  scan",
             "\n  doctor",
             "\n  quota",
+            "\n  init",
             "\n  clean",
             "\n  undo",
             "\n  trash",
@@ -223,7 +226,7 @@ fn assert_completion_order(shell: &str) {
     if shell == "bash" {
         assert!(output.contains("complete -F") || output.contains("_degu"));
         assert!(output.contains(
-            "scan doctor quota clean undo trash reclaim relocate admin ops adapters completions man help"
+            "scan doctor init quota clean undo trash reclaim relocate admin ops adapters completions man help"
         ));
         assert!(!output.contains("degu,usage)"));
         return;
@@ -234,6 +237,7 @@ fn assert_completion_order(shell: &str) {
             &[
                 "(scan)",
                 "(doctor)",
+                "(init)",
                 "(quota)",
                 "(clean)",
                 "(undo)",
@@ -252,6 +256,7 @@ fn assert_completion_order(shell: &str) {
             &[
                 "-a \"scan\"",
                 "-a \"doctor\"",
+                "-a \"init\"",
                 "-a \"quota\"",
                 "-a \"clean\"",
                 "-a \"undo\"",

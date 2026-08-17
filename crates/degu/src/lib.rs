@@ -77,6 +77,7 @@ fn run(verbose: u8, command: Command, policy: ColorPolicy) -> Result<()> {
 fn dispatch(command: Command, ui: runtime::Ui) -> Result<()> {
     match command {
         Command::Scan(args) => commands::scan::run(args, ui),
+        Command::Init { initial, output } => commands::init::run(initial, output.json),
         Command::Admin { .. } => unreachable!("handled by dedicated root-only dispatch"),
         Command::Doctor { output } => commands::doctor::run(output.json),
         Command::Quota(args) => commands::quota::run(args, ui),

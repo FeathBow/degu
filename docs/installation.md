@@ -1,8 +1,5 @@
 # Installation
 
-> [!IMPORTANT]
-> This guide documents degu **v0.1.5**, including account readiness, sealed staging, and `admin setup`. If `degu --version` reports a different version, use the guide tagged for that version.
-
 ## Install first, then check setup
 
 Install the user binary with one of the methods below. Before its first mutating command, run:
@@ -11,31 +8,37 @@ Install the user binary with one of the methods below. Before its first mutating
 degu doctor
 ```
 
-This check is read-only. It never creates or repairs system state.
+This selector check is read-only. It reports the chosen authority mode and activation state and never creates or repairs state.
 
 - **`ready`** — continue with `degu clean -n`.
-- **`missing`** — send the displayed path and `id -u` output to your administrator.
-- **`unsafe`, `unsupported`, or `uncertain`** — stop and investigate; do not recreate or chmod the path automatically.
+- **`missing`** — run `degu init --initial` only when this account has never activated a store; otherwise investigate possible authority loss. An administrator may provision the system authority instead.
+- **`split_authority` or `recovery_required`** — stop and investigate the recorded authorities and store; never choose one, reinitialize, or remove records automatically.
+- **`unsafe`, `unsupported`, or `uncertain`** — stop and investigate; do not recreate, chmod, or fall back to another path.
 
-Most users need know only `degu doctor`. The installer never runs `sudo`, reads `SUDO_UID`, or provisions another account.
+`degu init --initial` derives the effective UID and account home from the account database and provisions only the fixed self-managed path. It accepts no UID, path, HOME, XDG, cwd, or configuration selector, rejects root, and never activates a store or repairs an existing object:
 
-## Administrator setup for a missing account
+```sh
+degu init --initial
+degu doctor
+```
 
-For a numeric UID that has never activated degu, use a separately verified binary from an administrator-owned absolute path:
+The installer never runs `sudo`, reads `SUDO_UID`, or provisions another account.
+
+## Optional administrator-hardened setup
+
+For a numeric UID that has never activated degu, an administrator may use a separately verified binary from an administrator-owned absolute path:
 
 ```sh
 sudo /usr/local/sbin/degu admin setup --uid "$(id -u USERNAME)" --initial
 ```
 
-Replace `USERNAME`; do not run the user-owned copy under `~/.local/bin` with `sudo`. The command is create-only and requires real effective UID 0. `--initial` asserts that the UID has never activated a store; this is not repair or recovery.
+Replace `USERNAME`; do not run the user-owned copy under `~/.local/bin` with `sudo`. First stop every `degu init`, clean, undo, and purge process for that UID. The command is create-only and requires real effective UID 0. `--initial` asserts that the UID has no self candidate, no concurrent setup or lifecycle process, and no previously declared or activated authority. It is not repair, migration, or recovery authority. System setup refuses an already-visible self candidate; administrator quiescence is required to close the pre-publication cross-flavor race.
 
-The fixed leaf is `/var/lib/degu/store-activation/<uid>` on Linux and `/private/var/db/degu/store-activation/<uid>` on macOS. Provisioning accepts only authenticated ext4/XFS/APFS namespaces, creates root-owned product directories as `0755` and the UID-owned leaf as `0700`, and never repairs unsafe existing entries. Use an administrator-controlled package or configuration-management step for every intended UID.
+The fixed system leaf is `/var/lib/degu/store-activation/<uid>` on Linux and `/private/var/db/degu/store-activation/<uid>` on macOS. Self-managed authority uses the account-database home plus the fixed `.local/state/degu/store-activation/<uid>` suffix. Both paths require authenticated ext4/XFS/APFS namespaces, exact ownership and modes, absent ACLs, strong identity, no-follow bindings, and durable publication.
 
-### Why this setup is separate
+At runtime degu authenticates both candidates. Existing activation evidence wins over an empty peer; two evidence-bearing roots block as `split_authority`; an unsafe or uncertain system candidate never falls back to self. Every mutating lifecycle session retains the selected and peer locks. The first supported mutation records the exact WAL store; later XDG drift cannot select a new empty store.
 
-Mutating commands use the fixed current-UID anchor as the only store activation and discovery authority. `HOME`, XDG variables, configuration, the working directory, and caller-provided paths cannot select it. On first supported mutation, degu records the exact state-store locator; later XDG drift cannot select a new empty store.
-
-`doctor ready` authenticates only the anchor, not the activated store, WAL, or recovery state. A `RecoveryRequired` transaction remains blocked and must be investigated; reprovisioning cannot clear it. The full runtime contract is in [Operational safety](safety.md#sealed-staging-account-readiness).
+`doctor ready` includes selector, activation-record, and recorded-store inspection. A lost or corrupt store reports `recovery_required`; provisioning cannot clear it. The full contract is in [Operational safety](safety.md#sealed-staging-account-readiness).
 
 ## Install with Cargo
 

@@ -573,3 +573,40 @@ fn production_entry_requires_real_root() {
         ));
     }
 }
+
+#[test]
+fn system_initialization_refuses_an_existing_self_candidate() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let candidate = temp.path().join("self-candidate");
+    assert!(refuse_existing_self_candidate_path(candidate.clone()).is_ok());
+    std::fs::create_dir(&candidate).unwrap();
+    assert!(matches!(
+        refuse_existing_self_candidate_path(candidate.clone()),
+        Err(ActivationAnchorProvisioningError::Unsafe { path, .. }) if path == candidate
+    ));
+
+    let dangling = temp.path().join("self-candidate-symlink");
+    std::os::unix::fs::symlink(temp.path().join("missing-target"), &dangling).unwrap();
+    assert!(matches!(
+        refuse_existing_self_candidate_path(dangling.clone()),
+        Err(ActivationAnchorProvisioningError::Unsafe { path, .. }) if path == dangling
+    ));
+}
+
+#[test]
+fn system_argument_validation_rejects_reserved_uids_and_missing_assertion() {
+    let root = Path::new("/fixed-root");
+    assert!(matches!(
+        validate_provision_arguments(root, 0, true),
+        Err(ActivationAnchorProvisioningError::InvalidUid { uid: 0 })
+    ));
+    assert!(matches!(
+        validate_provision_arguments(root, u32::MAX, true),
+        Err(ActivationAnchorProvisioningError::InvalidUid { uid }) if uid == u32::MAX
+    ));
+    assert!(matches!(
+        validate_provision_arguments(root, test_uid(), false),
+        Err(ActivationAnchorProvisioningError::Unsafe { reason, .. })
+            if reason.contains("must assert --initial")
+    ));
+}

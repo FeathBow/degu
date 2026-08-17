@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 const LEAF_MODE: u32 = 0o700;
 const PUBLIC_MODE: u32 = 0o755;
 const PRIVATE_LOCK_MODE: u32 = 0o700;
-const PROVISIONING_LOCK_NAME: &str = ".anchor-provisioning-lock";
+pub(crate) const PROVISIONING_LOCK_NAME: &str = ".anchor-provisioning-lock";
 const PRIVATE_TEMP_PREFIX: &str = ".degu-anchor-initializing-";
 #[cfg(test)]
 const TEST_CLEANUP_BLOCKER_NAME: &str = ".test-cleanup-blocker";
@@ -38,9 +38,9 @@ mod publish;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use account::AccountBaseError;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) use account::system_anchor_root;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 use account::{OS_PREFIX_COMPONENTS as BASE_COMPONENTS, PRODUCT_COMPONENTS, SELF_STATE_COMPONENTS};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use account::{current_self_anchor_path, system_anchor_root};
 use publish::{
     chain_entry, directory_identity, fixed_path, io_error, merge_rollback_residue, open_directory,
     open_or_publish_directory, preflight_runtime_parent, report_all_scaffold_failure,
@@ -119,6 +119,27 @@ pub enum ActivationAnchorProvisioningError {
     },
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refuse_existing_self_candidate(uid: u32) -> Result<(), ActivationAnchorProvisioningError> {
+    let Some(path) = account::self_anchor_path_for_uid(uid)? else {
+        return Ok(());
+    };
+    refuse_existing_self_candidate_path(path)
+}
+
+fn refuse_existing_self_candidate_path(
+    path: PathBuf,
+) -> Result<(), ActivationAnchorProvisioningError> {
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => Err(ActivationAnchorProvisioningError::Unsafe {
+            path,
+            reason: "a self-managed activation candidate already exists; system initialization would compete",
+        }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ActivationAnchorProvisioningError::Io { path, source }),
+    }
+}
+
 /// Provision the fixed platform path for `uid`.
 ///
 /// The call is create-only and requires real effective UID zero. `initial` is
@@ -131,6 +152,9 @@ pub fn provision_activation_anchor(
     if !rustix::process::geteuid().is_root() {
         return Err(ActivationAnchorProvisioningError::NotRoot);
     }
+    validate_provision_arguments(Path::new("/"), uid, initial)?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    refuse_existing_self_candidate(uid)?;
     provision(
         Path::new("/"),
         uid,
@@ -266,6 +290,23 @@ enum DirectoryKind {
     PrivateLock,
 }
 
+fn validate_provision_arguments(
+    filesystem_root: &Path,
+    uid: u32,
+    initial: bool,
+) -> Result<(), ActivationAnchorProvisioningError> {
+    if uid == 0 || uid == u32::MAX {
+        return Err(ActivationAnchorProvisioningError::InvalidUid { uid });
+    }
+    if !initial {
+        return Err(ActivationAnchorProvisioningError::Unsafe {
+            path: fixed_path(ProvisioningFlavor::System(filesystem_root), uid),
+            reason: "the administrator must assert --initial; provisioning is not repair or recovery",
+        });
+    }
+    Ok(())
+}
+
 fn provision(
     filesystem_root: &Path,
     uid: u32,
@@ -276,15 +317,7 @@ fn provision(
     if credentials.enforce_root && !rustix::process::geteuid().is_root() {
         return Err(ActivationAnchorProvisioningError::NotRoot);
     }
-    if uid == 0 || uid == u32::MAX {
-        return Err(ActivationAnchorProvisioningError::InvalidUid { uid });
-    }
-    if !initial {
-        return Err(ActivationAnchorProvisioningError::Unsafe {
-            path: fixed_path(ProvisioningFlavor::System(filesystem_root), uid),
-            reason: "the administrator must assert --initial; provisioning is not repair or recovery",
-        });
-    }
+    validate_provision_arguments(filesystem_root, uid, initial)?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (filesystem_root, credentials, backend_probe);

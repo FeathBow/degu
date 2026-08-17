@@ -795,12 +795,13 @@ mod tests {
         }
         let finding = super::super::tests::finding_for_test(source.clone(), 4096, 2);
         let identity = EntryIdentity::capture(&source).unwrap();
-        let store = degu_core::seal_store::SealWalStore::open_or_create(
+        let store = degu_core::seal_store::SealWalStore::open_or_create_for_integration_test(
             &ctx.xdg_state().join("degu/sealed-staging"),
         )
         .unwrap();
         let (engine, startup) =
-            degu_core::sealed_staging::SealedStagingEngine::open(&store).unwrap();
+            degu_core::sealed_staging::SealedStagingEngine::open_for_integration_test(&store)
+                .unwrap();
         let (mut ready, _) = engine
             .recover_startup(startup, |_, _| {
                 Err(io::Error::other("empty recovery must not request anchors"))

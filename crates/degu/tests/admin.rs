@@ -32,7 +32,7 @@ fn setup_exposes_only_the_fixed_locator_inputs() {
         "--initial",
         "--json",
         "effective UID 0",
-        "not repair or recovery",
+        "not repair, migration, or recovery",
     ] {
         assert!(stdout.contains(required), "missing {required:?}: {stdout}");
     }

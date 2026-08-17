@@ -6,6 +6,9 @@ Inspect:
   doctor       Check whether required account setup is ready
   quota        Report authoritative filesystem quota for one path
 
+Account setup:
+  init         Provision this account's fixed self-managed authority
+
 Clean and recover:
   clean        Preview or execute a cleanup plan
   undo         Restore the latest staged clean operation

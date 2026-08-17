@@ -1,8 +1,5 @@
 # User guide
 
-> [!IMPORTANT]
-> This guide documents degu **v0.1.5**, including account readiness, sealed staging, `--review`, and `reclaim uv`. If `degu --version` reports a different version, use the user guide tagged for that version.
-
 ## Scan and quota
 
 Start read-only. `scan` shows individual findings, while `scan --summary` groups the same detected bytes and inodes by source.

@@ -6,10 +6,12 @@ use degu_core::finding::{
 use degu_core::oplog::{ObjectIdentity, OpOutcome};
 use degu_core::seal_store::SealWalStore;
 use degu_core::seal_wal::{ProductionAssociation, StagingLocator, TransactionId};
-use degu_core::sealed_staging::{ForwardStagingRequest, forward_filesystem_id};
+use degu_core::sealed_staging::{
+    ForwardStagingRequest, SealedStagingEngine, forward_filesystem_id,
+};
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn context() -> (tempfile::TempDir, DetectCtx) {
     let temp = tempfile::tempdir().unwrap();
@@ -91,27 +93,6 @@ fn restored_association_no_longer_blocks_legacy_mutation() {
 }
 
 #[test]
-fn production_locator_selection_has_no_home_or_xdg_input() {
-    let first = degu_core::activation::ActivationAnchorLocator::for_current_euid().unwrap();
-    let changed_home = Path::new("/tmp/degu-home-trap");
-    let changed_state = Path::new("/tmp/degu-xdg-trap");
-    let ctx = DetectCtx::for_test(
-        changed_home.to_path_buf(),
-        [(
-            OsString::from("XDG_STATE_HOME"),
-            changed_state.as_os_str().to_os_string(),
-        )],
-    );
-    assert_ne!(storage::sealed_staging_store_path(&ctx), first.as_path());
-    assert_eq!(
-        degu_core::activation::ActivationAnchorLocator::for_current_euid()
-            .unwrap()
-            .as_path(),
-        first.as_path()
-    );
-}
-
-#[test]
 fn desired_store_remains_the_canonical_current_xdg_locator_before_activation() {
     let (_temp, ctx) = context();
     let expected = std::fs::canonicalize(ctx.xdg_state())
@@ -170,8 +151,11 @@ fn production_clean_reaches_verified_commit_and_keeps_jsonl_diagnostic_only() {
     let plan =
         CapturedCleanPlan::capture(degu_core::plan::Plan::new(vec![finding], false).unwrap())
             .unwrap();
-    let store = SealWalStore::open_or_create(&ctx.xdg_state().join("degu/sealed-staging")).unwrap();
-    let (engine, startup) = SealedStagingEngine::open(&store).unwrap();
+    let store = SealWalStore::open_or_create_for_integration_test(
+        &ctx.xdg_state().join("degu/sealed-staging"),
+    )
+    .unwrap();
+    let (engine, startup) = SealedStagingEngine::open_for_integration_test(&store).unwrap();
     let (ready, _) = engine
         .recover_startup(startup, |_, _| {
             Err(std::io::Error::other(
@@ -183,7 +167,7 @@ fn production_clean_reaches_verified_commit_and_keeps_jsonl_diagnostic_only() {
     let mut session = MutationSession {
         lifecycle: Lifecycle::new(&ctx),
         _mutation_lock: lock,
-        sealed_staging: Some(ready),
+        sealed_staging: Some(ActivatedReadyStagingEngine::from_ready_for_integration_test(ready)),
         forward_clean: true,
         authority_purged: std::collections::HashSet::new(),
         _unsupported_legacy_lease: None,
@@ -342,8 +326,11 @@ fn production_clean_purge_consumes_authority_and_reaches_purged() {
     let plan =
         CapturedCleanPlan::capture(degu_core::plan::Plan::new(vec![finding], false).unwrap())
             .unwrap();
-    let store = SealWalStore::open_or_create(&ctx.xdg_state().join("degu/sealed-staging")).unwrap();
-    let (engine, startup) = SealedStagingEngine::open(&store).unwrap();
+    let store = SealWalStore::open_or_create_for_integration_test(
+        &ctx.xdg_state().join("degu/sealed-staging"),
+    )
+    .unwrap();
+    let (engine, startup) = SealedStagingEngine::open_for_integration_test(&store).unwrap();
     let (ready, _) = engine
         .recover_startup(startup, |_, _| {
             Err(std::io::Error::other(
@@ -355,7 +342,7 @@ fn production_clean_purge_consumes_authority_and_reaches_purged() {
     let mut session = MutationSession {
         lifecycle: Lifecycle::new(&ctx),
         _mutation_lock: lock,
-        sealed_staging: Some(ready),
+        sealed_staging: Some(ActivatedReadyStagingEngine::from_ready_for_integration_test(ready)),
         forward_clean: true,
         authority_purged: std::collections::HashSet::new(),
         _unsupported_legacy_lease: None,
@@ -420,8 +407,11 @@ fn forged_jsonl_mapping_cannot_steal_wal_undo_authority() {
     .with_production_association(
         ProductionAssociation::new("sealed-reclamation".to_string()).unwrap(),
     );
-    let store = SealWalStore::open_or_create(&ctx.xdg_state().join("degu/sealed-staging")).unwrap();
-    let (engine, startup) = SealedStagingEngine::open(&store).unwrap();
+    let store = SealWalStore::open_or_create_for_integration_test(
+        &ctx.xdg_state().join("degu/sealed-staging"),
+    )
+    .unwrap();
+    let (engine, startup) = SealedStagingEngine::open_for_integration_test(&store).unwrap();
     let (mut ready, _) = engine
         .recover_startup(startup, |_, _| {
             Err(std::io::Error::other(
@@ -438,7 +428,7 @@ fn forged_jsonl_mapping_cannot_steal_wal_undo_authority() {
     let mut session = MutationSession {
         lifecycle: Lifecycle::new(&ctx),
         _mutation_lock: lock,
-        sealed_staging: Some(ready),
+        sealed_staging: Some(ActivatedReadyStagingEngine::from_ready_for_integration_test(ready)),
         forward_clean: false,
         authority_purged: std::collections::HashSet::new(),
         _unsupported_legacy_lease: None,

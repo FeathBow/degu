@@ -34,88 +34,16 @@ impl Fixture {
         Self {
             _temp: temp,
             home,
-            anchor: ActivationAnchorLocator { path: anchor_path },
+            anchor: ActivationAnchorLocator {
+                path: anchor_path,
+                kind: AnchorKind::Test,
+            },
             store,
         }
     }
 
     fn authority(&self) -> PathBuf {
         self.anchor.as_path().to_path_buf()
-    }
-}
-
-#[test]
-fn readiness_authenticates_the_existing_anchor_without_creating_state() {
-    let fixture = Fixture::new();
-    let readiness = check_activation_anchor_readiness(&fixture.anchor).unwrap();
-    assert_eq!(
-        readiness.backend(),
-        crate::local_backend::certify_held_fd_backend(
-            std::fs::File::open(fixture.anchor.as_path()).unwrap(),
-        )
-        .unwrap()
-    );
-    assert!(fixture.authority().is_dir());
-    assert!(
-        std::fs::read_dir(fixture.authority())
-            .unwrap()
-            .next()
-            .is_none()
-    );
-    assert!(!fixture.store.exists());
-}
-
-#[test]
-fn readiness_missing_anchor_is_non_creating_and_fail_closed() {
-    let fixture = Fixture::without_anchor();
-    assert!(matches!(
-        check_activation_anchor_readiness(&fixture.anchor),
-        Err(ActivationAnchorReadinessError::Missing { path })
-            if path == fixture.authority()
-    ));
-    assert!(!fixture.authority().exists());
-    assert!(!fixture.store.exists());
-}
-
-#[test]
-fn readiness_preserves_definite_and_uncertain_certification_classes() {
-    let locator = Path::new("/fixed/system/anchor");
-    let cases = [
-        (
-            StoreActivationError::UnsafeAnchor(StoreError::UnsafeDirectory {
-                path: PathBuf::from("/fixed/system"),
-                reason: crate::seal_store::DIRECTORY_UNSUPPORTED_BACKEND_REASON,
-            }),
-            "unsupported",
-        ),
-        (
-            StoreActivationError::UnsafeAnchor(StoreError::UnsafeDirectory {
-                path: PathBuf::from("/fixed/system"),
-                reason: crate::seal_store::DIRECTORY_ACL_PRESENT_REASON,
-            }),
-            "unsafe",
-        ),
-        (
-            StoreActivationError::UnsafeAnchor(StoreError::BackendInspection {
-                path: PathBuf::from("/fixed/system"),
-                reason: CertificationError::AclProbeUnknown,
-            }),
-            "uncertain",
-        ),
-        (
-            StoreActivationError::Backend(CertificationError::FilesystemMagicMismatch),
-            "unsafe",
-        ),
-    ];
-    for (error, expected) in cases {
-        let classified = classify_readiness_error(locator, error);
-        let actual = match classified {
-            ActivationAnchorReadinessError::Missing { .. } => "missing",
-            ActivationAnchorReadinessError::Unsafe { .. } => "unsafe",
-            ActivationAnchorReadinessError::Unsupported { .. } => "unsupported",
-            ActivationAnchorReadinessError::Uncertain { .. } => "uncertain",
-        };
-        assert_eq!(actual, expected);
     }
 }
 
@@ -151,19 +79,23 @@ fn missing_anchor_blocks_without_creating_anchor_or_store() {
 }
 
 #[test]
-fn record_empty_anchor_reaches_injected_unsupported_support_classification() {
+fn record_empty_anchor_reaches_injected_unsupported_lease_without_state_creation() {
     for reason in [
         CertificationError::UnsupportedPlatform,
         CertificationError::UnsupportedFilesystem,
     ] {
         let fixture = Fixture::new();
         let mut probes = 0;
-        let state = discover_store_activation_with_probe(&fixture.anchor, &fixture.store, |_| {
-            probes += 1;
-            Err(StoreActivationError::Backend(reason.clone()))
-        })
-        .unwrap();
-        assert_eq!(state.kind(), StoreActivationKind::UnsupportedNeverActivated);
+        let outcome =
+            activate_store_for_mutation_with_probe(&fixture.anchor, &fixture.store, |_| {
+                probes += 1;
+                Err(StoreActivationError::Backend(reason.clone()))
+            })
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            MutationStoreActivation::UnsupportedNeverActivated(_)
+        ));
         assert_eq!(probes, 1);
         assert!(fixture.authority().is_dir());
         assert!(!fixture.store.exists());
@@ -178,17 +110,15 @@ fn production_adapter_activates_then_follows_the_recorded_store_across_xdg_drift
         panic!("supported first use did not converge to Activated")
     };
     assert_eq!(activated.locator(), fixture.store);
-    let (engine, report) = crate::sealed_staging::SealedStagingEngine::open(activated.store())
-        .expect("activated store must open its exact WAL engine");
+    let (engine, report) = activated
+        .open_staging()
+        .expect("activated store must open its exact authority-bound WAL engine");
     assert!(report.is_empty());
     assert!(matches!(
-        crate::sealed_staging::SealedStagingEngine::open(activated.store()),
-        Err(crate::sealed_staging::StagingEngineError::Store(
-            StoreError::Lease(RecoveryLockError::Busy)
-        ))
+        activate_store_for_mutation(&fixture.anchor, &fixture.store),
+        Err(StoreActivationError::Io { .. })
     ));
     drop(engine);
-    drop(activated);
 
     let changed = fixture.home.join("state/degu/changed-store");
     let activated = activate_store_for_mutation(&fixture.anchor, &changed).unwrap();
@@ -214,11 +144,11 @@ fn unsupported_legacy_lease_holds_the_anchor_lock_until_session_end() {
     ));
     assert!(!fixture.store.exists());
     assert!(matches!(
-        check_activation_anchor_readiness(&fixture.anchor),
-        Err(ActivationAnchorReadinessError::Uncertain { .. })
+        open_activation_anchor(&fixture.anchor),
+        Err(StoreActivationError::Io { .. })
     ));
     drop(lease);
-    assert!(check_activation_anchor_readiness(&fixture.anchor).is_ok());
+    assert!(open_activation_anchor(&fixture.anchor).is_ok());
     assert!(
         std::fs::read_dir(fixture.authority())
             .unwrap()
@@ -241,13 +171,11 @@ fn production_adapter_never_recreates_lost_or_corrupt_store() {
 }
 
 #[test]
-fn activation_records_bypass_the_desired_store_support_probe() {
+fn discovery_follows_activation_records_without_a_desired_store_probe() {
     let fixture = Fixture::new();
     drop(activate_or_resume_store(&fixture.anchor, &fixture.store).unwrap());
-    let state = discover_store_activation_with_probe(&fixture.anchor, &fixture.store, |_| {
-        panic!("support probe must not run when activation evidence exists")
-    })
-    .unwrap();
+    let state =
+        discover_store_activation(&fixture.anchor, Path::new("/ignored/desired/store")).unwrap();
     assert_eq!(state.kind(), StoreActivationKind::Activated);
 }
 
@@ -292,12 +220,10 @@ fn real_tmpfs_desired_store_is_explicitly_unsupported_when_available() {
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
     let store = parent.join("sealed-staging");
 
-    assert_eq!(
-        discover_store_activation(&fixture.anchor, &store)
-            .unwrap()
-            .kind(),
-        StoreActivationKind::UnsupportedNeverActivated
-    );
+    assert!(matches!(
+        activate_store_for_mutation(&fixture.anchor, &store).unwrap(),
+        MutationStoreActivation::UnsupportedNeverActivated(_)
+    ));
     assert!(fixture.authority().is_dir());
     assert!(!store.exists());
     assert!(matches!(
@@ -367,9 +293,9 @@ fn activation_publishes_private_bidirectional_records() {
 #[test]
 fn durable_prepare_is_distinct_and_resume_ignores_changed_xdg() {
     let fixture = Fixture::new();
-    // Anchor/parent validation syncs are 0/1, prepare file is 2, and its
-    // publication-directory sync is 3. The rename is visible at boundary 3.
-    inject_sync_failure(Some(3));
+    // Anchor/parent validation is 0/1 and the authority claim publication is
+    // 2/3; prepare becomes visible at its publication sync boundary 5.
+    inject_sync_failure(Some(5));
     assert!(matches!(
         activate_or_resume_store(&fixture.anchor, &fixture.store),
         Err(StoreActivationError::SyncUncertain("preparing record"))
@@ -393,7 +319,7 @@ fn durable_prepare_is_distinct_and_resume_ignores_changed_xdg() {
 #[allow(clippy::disallowed_methods)] // simulates loss after durable prepare publication
 fn store_loss_while_preparing_is_lost_not_recreated() {
     let fixture = Fixture::new();
-    inject_sync_failure(Some(3));
+    inject_sync_failure(Some(5));
     assert!(activate_or_resume_store(&fixture.anchor, &fixture.store).is_err());
     inject_sync_failure(None);
     assert_eq!(
@@ -825,4 +751,652 @@ fn concurrent_authority_user_is_a_blocking_error_not_a_state() {
             .kind(),
         StoreActivationKind::Activated
     );
+}
+
+struct SelectorFixture {
+    _temp: tempfile::TempDir,
+    system: ActivationAnchorLocator,
+    self_managed: ActivationAnchorLocator,
+    store: PathBuf,
+}
+
+impl SelectorFixture {
+    fn new(system: bool, self_managed: bool) -> Self {
+        let temp = crate::secure_test_tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let locator = |name: &str| ActivationAnchorLocator {
+            path: root.join(name),
+            // Both test candidates live below an EUID-owned temporary parent.
+            // The selector still labels the first candidate administrator-
+            // hardened and the second self-managed.
+            kind: AnchorKind::Test,
+        };
+        let system_locator = locator("system");
+        let self_locator = locator("self");
+        for candidate in [
+            system.then_some(&system_locator),
+            self_managed.then_some(&self_locator),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            std::fs::create_dir(candidate.as_path()).unwrap();
+            std::fs::set_permissions(candidate.as_path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let state = root.join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Self {
+            _temp: temp,
+            system: system_locator,
+            self_managed: self_locator,
+            store: state.join("sealed-staging"),
+        }
+    }
+
+    fn select(&self) -> Result<AuthoritySelection, StoreActivationError> {
+        select_authority_pair(self.system.clone(), self.self_managed.clone())
+    }
+}
+
+#[test]
+fn selector_truth_table_never_falls_back_from_activation_evidence() {
+    use StoreActivationKind::{Activated, CorruptOrReplaced, Lost, NeverActivated, Preparing};
+    let cases = [
+        (Some(NeverActivated), None, Ok(AuthorityChoice::System)),
+        (None, Some(NeverActivated), Ok(AuthorityChoice::SelfManaged)),
+        (
+            Some(NeverActivated),
+            Some(NeverActivated),
+            Ok(AuthorityChoice::System),
+        ),
+        (
+            Some(Activated),
+            Some(NeverActivated),
+            Ok(AuthorityChoice::System),
+        ),
+        (
+            Some(NeverActivated),
+            Some(Preparing),
+            Ok(AuthorityChoice::SelfManaged),
+        ),
+        (Some(Preparing), Some(Activated), Err(())),
+        (
+            Some(Lost),
+            Some(NeverActivated),
+            Ok(AuthorityChoice::System),
+        ),
+        (
+            Some(NeverActivated),
+            Some(CorruptOrReplaced),
+            Ok(AuthorityChoice::SelfManaged),
+        ),
+        (Some(CorruptOrReplaced), Some(Lost), Err(())),
+    ];
+    for (system, self_managed, expected) in cases {
+        assert_eq!(choose_authority(system, self_managed), expected);
+    }
+}
+
+#[test]
+fn selector_handles_missing_and_record_empty_candidates_without_creating_state() {
+    let neither = SelectorFixture::new(false, false);
+    assert!(matches!(
+        neither.select(),
+        Err(StoreActivationError::NoAuthority { system, self_managed })
+            if system == neither.system.path && self_managed == neither.self_managed.path
+    ));
+    assert!(!neither.store.exists());
+
+    let system_only = SelectorFixture::new(true, false);
+    let selected = system_only.select().unwrap();
+    assert_eq!(
+        selected.mode,
+        ActivationAuthorityMode::AdministratorHardened
+    );
+    assert_eq!(selected.selected.authority.path, system_only.system.path);
+    assert_eq!(
+        selected.selected.state.kind(),
+        StoreActivationKind::NeverActivated
+    );
+    drop(selected);
+
+    let self_only = SelectorFixture::new(false, true);
+    let selected = self_only.select().unwrap();
+    assert_eq!(selected.mode, ActivationAuthorityMode::SelfManaged);
+    assert_eq!(
+        selected.selected.authority.path,
+        self_only.self_managed.path
+    );
+    drop(selected);
+
+    let both = SelectorFixture::new(true, true);
+    let selected = both.select().unwrap();
+    assert_eq!(
+        selected.mode,
+        ActivationAuthorityMode::AdministratorHardened
+    );
+    assert_eq!(selected.selected.authority.path, both.system.path);
+    assert!(selected.peer.is_some());
+    drop(selected);
+    assert!(!both.store.exists());
+}
+
+#[test]
+fn existing_evidence_wins_over_an_empty_peer_and_two_evidence_roots_block() {
+    let self_active = SelectorFixture::new(true, true);
+    drop(activate_or_resume_store(&self_active.self_managed, &self_active.store).unwrap());
+    let selected = self_active.select().unwrap();
+    assert_eq!(selected.mode, ActivationAuthorityMode::SelfManaged);
+    assert_eq!(
+        selected.selected.state.kind(),
+        StoreActivationKind::Activated
+    );
+    drop(selected);
+
+    let system_active = SelectorFixture::new(true, true);
+    drop(activate_or_resume_store(&system_active.system, &system_active.store).unwrap());
+    let selected = system_active.select().unwrap();
+    assert_eq!(
+        selected.mode,
+        ActivationAuthorityMode::AdministratorHardened
+    );
+    drop(selected);
+
+    let split = SelectorFixture::new(true, true);
+    let second_store = split.store.parent().unwrap().join("second-store");
+    drop(activate_or_resume_store(&split.system, &split.store).unwrap());
+    drop(activate_or_resume_store(&split.self_managed, &second_store).unwrap());
+    assert!(matches!(
+        split.select(),
+        Err(StoreActivationError::SplitAuthority { system, self_managed })
+            if system == split.system.path && self_managed == split.self_managed.path
+    ));
+}
+
+#[test]
+fn unsafe_system_candidate_blocks_instead_of_falling_back_to_self() {
+    let fixture = SelectorFixture::new(true, true);
+    drop(activate_or_resume_store(&fixture.self_managed, &fixture.store).unwrap());
+    std::fs::set_permissions(
+        fixture.system.as_path(),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        fixture.select(),
+        Err(StoreActivationError::UnsafeAnchor(_))
+    ));
+}
+
+#[test]
+fn mutation_result_retains_selected_and_peer_locks_for_the_session() {
+    let fixture = SelectorFixture::new(true, true);
+    drop(activate_or_resume_store(&fixture.self_managed, &fixture.store).unwrap());
+    let activated =
+        activate_authority_selection_with_probe(fixture.select().unwrap(), &fixture.store, |_| {
+            panic!("recorded activation must bypass the desired-store probe")
+        })
+        .unwrap();
+    let MutationStoreActivation::Activated(activated) = activated else {
+        panic!("recorded self authority did not remain activated")
+    };
+    for locator in [&fixture.system, &fixture.self_managed] {
+        assert!(matches!(
+            open_activation_anchor(locator),
+            Err(StoreActivationError::Io { .. })
+        ));
+    }
+    drop(activated);
+    assert!(open_activation_anchor(&fixture.system).is_ok());
+    assert!(open_activation_anchor(&fixture.self_managed).is_ok());
+}
+
+#[test]
+fn runtime_waits_for_the_self_provisioning_commit_lock() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let product = temp.path().canonicalize().unwrap().join("degu");
+    let store_parent = product.join("store-activation");
+    let anchor_path = store_parent.join(rustix::process::geteuid().as_raw().to_string());
+    let provisioning_lock = product.join(crate::provision::PROVISIONING_LOCK_NAME);
+    for path in [&product, &store_parent, &anchor_path, &provisioning_lock] {
+        std::fs::create_dir(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let locator = ActivationAnchorLocator {
+        path: anchor_path,
+        kind: AnchorKind::SelfManaged,
+    };
+    let held =
+        ExclusiveFileLock::try_acquire(std::fs::File::open(&provisioning_lock).unwrap()).unwrap();
+    assert!(matches!(
+        open_activation_anchor(&locator),
+        Err(StoreActivationError::Io { .. })
+    ));
+    drop(held);
+    assert!(open_activation_anchor(&locator).is_ok());
+}
+
+#[test]
+fn runtime_rejects_an_anchor_without_its_flavor_provisioning_lock() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let product = temp.path().canonicalize().unwrap().join("degu");
+    let store_parent = product.join("store-activation");
+    let anchor_path = store_parent.join(rustix::process::geteuid().as_raw().to_string());
+    for path in [&product, &store_parent, &anchor_path] {
+        std::fs::create_dir(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let locator = ActivationAnchorLocator {
+        path: anchor_path,
+        kind: AnchorKind::SelfManaged,
+    };
+    assert!(open_activation_anchor(&locator).is_err());
+}
+
+#[test]
+fn preparing_with_a_mismatched_reciprocal_binding_is_corrupt() {
+    let fixture = Fixture::new();
+    // Authority-claim validation syncs are 0/1 and anchor/parent validation
+    // syncs are 2/3; prepare publication becomes visible at boundary 5 and
+    // leaves the transaction resumably preparing.
+    inject_sync_failure(Some(5));
+    assert!(activate_or_resume_store(&fixture.anchor, &fixture.store).is_err());
+    inject_sync_failure(None);
+    assert_eq!(
+        discover_store_activation(&fixture.anchor, &fixture.store)
+            .unwrap()
+            .kind(),
+        StoreActivationKind::Preparing
+    );
+    std::fs::write(fixture.store.join(STORE_BINDING_NAME), b"mismatched").unwrap();
+    std::fs::set_permissions(
+        fixture.store.join(STORE_BINDING_NAME),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    assert_eq!(
+        discover_store_activation(&fixture.anchor, &fixture.store)
+            .unwrap()
+            .kind(),
+        StoreActivationKind::CorruptOrReplaced
+    );
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)] // simulates out-of-protocol selected-anchor loss
+fn peer_witness_blocks_reactivation_after_selected_authority_loss() {
+    let fixture = SelectorFixture::new(true, true);
+    let activated =
+        activate_authority_selection_with_probe(fixture.select().unwrap(), &fixture.store, |_| {
+            Ok(())
+        })
+        .unwrap();
+    drop(activated);
+    assert!(fixture.system.path.join(AUTHORITY_RECORD_NAME).is_file());
+    assert!(
+        fixture
+            .self_managed
+            .path
+            .join(AUTHORITY_RECORD_NAME)
+            .is_file()
+    );
+
+    std::fs::remove_dir_all(&fixture.system.path).unwrap();
+    assert!(matches!(
+        fixture.select(),
+        Err(StoreActivationError::SelectedAuthorityLost { selected, witness })
+            if selected == fixture.system.path && witness == fixture.self_managed.path
+    ));
+    let changed = fixture.store.parent().unwrap().join("changed-store");
+    assert!(!changed.exists());
+}
+
+#[test]
+fn an_unclaimed_self_anchor_cannot_activate_without_initial_declaration() {
+    let fixture = SelectorFixture::new(false, true);
+    let result =
+        activate_authority_selection_with_probe(fixture.select().unwrap(), &fixture.store, |_| {
+            panic!("undeclared self authority must block before probing the store")
+        });
+    assert!(matches!(
+        result,
+        Err(StoreActivationError::SelfInitializationRequired)
+    ));
+    assert!(!fixture.store.exists());
+    assert!(
+        !fixture
+            .self_managed
+            .path
+            .join(AUTHORITY_RECORD_NAME)
+            .exists()
+    );
+}
+
+#[test]
+fn declared_self_authority_activates_and_backfills_an_empty_system_witness() {
+    let fixture = SelectorFixture::new(true, true);
+    // Model the atomic post-provision declaration performed by `degu init`.
+    let self_candidate = open_authority_candidate(&fixture.self_managed)
+        .unwrap()
+        .unwrap();
+    ensure_authority_claim(&self_candidate.authority, None, None).unwrap();
+    drop(self_candidate);
+
+    let selection = fixture.select().unwrap();
+    assert_eq!(selection.mode, ActivationAuthorityMode::SelfManaged);
+    let activated =
+        activate_authority_selection_with_probe(selection, &fixture.store, |_| Ok(())).unwrap();
+    drop(activated);
+    let self_claim = std::fs::read(fixture.self_managed.path.join(AUTHORITY_RECORD_NAME)).unwrap();
+    let system_claim = std::fs::read(fixture.system.path.join(AUTHORITY_RECORD_NAME)).unwrap();
+    assert_eq!(system_claim, self_claim);
+}
+
+#[test]
+fn mismatched_durable_authority_claims_are_split_authority() {
+    let fixture = SelectorFixture::new(true, true);
+    for locator in [&fixture.system, &fixture.self_managed] {
+        let candidate = open_authority_candidate(locator).unwrap().unwrap();
+        ensure_authority_claim(&candidate.authority, None, None).unwrap();
+    }
+    assert!(matches!(
+        fixture.select(),
+        Err(StoreActivationError::SplitAuthority { .. })
+    ));
+}
+
+#[test]
+fn authority_record_codec_round_trips_selected_identity() {
+    let fixture = SelectorFixture::new(false, true);
+    let candidate = open_authority_candidate(&fixture.self_managed)
+        .unwrap()
+        .unwrap();
+    let claim = ensure_authority_claim(&candidate.authority, None, None).unwrap();
+    let bytes = std::fs::read(fixture.self_managed.path.join(AUTHORITY_RECORD_NAME)).unwrap();
+    assert!(bytes.starts_with(MAGIC_AUTHORITY));
+    assert_eq!(decode_authority(&bytes), Some(claim));
+}
+
+#[test]
+fn self_initialization_reports_a_new_declaration_as_mutation() {
+    let outcome = SelfAuthorityInitializationOutcome {
+        provisioning: crate::provision::ActivationAnchorProvisioningOutcome {
+            path: PathBuf::from("/fixed/self/anchor"),
+            uid: 1000,
+            backend: CertifiedLocalBackend::Ext4,
+            status: crate::provision::ActivationAnchorProvisioningStatus::AlreadyProvisioned,
+        },
+        declared: true,
+    };
+    assert!(outcome.mutated());
+}
+
+fn test_provisioning_outcome(
+    path: PathBuf,
+) -> crate::provision::ActivationAnchorProvisioningOutcome {
+    crate::provision::ActivationAnchorProvisioningOutcome {
+        path,
+        uid: 1000,
+        backend: CertifiedLocalBackend::Ext4,
+        status: crate::provision::ActivationAnchorProvisioningStatus::Created,
+    }
+}
+
+#[test]
+fn post_provision_system_race_retains_the_committed_anchor_outcome() {
+    let fixture = SelectorFixture::new(true, true);
+    let provisioning = test_provisioning_outcome(fixture.self_managed.path.clone());
+    let error = complete_provisioned_self_authority_with(
+        provisioning.clone(),
+        &fixture.system,
+        &fixture.self_managed,
+        |_| Ok(()),
+        |_, _| panic!("claim publication must not run after the system recheck fails"),
+    )
+    .unwrap_err();
+    let SelfAuthorityInitializationError::PostProvision(error) = error else {
+        panic!("expected a post-provision error");
+    };
+    assert_eq!(error.provisioning(), &provisioning);
+    assert_eq!(
+        error.authority_claim(),
+        AuthorityClaimPublicationState::NotAttempted
+    );
+    assert!(matches!(
+        error.authority_error(),
+        StoreActivationError::SystemAuthorityPresent { path }
+            if path == &fixture.system.path
+    ));
+    assert!(fixture.self_managed.path.is_dir());
+}
+
+#[test]
+fn real_claim_publication_boundary_classifies_post_provision_failure() {
+    for (fail_at, expected_state, expected_visible) in [
+        (0, AuthorityClaimPublicationState::NotAttempted, false),
+        (1, AuthorityClaimPublicationState::MayHavePublished, true),
+    ] {
+        let fixture = SelectorFixture::new(false, true);
+        let provisioning = test_provisioning_outcome(fixture.self_managed.path.clone());
+        let error = complete_provisioned_self_authority_with(
+            provisioning,
+            &fixture.system,
+            &fixture.self_managed,
+            |_| Ok(()),
+            |candidate, on_published| {
+                inject_sync_failure(Some(fail_at));
+                let result = ensure_authority_claim_observed(
+                    &candidate.authority,
+                    None,
+                    candidate.claim.as_ref(),
+                    on_published,
+                )
+                .map(drop);
+                inject_sync_failure(None);
+                result
+            },
+        )
+        .unwrap_err();
+        let SelfAuthorityInitializationError::PostProvision(error) = error else {
+            panic!("expected a post-provision error");
+        };
+        assert_eq!(error.authority_claim(), expected_state);
+        assert!(matches!(
+            error.authority_error(),
+            StoreActivationError::SyncUncertain("selected authority claim")
+        ));
+        assert_eq!(
+            fixture
+                .self_managed
+                .path
+                .join(AUTHORITY_RECORD_NAME)
+                .is_file(),
+            expected_visible
+        );
+    }
+}
+
+#[test]
+fn existing_claim_remains_published_when_revalidation_sync_fails() {
+    let fixture = SelectorFixture::new(false, true);
+    let candidate = open_authority_candidate(&fixture.self_managed)
+        .unwrap()
+        .unwrap();
+    ensure_authority_claim(&candidate.authority, None, None).unwrap();
+    drop(candidate);
+
+    let provisioning = test_provisioning_outcome(fixture.self_managed.path.clone());
+    let error = complete_provisioned_self_authority_with(
+        provisioning,
+        &fixture.system,
+        &fixture.self_managed,
+        |_| Ok(()),
+        |candidate, on_published| {
+            inject_sync_failure(Some(0));
+            let result = ensure_authority_claim_observed(
+                &candidate.authority,
+                None,
+                candidate.claim.as_ref(),
+                on_published,
+            )
+            .map(drop);
+            inject_sync_failure(None);
+            result
+        },
+    )
+    .unwrap_err();
+    let SelfAuthorityInitializationError::PostProvision(error) = error else {
+        panic!("expected a post-provision error");
+    };
+    assert_eq!(
+        error.authority_claim(),
+        AuthorityClaimPublicationState::Published
+    );
+    assert!(
+        fixture
+            .self_managed
+            .path
+            .join(AUTHORITY_RECORD_NAME)
+            .is_file()
+    );
+}
+
+#[test]
+fn post_claim_account_drift_retains_published_disposition() {
+    let fixture = SelectorFixture::new(false, true);
+    let provisioning = test_provisioning_outcome(fixture.self_managed.path.clone());
+    let checks = std::cell::Cell::new(0_u8);
+    let error = complete_provisioned_self_authority_with(
+        provisioning.clone(),
+        &fixture.system,
+        &fixture.self_managed,
+        |expected| {
+            let check = checks.get();
+            checks.set(check + 1);
+            if check == 2 {
+                return Err(StoreActivationError::AccountBaseChanged {
+                    expected: expected.to_path_buf(),
+                    actual: PathBuf::from("/changed/self/anchor"),
+                });
+            }
+            Ok(())
+        },
+        |candidate, on_published| {
+            ensure_authority_claim_observed(
+                &candidate.authority,
+                None,
+                candidate.claim.as_ref(),
+                on_published,
+            )
+            .map(drop)
+        },
+    )
+    .unwrap_err();
+    let SelfAuthorityInitializationError::PostProvision(error) = error else {
+        panic!("expected a post-provision error");
+    };
+    assert_eq!(checks.get(), 3);
+    assert_eq!(error.provisioning(), &provisioning);
+    assert_eq!(
+        error.authority_claim(),
+        AuthorityClaimPublicationState::Published
+    );
+    assert!(matches!(
+        error.authority_error(),
+        StoreActivationError::AccountBaseChanged { expected, actual }
+            if expected == &fixture.self_managed.path
+                && actual == Path::new("/changed/self/anchor")
+    ));
+    assert!(fixture.self_managed.path.is_dir());
+    assert!(
+        fixture
+            .self_managed
+            .path
+            .join(AUTHORITY_RECORD_NAME)
+            .is_file()
+    );
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)] // simulates selected loss after a crash boundary
+fn peer_first_claim_crash_still_witnesses_selected_authority_loss() {
+    let fixture = SelectorFixture::new(true, true);
+    // Candidate-open syncs are 0..=3. The peer witness file sync is 4 and its
+    // publication-directory sync is 5; inject after that durable boundary and
+    // before the selected claim is published.
+    inject_sync_failure_after(5);
+    assert!(matches!(
+        activate_authority_selection_with_probe(fixture.select().unwrap(), &fixture.store, |_| Ok(
+            ()
+        )),
+        Err(StoreActivationError::SyncUncertain(
+            "peer authority witness"
+        ))
+    ));
+    inject_sync_failure(None);
+    assert!(
+        fixture
+            .self_managed
+            .path
+            .join(AUTHORITY_RECORD_NAME)
+            .is_file()
+    );
+    assert!(!fixture.system.path.join(AUTHORITY_RECORD_NAME).exists());
+
+    // The selected candidate inherits the authenticated peer claim in memory,
+    // so retry completes the selected record with the same selection ID.
+    let retry = fixture.select().unwrap();
+    assert!(retry.selected.claim.is_some());
+    drop(activate_authority_selection_with_probe(retry, &fixture.store, |_| Ok(())).unwrap());
+    assert!(fixture.system.path.join(AUTHORITY_RECORD_NAME).is_file());
+
+    std::fs::remove_dir_all(&fixture.system.path).unwrap();
+    assert!(matches!(
+        fixture.select(),
+        Err(StoreActivationError::SelectedAuthorityLost { selected, witness })
+            if selected == fixture.system.path && witness == fixture.self_managed.path
+    ));
+}
+
+#[test]
+fn missing_leaf_still_observes_an_in_progress_provisioning_lock() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let product = temp.path().canonicalize().unwrap().join("degu");
+    let provisioning_lock = product.join(crate::provision::PROVISIONING_LOCK_NAME);
+    std::fs::create_dir(&product).unwrap();
+    std::fs::create_dir(&provisioning_lock).unwrap();
+    for path in [&product, &provisioning_lock] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let locator = ActivationAnchorLocator {
+        path: product
+            .join("store-activation")
+            .join(rustix::process::geteuid().as_raw().to_string()),
+        kind: AnchorKind::SelfManaged,
+    };
+    let held =
+        ExclusiveFileLock::try_acquire(std::fs::File::open(&provisioning_lock).unwrap()).unwrap();
+    assert!(matches!(
+        open_authority_candidate(&locator),
+        Err(StoreActivationError::Io { .. })
+    ));
+    drop(held);
+    assert!(open_authority_candidate(&locator).unwrap().is_none());
+}
+
+#[test]
+fn account_home_handoff_cannot_declare_a_different_locator() {
+    let expected = PathBuf::from("/account-a/.local/state/degu/store-activation/1000");
+    let actual = PathBuf::from("/account-b/.local/state/degu/store-activation/1000");
+    assert!(matches!(
+        require_current_self_path_with(&expected, || Ok(actual.clone())),
+        Err(StoreActivationError::AccountBaseChanged {
+            expected: observed_expected,
+            actual: observed_actual,
+        }) if observed_expected == expected && observed_actual == actual
+    ));
+    assert!(require_current_self_path_with(&expected, || Ok(expected.clone())).is_ok());
 }

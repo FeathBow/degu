@@ -1250,7 +1250,9 @@ impl SealedStagingEngine {
     /// Opens the store once per mutation session, replays even an empty WAL, and
     /// resumes append on that same locked descriptor. Any legacy bare transaction
     /// fails closed rather than being promoted into sealed staging.
-    pub fn open(store: &SealWalStore) -> Result<(Self, StartupRecoveryReport), StagingEngineError> {
+    pub(crate) fn open(
+        store: &SealWalStore,
+    ) -> Result<(Self, StartupRecoveryReport), StagingEngineError> {
         let mut recovery = store.try_lease()?;
         let replay = recovery.replay_and_repair()?.clone();
         if replay
@@ -1298,6 +1300,14 @@ impl SealedStagingEngine {
                 generation: recovery_generation,
             },
         ))
+    }
+
+    #[cfg(feature = "integration-test-anchor")]
+    #[doc(hidden)]
+    pub fn open_for_integration_test(
+        store: &SealWalStore,
+    ) -> Result<(Self, StartupRecoveryReport), StagingEngineError> {
+        Self::open(store)
     }
 
     /// Exhausts the exact report from [`Self::open`]. The provider is invoked

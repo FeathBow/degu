@@ -2688,6 +2688,27 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                         ));
                     }
                 }
+                if evidence.relative_path().as_os_str().is_empty() {
+                    let exact_v11_parent = versioned.version >= 11
+                        && tx
+                            .staging_schema_version
+                            .is_some_and(|version| version >= 11)
+                        && tx.staging.as_ref().is_some_and(|metadata| {
+                            evidence_is_exact_source_parent(&evidence, metadata)
+                        })
+                        && match reverses_mutation_id {
+                            None => phase == TransactionState::ParentSealIntent,
+                            Some(original) => tx.permissions.iter().any(|permission| {
+                                permission.mutation_id == original
+                                    && permission.phase == TransactionState::ParentSealIntent
+                            }),
+                        };
+                    if !exact_v11_parent {
+                        return Err(ReplayError::InvalidHistory(
+                            "empty permission evidence is not the exact v11 source parent",
+                        ));
+                    }
+                }
                 if tx.indices.contains_key(&mutation_id) {
                     return Err(ReplayError::InvalidHistory("duplicate permission intent"));
                 }
@@ -3290,14 +3311,25 @@ fn decode_record(payload: &[u8], offset: u64, version: u16) -> Result<SealRecord
                     reason: "permission mode exceeds the supported mode-bit schema",
                 });
             }
-            let evidence = PersistentRecoveryEvidence::new(
-                relative_path,
-                filesystem_id,
-                device,
-                inode,
-                generation_or_btime,
-                evidence_mode,
-            )
+            let evidence = if version >= 11 {
+                PersistentRecoveryEvidence::new_staging(
+                    relative_path,
+                    filesystem_id,
+                    device,
+                    inode,
+                    generation_or_btime,
+                    evidence_mode,
+                )
+            } else {
+                PersistentRecoveryEvidence::new(
+                    relative_path,
+                    filesystem_id,
+                    device,
+                    inode,
+                    generation_or_btime,
+                    evidence_mode,
+                )
+            }
             .ok_or(ReplayError::Malformed {
                 offset,
                 reason: "recovery path is not confined",

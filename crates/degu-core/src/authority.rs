@@ -203,7 +203,48 @@ impl PersistentRecoveryEvidence {
         generation_or_btime: Option<u64>,
         expected_mode: u32,
     ) -> Option<Self> {
-        is_confined_relative_path(&relative_path).then_some(Self {
+        Self::new_inner(
+            relative_path,
+            filesystem_id,
+            device,
+            inode,
+            generation_or_btime,
+            expected_mode,
+            false,
+        )
+    }
+
+    pub(crate) fn new_staging(
+        relative_path: PathBuf,
+        filesystem_id: Option<String>,
+        device: u64,
+        inode: u64,
+        generation_or_btime: Option<u64>,
+        expected_mode: u32,
+    ) -> Option<Self> {
+        Self::new_inner(
+            relative_path,
+            filesystem_id,
+            device,
+            inode,
+            generation_or_btime,
+            expected_mode,
+            true,
+        )
+    }
+
+    fn new_inner(
+        relative_path: PathBuf,
+        filesystem_id: Option<String>,
+        device: u64,
+        inode: u64,
+        generation_or_btime: Option<u64>,
+        expected_mode: u32,
+        allow_anchor: bool,
+    ) -> Option<Self> {
+        (is_confined_relative_path(&relative_path)
+            || allow_anchor && relative_path.as_os_str().is_empty())
+        .then_some(Self {
             relative_path,
             filesystem_id,
             device,

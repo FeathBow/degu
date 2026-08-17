@@ -190,14 +190,25 @@ fn execute_local_mode_mutation_inner<W: DurableWrite>(
         }
         None => request.locator.incarnation,
     };
-    let evidence = PersistentRecoveryEvidence::new(
-        request.locator.relative_path,
-        request.locator.filesystem_id,
-        prepared.device(),
-        prepared.inode(),
-        incarnation,
-        prepared.target_mode(),
-    )
+    let evidence = if staging {
+        PersistentRecoveryEvidence::new_staging(
+            request.locator.relative_path,
+            request.locator.filesystem_id,
+            prepared.device(),
+            prepared.inode(),
+            incarnation,
+            prepared.target_mode(),
+        )
+    } else {
+        PersistentRecoveryEvidence::new(
+            request.locator.relative_path,
+            request.locator.filesystem_id,
+            prepared.device(),
+            prepared.inode(),
+            incarnation,
+            prepared.target_mode(),
+        )
+    }
     .ok_or(LocalModeExecutionError::InvalidRequest(
         "recovery locator is not a confined relative path",
     ))?;

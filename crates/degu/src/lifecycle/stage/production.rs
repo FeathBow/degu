@@ -854,7 +854,16 @@ mod tests {
             b"keep"
         );
         assert!(!trash_root.join(".claims/0002").exists());
-        assert_eq!(run.engine.production_entries().len(), 1);
+        let entries = run.engine.production_entries();
+        assert_eq!(entries.len(), 1);
+        let recovery_anchor = entries[0]
+            .recovery_anchor()
+            .expect("production staging must persist its recovery anchor");
+        source
+            .parent()
+            .unwrap()
+            .strip_prefix(recovery_anchor)
+            .expect("recovery anchor must confine the source parent");
     }
 
     #[test]

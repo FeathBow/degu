@@ -145,12 +145,19 @@ fn clean_stages_a_cache_beneath_a_symlinked_xdg_parent() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!cache.exists());
-    let entries = visible_trash_entries(&state.path().join("degu/trash"));
-    assert_eq!(entries.len(), 1);
-    assert_eq!(
-        std::fs::read(entries[0].join("wheel.whl")).unwrap(),
-        expected
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let entry = std::path::PathBuf::from(
+        report["executed"][0]["trash_entry"]
+            .as_str()
+            .expect("successful staging must report its trash entry"),
     );
+    assert!(
+        entry.starts_with(state.path().join("degu/trash"))
+            || entry.starts_with(real_cache_home.path().join(".degu-trash")),
+        "unexpected mount-scoped trash entry: {}",
+        entry.display()
+    );
+    assert_eq!(std::fs::read(entry.join("wheel.whl")).unwrap(), expected);
 }
 
 #[test]

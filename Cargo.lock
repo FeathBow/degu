@@ -263,7 +263,7 @@ dependencies = [
 
 [[package]]
 name = "degu"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "degu-adapters"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "degu-core",
  "degu-walk",
@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "degu-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "degu-walk",
  "getrandom",
@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "degu-walk"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "rustix",
  "tempfile",

@@ -68,7 +68,7 @@ For datasets, checkpoints, and unknown large files, pair degu with a disk-usage 
 | Operation | Setup | Boundary |
 |---|---|---|
 | `scan`, `quota`, `clean -n` | none | read-only; dry-run creates no degu state |
-| degu-managed `clean`, `undo`, `trash purge` | `degu init --initial` for first-use self-managed authority, or optional administrator setup | runs without elevation; anchor, WAL, and canonical-HOME staging roles each require a certified ext4/XFS/APFS backend |
+| degu-managed `clean`, `undo`, `trash purge` | `degu init --initial` for first-use self-managed authority, or optional administrator setup | runs without elevation; anchor, WAL, and each source/trash mount domain independently require a certified ext4/XFS/APFS backend |
 | `reclaim uv` | explicit executable and cache root | irreversible tool-native mutation; no account anchor, degu trash, or undo |
 
 Unsupported filesystems never gain sealed authority. See the [safety model](docs/safety.md) for compatibility and recovery behavior.

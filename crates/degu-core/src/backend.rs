@@ -271,7 +271,22 @@ pub struct HeldTreePolicySummary {
     pub path_bytes: u64,
     pub manifest_bytes: u64,
     pub content_bytes_from_metadata: u64,
+    pub regular_hard_links: HeldTreeRegularHardLinkTopology,
     pub assessed_at: SystemTime,
+}
+
+/// Data-only summary of complete regular-file link groups enumerated inside the
+/// assessed tree. It grants no staging or purge authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HeldTreeRegularHardLinkTopology {
+    pub multi_link_groups: u64,
+    pub linked_entries: u64,
+}
+
+impl HeldTreeRegularHardLinkTopology {
+    pub fn contains_multi_link_group(self) -> bool {
+        self.multi_link_groups != 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -338,7 +353,7 @@ pub enum HeldTreeAssessmentFailureKind {
     BackendBoundary,
     IdentityChanged,
     StrongIncarnationUnavailable,
-    ExternalHardLink,
+    ExternalOrUnenumeratedHardLink,
     NonDirectoryExtendedMetadata,
     MetadataEvidenceUnavailable,
     AclPresent,
@@ -370,7 +385,7 @@ impl HeldTreeAssessmentFailureKind {
             Self::BackendBoundary => "backend_boundary",
             Self::IdentityChanged => "identity_changed",
             Self::StrongIncarnationUnavailable => "strong_incarnation_unavailable",
-            Self::ExternalHardLink => "external_hard_link",
+            Self::ExternalOrUnenumeratedHardLink => "external_or_unenumerated_hard_link",
             Self::NonDirectoryExtendedMetadata => "non_directory_extended_metadata",
             Self::MetadataEvidenceUnavailable => "metadata_evidence_unavailable",
             Self::AclPresent => "acl_present",
@@ -402,7 +417,9 @@ impl HeldTreeAssessmentFailureKind {
             Self::BackendBoundary => "backend boundary encountered",
             Self::IdentityChanged => "entry identity changed",
             Self::StrongIncarnationUnavailable => "strong entry incarnation unavailable",
-            Self::ExternalHardLink => "external hard link encountered",
+            Self::ExternalOrUnenumeratedHardLink => {
+                "external or unenumerated hard link encountered"
+            }
             Self::NonDirectoryExtendedMetadata => "unsupported extended metadata",
             Self::MetadataEvidenceUnavailable => "extended-metadata evidence unavailable",
             Self::AclPresent => "ACL present",
@@ -429,7 +446,7 @@ impl HeldTreeAssessmentFailureKind {
             Self::SourceParentPolicyRejected
             | Self::ForeignOwner
             | Self::ProtectedName
-            | Self::ExternalHardLink
+            | Self::ExternalOrUnenumeratedHardLink
             | Self::NonDirectoryExtendedMetadata
             | Self::AclPresent
             | Self::UnsupportedContentKind
@@ -528,6 +545,10 @@ fn map_tree_assessment(a: held::HeldTreeAdmissionAssessment) -> HeldTreePolicyAs
                 path_bytes: tree.path_bytes,
                 manifest_bytes: tree.manifest_bytes,
                 content_bytes_from_metadata: tree.content_bytes,
+                regular_hard_links: HeldTreeRegularHardLinkTopology {
+                    multi_link_groups: tree.regular_hard_links.multi_link_groups,
+                    linked_entries: tree.regular_hard_links.linked_entries,
+                },
                 assessed_at: tree.assessed_at,
             },
             source_parent_seal: seal(source_parent_seal),
@@ -575,7 +596,10 @@ fn map_tree_assessment_failure(e: held::HeldTreeError) -> HeldTreeAssessmentFail
             HeldTreeAssessmentFailureKind::StrongIncarnationUnavailable,
             Some(p),
         ),
-        E::ExternalHardLink(p) => (HeldTreeAssessmentFailureKind::ExternalHardLink, Some(p)),
+        E::ExternalOrUnenumeratedHardLink(p) => (
+            HeldTreeAssessmentFailureKind::ExternalOrUnenumeratedHardLink,
+            Some(p),
+        ),
         E::NonDirectoryExtendedMetadata(p) => (
             HeldTreeAssessmentFailureKind::NonDirectoryExtendedMetadata,
             Some(p),
@@ -1377,7 +1401,7 @@ mod tests {
             (K::BackendBoundary, C::PlatformEvidence),
             (K::IdentityChanged, C::RaceOrIo),
             (K::StrongIncarnationUnavailable, C::PlatformEvidence),
-            (K::ExternalHardLink, C::TreePolicy),
+            (K::ExternalOrUnenumeratedHardLink, C::TreePolicy),
             (K::NonDirectoryExtendedMetadata, C::TreePolicy),
             (K::MetadataEvidenceUnavailable, C::RaceOrIo),
             (K::AclPresent, C::TreePolicy),

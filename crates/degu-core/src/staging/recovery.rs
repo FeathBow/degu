@@ -133,6 +133,8 @@ pub(crate) enum RecoveryRebindError {
     UndoRenameUnknown(#[source] io::Error),
     #[error("verified undo parent fsync failed: {0}")]
     UndoParentSync(#[source] io::Error),
+    #[error("sealed purge does not support a tree containing multi-link regular-file groups")]
+    PurgeUnsupportedInternalHardLinks,
     #[error("object-bound purge execution failed: {0}")]
     PurgeExecution(#[source] HeldTreeError),
 }
@@ -916,6 +918,17 @@ impl VerifiedPurgeSession<'_> {
                 return Err(error);
             }
         };
+        // This admission gate deliberately precedes PurgeAuthorized/Purgeable,
+        // PurgeIntent, every progress frame, and every unlink. Internal hardlink
+        // topology is supported for staging and undo, but partial unlinking would
+        // destroy the complete alias set and is therefore not authorized.
+        if inventory
+            .regular_hard_link_topology()
+            .contains_multi_link_group()
+        {
+            *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
+            return Err(RecoveryRebindError::PurgeUnsupportedInternalHardLinks);
+        }
         let manifest = verifier.undo.expected_manifest;
         if verifier.wal.transaction_state(transaction) == Some(TransactionState::VerifiedCommitted)
         {

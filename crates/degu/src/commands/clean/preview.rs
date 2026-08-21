@@ -2,7 +2,7 @@ use crate::presentation::escape_terminal_text;
 use degu_core::backend::{
     CertificationError, HeldTreeAssessmentFailure, HeldTreeAssessmentFailureCategory,
     HeldTreeAssessmentFailureKind, HeldTreePolicyAssessmentOutcome,
-    assess_held_tree_policy_metadata, certify_held_fd,
+    HeldTreeRegularHardLinkTopology, assess_held_tree_policy_metadata, certify_held_fd,
 };
 use degu_core::finding::Finding;
 use rustix::fs::{Mode, OFlags};
@@ -21,12 +21,15 @@ const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
 /// trash destination, or mutation authority.
 pub(super) struct PreviewStagingAssessment {
     path: PathBuf,
+    purge_requested: bool,
     status: PreviewStagingStatus,
 }
 
 #[derive(Debug)]
 pub(super) enum PreviewStagingStatus {
-    TreePolicyAssessed,
+    TreePolicyAssessed {
+        regular_hard_links: HeldTreeRegularHardLinkTopology,
+    },
     Blocked {
         kind: &'static str,
         category: &'static str,
@@ -47,10 +50,14 @@ pub(super) enum PreviewStagingStatus {
 }
 
 impl PreviewStagingAssessment {
-    pub(super) fn assess(finding: &Finding, atomic_selection: bool) -> Self {
+    pub(super) fn assess(finding: &Finding, purge_requested: bool, atomic_selection: bool) -> Self {
         let path = finding.path().to_path_buf();
         let status = apply_selection_policy(assess_path(&path), atomic_selection);
-        Self { path, status }
+        Self {
+            path,
+            purge_requested,
+            status,
+        }
     }
 
     pub(super) fn path(&self) -> &Path {
@@ -58,7 +65,19 @@ impl PreviewStagingAssessment {
     }
 
     pub(super) fn is_tree_policy_assessed(&self) -> bool {
-        matches!(self.status, PreviewStagingStatus::TreePolicyAssessed)
+        matches!(self.status, PreviewStagingStatus::TreePolicyAssessed { .. })
+    }
+
+    pub(super) fn has_internal_hard_links(&self) -> bool {
+        matches!(
+            self.status,
+            PreviewStagingStatus::TreePolicyAssessed { regular_hard_links }
+                if regular_hard_links.contains_multi_link_group()
+        )
+    }
+
+    pub(super) fn purge_supported(&self) -> bool {
+        !self.has_internal_hard_links()
     }
 
     pub(super) fn is_blocked(&self) -> bool {
@@ -75,7 +94,7 @@ impl PreviewStagingAssessment {
 
     pub(super) fn reason(&self) -> Option<&str> {
         match &self.status {
-            PreviewStagingStatus::TreePolicyAssessed => None,
+            PreviewStagingStatus::TreePolicyAssessed { .. } => None,
             PreviewStagingStatus::Blocked { reason, .. }
             | PreviewStagingStatus::DeferredUntilExecutionSeal { reason, .. }
             | PreviewStagingStatus::SealedPathUnavailable { reason, .. } => Some(reason),
@@ -85,9 +104,22 @@ impl PreviewStagingAssessment {
     pub(super) fn json(&self) -> Value {
         let path = self.path.to_string_lossy();
         match &self.status {
-            PreviewStagingStatus::TreePolicyAssessed => serde_json::json!({
+            PreviewStagingStatus::TreePolicyAssessed { regular_hard_links } => serde_json::json!({
                 "path": path,
                 "status": "tree_policy_assessed",
+                "requested_action": if self.purge_requested { "purge" } else { "stage" },
+                "contains_internal_hardlinks": regular_hard_links.contains_multi_link_group(),
+                "regular_hard_links": {
+                    "multi_link_groups": regular_hard_links.multi_link_groups,
+                    "linked_entries": regular_hard_links.linked_entries,
+                    "topology": if regular_hard_links.contains_multi_link_group() { "internal_complete" } else { "single_link_only" },
+                },
+                "purge_admission": {
+                    "supported": !regular_hard_links.contains_multi_link_group(),
+                    "limitation": regular_hard_links.contains_multi_link_group().then_some(
+                        "multi-link regular-file groups may be staged and undone, but sealed purge is unsupported"
+                    ),
+                },
                 "pending_validation": {
                     "source_parent_seal": "requires_execution",
                     "regular_file_content_read_and_proof": "requires_execution",
@@ -254,8 +286,10 @@ fn assess_path(path: &Path) -> PreviewStagingStatus {
         Err(error) => return certification_unavailable(error),
     };
     match assess_held_tree_policy_metadata(evidence, basename) {
-        Ok(HeldTreePolicyAssessmentOutcome::TreePolicyAssessed { .. }) => {
-            PreviewStagingStatus::TreePolicyAssessed
+        Ok(HeldTreePolicyAssessmentOutcome::TreePolicyAssessed { tree, .. }) => {
+            PreviewStagingStatus::TreePolicyAssessed {
+                regular_hard_links: tree.regular_hard_links,
+            }
         }
         Ok(HeldTreePolicyAssessmentOutcome::TreePolicyDeferredUntilSourceParentSeal { .. }) => {
             PreviewStagingStatus::DeferredUntilExecutionSeal {
@@ -416,7 +450,9 @@ mod tests {
         let path = PathBuf::from("/preview/item");
         for (status, expected) in [
             (
-                PreviewStagingStatus::TreePolicyAssessed,
+                PreviewStagingStatus::TreePolicyAssessed {
+                    regular_hard_links: HeldTreeRegularHardLinkTopology::default(),
+                },
                 "tree_policy_assessed",
             ),
             (
@@ -447,6 +483,7 @@ mod tests {
             ),
         ] {
             let assessment = PreviewStagingAssessment {
+                purge_requested: false,
                 path: path.clone(),
                 status,
             };
@@ -463,7 +500,7 @@ mod tests {
 
         let json = blocked_json(
             "/preview/item".to_owned(),
-            "external_hard_link",
+            "external_or_unenumerated_hard_link",
             "tree_policy",
             Some(Path::new(&OsString::from_vec(vec![
                 b'd', b'i', b'r', b'/', 0xff,
@@ -501,6 +538,7 @@ mod tests {
             "identity changed",
         );
         let assessment = PreviewStagingAssessment {
+            purge_requested: false,
             path: PathBuf::from("/preview/item"),
             status,
         };
@@ -534,6 +572,7 @@ mod tests {
                 "{kind:?} must not be shown as a stable policy block"
             );
             let assessment = PreviewStagingAssessment {
+                purge_requested: false,
                 path: PathBuf::from("/preview/item"),
                 status,
             };

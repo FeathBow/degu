@@ -64,6 +64,10 @@ enum CleanState {
         entry: PathBuf,
         reason: String,
     },
+    PurgeUnsupported {
+        entry: PathBuf,
+        reason: String,
+    },
     Purged {
         entry: PathBuf,
         final_log_failure: Option<String>,
@@ -124,6 +128,14 @@ impl CleanExecution {
         reason: String,
     ) -> Self {
         Self::with_state(finding, CleanState::PurgeFailed { entry, reason })
+    }
+
+    pub(super) fn production_purge_unsupported(
+        finding: &Finding,
+        entry: PathBuf,
+        reason: String,
+    ) -> Self {
+        Self::with_state(finding, CleanState::PurgeUnsupported { entry, reason })
     }
 
     pub(super) fn quarantined(finding: &Finding, entry: Option<PathBuf>, reason: String) -> Self {
@@ -199,6 +211,7 @@ impl CleanExecution {
             | CleanState::StagedWithFailure { entry, .. }
             | CleanState::ProductionCommittedWithFailure { entry, .. }
             | CleanState::PurgeFailed { entry, .. }
+            | CleanState::PurgeUnsupported { entry, .. }
             | CleanState::Purged { entry, .. } => Some(entry),
         }
     }
@@ -240,7 +253,8 @@ impl CleanExecution {
                 reservation_cleanup_failure: reservation_cleanup_failure.as_deref(),
                 jsonl_projection_failure: jsonl_projection_failure.as_deref(),
             }),
-            CleanState::PurgeFailed { reason, .. } => {
+            CleanState::PurgeFailed { reason, .. }
+            | CleanState::PurgeUnsupported { reason, .. } => {
                 Some(CleanExecutionFailure::PurgeFailed { reason })
             }
             CleanState::Purged {
@@ -274,7 +288,8 @@ impl CleanExecution {
             CleanState::Staged { .. }
             | CleanState::ProductionStaged { .. }
             | CleanState::StagedWithFailure { .. }
-            | CleanState::ProductionCommittedWithFailure { .. } => "staged",
+            | CleanState::ProductionCommittedWithFailure { .. }
+            | CleanState::PurgeUnsupported { .. } => "staged",
             CleanState::PurgeFailed { .. } => "purge_failed",
             CleanState::Purged { .. } => "purged",
         }
@@ -291,6 +306,7 @@ impl CleanExecution {
                 | CleanState::StagedWithFailure { .. }
                 | CleanState::ProductionCommittedWithFailure { .. }
                 | CleanState::PurgeFailed { .. }
+                | CleanState::PurgeUnsupported { .. }
         )
     }
 
@@ -335,6 +351,7 @@ impl CleanExecution {
             self.state,
             CleanState::ProductionStaged { .. }
                 | CleanState::ProductionCommittedWithFailure { .. }
+                | CleanState::PurgeUnsupported { .. }
                 | CleanState::Quarantined { .. }
                 | CleanState::RecoveryBlocked { .. }
         )

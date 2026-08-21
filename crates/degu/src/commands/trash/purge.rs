@@ -138,7 +138,10 @@ fn print_plan(plan: &TrashPurgePlan, home: &Path, color_enabled: bool) -> Result
         return stdoutln!("Purge plan: expired trash claim markers, if present, {action}.");
     }
     let noun = if plan.len() == 1 { "entry" } else { "entries" };
-    stdoutln!("Purge plan: all {} trash {noun} {action}.", plan.len(),)?;
+    stdoutln!(
+        "Purge plan: {} reviewed trash {noun} will be considered; purge-supported entries {action}, while sealed internal-hardlink entries are retained and remain undoable.",
+        plan.len(),
+    )?;
     for entry in plan.entries() {
         stdoutln!("  {}", escape_terminal_text(&display_path(entry, home)))?;
     }

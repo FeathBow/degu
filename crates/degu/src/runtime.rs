@@ -474,7 +474,7 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     const TEST_WIDTH: u16 = 80;
-    const NOTE: &str = "Quota can change only after permanent deletion: inspect degu trash list; degu trash purge deletes all listed entries.";
+    const NOTE: &str = "Quota can change only after permanent deletion: inspect degu trash list; trash purge deletes purge-supported entries but retains sealed internal-hardlink entries.";
 
     fn sample_headline() -> Headline {
         Headline::new("Ready to clean", HeadlineLead::Separator)

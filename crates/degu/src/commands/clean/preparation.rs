@@ -200,7 +200,13 @@ pub(super) fn prepare(args: CleanArgs, ui: Ui) -> Result<PreparedClean> {
     let staging_preflight = request.settings.dry_run.then(|| {
         planned
             .iter()
-            .map(|finding| PreviewStagingAssessment::assess(finding, request.scope.has_paths()))
+            .map(|finding| {
+                PreviewStagingAssessment::assess(
+                    finding,
+                    request.settings.purge,
+                    request.scope.has_paths(),
+                )
+            })
             .collect::<Vec<_>>()
             .into_boxed_slice()
     });

@@ -104,6 +104,29 @@ fn print_selected(prepared: &PreparedClean) -> Result<()> {
                 )
             )?;
         }
+        let internal_hard_link_items = assessed
+            .iter()
+            .filter(|finding| {
+                prepared
+                    .preview_assessment(finding)
+                    .is_some_and(|assessment| assessment.has_internal_hard_links())
+            })
+            .count();
+        if internal_hard_link_items != 0 {
+            let note = if prepared.settings.purge {
+                format!(
+                    "{internal_hard_link_items} location(s) contain complete internal regular-file hardlink groups: execution may stage them, but permanent purge is unsupported and they will remain undoable in Degu trash."
+                )
+            } else {
+                format!(
+                    "{internal_hard_link_items} location(s) contain complete internal regular-file hardlink groups: staging and undo are supported, but later permanent purge is unsupported."
+                )
+            };
+            stdoutln!(
+                "{}",
+                prepared.settings.ui.toned_prose(0, &note, Tone::Secondary)
+            )?;
+        }
         if any_hardlinked(&assessed_owned) {
             stdoutln!("")?;
         }
@@ -153,26 +176,66 @@ fn print_permanent_preview(
     stats: cleanup::FindingStats,
     findings: &[degu_core::finding::Finding],
 ) -> Result<()> {
-    stdoutln!(
-        "{}",
-        semantic::paint(
+    let purge_supported = findings
+        .iter()
+        .filter(|finding| {
+            prepared
+                .preview_assessment(finding)
+                .is_none_or(|assessment| assessment.purge_supported())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let staged_only = findings
+        .iter()
+        .filter(|finding| {
+            prepared
+                .preview_assessment(finding)
+                .is_some_and(|assessment| !assessment.purge_supported())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !purge_supported.is_empty() {
+        stdoutln!(
+            "{}",
+            semantic::paint(
+                prepared.settings.ui.prose(&format!(
+                    "Would permanently delete {} after exact authority verification",
+                    preview_bytes(prepared, &purge_supported)
+                )),
+                Tone::Destructive,
+                prepared.settings.ui.colors.stdout
+            )
+        )?;
+    }
+    if !staged_only.is_empty() {
+        stdoutln!(
+            "{}",
             prepared.settings.ui.prose(&format!(
-                "Would permanently delete {} after exact authority verification",
-                preview_bytes(prepared, findings)
-            )),
-            Tone::Destructive,
-            prepared.settings.ui.colors.stdout
-        )
-    )?;
+                "Would stage {} in Degu trash, but not permanently delete it because sealed purge does not support multi-link regular-file groups",
+                preview_bytes(prepared, &staged_only)
+            ))
+        )?;
+    }
     print_scope_summary(prepared, stats)?;
-    stdoutln!(
-        "{}",
-        semantic::paint(
-            "Preview is mutation-free; confirmed execution must seal and stage before authority-bound deletion. Not restorable.",
-            Tone::Destructive,
-            prepared.settings.ui.colors.stdout
-        )
-    )
+    if !purge_supported.is_empty() {
+        stdoutln!(
+            "{}",
+            semantic::paint(
+                "Preview is mutation-free; confirmed execution must seal and stage before authority-bound deletion. Not restorable.",
+                Tone::Destructive,
+                prepared.settings.ui.colors.stdout
+            )
+        )?;
+    }
+    if !staged_only.is_empty() {
+        stdoutln!(
+            "{}",
+            prepared.settings.ui.prose(
+                "Unsupported purge locations remain fully staged and can be restored with `degu undo`."
+            )
+        )?;
+    }
+    Ok(())
 }
 
 fn print_staging_preview(
@@ -203,7 +266,7 @@ fn print_staging_preview(
         "{}",
         semantic::paint(
             prepared.settings.ui.prose(
-                "Quota can change only after permanent deletion: inspect degu trash list; degu trash purge deletes all listed entries."
+                "Quota can change only after permanent deletion: inspect degu trash list; trash purge deletes purge-supported entries but retains sealed internal-hardlink entries."
             ),
             Tone::Secondary,
             prepared.settings.ui.colors.stdout

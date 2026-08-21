@@ -215,7 +215,7 @@ fn clean_dry_run_previews_and_never_purges_expired_trash() {
     assert!(expired.exists());
     let stdout = String::from_utf8(human.stdout).unwrap();
     assert!(stdout.contains(
-        "Expired trash: 1 entry will be considered (at least 7 days old); purge-supported entries would be permanently deleted, while sealed internal-hardlink entries are retained and remain undoable."
+        "Expired trash: 1 entry will be considered (at least 7 days old); purge-supported entries would be permanently deleted, while sealed entries with unsupported purge topology are retained and remain undoable."
     ));
     assert!(stdout.contains(&expired.display().to_string()));
     assert_eq!(oplog_records(&state).len(), 1);

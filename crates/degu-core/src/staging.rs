@@ -473,6 +473,17 @@ impl VerifiedPurgeError {
                 )
             })
     }
+
+    pub fn is_unsupported_regular_xattrs(&self) -> bool {
+        self.source
+            .downcast_ref::<crate::staging::recovery::RecoveryRebindError>()
+            .is_some_and(|source| {
+                matches!(
+                    source,
+                    crate::staging::recovery::RecoveryRebindError::PurgeUnsupportedRegularXattrs
+                )
+            })
+    }
 }
 
 /// Opaque, one-use authority for the exact WAL association and transaction.
@@ -863,7 +874,8 @@ impl ReadyStagingEngine {
             self.engine.startup_blocked = !self.engine.wal.can_begin_staging_transaction();
             let disposition = match (&source, state) {
                 (
-                    crate::staging::recovery::RecoveryRebindError::PurgeUnsupportedInternalHardLinks,
+                    crate::staging::recovery::RecoveryRebindError::PurgeUnsupportedInternalHardLinks
+                    | crate::staging::recovery::RecoveryRebindError::PurgeUnsupportedRegularXattrs,
                     Some(TransactionState::VerifiedCommitted),
                 ) if !self.engine.startup_blocked => VerifiedPurgeFailureDisposition::NotStarted,
                 (_, Some(TransactionState::RecoveryRequired)) => {

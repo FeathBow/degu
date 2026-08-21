@@ -127,6 +127,29 @@ fn print_selected(prepared: &PreparedClean) -> Result<()> {
                 prepared.settings.ui.toned_prose(0, &note, Tone::Secondary)
             )?;
         }
+        let ordinary_xattr_items = assessed
+            .iter()
+            .filter(|finding| {
+                prepared
+                    .preview_assessment(finding)
+                    .is_some_and(|assessment| assessment.has_ordinary_regular_xattrs())
+            })
+            .count();
+        if ordinary_xattr_items != 0 {
+            let note = if prepared.settings.purge {
+                format!(
+                    "{ordinary_xattr_items} location(s) contain proof-bound ordinary regular-file xattrs: execution may stage them, but permanent purge is unsupported and they will remain undoable in Degu trash."
+                )
+            } else {
+                format!(
+                    "{ordinary_xattr_items} location(s) contain proof-bound ordinary regular-file xattrs: staging and undo are supported, but later permanent purge is unsupported."
+                )
+            };
+            stdoutln!(
+                "{}",
+                prepared.settings.ui.toned_prose(0, &note, Tone::Secondary)
+            )?;
+        }
         if any_hardlinked(&assessed_owned) {
             stdoutln!("")?;
         }
@@ -208,10 +231,28 @@ fn print_permanent_preview(
         )?;
     }
     if !staged_only.is_empty() {
+        let has_links = staged_only.iter().any(|finding| {
+            prepared
+                .preview_assessment(finding)
+                .is_some_and(|assessment| assessment.has_internal_hard_links())
+        });
+        let has_xattrs = staged_only.iter().any(|finding| {
+            prepared
+                .preview_assessment(finding)
+                .is_some_and(|assessment| assessment.has_ordinary_regular_xattrs())
+        });
+        let unsupported = match (has_links, has_xattrs) {
+            (true, true) => {
+                "multi-link regular-file groups or proof-bound ordinary regular-file xattrs"
+            }
+            (true, false) => "multi-link regular-file groups",
+            (false, true) => "proof-bound ordinary regular-file xattrs",
+            (false, false) => "the staged proof topology",
+        };
         stdoutln!(
             "{}",
             prepared.settings.ui.prose(&format!(
-                "Would stage {} in Degu trash, but not permanently delete it because sealed purge does not support multi-link regular-file groups",
+                "Would stage {} in Degu trash, but not permanently delete it because sealed purge does not support {unsupported}",
                 preview_bytes(prepared, &staged_only)
             ))
         )?;

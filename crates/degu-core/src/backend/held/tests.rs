@@ -118,7 +118,7 @@ fn set_test_xattr(path: &Path) {
     let result = unsafe {
         libc::fsetxattr(
             file.as_raw_fd(),
-            c"com.degu.content-admission".as_ptr(),
+            c"com.apple.quarantine".as_ptr(),
             b"x".as_ptr().cast(),
             1,
             0,
@@ -129,6 +129,39 @@ fn set_test_xattr(path: &Path) {
         result,
         0,
         "failed to set test xattr: {}",
+        io::Error::last_os_error()
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn set_test_xattr_value(path: &Path, value: &[u8]) {
+    let file = std::fs::File::open(path).unwrap();
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            c"user.degu-content-admission".as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            c"com.apple.quarantine".as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    assert_eq!(
+        result,
+        0,
+        "failed to replace test xattr: {}",
         io::Error::last_os_error()
     );
 }
@@ -152,7 +185,7 @@ fn set_symlink_test_xattr(path: &Path) -> io::Result<()> {
     let result = unsafe {
         libc::setxattr(
             path.as_ptr(),
-            c"com.degu.content-admission".as_ptr(),
+            c"com.apple.quarantine".as_ptr(),
             b"x".as_ptr().cast(),
             1,
             0,
@@ -278,6 +311,76 @@ fn assessment_regular_files_remain_metadata_only_while_proving_reads_content() {
     let proved = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
     assert_eq!(REGULAR_CONTENT_BYTES_READ.with(std::cell::Cell::get), 3);
     assert_eq!(proved.entry_count(), 5);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn assessment_sizes_admitted_xattrs_without_reading_values() {
+    let (temp, root) = setup_tree();
+    set_test_xattr_value(&root.join("a/file"), b"assessment-must-not-read");
+    REGULAR_XATTR_VALUE_BYTES_READ.with(|bytes| bytes.set(0));
+
+    let (assessment, _) =
+        unwrap_tree_assessment(assess(&temp, vec![], HeldTreeLimits::default()).unwrap());
+    assert_eq!(assessment.regular_xattrs.attributes, 1);
+    assert_eq!(assessment.regular_xattrs.value_bytes, 24);
+    assert_eq!(
+        REGULAR_XATTR_VALUE_BYTES_READ.with(std::cell::Cell::get),
+        0,
+        "assessment must use only bounded name enumeration and value sizing"
+    );
+
+    collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    assert!(REGULAR_XATTR_VALUE_BYTES_READ.with(std::cell::Cell::get) >= 24);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn admitted_xattr_sizes_remain_in_the_aggregate_content_budget() {
+    let (temp, root) = setup_tree();
+    set_test_xattr(&root.join("a/file"));
+    let limits = HeldTreeLimits {
+        // The regular file and symlink already consume four bytes. The
+        // admitted one-byte xattr must be charged to the same aggregate.
+        max_content_bytes: 4,
+        ..HeldTreeLimits::default()
+    };
+    for result in [
+        collect(&temp, vec![], limits).map(|_| ()),
+        assess(&temp, vec![], limits).map(|_| ()),
+    ] {
+        assert!(matches!(
+            result,
+            Err(HeldTreeError::Limit {
+                kind: HeldTreeLimit::ContentBytes,
+                limit: 4,
+            })
+        ));
+    }
+}
+
+#[test]
+fn unknown_acl_and_xattr_evidence_are_unavailable_not_present() {
+    for facts in [
+        EntryFacts {
+            kind: EntryKind::Regular,
+            acl: Evidence::Unknown,
+            xattr_platform: current_xattr_platform(),
+            xattrs: Xattrs::Names(&[]),
+        },
+        EntryFacts {
+            kind: EntryKind::Regular,
+            acl: Evidence::Absent,
+            xattr_platform: current_xattr_platform(),
+            xattrs: Xattrs::Unknown,
+        },
+    ] {
+        assert!(matches!(
+            require_content_admitted(facts, Path::new("file")),
+            Err(HeldTreeError::NonDirectoryMetadataUnavailable(path))
+                if path == Path::new("file")
+        ));
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -691,21 +794,26 @@ fn immutable_parent_demonstrates_that_tree_assessment_is_not_seal_readiness() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn assessment_and_prove_share_xattr_rejection() {
+fn assessment_and_prove_share_ordinary_xattr_admission() {
     let (temp, root) = setup_tree();
     set_test_xattr(&root.join("a/file"));
-    assert_same_admission_error(
-        collect(&temp, vec![], HeldTreeLimits::default()),
-        assess(&temp, vec![], HeldTreeLimits::default()),
+    let inventory = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    let (assessment, _) =
+        unwrap_tree_assessment(assess(&temp, vec![], HeldTreeLimits::default()).unwrap());
+    assert_eq!(
+        inventory.regular_xattr_topology(),
+        assessment.regular_xattrs
     );
+    assert!(assessment.regular_xattrs.contains_xattrs());
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn assessment_and_prove_share_regular_acl_rejection_when_supported() {
+fn acl_probe_remains_independent_when_an_ordinary_xattr_is_present() {
     use std::os::fd::AsRawFd;
 
     let (temp, root) = setup_tree();
+    set_test_xattr(&root.join("a/file"));
     let file = std::fs::File::open(root.join("a/file")).unwrap();
     let acl: [u8; 44] = [
         2, 0, 0, 0, // version
@@ -1016,18 +1124,53 @@ fn confined_reopener_compares_the_recorded_strong_incarnation() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn regular_xattrs_remain_rejected_but_directory_xattrs_remain_out_of_scope() {
+fn ordinary_regular_xattrs_use_v3_while_v2_rejects_and_directory_xattrs_remain_out_of_scope() {
     let (temp, root) = setup_tree();
     set_test_xattr(&root.join("a/file"));
+    let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    assert_eq!(tree.fingerprint().schema_version, CONTENT_PROOF_VERSION);
+    assert_eq!(
+        tree.regular_xattr_topology(),
+        RegularXattrTopology {
+            entries: 1,
+            attributes: 1,
+            value_bytes: 1,
+        }
+    );
+    tree.rewalk_exact().unwrap();
+
+    let legacy = HeldTreeInventory::collect_for_schema(
+        certify_held_fd(open_directory(temp.path())).unwrap(),
+        OsStr::new("root"),
+        vec![],
+        HeldTreeLimits::default(),
+        LEGACY_CONTENT_PROOF_VERSION,
+    );
     assert!(matches!(
-        collect(&temp, vec![], HeldTreeLimits::default()),
+        legacy,
         Err(HeldTreeError::NonDirectoryExtendedMetadata(path)) if path == Path::new("a/file")
     ));
 
     let (temp, root) = setup_tree();
     set_test_xattr(&root.join("a"));
     let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    assert!(!tree.regular_xattr_topology().contains_xattrs());
     tree.rewalk_exact().unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn ordinary_regular_xattr_value_drift_breaks_exact_rewalk() {
+    let (temp, root) = setup_tree();
+    let file = root.join("a/file");
+    set_test_xattr(&file);
+    let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    set_test_xattr_value(&file, b"changed");
+    assert!(matches!(
+        tree.rewalk_exact(),
+        Err(HeldTreeError::PostChanged(path) | HeldTreeError::XattrsChangedDuringProof(path))
+            if path == Path::new("a/file")
+    ));
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1299,6 +1442,7 @@ fn fingerprint_codec_is_domain_separated_raw_and_field_complete() {
             ctime_sec: 19,
             ctime_nsec: 20,
             sha256: [0x42; 32],
+            xattrs: empty_regular_xattr_proof(),
         },
     };
     let fingerprint = fingerprint_manifest_v1(std::slice::from_ref(&base));
@@ -1312,7 +1456,7 @@ fn fingerprint_codec_is_domain_separated_raw_and_field_complete() {
         ]
     );
     let v2 = fingerprint_manifest_v2(std::slice::from_ref(&base));
-    assert_eq!(v2.schema_version, CONTENT_PROOF_VERSION);
+    assert_eq!(v2.schema_version, LEGACY_CONTENT_PROOF_VERSION);
     assert_eq!(
         v2.sha256,
         [
@@ -1320,6 +1464,25 @@ fn fingerprint_codec_is_domain_separated_raw_and_field_complete() {
             0xe2, 0x4f, 0x44, 0x9d, 0xb3, 0x68, 0x1b, 0x8f, 0xe9, 0x19, 0xd1, 0x7e, 0x38, 0x1d,
             0x08, 0x2f, 0x33, 0xfc,
         ]
+    );
+
+    let v3 = fingerprint_manifest_v3(std::slice::from_ref(&base));
+    assert_eq!(v3.schema_version, CONTENT_PROOF_VERSION);
+    assert_ne!(v3.sha256, v2.sha256);
+    let mut with_xattr = base.clone();
+    if let ContentProof::Regular { xattrs, .. } = &mut with_xattr.content {
+        xattrs.attribute_count = 1;
+        xattrs.value_bytes = 3;
+        xattrs.sha256 = [0x77; 32];
+    }
+    assert_ne!(
+        fingerprint_manifest_v3(std::slice::from_ref(&with_xattr)).sha256,
+        v3.sha256
+    );
+    assert_eq!(
+        fingerprint_manifest_v2(std::slice::from_ref(&with_xattr)).sha256,
+        v2.sha256,
+        "v2 bytes must ignore the v3-only xattr proof"
     );
 
     let mut variants = Vec::new();
@@ -1517,6 +1680,31 @@ fn external_link_after_last_initial_alias_observation_fails_final_reobservation(
     ));
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn ordinary_xattr_drift_before_final_regular_reobservation_fails_closed() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let (temp, root) = setup_tree();
+    let file = root.join("a/file");
+    set_test_xattr(&file);
+    let fired = Rc::new(Cell::new(false));
+    let observed_fired = Rc::clone(&fired);
+    let _hook = install_final_regular_reobservation_test_hook(move || {
+        set_test_xattr_value(&file, b"changed-after-proof");
+        observed_fired.set(true);
+    });
+
+    let result = collect(&temp, vec![], HeldTreeLimits::default());
+    assert!(fired.get(), "final re-observation hook did not fire");
+    assert!(matches!(
+        result,
+        Err(HeldTreeError::ContentChangedDuringHash(_))
+            | Err(HeldTreeError::XattrsChangedDuringProof(_))
+    ));
+}
+
 #[test]
 fn alias_mutation_between_hashes_fails_and_observation_hook_fires() {
     use std::cell::Cell;
@@ -1560,6 +1748,7 @@ fn alias_group_rejects_differing_proved_content_hashes() {
         ctime_sec: 31,
         ctime_nsec: 37,
         sha256: Some([0x41; 32]),
+        xattrs: empty_regular_xattr_proof(),
     };
     let aliases = [
         RegularFileReobservation {

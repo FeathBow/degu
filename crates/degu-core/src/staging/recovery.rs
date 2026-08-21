@@ -135,6 +135,8 @@ pub(crate) enum RecoveryRebindError {
     UndoParentSync(#[source] io::Error),
     #[error("sealed purge does not support a tree containing multi-link regular-file groups")]
     PurgeUnsupportedInternalHardLinks,
+    #[error("sealed purge does not support a tree containing ordinary regular-file xattrs")]
+    PurgeUnsupportedRegularXattrs,
     #[error("object-bound purge execution failed: {0}")]
     PurgeExecution(#[source] HeldTreeError),
 }
@@ -928,6 +930,10 @@ impl VerifiedPurgeSession<'_> {
         {
             *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
             return Err(RecoveryRebindError::PurgeUnsupportedInternalHardLinks);
+        }
+        if inventory.regular_xattr_topology().contains_xattrs() {
+            *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
+            return Err(RecoveryRebindError::PurgeUnsupportedRegularXattrs);
         }
         let manifest = verifier.undo.expected_manifest;
         if verifier.wal.transaction_state(transaction) == Some(TransactionState::VerifiedCommitted)

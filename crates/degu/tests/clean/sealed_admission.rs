@@ -159,6 +159,154 @@ fn internal_hardlink_purge_stages_full_tree_then_reports_unsupported_and_undoes(
     assert_eq!(std::fs::metadata(&original).unwrap().nlink(), 2);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn ordinary_regular_xattr_previews_stages_and_fresh_process_undo_preserves_value() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let file = fixture.cache.join("wheel.whl");
+    set_ordinary_xattr(&file, b"proof-bound");
+
+    let preview = fixture.run(&["clean", "-n", "--json"]);
+    assert_output_success(&preview);
+    let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    let preflight = &preview["staging_preflight"][0];
+    assert_eq!(preflight["status"], "tree_policy_assessed", "{preview:#}");
+    assert_eq!(preflight["contains_ordinary_regular_xattrs"], true);
+    assert_eq!(preflight["regular_xattrs"]["entries"], 1);
+    assert_eq!(preflight["regular_xattrs"]["attributes"], 1);
+    assert_eq!(preflight["regular_xattrs"]["value_bytes"], 11);
+    assert_eq!(preflight["regular_xattrs"]["proof_schema"], 3);
+    assert_eq!(preflight["purge_admission"]["supported"], false);
+
+    let clean = fixture.run(&[
+        "clean",
+        "--yes",
+        "--json",
+        "--path",
+        fixture.cache.to_str().unwrap(),
+    ]);
+    assert_output_success(&clean);
+    let report: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    let trash = PathBuf::from(report["executed"][0]["trash_entry"].as_str().unwrap());
+    assert_eq!(
+        read_ordinary_xattr(&trash.join("wheel.whl")),
+        b"proof-bound"
+    );
+
+    let purge = fixture.run(&["trash", "purge", "--yes", "--json"]);
+    assert!(!purge.status.success());
+    let purge_report: serde_json::Value = serde_json::from_slice(&purge.stdout).unwrap();
+    assert!(purge_report["purged"].as_array().unwrap().is_empty());
+    assert_eq!(purge_report["failed"].as_array().unwrap().len(), 1);
+    assert!(
+        purge_report["failed"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("does not support a tree containing ordinary regular-file xattrs"),
+        "{purge_report:#}"
+    );
+    assert_eq!(
+        read_ordinary_xattr(&trash.join("wheel.whl")),
+        b"proof-bound"
+    );
+
+    let undo = fixture.run(&["undo", "--json"]);
+    assert_output_success(&undo);
+    assert_eq!(read_ordinary_xattr(&file), b"proof-bound");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn ordinary_regular_xattr_purge_is_gated_after_stage_and_remains_undoable() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let file = fixture.cache.join("wheel.whl");
+    set_ordinary_xattr(&file, b"keep");
+
+    let clean = fixture.run(&[
+        "clean",
+        "--purge",
+        "--yes",
+        "--json",
+        "--path",
+        fixture.cache.to_str().unwrap(),
+    ]);
+    assert!(!clean.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    let item = &report["executed"][0];
+    assert_eq!(item["state"], "staged", "{report:#}");
+    assert_eq!(item["purged"], false, "{report:#}");
+    assert!(
+        item["outcome"]["failed"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("does not support a tree containing ordinary regular-file xattrs"),
+        "{report:#}"
+    );
+    let trash = PathBuf::from(item["trash_entry"].as_str().unwrap());
+    assert_eq!(read_ordinary_xattr(&trash.join("wheel.whl")), b"keep");
+
+    let undo = fixture.run(&["undo", "--json"]);
+    assert_output_success(&undo);
+    assert_eq!(read_ordinary_xattr(&file), b"keep");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn xattr_only_human_purge_preview_does_not_promise_deletion() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let file = fixture.cache.join("wheel.whl");
+    set_ordinary_xattr(&file, b"keep");
+
+    let preview = fixture.run(&["clean", "-n", "--purge"]);
+    assert_output_success(&preview);
+    let preview = String::from_utf8(preview.stdout).unwrap();
+    assert!(preview.contains("Would stage"), "{preview}");
+    assert!(
+        preview.contains(
+            "not permanently delete it because sealed purge does not support proof-bound ordinary regular-file xattrs"
+        ),
+        "{preview}"
+    );
+    assert!(!preview.contains("multi-link"), "{preview}");
+
+    let clean = fixture.run(&[
+        "clean",
+        "--yes",
+        "--json",
+        "--path",
+        fixture.cache.to_str().unwrap(),
+    ]);
+    assert_output_success(&clean);
+    let report: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    let trash = PathBuf::from(report["executed"][0]["trash_entry"].as_str().unwrap());
+
+    let purge = fixture.run(&["trash", "purge", "--yes"]);
+    assert!(!purge.status.success());
+    let stdout = String::from_utf8(purge.stdout).unwrap();
+    assert!(
+        stdout.contains("Purge plan: 1 reviewed trash entry will be considered"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "sealed entries with unsupported purge topology are retained and remain undoable"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("all 1 trash entry")
+            && !stdout.contains("trash entry will be permanently deleted"),
+        "{stdout}"
+    );
+    assert_eq!(read_ordinary_xattr(&trash.join("wheel.whl")), b"keep");
+}
+
 #[test]
 fn trash_purge_retains_internal_hardlink_and_continues_legacy_entry() {
     let Some(fixture) = Fixture::new() else {
@@ -862,6 +1010,89 @@ fn assert_rejected(output: &std::process::Output, expected: &str) {
         stderr.contains("one or more clean locations failed"),
         "{stderr}"
     );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn set_ordinary_xattr(path: &Path, value: &[u8]) {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).unwrap();
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            c"user.degu-proof-v3".as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            c"com.apple.quarantine".as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    assert_eq!(
+        result,
+        0,
+        "failed to set ordinary xattr: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_ordinary_xattr(path: &Path) -> Vec<u8> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).unwrap();
+    #[cfg(target_os = "linux")]
+    let size = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"user.degu-proof-v3".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let size = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"com.apple.quarantine".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+        )
+    };
+    assert!(size >= 0, "failed to size ordinary xattr");
+    let mut value = vec![0_u8; size as usize];
+    #[cfg(target_os = "linux")]
+    let read = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"user.degu-proof-v3".as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let read = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"com.apple.quarantine".as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    assert_eq!(read, size, "failed to read ordinary xattr");
+    value
 }
 
 fn count_directories(root: &Path) -> usize {

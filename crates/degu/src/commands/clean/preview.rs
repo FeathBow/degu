@@ -2,7 +2,8 @@ use crate::presentation::escape_terminal_text;
 use degu_core::backend::{
     CertificationError, HeldTreeAssessmentFailure, HeldTreeAssessmentFailureCategory,
     HeldTreeAssessmentFailureKind, HeldTreePolicyAssessmentOutcome,
-    HeldTreeRegularHardLinkTopology, assess_held_tree_policy_metadata, certify_held_fd,
+    HeldTreeRegularHardLinkTopology, HeldTreeRegularXattrTopology,
+    assess_held_tree_policy_metadata, certify_held_fd,
 };
 use degu_core::finding::Finding;
 use rustix::fs::{Mode, OFlags};
@@ -29,6 +30,7 @@ pub(super) struct PreviewStagingAssessment {
 pub(super) enum PreviewStagingStatus {
     TreePolicyAssessed {
         regular_hard_links: HeldTreeRegularHardLinkTopology,
+        regular_xattrs: HeldTreeRegularXattrTopology,
     },
     Blocked {
         kind: &'static str,
@@ -71,13 +73,21 @@ impl PreviewStagingAssessment {
     pub(super) fn has_internal_hard_links(&self) -> bool {
         matches!(
             self.status,
-            PreviewStagingStatus::TreePolicyAssessed { regular_hard_links }
+            PreviewStagingStatus::TreePolicyAssessed { regular_hard_links, .. }
                 if regular_hard_links.contains_multi_link_group()
         )
     }
 
+    pub(super) fn has_ordinary_regular_xattrs(&self) -> bool {
+        matches!(
+            self.status,
+            PreviewStagingStatus::TreePolicyAssessed { regular_xattrs, .. }
+                if regular_xattrs.contains_xattrs()
+        )
+    }
+
     pub(super) fn purge_supported(&self) -> bool {
-        !self.has_internal_hard_links()
+        !self.has_internal_hard_links() && !self.has_ordinary_regular_xattrs()
     }
 
     pub(super) fn is_blocked(&self) -> bool {
@@ -104,28 +114,52 @@ impl PreviewStagingAssessment {
     pub(super) fn json(&self) -> Value {
         let path = self.path.to_string_lossy();
         match &self.status {
-            PreviewStagingStatus::TreePolicyAssessed { regular_hard_links } => serde_json::json!({
-                "path": path,
-                "status": "tree_policy_assessed",
-                "requested_action": if self.purge_requested { "purge" } else { "stage" },
-                "contains_internal_hardlinks": regular_hard_links.contains_multi_link_group(),
-                "regular_hard_links": {
-                    "multi_link_groups": regular_hard_links.multi_link_groups,
-                    "linked_entries": regular_hard_links.linked_entries,
-                    "topology": if regular_hard_links.contains_multi_link_group() { "internal_complete" } else { "single_link_only" },
-                },
-                "purge_admission": {
-                    "supported": !regular_hard_links.contains_multi_link_group(),
-                    "limitation": regular_hard_links.contains_multi_link_group().then_some(
-                        "multi-link regular-file groups may be staged and undone, but sealed purge is unsupported"
+            PreviewStagingStatus::TreePolicyAssessed {
+                regular_hard_links,
+                regular_xattrs,
+            } => {
+                let has_hardlinks = regular_hard_links.contains_multi_link_group();
+                let has_xattrs = regular_xattrs.contains_xattrs();
+                let limitation = match (has_hardlinks, has_xattrs) {
+                    (true, true) => Some(
+                        "multi-link regular-file groups and ordinary regular-file xattrs may be staged and undone, but sealed purge is unsupported",
                     ),
-                },
-                "pending_validation": {
-                    "source_parent_seal": "requires_execution",
-                    "regular_file_content_read_and_proof": "requires_execution",
-                    "runtime_revalidation": "requires_execution",
-                },
-            }),
+                    (true, false) => Some(
+                        "multi-link regular-file groups may be staged and undone, but sealed purge is unsupported",
+                    ),
+                    (false, true) => Some(
+                        "ordinary regular-file xattrs may be staged and undone, but sealed purge is unsupported",
+                    ),
+                    (false, false) => None,
+                };
+                serde_json::json!({
+                    "path": path,
+                    "status": "tree_policy_assessed",
+                    "requested_action": if self.purge_requested { "purge" } else { "stage" },
+                    "contains_internal_hardlinks": has_hardlinks,
+                    "contains_ordinary_regular_xattrs": has_xattrs,
+                    "regular_hard_links": {
+                        "multi_link_groups": regular_hard_links.multi_link_groups,
+                        "linked_entries": regular_hard_links.linked_entries,
+                        "topology": if has_hardlinks { "internal_complete" } else { "single_link_only" },
+                    },
+                    "regular_xattrs": {
+                        "entries": regular_xattrs.entries,
+                        "attributes": regular_xattrs.attributes,
+                        "value_bytes": regular_xattrs.value_bytes,
+                        "proof_schema": 3,
+                    },
+                    "purge_admission": {
+                        "supported": !has_hardlinks && !has_xattrs,
+                        "limitation": limitation,
+                    },
+                    "pending_validation": {
+                        "source_parent_seal": "requires_execution",
+                        "regular_file_content_read_and_proof": "requires_execution",
+                        "runtime_revalidation": "requires_execution",
+                    },
+                })
+            }
             PreviewStagingStatus::Blocked {
                 kind,
                 category,
@@ -289,6 +323,7 @@ fn assess_path(path: &Path) -> PreviewStagingStatus {
         Ok(HeldTreePolicyAssessmentOutcome::TreePolicyAssessed { tree, .. }) => {
             PreviewStagingStatus::TreePolicyAssessed {
                 regular_hard_links: tree.regular_hard_links,
+                regular_xattrs: tree.regular_xattrs,
             }
         }
         Ok(HeldTreePolicyAssessmentOutcome::TreePolicyDeferredUntilSourceParentSeal { .. }) => {
@@ -452,6 +487,7 @@ mod tests {
             (
                 PreviewStagingStatus::TreePolicyAssessed {
                     regular_hard_links: HeldTreeRegularHardLinkTopology::default(),
+                    regular_xattrs: HeldTreeRegularXattrTopology::default(),
                 },
                 "tree_policy_assessed",
             ),

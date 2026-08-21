@@ -150,7 +150,7 @@ pub(super) fn print_expiry_plan(
     );
     let noun = if plan.len() == 1 { "entry" } else { "entries" };
     stdoutln!(
-        "Expired trash: {} {noun} will be considered (at least {} days old); purge-supported entries {action}, while sealed internal-hardlink entries are retained and remain undoable.",
+        "Expired trash: {} {noun} will be considered (at least {} days old); purge-supported entries {action}, while sealed entries with unsupported purge topology are retained and remain undoable.",
         plan.len(),
         TRASH_RETENTION_DAYS
     )?;

@@ -616,10 +616,11 @@ fn execute_reserved(
             // The object stays durably staged in trash; a non-recovery admission
             // failure is not a stage failure and must not skip the oplog record.
             Err(error) => {
-                let unsupported_internal_hard_links = error.is_unsupported_internal_hard_links();
+                let unsupported_content = error.is_unsupported_internal_hard_links()
+                    || error.is_unsupported_regular_xattrs();
                 purge_admission_failure = Some((
                     format!("purge admission failed during {}: {error}", error.stage()),
-                    unsupported_internal_hard_links,
+                    unsupported_content,
                 ));
                 false
             }
@@ -642,7 +643,7 @@ fn execute_reserved(
             entry,
             (!failures.is_empty()).then(|| failures.join("; ")),
         ))
-    } else if let Some((admission, unsupported_internal_hard_links)) = purge_admission_failure {
+    } else if let Some((admission, unsupported_content)) = purge_admission_failure {
         let mut reason = format!(
             "object is durably staged in trash but sealed purge failed, so it was not deleted and can be restored with `degu undo`: {admission}"
         );
@@ -652,7 +653,7 @@ fn execute_reserved(
         if let Some(error) = jsonl_projection_failure {
             reason.push_str(&format!("; operation-log projection failed: {error}"));
         }
-        if unsupported_internal_hard_links {
+        if unsupported_content {
             Ok(CleanExecution::production_purge_unsupported(
                 finding, entry, reason,
             ))

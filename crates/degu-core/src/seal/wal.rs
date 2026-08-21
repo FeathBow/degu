@@ -22,7 +22,8 @@ use std::sync::Arc;
 
 const MAGIC: &[u8; 4] = b"DSWL";
 const VERSION: u16 = 11;
-const CONTENT_PROOF_MANIFEST_VERSION: u16 = 2;
+const LEGACY_CONTENT_PROOF_MANIFEST_VERSION: u16 = 2;
+const CONTENT_PROOF_MANIFEST_VERSION: u16 = 3;
 const HEADER_LEN: usize = 20;
 const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 const MAX_WAL_LEN: u64 = 64 * 1024 * 1024;
@@ -354,6 +355,7 @@ fn mode_is_exclusive_parent(mode: u32) -> bool {
 pub struct DurableTreeManifest {
     /// Version 1 committed only namespace metadata. Version 2 additionally
     /// commits held-FD content/freshness evidence for every non-directory.
+    /// Version 3 also commits admitted ordinary regular-file xattr names and values.
     pub schema_version: u16,
     pub entry_count: u64,
     pub sha256: [u8; 32],
@@ -361,7 +363,10 @@ pub struct DurableTreeManifest {
 
 impl DurableTreeManifest {
     pub(crate) fn has_content_proof(self) -> bool {
-        self.schema_version == CONTENT_PROOF_MANIFEST_VERSION
+        matches!(
+            self.schema_version,
+            LEGACY_CONTENT_PROOF_MANIFEST_VERSION | CONTENT_PROOF_MANIFEST_VERSION
+        )
     }
 }
 
@@ -2394,7 +2399,10 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                 tx.staging = Some(metadata);
             }
             SealRecord::TreeManifestComplete { manifest, .. } => {
-                if !matches!(manifest.schema_version, 1 | CONTENT_PROOF_MANIFEST_VERSION) {
+                if !matches!(
+                    manifest.schema_version,
+                    1 | LEGACY_CONTENT_PROOF_MANIFEST_VERSION | CONTENT_PROOF_MANIFEST_VERSION
+                ) {
                     return Err(ReplayError::InvalidHistory(
                         "tree manifest uses an unsupported proof schema",
                     ));

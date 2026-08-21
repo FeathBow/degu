@@ -272,6 +272,7 @@ pub struct HeldTreePolicySummary {
     pub manifest_bytes: u64,
     pub content_bytes_from_metadata: u64,
     pub regular_hard_links: HeldTreeRegularHardLinkTopology,
+    pub regular_xattrs: HeldTreeRegularXattrTopology,
     pub assessed_at: SystemTime,
 }
 
@@ -286,6 +287,21 @@ pub struct HeldTreeRegularHardLinkTopology {
 impl HeldTreeRegularHardLinkTopology {
     pub fn contains_multi_link_group(self) -> bool {
         self.multi_link_groups != 0
+    }
+}
+
+/// Data-only summary of ordinary regular-file xattrs admitted by proof schema
+/// v3. It grants no staging, undo, or purge authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HeldTreeRegularXattrTopology {
+    pub entries: u64,
+    pub attributes: u64,
+    pub value_bytes: u64,
+}
+
+impl HeldTreeRegularXattrTopology {
+    pub fn contains_xattrs(self) -> bool {
+        self.attributes != 0
     }
 }
 
@@ -549,6 +565,11 @@ fn map_tree_assessment(a: held::HeldTreeAdmissionAssessment) -> HeldTreePolicyAs
                     multi_link_groups: tree.regular_hard_links.multi_link_groups,
                     linked_entries: tree.regular_hard_links.linked_entries,
                 },
+                regular_xattrs: HeldTreeRegularXattrTopology {
+                    entries: tree.regular_xattrs.entries,
+                    attributes: tree.regular_xattrs.attributes,
+                    value_bytes: tree.regular_xattrs.value_bytes,
+                },
                 assessed_at: tree.assessed_at,
             },
             source_parent_seal: seal(source_parent_seal),
@@ -612,7 +633,7 @@ fn map_tree_assessment_failure(e: held::HeldTreeError) -> HeldTreeAssessmentFail
             HeldTreeAssessmentFailureKind::UnsupportedContentKind,
             Some(p),
         ),
-        E::ContentChangedDuringHash(p) => (
+        E::ContentChangedDuringHash(p) | E::XattrsChangedDuringProof(p) => (
             HeldTreeAssessmentFailureKind::ContentOrMetadataChanged,
             Some(p),
         ),

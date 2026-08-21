@@ -19,7 +19,9 @@ use crate::seal::executor::{
     LocalModeExecutionError, LocalModeMutationRequest, LocalModeMutationResult, LocalModeTransform,
     RecoveryLocator, execute_staging_local_mode_mutation,
 };
-use crate::seal::wal::{DurableWrite, SealWal, StrongObjectIdentity, TransactionId};
+use crate::seal::wal::{
+    DurableWrite, RECOVERY_MAX_ACTIVE_PERMISSIONS, SealWal, StrongObjectIdentity, TransactionId,
+};
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -33,7 +35,11 @@ const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
-const HARD_DIRECTORY_CAP: u64 = 1_024;
+/// Recovery may retain this many active permission operations internally.
+/// Tree requests must reserve one operation for the source-parent seal, so the
+/// root-inclusive request ceiling is one lower for every schema and traversal.
+const HARD_DIRECTORY_CAP: u64 = RECOVERY_MAX_ACTIVE_PERMISSIONS as u64;
+pub(crate) const MAX_TREE_DIRECTORIES: u64 = HARD_DIRECTORY_CAP - 1;
 const MANIFEST_DOMAIN_V1: &[u8] = b"degu-held-tree-manifest-v1\0";
 const MANIFEST_DOMAIN_V2: &[u8] = b"degu-held-tree-manifest-v2-content\0";
 const CONTENT_PROOF_VERSION: u16 = 2;
@@ -45,11 +51,92 @@ const XATTR_LIST_ATTEMPTS: usize = 3;
 const MAX_XATTR_NAME_LIST_BYTES: usize = 64 * 1024;
 const MAX_XATTR_NAMES: usize = 1_024;
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReopenerTestPhase {
+    AfterOpenBeforeValidation,
+    AfterValidatedHopBeforeNextOperation,
+}
+
+#[cfg(test)]
+type ReopenerTestCallback = Box<dyn FnMut(ReopenerTestPhase, &Path)>;
+#[cfg(test)]
+type TransientSealTestCallback = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
 std::thread_local! {
     pub(crate) static PURGE_FAIL_AFTER_REMOVALS: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
     pub(crate) static PURGE_FAIL_PARENT_FSYNC: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static REOPENER_MAX_NON_ROOT_FDS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static REGULAR_CONTENT_BYTES_READ: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    static REOPENER_TEST_CALLBACK: std::cell::RefCell<Option<ReopenerTestCallback>> =
+        const { std::cell::RefCell::new(None) };
+    static BEFORE_TRANSIENT_SEAL: std::cell::RefCell<Option<TransientSealTestCallback>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ReopenerTestHookGuard;
+
+#[cfg(test)]
+impl Drop for ReopenerTestHookGuard {
+    fn drop(&mut self) {
+        REOPENER_TEST_CALLBACK.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_transient_seal_test_hook(callback: impl FnOnce(&Path) + 'static) {
+    BEFORE_TRANSIENT_SEAL.with(|slot| {
+        let previous = slot.borrow_mut().replace(Box::new(callback));
+        assert!(
+            previous.is_none(),
+            "a transient seal test hook is already installed"
+        );
+    });
+}
+
+#[cfg(test)]
+fn fire_transient_seal_test_hook(path: &Path) {
+    BEFORE_TRANSIENT_SEAL.with(|slot| {
+        if let Some(callback) = slot.borrow_mut().take() {
+            callback(path);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn install_reopener_test_hook(
+    callback: impl FnMut(ReopenerTestPhase, &Path) + 'static,
+) -> ReopenerTestHookGuard {
+    REOPENER_TEST_CALLBACK.with(|slot| {
+        let previous = slot.borrow_mut().replace(Box::new(callback));
+        assert!(
+            previous.is_none(),
+            "a reopener test hook is already installed"
+        );
+    });
+    ReopenerTestHookGuard
+}
+
+#[cfg(test)]
+fn fire_reopener_test_hook(phase: ReopenerTestPhase, path: &Path) {
+    // Temporarily remove the callback so fixture namespace operations cannot
+    // accidentally re-enter a mutably borrowed thread-local hook.
+    let callback = REOPENER_TEST_CALLBACK.with(|slot| slot.borrow_mut().take());
+    if let Some(mut callback) = callback {
+        callback(phase, path);
+        REOPENER_TEST_CALLBACK.with(|slot| {
+            let previous = slot.borrow_mut().replace(callback);
+            assert!(
+                previous.is_none(),
+                "reopener test hook was replaced while firing"
+            );
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,7 +154,7 @@ impl Default for HeldTreeLimits {
     fn default() -> Self {
         Self {
             max_entries: 100_000,
-            max_directories: 256,
+            max_directories: MAX_TREE_DIRECTORIES,
             max_depth: 128,
             max_path_bytes: 16 * 1024 * 1024,
             max_manifest_bytes: 64 * 1024 * 1024,
@@ -102,7 +189,9 @@ impl<E> From<HeldTreeError> for HeldTreePurgeError<E> {
 pub(crate) enum HeldTreeError {
     #[error("held tree root must be exactly one normal component")]
     InvalidRoot,
-    #[error("requested directory limit exceeds the hard FD cap")]
+    #[error("directory evidence path contains a non-normal relative component at {0}")]
+    InvalidDirectoryPath(PathBuf),
+    #[error("requested tree directory limit exceeds 1023 total directories (including the root)")]
     InvalidDirectoryLimit,
     #[error("held tree exceeded its {kind:?} limit of {limit}")]
     Limit { kind: HeldTreeLimit, limit: u64 },
@@ -155,6 +244,8 @@ pub(crate) enum HeldTreeError {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum HeldTreeSealError {
+    #[error("held tree seal validation failed: {0}")]
+    Tree(#[from] HeldTreeError),
     #[error("tree seal mutation id space is exhausted")]
     MutationIdExhausted,
     #[error("held tree seal failed at {path}: {source}")]
@@ -338,17 +429,67 @@ pub(crate) struct HeldDirectoryOrder {
     pub observed_mode: u32,
 }
 
+/// Descriptor-free evidence for reopening one collected directory from the
+/// retained certified root. This is identity evidence only and grants no
+/// namespace or mutation authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectoryEvidence {
+    relative_path: PathBuf,
+    depth: u32,
+    identity: NodeIdentity,
+    owner_uid: u32,
+    group_gid: u32,
+    observed_mode: u32,
+}
+
 #[derive(Debug)]
 struct HeldDirectory {
     held: HeldLocalBackendEvidence,
-    path: PathBuf,
-    depth: u32,
-    incarnation: u64,
+    evidence: DirectoryEvidence,
 }
 
-/// Private bounded inventory retaining all directory FDs for exact rewalk and
-/// lease-bound minimal sealing. By itself it carries no WAL lease and is not
-/// rename, restore, purge, or deletion authority.
+impl HeldDirectory {
+    fn new(
+        held: HeldLocalBackendEvidence,
+        relative_path: PathBuf,
+        depth: u32,
+        identity: NodeIdentity,
+    ) -> Self {
+        let evidence = DirectoryEvidence {
+            relative_path,
+            depth,
+            identity,
+            owner_uid: held.owner_uid(),
+            group_gid: held.group_gid(),
+            observed_mode: held.mode(),
+        };
+        Self { held, evidence }
+    }
+}
+
+#[derive(Debug)]
+enum ReopenedHeldDirectory<'a> {
+    Root(&'a HeldLocalBackendEvidence),
+    Descendant(HeldLocalBackendEvidence),
+}
+
+#[derive(Debug)]
+struct ReopenedDirectory<'a> {
+    held: ReopenedHeldDirectory<'a>,
+}
+
+impl ReopenedDirectory<'_> {
+    fn held(&self) -> &HeldLocalBackendEvidence {
+        match &self.held {
+            ReopenedHeldDirectory::Root(held) => held,
+            ReopenedHeldDirectory::Descendant(held) => held,
+        }
+    }
+}
+
+/// Private bounded inventory retaining the source parent and tree root as
+/// reopen anchors. Descendant directories are data-only evidence; transient
+/// certified descriptors provide exact rewalk, sealing, and purge authority.
 #[derive(Debug)]
 pub(crate) struct HeldTreeInventory {
     parent: HeldLocalBackendEvidence,
@@ -359,7 +500,12 @@ pub(crate) struct HeldTreeInventory {
     protected_names: Vec<OsString>,
     limits: HeldTreeLimits,
     manifest_schema: u16,
-    directories: Vec<HeldDirectory>,
+    /// Prevalidated lookup evidence. `directories` remains in BFS order for
+    /// deterministic mutation ordering; it contains no retained descriptors.
+    /// The separately retained `root` is the only tree-directory authority.
+    directory_index: BTreeMap<PathBuf, usize>,
+    directories: Vec<DirectoryEvidence>,
+    root: HeldDirectory,
     manifest: Vec<ManifestEntry>,
 }
 
@@ -453,15 +599,22 @@ impl V2Traversal for AssessTraversal {
     }
 }
 
+#[derive(Debug)]
+struct WalkDirectory {
+    evidence: DirectoryEvidence,
+}
+
 struct V2Walk<M: V2Traversal> {
     parent: HeldLocalBackendEvidence,
     root_name: OsString,
     root_identity: NodeIdentity,
+    root: HeldDirectory,
     backend: CertifiedLocalBackend,
     mount_id: u64,
     protected_names: Vec<OsString>,
     limits: HeldTreeLimits,
-    directories: Vec<HeldDirectory>,
+    directory_index: BTreeMap<PathBuf, DirectoryEvidence>,
+    directories: Vec<WalkDirectory>,
     entries: Vec<M::Entry>,
     budget: Budget,
 }
@@ -473,7 +626,7 @@ fn validate_v2_inputs(
 ) -> Result<(), HeldTreeError> {
     require_one_component(root_name)?;
     validate_policy(protected_names)?;
-    if limits.max_directories > HARD_DIRECTORY_CAP {
+    if limits.max_directories > MAX_TREE_DIRECTORIES {
         return Err(HeldTreeError::InvalidDirectoryLimit);
     }
     if protected_names.iter().any(|name| name == root_name) {
@@ -495,6 +648,13 @@ fn collect_proven_v2(
         limits,
         ParentAdmission::CurrentExclusive,
     )?;
+    let root = walked.root;
+    let directories = walked
+        .directories
+        .into_iter()
+        .map(|directory| directory.evidence)
+        .collect::<Vec<_>>();
+    let directory_index = build_directory_index(&directories)?;
     Ok(HeldTreeInventory {
         parent: walked.parent,
         root_name: walked.root_name,
@@ -504,7 +664,9 @@ fn collect_proven_v2(
         protected_names: walked.protected_names,
         limits: walked.limits,
         manifest_schema: CONTENT_PROOF_VERSION,
-        directories: walked.directories,
+        directory_index,
+        directories,
+        root,
         manifest: walked.entries,
     })
 }
@@ -542,23 +704,27 @@ fn traverse_v2<M: V2Traversal>(
         return Err(HeldTreeError::BackendBoundary(root_path));
     }
     let root_identity = opened.identity;
+    let parent_mount_id = held.mount_id();
     let root_entry = M::make_root(opened);
     let mut budget = Budget::new(limits, CONTENT_PROOF_VERSION);
     budget.add_path(M::path(&root_entry), 0)?;
     budget.add_directory()?;
+    let root = HeldDirectory::new(held, PathBuf::new(), 0, root_identity);
+    let root_evidence = root.evidence.clone();
+    let mut directory_index = BTreeMap::new();
+    directory_index.insert(PathBuf::new(), root_evidence.clone());
     let mut walked = V2Walk::<M> {
         parent,
         root_name: root_name.to_os_string(),
         root_identity,
+        root,
         backend,
-        mount_id: held.mount_id(),
+        mount_id: parent_mount_id,
         protected_names,
         limits,
-        directories: vec![HeldDirectory {
-            held,
-            path: PathBuf::new(),
-            depth: 0,
-            incarnation: root_identity.incarnation,
+        directory_index,
+        directories: vec![WalkDirectory {
+            evidence: root_evidence,
         }],
         entries: vec![root_entry],
         budget,
@@ -591,14 +757,40 @@ fn read_v2_children<M: V2Traversal>(
     walked: &mut V2Walk<M>,
     index: usize,
 ) -> Result<(), HeldTreeError> {
-    let parent_path = walked.directories[index].path.clone();
-    let parent_depth = walked.directories[index].depth;
-    require_directory_current(&walked.directories[index], walked.backend, walked.mount_id)?;
-    let fresh = with_fd(&walked.directories[index].held, |fd| {
+    let parent_path = walked.directories[index].evidence.relative_path.clone();
+    let parent_depth = walked.directories[index].evidence.depth;
+    let reopened = if index == 0 {
+        require_directory_current(&walked.root, walked.backend, walked.mount_id)?;
+        ReopenedDirectory {
+            held: ReopenedHeldDirectory::Root(&walked.root.held),
+        }
+    } else {
+        reopen_directory_from_root(
+            &walked.root,
+            &parent_path,
+            |path| walked.directory_index.get(path),
+            walked.backend,
+            walked.mount_id,
+            || {
+                verify_root_binding_fields(
+                    &walked.parent,
+                    &walked.root_name,
+                    walked.root_identity,
+                    walked.mount_id,
+                    walked.backend,
+                )
+            },
+            false,
+        )?
+    };
+    let parent = reopened.held();
+    let fresh = with_fd(parent, |fd| {
         rustix::fs::openat(fd, c".", OPEN_DIRECTORY, Mode::empty())
     })
     .map_err(|error| io_error(&parent_path, error))?;
     let entries = Dir::new(fresh).map_err(|error| io_error(&parent_path, error))?;
+    let mut new_entries = Vec::new();
+    let mut new_directories = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| io_error(&parent_path, error))?;
         if matches!(entry.file_name().to_bytes(), b"." | b"..") {
@@ -607,14 +799,12 @@ fn read_v2_children<M: V2Traversal>(
         let name = OsStr::from_bytes(entry.file_name().to_bytes());
         let path = parent_path.join(name);
         require_unprotected(&walked.protected_names, name, &path)?;
-        let inspected = with_fd(&walked.directories[index].held, |fd| {
-            inspect_at(fd, name, &path)
-        })?;
+        let inspected = with_fd(parent, |fd| inspect_at(fd, name, &path))?;
         require_owner(&path, inspected.uid, rustix::process::geteuid().as_raw())?;
         require_boundary(&path, walked.backend, walked.mount_id, &inspected)?;
         let depth = parent_depth.saturating_add(1);
         let child = if inspected.identity.kind == NodeKind::Directory {
-            let fd = with_fd(&walked.directories[index].held, |parent_fd| {
+            let fd = with_fd(parent, |parent_fd| {
                 rustix::fs::openat(parent_fd, name, OPEN_DIRECTORY, Mode::empty())
             })
             .map_err(|error| io_error(&path, error))?;
@@ -632,27 +822,38 @@ fn read_v2_children<M: V2Traversal>(
         } else {
             None
         };
-        let result = M::inspect_entry(
-            &walked.directories[index].held,
-            name,
-            &path,
-            &inspected,
-            &mut walked.budget,
-        )?;
+        let result = M::inspect_entry(parent, name, &path, &inspected, &mut walked.budget)?;
         walked.budget.add_path(M::path(&result), depth)?;
         if child.is_some() {
             walked.budget.add_directory()?;
         }
-        let incarnation = M::identity(&result).incarnation;
-        walked.entries.push(result);
+        let directory_identity = M::identity(&result);
+        new_entries.push(result);
         if let Some(held) = child {
-            walked.directories.push(HeldDirectory {
-                held,
-                path,
+            let evidence = DirectoryEvidence {
+                relative_path: path,
                 depth,
-                incarnation,
-            });
+                identity: directory_identity,
+                owner_uid: held.owner_uid(),
+                group_gid: held.group_gid(),
+                observed_mode: held.mode(),
+            };
+            drop(held);
+            new_directories.push(WalkDirectory { evidence });
         }
+    }
+    drop(reopened);
+    walked.entries.extend(new_entries);
+    for directory in new_directories {
+        let path = directory.evidence.relative_path.clone();
+        if walked
+            .directory_index
+            .insert(path.clone(), directory.evidence.clone())
+            .is_some()
+        {
+            return Err(HeldTreeError::IdentityChanged(path));
+        }
+        walked.directories.push(directory);
     }
     Ok(())
 }
@@ -675,8 +876,8 @@ impl HeldTreeInventory {
     }
 
     /// Collects only the evidence committed by the requested durable schema.
-    /// Schema 1 preserves historical recovery semantics and never reads file
-    /// content or imposes v2 hardlink/xattr/content-budget constraints.
+    /// Schema 1 certifies each discovered directory immediately, never reads
+    /// file content, and imposes no v2 hardlink/xattr/content-budget constraints.
     pub(crate) fn collect_for_schema(
         parent: HeldLocalBackendEvidence,
         root_name: &OsStr,
@@ -692,7 +893,7 @@ impl HeldTreeInventory {
         }
         require_one_component(root_name)?;
         validate_policy(&protected_names)?;
-        if limits.max_directories > HARD_DIRECTORY_CAP {
+        if limits.max_directories > MAX_TREE_DIRECTORIES {
             return Err(HeldTreeError::InvalidDirectoryLimit);
         }
         if protected_names.iter().any(|name| name == root_name) {
@@ -732,21 +933,20 @@ impl HeldTreeInventory {
         let mut budget = Budget::new(limits, manifest_schema);
         budget.add_path(&root_entry.path, 0)?;
         budget.add_directory()?;
+        let root = HeldDirectory::new(held, PathBuf::new(), 0, root_identity);
+        let root_evidence = root.evidence.clone();
         let mut tree = Self {
             parent,
             root_name: root_name.to_os_string(),
             root_identity,
             backend,
-            mount_id: held.mount_id(),
+            mount_id: root.held.mount_id(),
             protected_names,
             limits,
             manifest_schema,
-            directories: vec![HeldDirectory {
-                held,
-                path: PathBuf::new(),
-                depth: 0,
-                incarnation: root_identity.incarnation,
-            }],
+            directory_index: BTreeMap::from([(PathBuf::new(), 0)]),
+            directories: vec![root_evidence],
+            root,
             manifest: vec![root_entry],
         };
         let mut index = 0;
@@ -756,6 +956,7 @@ impl HeldTreeInventory {
         }
         tree.manifest
             .sort_by(|left, right| left.path.cmp(&right.path));
+        tree.directory_index = build_directory_index(&tree.directories)?;
         tree.verify_root_binding()?;
         Ok(tree)
     }
@@ -820,12 +1021,12 @@ impl HeldTreeInventory {
             .iter()
             .rev()
             .map(|directory| HeldDirectoryOrder {
-                relative_path: directory.path.clone(),
+                relative_path: directory.relative_path.clone(),
                 depth: directory.depth,
-                device: directory.held.device(),
-                inode: directory.held.inode(),
-                incarnation: directory.incarnation,
-                observed_mode: directory.held.mode(),
+                device: directory.identity.device,
+                inode: directory.identity.inode,
+                incarnation: directory.identity.incarnation,
+                observed_mode: directory.observed_mode,
             })
     }
 
@@ -839,8 +1040,8 @@ impl HeldTreeInventory {
     }
 
     /// Consumes the freshly verified inventory and removes that exact tree using
-    /// only retained directory descriptors. Every non-directory is revalidated
-    /// (including content, one-link policy, ownership, type and strong
+    /// root-relative transient directory descriptors. Every non-directory is
+    /// revalidated (including content, one-link policy, ownership, type and strong
     /// incarnation) immediately before unlink. Directories are removed in
     /// bounded postorder, symlinks are never followed, and the retained trash
     /// parent is synced only after the exact root name has been removed.
@@ -875,26 +1076,17 @@ impl HeldTreeInventory {
                 .path
                 .file_name()
                 .ok_or(HeldTreeError::InvalidRoot)?;
-            let parent = self
-                .directories
-                .iter()
-                .find(|directory| directory.path == parent_path)
-                .ok_or_else(|| HeldTreeError::IdentityChanged(expected.path.clone()))?;
-            require_directory_current(parent, self.backend, self.mount_id)?;
-            let before = with_fd(&parent.held, |fd| inspect_at(fd, name, &expected.path))?;
+            let reopened = self.reopen_directory(parent_path)?;
+            let parent = reopened.held();
+            let before = with_fd(parent, |fd| inspect_at(fd, name, &expected.path))?;
             require_owner(
                 &expected.path,
                 before.uid,
                 rustix::process::geteuid().as_raw(),
             )?;
             require_boundary(&expected.path, self.backend, self.mount_id, &before)?;
-            let content = inspect_content_at(
-                &parent.held,
-                name,
-                &expected.path,
-                &before,
-                &mut content_budget,
-            )?;
+            let content =
+                inspect_content_at(parent, name, &expected.path, &before, &mut content_budget)?;
             let actual = before.into_manifest(expected.path.clone(), content);
             if &actual != expected {
                 return Err(HeldTreeError::IdentityChanged(expected.path.clone()).into());
@@ -904,8 +1096,9 @@ impl HeldTreeInventory {
             } else {
                 AtFlags::empty()
             };
-            retry_interrupted(|| with_fd(&parent.held, |fd| rustix::fs::unlinkat(fd, name, flags)))
+            retry_interrupted(|| with_fd(parent, |fd| rustix::fs::unlinkat(fd, name, flags)))
                 .map_err(|error| io_error(&expected.path, error))?;
+            drop(reopened);
             removed = removed.checked_add(1).ok_or(HeldTreeError::Limit {
                 kind: HeldTreeLimit::Entries,
                 limit: self.limits.max_entries,
@@ -919,7 +1112,7 @@ impl HeldTreeInventory {
         let named_root = with_fd(&self.parent, |fd| {
             inspect_at(fd, &self.root_name, Path::new(""))
         })?;
-        let held_root = inspect_held(&self.directories[0].held, Path::new(""))?;
+        let held_root = inspect_held(&self.root.held, Path::new(""))?;
         require_same_identity(Path::new(""), self.root_identity, named_root.identity)?;
         require_same_identity(Path::new(""), self.root_identity, held_root.identity)?;
         retry_interrupted(|| {
@@ -954,33 +1147,74 @@ impl HeldTreeInventory {
         first_mutation_id: u64,
     ) -> Result<u64, HeldTreeSealError> {
         let mut mutation_id = first_mutation_id;
-        for directory in self.directories.iter_mut().rev() {
-            let relative_path = source_root.join(&directory.path);
-            let result = execute_staging_local_mode_mutation(
-                wal,
-                &mut directory.held,
-                LocalModeMutationRequest {
-                    transaction,
-                    mutation_id,
-                    locator: RecoveryLocator::held_staging(
-                        relative_path,
-                        filesystem_id.to_owned(),
-                        directory.incarnation,
-                    ),
-                    transform: LocalModeTransform::Seal {
-                        acquire_owner_write_search: false,
+        for position in (0..self.directories.len()).rev() {
+            let evidence = self.directories[position].clone();
+            let relative_path = source_root.join(&evidence.relative_path);
+            let path = evidence.relative_path.clone();
+            let result = if position == 0 {
+                execute_staging_local_mode_mutation(
+                    wal,
+                    &mut self.root.held,
+                    LocalModeMutationRequest {
+                        transaction,
+                        mutation_id,
+                        locator: RecoveryLocator::held_staging(
+                            relative_path,
+                            filesystem_id.to_owned(),
+                            evidence.identity.incarnation,
+                        ),
+                        transform: LocalModeTransform::Seal {
+                            acquire_owner_write_search: false,
+                        },
                     },
-                },
-            )
+                )
+            } else {
+                let mut reopened =
+                    self.reopen_directory_for_transient_seal(&evidence.relative_path)?;
+                let held = match &mut reopened.held {
+                    ReopenedHeldDirectory::Descendant(held) => held,
+                    ReopenedHeldDirectory::Root(_) => {
+                        return Err(HeldTreeSealError::Mutation {
+                            path,
+                            source: LocalModeExecutionError::InvalidRequest(
+                                "reopener returned retained root unexpectedly",
+                            ),
+                        });
+                    }
+                };
+                execute_staging_local_mode_mutation(
+                    wal,
+                    held,
+                    LocalModeMutationRequest {
+                        transaction,
+                        mutation_id,
+                        locator: RecoveryLocator::held_staging(
+                            relative_path,
+                            filesystem_id.to_owned(),
+                            evidence.identity.incarnation,
+                        ),
+                        transform: LocalModeTransform::Seal {
+                            acquire_owner_write_search: false,
+                        },
+                    },
+                )
+            }
             .map_err(|source| HeldTreeSealError::Mutation {
-                path: directory.path.clone(),
+                path: evidence.relative_path.clone(),
                 source,
             })?;
-            if result == LocalModeMutationResult::ConfirmedNotApplied {
-                return Err(HeldTreeSealError::ConfirmedNotApplied(
-                    directory.path.clone(),
-                ));
-            }
+            let applied_mode = match result {
+                LocalModeMutationResult::Applied { applied_mode, .. } => applied_mode,
+                LocalModeMutationResult::ConfirmedNotApplied => {
+                    return Err(HeldTreeSealError::ConfirmedNotApplied(
+                        evidence.relative_path.clone(),
+                    ));
+                }
+            };
+            // Only the executor's WAL-bound, verified Applied result advances
+            // inventory evidence. Error and unknown outcomes return above and
+            // can never synthesize a post-mutation mode from stale evidence.
+            self.directories[position].observed_mode = applied_mode;
             mutation_id = mutation_id
                 .checked_add(1)
                 .ok_or(HeldTreeSealError::MutationIdExhausted)?;
@@ -1004,7 +1238,7 @@ impl HeldTreeInventory {
         let sealed_modes = self
             .directories
             .iter()
-            .map(|directory| (directory.path.as_path(), directory.held.mode()))
+            .map(|directory| (directory.relative_path.as_path(), directory.observed_mode))
             .collect::<BTreeMap<_, _>>();
         for (before, after) in self.manifest.iter().zip(&post.manifest) {
             if before.path != after.path
@@ -1045,32 +1279,35 @@ impl HeldTreeInventory {
         } else {
             ContentProof::Legacy
         };
-        let root = inspect_held(&self.directories[0].held, Path::new(""))?
+        let reopened_root = self.reopen_directory(Path::new(""))?;
+        let root = inspect_held(reopened_root.held(), Path::new(""))?
             .into_manifest(PathBuf::new(), root_content);
         budget.add_path(&root.path, 0)?;
         budget.add_directory()?;
         actual.insert(PathBuf::new(), root);
         for directory in &self.directories {
-            require_directory_current(directory, self.backend, self.mount_id)?;
-            let fresh = with_fd(&directory.held, |fd| {
+            let reopened = self.reopen_directory(&directory.relative_path)?;
+            let held = reopened.held();
+            let fresh = with_fd(held, |fd| {
                 rustix::fs::openat(fd, c".", OPEN_DIRECTORY, Mode::empty())
             })
-            .map_err(|error| io_error(&directory.path, error))?;
-            let entries = Dir::new(fresh).map_err(|error| io_error(&directory.path, error))?;
+            .map_err(|error| io_error(&directory.relative_path, error))?;
+            let entries =
+                Dir::new(fresh).map_err(|error| io_error(&directory.relative_path, error))?;
             for entry in entries {
-                let entry = entry.map_err(|error| io_error(&directory.path, error))?;
+                let entry = entry.map_err(|error| io_error(&directory.relative_path, error))?;
                 if matches!(entry.file_name().to_bytes(), b"." | b"..") {
                     continue;
                 }
                 let name = OsStr::from_bytes(entry.file_name().to_bytes());
-                let path = directory.path.join(name);
+                let path = directory.relative_path.join(name);
                 require_unprotected(&self.protected_names, name, &path)?;
-                let inspected = with_fd(&directory.held, |fd| inspect_at(fd, name, &path))?;
+                let inspected = with_fd(held, |fd| inspect_at(fd, name, &path))?;
                 require_owner(&path, inspected.uid, rustix::process::geteuid().as_raw())?;
                 require_boundary(&path, self.backend, self.mount_id, &inspected)?;
                 let content = inspect_content_for_schema(
                     self.manifest_schema,
-                    &directory.held,
+                    held,
                     name,
                     &path,
                     &inspected,
@@ -1100,15 +1337,57 @@ impl HeldTreeInventory {
         self.verify_root_binding()
     }
 
+    /// Reopens one recorded directory from the retained certified root. Only
+    /// literal normal relative components are accepted. Each next component is
+    /// opened and fully certified before the prior non-root descriptor is
+    /// dropped, so any depth uses at most two transient non-root descriptors.
+    fn reopen_directory(
+        &self,
+        relative_path: &Path,
+    ) -> Result<ReopenedDirectory<'_>, HeldTreeError> {
+        reopen_directory_from_root(
+            &self.root,
+            relative_path,
+            |path| self.directory_evidence(path),
+            self.backend,
+            self.mount_id,
+            || self.verify_root_binding(),
+            false,
+        )
+    }
+
+    fn reopen_directory_for_transient_seal(
+        &self,
+        relative_path: &Path,
+    ) -> Result<ReopenedDirectory<'_>, HeldTreeError> {
+        reopen_directory_from_root(
+            &self.root,
+            relative_path,
+            |path| self.directory_evidence(path),
+            self.backend,
+            self.mount_id,
+            || self.verify_root_binding(),
+            true,
+        )
+    }
+
+    fn directory_evidence(&self, relative_path: &Path) -> Option<&DirectoryEvidence> {
+        let position = *self.directory_index.get(relative_path)?;
+        let evidence = self.directories.get(position)?;
+        (evidence.relative_path == relative_path).then_some(evidence)
+    }
+
     fn read_children(&mut self, index: usize, budget: &mut Budget) -> Result<(), HeldTreeError> {
-        let parent_path = self.directories[index].path.clone();
+        let parent_path = self.directories[index].relative_path.clone();
         let parent_depth = self.directories[index].depth;
-        require_directory_current(&self.directories[index], self.backend, self.mount_id)?;
-        let fresh = with_fd(&self.directories[index].held, |fd| {
+        let reopened = self.reopen_directory(&parent_path)?;
+        let parent = reopened.held();
+        let fresh = with_fd(parent, |fd| {
             rustix::fs::openat(fd, c".", OPEN_DIRECTORY, Mode::empty())
         })
         .map_err(|error| io_error(&parent_path, error))?;
         let entries = Dir::new(fresh).map_err(|error| io_error(&parent_path, error))?;
+        let mut children = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|error| io_error(&parent_path, error))?;
             if matches!(entry.file_name().to_bytes(), b"." | b"..") {
@@ -1117,14 +1396,15 @@ impl HeldTreeInventory {
             let name = OsStr::from_bytes(entry.file_name().to_bytes());
             let path = parent_path.join(name);
             require_unprotected(&self.protected_names, name, &path)?;
-            let inspected = with_fd(&self.directories[index].held, |fd| {
-                inspect_at(fd, name, &path)
-            })?;
+            let inspected = with_fd(parent, |fd| inspect_at(fd, name, &path))?;
             require_owner(&path, inspected.uid, rustix::process::geteuid().as_raw())?;
             require_boundary(&path, self.backend, self.mount_id, &inspected)?;
             let depth = parent_depth.saturating_add(1);
             let child = if inspected.identity.kind == NodeKind::Directory {
-                let fd = with_fd(&self.directories[index].held, |parent_fd| {
+                // Preserve schema-v1's immediate directory certification and
+                // error ordering while retaining the descriptor only for this
+                // entry's collection. Later traversal reopens from the root.
+                let fd = with_fd(parent, |parent_fd| {
                     rustix::fs::openat(parent_fd, name, OPEN_DIRECTORY, Mode::empty())
                 })
                 .map_err(|error| io_error(&path, error))?;
@@ -1144,7 +1424,7 @@ impl HeldTreeInventory {
             };
             let content = inspect_content_for_schema(
                 self.manifest_schema,
-                &self.directories[index].held,
+                parent,
                 name,
                 &path,
                 &inspected,
@@ -1155,15 +1435,23 @@ impl HeldTreeInventory {
             if child.is_some() {
                 budget.add_directory()?;
             }
-            let incarnation = manifest.identity.incarnation;
+            let evidence = child.as_ref().map(|held| DirectoryEvidence {
+                relative_path: path.clone(),
+                depth,
+                identity: manifest.identity,
+                owner_uid: held.owner_uid(),
+                group_gid: held.group_gid(),
+                observed_mode: held.mode(),
+            });
+            children.push((manifest, evidence));
+        }
+        drop(reopened);
+        for (manifest, evidence) in children {
             self.manifest.push(manifest);
-            if let Some(held) = child {
-                self.directories.push(HeldDirectory {
-                    held,
-                    path,
-                    depth,
-                    incarnation,
-                });
+            if let Some(evidence) = evidence {
+                self.directory_index
+                    .insert(evidence.relative_path.clone(), self.directories.len());
+                self.directories.push(evidence);
             }
         }
         Ok(())
@@ -1171,15 +1459,13 @@ impl HeldTreeInventory {
 
     fn verify_root_binding(&self) -> Result<(), HeldTreeError> {
         require_exclusive_parent(&self.parent, self.backend)?;
-        let inspected = with_fd(&self.parent, |fd| {
-            inspect_at(fd, &self.root_name, Path::new(""))
-        })
-        .map_err(|_| HeldTreeError::RootBindingChanged)?;
-        if root_binding_matches(self.root_identity, self.mount_id, self.backend, &inspected) {
-            Ok(())
-        } else {
-            Err(HeldTreeError::RootBindingChanged)
-        }
+        verify_root_binding_fields(
+            &self.parent,
+            &self.root_name,
+            self.root_identity,
+            self.mount_id,
+            self.backend,
+        )
     }
 }
 
@@ -1584,6 +1870,10 @@ fn inspect_regular_content(
         if read == 0 {
             break;
         }
+        #[cfg(test)]
+        REGULAR_CONTENT_BYTES_READ.with(|bytes| {
+            bytes.set(bytes.get().saturating_add(read as u64));
+        });
         total = total
             .checked_add(read as u64)
             .ok_or_else(|| HeldTreeError::ContentChangedDuringHash(path.to_path_buf()))?;
@@ -2113,25 +2403,259 @@ fn require_exclusive_parent(
     }
 }
 
+fn verify_root_binding_fields(
+    parent: &HeldLocalBackendEvidence,
+    root_name: &OsStr,
+    root_identity: NodeIdentity,
+    mount_id: u64,
+    backend: CertifiedLocalBackend,
+) -> Result<(), HeldTreeError> {
+    let inspected = with_fd(parent, |fd| inspect_at(fd, root_name, Path::new("")))
+        .map_err(|_| HeldTreeError::RootBindingChanged)?;
+    if root_binding_matches(root_identity, mount_id, backend, &inspected) {
+        Ok(())
+    } else {
+        Err(HeldTreeError::RootBindingChanged)
+    }
+}
+
+/// Opens a recorded directory strictly beneath the retained root descriptor.
+/// Every component is NOFOLLOW-opened and certified against data-only evidence
+/// before traversal advances; only the current and next non-root FDs overlap.
+fn reopen_directory_from_root<'root, 'e>(
+    root: &'root HeldDirectory,
+    relative_path: &Path,
+    directory_evidence: impl Fn(&Path) -> Option<&'e DirectoryEvidence>,
+    backend: CertifiedLocalBackend,
+    mount_id: u64,
+    verify_root_binding: impl FnOnce() -> Result<(), HeldTreeError>,
+    transient_seal_final_validation: bool,
+) -> Result<ReopenedDirectory<'root>, HeldTreeError> {
+    let components = normal_relative_components(relative_path)?;
+    let component_count = components.len();
+    let target = directory_evidence(relative_path)
+        .ok_or_else(|| HeldTreeError::IdentityChanged(relative_path.to_path_buf()))?;
+    if usize::try_from(target.depth).ok() != Some(components.len()) {
+        return Err(HeldTreeError::InvalidDirectoryPath(
+            relative_path.to_path_buf(),
+        ));
+    }
+    if !root.evidence.relative_path.as_os_str().is_empty() || root.evidence.depth != 0 {
+        return Err(HeldTreeError::InvalidDirectoryPath(PathBuf::new()));
+    }
+    validate_reopened_directory(&root.held, &root.evidence, backend, mount_id)?;
+    #[cfg(test)]
+    fire_reopener_test_hook(
+        ReopenerTestPhase::AfterValidatedHopBeforeNextOperation,
+        Path::new(""),
+    );
+    verify_root_binding()?;
+    if components.is_empty() {
+        return Ok(ReopenedDirectory {
+            held: ReopenedHeldDirectory::Root(&root.held),
+        });
+    }
+
+    let mut prefix = PathBuf::new();
+    let mut current: Option<HeldLocalBackendEvidence> = None;
+    let mut live_non_root = 0_usize;
+    for (index, component) in components.into_iter().enumerate() {
+        prefix.push(component);
+        let expected = directory_evidence(&prefix)
+            .ok_or_else(|| HeldTreeError::IdentityChanged(prefix.clone()))?;
+        if usize::try_from(expected.depth).ok() != Some(index + 1) {
+            return Err(HeldTreeError::InvalidDirectoryPath(prefix));
+        }
+        let parent = current.as_ref().unwrap_or(&root.held);
+        let fd = with_fd(parent, |parent_fd| {
+            rustix::fs::openat(parent_fd, component, OPEN_DIRECTORY, Mode::empty())
+        })
+        .map_err(|error| io_error(&prefix, error))?;
+        #[cfg(test)]
+        fire_reopener_test_hook(ReopenerTestPhase::AfterOpenBeforeValidation, &prefix);
+        let next = certify_held_fd(fd).map_err(|reason| HeldTreeError::Certification {
+            path: prefix.clone(),
+            reason,
+        })?;
+        live_non_root += 1;
+        note_reopener_live_non_root_fds(live_non_root);
+        validate_reopened_directory(&next, expected, backend, mount_id)?;
+        #[cfg(test)]
+        fire_reopener_test_hook(
+            ReopenerTestPhase::AfterValidatedHopBeforeNextOperation,
+            &prefix,
+        );
+        validate_reopened_name(parent, component, expected, backend, mount_id)?;
+        if transient_seal_final_validation && index + 1 == component_count {
+            // Tests may inject a race here, but the validation itself is the
+            // unconditional production path immediately before the caller can
+            // append a WAL intent or invoke fchmod.
+            #[cfg(test)]
+            fire_transient_seal_test_hook(&prefix);
+            validate_reopened_directory(&next, expected, backend, mount_id)?;
+            validate_reopened_name(parent, component, expected, backend, mount_id)?;
+        }
+
+        let previous = current.replace(next);
+        if previous.is_some() {
+            drop(previous);
+            live_non_root -= 1;
+        }
+    }
+
+    Ok(ReopenedDirectory {
+        held: ReopenedHeldDirectory::Descendant(
+            current.ok_or_else(|| HeldTreeError::IdentityChanged(relative_path.to_path_buf()))?,
+        ),
+    })
+}
+
+fn build_directory_index(
+    directories: &[DirectoryEvidence],
+) -> Result<BTreeMap<PathBuf, usize>, HeldTreeError> {
+    let mut index = BTreeMap::new();
+    for (position, directory) in directories.iter().enumerate() {
+        let path = &directory.relative_path;
+        let components = normal_relative_components(path)?;
+        if usize::try_from(directory.depth).ok() != Some(components.len()) {
+            return Err(HeldTreeError::InvalidDirectoryPath(path.clone()));
+        }
+        if index.insert(path.clone(), position).is_some() {
+            return Err(HeldTreeError::IdentityChanged(path.clone()));
+        }
+    }
+    if index.get(Path::new("")) != Some(&0) {
+        return Err(HeldTreeError::InvalidDirectoryPath(PathBuf::new()));
+    }
+    Ok(index)
+}
+
+fn normal_relative_components(path: &Path) -> Result<Vec<&OsStr>, HeldTreeError> {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut components = Vec::new();
+    for component in bytes.split(|byte| *byte == b'/') {
+        if component.is_empty() || matches!(component, b"." | b"..") {
+            return Err(HeldTreeError::InvalidDirectoryPath(path.to_path_buf()));
+        }
+        components.push(OsStr::from_bytes(component));
+    }
+    Ok(components)
+}
+
+fn validate_reopened_name(
+    parent: &HeldLocalBackendEvidence,
+    name: &OsStr,
+    expected: &DirectoryEvidence,
+    backend: CertifiedLocalBackend,
+    mount_id: u64,
+) -> Result<(), HeldTreeError> {
+    let inspected = with_fd(parent, |fd| inspect_at(fd, name, &expected.relative_path))?;
+    require_same_identity(
+        &expected.relative_path,
+        expected.identity,
+        inspected.identity,
+    )?;
+    require_owner(&expected.relative_path, inspected.uid, expected.owner_uid)?;
+    require_owner(
+        &expected.relative_path,
+        expected.owner_uid,
+        rustix::process::geteuid().as_raw(),
+    )?;
+    if inspected.gid != expected.group_gid || inspected.mode != expected.observed_mode {
+        return Err(HeldTreeError::IdentityChanged(
+            expected.relative_path.clone(),
+        ));
+    }
+    require_boundary(&expected.relative_path, backend, mount_id, &inspected)
+}
+
+fn validate_reopened_directory(
+    held: &HeldLocalBackendEvidence,
+    expected: &DirectoryEvidence,
+    backend: CertifiedLocalBackend,
+    mount_id: u64,
+) -> Result<(), HeldTreeError> {
+    with_fd(held, |fd| crate::backend::require_held_fd_acl_absent(fd)).map_err(|reason| {
+        HeldTreeError::Certification {
+            path: expected.relative_path.clone(),
+            reason,
+        }
+    })?;
+    let fresh_backend =
+        with_fd(held, |fd| crate::backend::certify_held_fd_backend(fd)).map_err(|reason| {
+            HeldTreeError::Certification {
+                path: expected.relative_path.clone(),
+                reason,
+            }
+        })?;
+    let inspected = inspect_held(held, &expected.relative_path)?;
+    require_same_identity(
+        &expected.relative_path,
+        expected.identity,
+        inspected.identity,
+    )?;
+    require_owner(&expected.relative_path, inspected.uid, expected.owner_uid)?;
+    require_owner(
+        &expected.relative_path,
+        expected.owner_uid,
+        rustix::process::geteuid().as_raw(),
+    )?;
+    if inspected.gid != expected.group_gid || inspected.mode != expected.observed_mode {
+        return Err(HeldTreeError::IdentityChanged(
+            expected.relative_path.clone(),
+        ));
+    }
+    if held.backend() != backend || fresh_backend != backend || held.mount_id() != mount_id {
+        return Err(HeldTreeError::BackendBoundary(
+            expected.relative_path.clone(),
+        ));
+    }
+    require_boundary(&expected.relative_path, backend, mount_id, &inspected)
+}
+
+#[cfg(test)]
+fn note_reopener_live_non_root_fds(live: usize) {
+    REOPENER_MAX_NON_ROOT_FDS.with(|maximum| maximum.set(maximum.get().max(live)));
+}
+
+#[cfg(not(test))]
+fn note_reopener_live_non_root_fds(_live: usize) {}
+
 fn require_directory_current(
     directory: &HeldDirectory,
     backend: CertifiedLocalBackend,
     mount_id: u64,
 ) -> Result<(), HeldTreeError> {
-    with_fd(&directory.held, |fd| {
-        crate::backend::require_held_fd_acl_absent(fd)
-    })
-    .map_err(|reason| HeldTreeError::Certification {
-        path: directory.path.clone(),
-        reason,
+    require_directory_evidence_current(&directory.held, &directory.evidence, backend, mount_id)
+}
+
+fn require_directory_evidence_current(
+    held: &HeldLocalBackendEvidence,
+    evidence: &DirectoryEvidence,
+    backend: CertifiedLocalBackend,
+    mount_id: u64,
+) -> Result<(), HeldTreeError> {
+    with_fd(held, |fd| crate::backend::require_held_fd_acl_absent(fd)).map_err(|reason| {
+        HeldTreeError::Certification {
+            path: evidence.relative_path.clone(),
+            reason,
+        }
     })?;
-    let inspected = inspect_held(&directory.held, &directory.path)?;
+    let inspected = inspect_held(held, &evidence.relative_path)?;
     require_owner(
-        &directory.path,
+        &evidence.relative_path,
         inspected.uid,
         rustix::process::geteuid().as_raw(),
     )?;
-    require_boundary(&directory.path, backend, mount_id, &inspected)
+    if inspected.gid != evidence.group_gid || inspected.mode != evidence.observed_mode {
+        return Err(HeldTreeError::IdentityChanged(
+            evidence.relative_path.clone(),
+        ));
+    }
+    require_boundary(&evidence.relative_path, backend, mount_id, &inspected)
 }
 
 fn require_unprotected(

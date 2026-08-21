@@ -122,19 +122,20 @@ fn preflight_item(
     // Match ordinary production's primary-failure order exactly. In particular,
     // a pathname policy failure must not be masked by a held-tree deferral or
     // assessment error that ordinary `execute` would never reach first.
-    let _policy = preflight_policy(ctx, finding, identity)?;
+    let policy = preflight_policy(ctx, finding, identity)?;
+    preflight_tree_policy(&policy.canonical_source)
+}
 
-    let lexical_parent = finding
-        .path()
+fn preflight_tree_policy(
+    canonical_source: &Path,
+) -> Result<HeldTreePolicyAssessmentOutcome, String> {
+    let canonical_parent = canonical_source
         .parent()
         .ok_or_else(|| "sealed staging source has no parent".to_string())?;
-    let canonical_parent = std::fs::canonicalize(lexical_parent)
-        .map_err(|error| format!("failed to canonicalize sealed staging source parent: {error}"))?;
-    let root_basename = finding
-        .path()
+    let root_basename = canonical_source
         .file_name()
         .ok_or_else(|| "sealed staging source has no basename".to_string())?;
-    let source_parent = open_directory(&canonical_parent)
+    let source_parent = open_directory(canonical_parent)
         .map_err(|error| format!("failed to hold sealed staging source parent: {error}"))?;
     let parent_evidence = certify_held_fd(source_parent)
         .map_err(|error| format!("sealed staging source-parent certification failed: {error:?}"))?;
@@ -274,9 +275,17 @@ pub(super) fn execute(
         Ok(policy) => policy,
         Err(reason) => return failed(finding, reason, false),
     };
+    if let Err(reason) = preflight_tree_policy(&policy.canonical_source) {
+        return failed(finding, reason, false);
+    }
 
-    // Root creation is deliberately after all static production-policy gates.
-    // Reservation is later still, after the exact managed root is authenticated.
+    // Root creation is deliberately after all pathname and data-only tree-policy
+    // error gates. A deferred result is intentionally allowed for ordinary
+    // full-scope execution: the core's execution-authority source-parent seal
+    // is what makes that assessment evaluable. Explicit atomic selection is
+    // stricter and rejects deferred results in batch_preflight above. The core
+    // repeats assessment under execution authority to detect races, but known
+    // failures cannot create trash, claim, or WAL state.
     let trash_root = match super::prepare_trash_root(run.ctx, finding.path()) {
         Ok(root) => root,
         Err(reason) => return failed(finding, reason, false),

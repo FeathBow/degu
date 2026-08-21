@@ -1,6 +1,6 @@
 use super::support::*;
-use assert_cmd::Command;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 
 struct Lifecycle {
@@ -114,12 +114,35 @@ fn assert_purge(fixture: &Lifecycle, trash_entry: &str) {
 /// from an ambient test variable.
 #[test]
 fn production_sealed_staging_cli_clean_undo_and_direct_purge() {
+    // The held-tree inventory includes the cache root: root + 1,022 siblings is
+    // the exact 1,023-total production boundary.
+    const SIBLING_DIRECTORIES: usize = 1_022;
+    const TOTAL_DIRECTORIES: usize = SIBLING_DIRECTORIES + 1;
+    const CHILD_NOFILE_LIMIT: libc::rlim_t = 64;
+
     let home = tempfile::tempdir().unwrap();
     let Some(backend) = require_sealed_fixture_backend(home.path()) else {
         return;
     };
 
     let (cache, state) = fake_pip_cache(&home, ".cache/pip");
+    for index in 0..SIBLING_DIRECTORIES {
+        let directory = cache.join(format!("sibling-{index:04}"));
+        std::fs::create_dir(&directory).unwrap();
+        // Group-writable trees are deliberately demoted by classification, so
+        // pin the fixture mode instead of inheriting the ambient umask.
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            directory.join("payload.bin"),
+            format!("bounded-fd-payload-{index:04}"),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        count_directories(&cache),
+        TOTAL_DIRECTORIES,
+        "fixture is not the exact root-inclusive production boundary"
+    );
     let source_backend = certify_backend(&cache).unwrap();
     let state_backend = certify_backend(state.path()).unwrap();
     assert_eq!(
@@ -142,7 +165,7 @@ fn production_sealed_staging_cli_clean_undo_and_direct_purge() {
     let anchor = std::fs::canonicalize(anchor).unwrap();
 
     let run = |args: &[&str]| {
-        let mut command = Command::new(assert_cmd::cargo::cargo_bin("degu"));
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("degu"));
         command
             .env_clear()
             .env("HOME", home.path())
@@ -152,6 +175,24 @@ fn production_sealed_staging_cli_clean_undo_and_direct_purge() {
             .env("DEGU_INTEGRATION_TEST_ANCHOR", &anchor)
             // Intentionally do not set DEGU_INTEGRATION_TEST_LEGACY_CLEAN.
             .args(args);
+        // Every lifecycle command is a fresh process/session and must complete
+        // with the inherited descriptor ceiling lowered, never raised, to 64.
+        unsafe {
+            command.pre_exec(|| {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                limit.rlim_cur = limit.rlim_cur.min(CHILD_NOFILE_LIMIT);
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         command.output().unwrap()
     };
 
@@ -188,6 +229,23 @@ fn production_sealed_staging_cli_clean_undo_and_direct_purge() {
         assert!(undo_report[section].as_array().unwrap().is_empty());
     }
     assert!(cache.join("wheel.whl").is_file());
+    assert_eq!(
+        count_directories(&cache),
+        TOTAL_DIRECTORIES,
+        "undo did not restore the complete 1,023-directory inventory"
+    );
+    for index in 0..SIBLING_DIRECTORIES {
+        assert_eq!(
+            std::fs::read_to_string(
+                cache
+                    .join(format!("sibling-{index:04}"))
+                    .join("payload.bin")
+            )
+            .unwrap(),
+            format!("bounded-fd-payload-{index:04}"),
+            "undo did not restore regular payload {index}"
+        );
+    }
     assert!(visible_trash_entries(&state.path().join("degu/trash")).is_empty());
     assert_eq!(activation_snapshot(&anchor, state.path()), activation);
     let restored_wal_len = std::fs::metadata(&wal).unwrap().len();
@@ -229,6 +287,14 @@ fn production_sealed_staging_cli_clean_undo_and_direct_purge() {
     // Direct sealed purge projects the completed trash association; its purge
     // authority and terminal result remain in the durable seal WAL.
     assert_eq!(purged_records[2]["trash_entry"], first_trash);
+}
+
+fn count_directories(root: &Path) -> usize {
+    1 + std::fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .count()
 }
 
 fn activation_snapshot(anchor: &Path, state: &Path) -> Vec<Vec<u8>> {

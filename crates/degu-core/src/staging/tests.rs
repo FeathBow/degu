@@ -350,7 +350,12 @@ fn permission_and_path_workload_limits_are_checked_before_rebind() {
     assert!(validate_recovery_workload(&snapshot).is_err());
 
     let permission = snapshot.permissions[0].clone();
-    snapshot.permissions = vec![permission; MAX_RECOVERY_PERMISSION_OPERATIONS + 1];
+    snapshot.permissions = vec![permission.clone(); RECOVERY_MAX_ACTIVE_PERMISSIONS];
+    assert!(
+        validate_recovery_workload(&snapshot).is_ok(),
+        "the exact 1,024-operation recovery envelope must remain accepted"
+    );
+    snapshot.permissions = vec![permission; RECOVERY_MAX_ACTIVE_PERMISSIONS + 1];
     assert!(validate_recovery_workload(&snapshot).is_err());
 
     let deep = (0..=MAX_RECOVERY_PATH_COMPONENTS)

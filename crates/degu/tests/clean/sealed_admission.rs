@@ -7,7 +7,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-const HELD_TREE_MAX_DIRECTORIES: usize = 256;
+const MAX_TREE_DIRECTORIES: usize = 1_023;
 
 #[test]
 fn clean_tree_preview_assessment_does_not_activate_or_create_lifecycle_state() {
@@ -18,23 +18,24 @@ fn clean_tree_preview_assessment_does_not_activate_or_create_lifecycle_state() {
 }
 
 #[test]
-fn preview_blocks_tree_just_over_sealed_directory_limit_and_production_rejects() {
+fn preview_blocks_1024_tree_directories_before_any_production_mutation() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
-    // The sealed inventory counts its root, so root + 256 children is the
-    // smallest tree above the default 256-total-directory admission bound.
-    for index in 0..HELD_TREE_MAX_DIRECTORIES {
-        let dir = fixture.cache.join(format!("dir-{index:03}"));
+    // The inventory counts its root. Root + 1,023 children is 1,024 tree
+    // directories and would require 1,025 active recovery permissions once the
+    // source-parent seal is included. Reject it before any lifecycle mutation.
+    for index in 0..MAX_TREE_DIRECTORIES {
+        let dir = fixture.cache.join(format!("dir-{index:04}"));
         std::fs::create_dir(&dir).unwrap();
         // Group-writable trees are deliberately demoted by classification, so
         // pin the fixture mode instead of inheriting the ambient umask.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    assert_eq!(count_directories(&fixture.cache), 257);
+    assert_eq!(count_directories(&fixture.cache), 1_024);
     fixture.assert_preview_blocked("directory_limit_exceeded", "directory limit exceeded");
     fixture.assert_production_rejects("directory limit exceeded");
-    assert_eq!(count_directories(&fixture.cache), 257);
+    assert_eq!(count_directories(&fixture.cache), 1_024);
     assert!(fixture.cache.join("wheel.whl").is_file());
 }
 

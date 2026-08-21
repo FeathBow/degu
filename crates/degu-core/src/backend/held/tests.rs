@@ -164,6 +164,86 @@ fn set_symlink_test_xattr(path: &Path) -> io::Result<()> {
 }
 
 #[test]
+fn production_directory_budget_fits_the_recovery_permission_envelope() {
+    let limits = HeldTreeLimits::default();
+    assert_eq!(limits.max_directories, MAX_TREE_DIRECTORIES);
+    assert_eq!(MAX_TREE_DIRECTORIES + 1, HARD_DIRECTORY_CAP);
+    assert_eq!(
+        HARD_DIRECTORY_CAP,
+        crate::seal::wal::RECOVERY_MAX_ACTIVE_PERMISSIONS as u64
+    );
+    assert_eq!(limits.max_entries, 100_000);
+    assert_eq!(limits.max_depth, 128);
+    assert_eq!(limits.max_path_bytes, 16 * 1024 * 1024);
+    assert_eq!(limits.max_manifest_bytes, 64 * 1024 * 1024);
+    assert_eq!(limits.max_content_bytes, 1024 * 1024 * 1024);
+}
+
+#[test]
+fn every_traversal_rejects_an_explicit_1024_directory_request() {
+    let (temp, _) = setup_tree();
+    let limits = HeldTreeLimits {
+        max_directories: HARD_DIRECTORY_CAP,
+        ..HeldTreeLimits::default()
+    };
+    let v2 = collect(&temp, vec![], limits).unwrap_err();
+    let assessment = assess(&temp, vec![], limits).unwrap_err();
+    let legacy = HeldTreeInventory::collect_for_schema(
+        certify_held_fd(open_directory(temp.path())).unwrap(),
+        OsStr::new("root"),
+        vec![],
+        limits,
+        1,
+    )
+    .unwrap_err();
+
+    for error in [v2, assessment, legacy] {
+        assert!(matches!(error, HeldTreeError::InvalidDirectoryLimit));
+        assert_eq!(
+            error.to_string(),
+            "requested tree directory limit exceeds 1023 total directories (including the root)"
+        );
+    }
+}
+
+#[test]
+fn production_boundary_accepts_1023_total_directories_and_rejects_1024() {
+    let (temp, root) = setup_tree();
+    // setup_tree contains root, a, and a/b. Add 1,020 siblings for 1,023 total.
+    for index in 0..(MAX_TREE_DIRECTORIES - 3) {
+        std::fs::create_dir(root.join(format!("boundary-{index:04}"))).unwrap();
+    }
+    let inventory = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    assert_eq!(inventory.directories.len() as u64, MAX_TREE_DIRECTORIES);
+    let (assessment, _) =
+        unwrap_tree_assessment(assess(&temp, vec![], HeldTreeLimits::default()).unwrap());
+    assert_eq!(assessment.directories, MAX_TREE_DIRECTORIES);
+    let legacy = HeldTreeInventory::collect_for_schema(
+        certify_held_fd(open_directory(temp.path())).unwrap(),
+        OsStr::new("root"),
+        vec![],
+        HeldTreeLimits::default(),
+        1,
+    )
+    .unwrap();
+    assert_eq!(legacy.directories.len() as u64, MAX_TREE_DIRECTORIES);
+
+    std::fs::create_dir(root.join("boundary-over-limit")).unwrap();
+    for error in [
+        collect(&temp, vec![], HeldTreeLimits::default()).unwrap_err(),
+        assess(&temp, vec![], HeldTreeLimits::default()).unwrap_err(),
+    ] {
+        assert!(matches!(
+            error,
+            HeldTreeError::Limit {
+                kind: HeldTreeLimit::Directories,
+                limit: MAX_TREE_DIRECTORIES,
+            }
+        ));
+    }
+}
+
+#[test]
 fn metadata_only_tree_policy_matches_clean_v2_admission_without_claiming_seal_readiness() {
     fn assert_data_traits<T: Clone + Send + Sync + Eq + std::fmt::Debug>() {}
     assert_data_traits::<HeldTreeAdmissionAssessment>();
@@ -183,6 +263,128 @@ fn metadata_only_tree_policy_matches_clean_v2_admission_without_claiming_seal_re
     assert!(tree.path_bytes > 0);
     assert!(tree.manifest_bytes > tree.path_bytes);
     assert_eq!(tree.content_bytes, 4); // "one" plus the one-byte symlink target.
+}
+
+#[test]
+fn assessment_regular_files_remain_metadata_only_while_proving_reads_content() {
+    let (temp, _) = setup_tree();
+    REGULAR_CONTENT_BYTES_READ.with(|bytes| bytes.set(0));
+    unwrap_tree_assessment(assess(&temp, vec![], HeldTreeLimits::default()).unwrap());
+    assert_eq!(REGULAR_CONTENT_BYTES_READ.with(std::cell::Cell::get), 0);
+
+    let proved = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    assert_eq!(REGULAR_CONTENT_BYTES_READ.with(std::cell::Cell::get), 3);
+    assert_eq!(proved.entry_count(), 5);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_assessment_fd_peak_is_independent_of_directory_count() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), Permissions::from_mode(0o700)).unwrap();
+    let root = temp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    for index in 0..240 {
+        std::fs::create_dir(root.join(format!("sibling-{index:03}"))).unwrap();
+    }
+
+    let baseline = observed_process_fd_count();
+    let peak = Rc::new(Cell::new(baseline));
+    let fired = Rc::new(Cell::new(0_u64));
+    let observed_peak = Rc::clone(&peak);
+    let observed_fired = Rc::clone(&fired);
+    let _hook = install_reopener_test_hook(move |_, path| {
+        if !path.as_os_str().is_empty() {
+            observed_fired.set(observed_fired.get() + 1);
+            observed_peak.set(observed_peak.get().max(observed_process_fd_count()));
+        }
+    });
+    let (tree, _) =
+        unwrap_tree_assessment(assess(&temp, vec![], HeldTreeLimits::default()).unwrap());
+    assert_eq!(tree.directories, 241);
+    assert!(fired.get() >= 240, "descendant reopener hook did not fire");
+    assert!(
+        peak.get().saturating_sub(baseline) <= 4,
+        "assessment retained directory descriptors: baseline={baseline}, peak={}",
+        peak.get()
+    );
+    assert_eq!(observed_process_fd_count(), baseline);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn assessment_fd_peak_is_bounded_across_240_sibling_directories() {
+    const CHILD_MARKER_ENV: &str = "DEGU_ASSESSMENT_FD_OBSERVATION_CHILD_MARKER";
+    if let Some(marker) = std::env::var_os(CHILD_MARKER_ENV) {
+        assert_assessment_fd_peak_is_independent_of_directory_count();
+        std::fs::write(marker, b"observed").unwrap();
+        return;
+    }
+
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir.path().join("completed");
+    let test_name = format!(
+        "{}::assessment_fd_peak_is_bounded_across_240_sibling_directories",
+        module_path!()
+            .strip_prefix("degu_core::")
+            .unwrap_or(module_path!())
+    );
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test_name, "--nocapture"])
+        .env(CHILD_MARKER_ENV, &marker)
+        .status()
+        .unwrap();
+    assert!(status.success(), "isolated assessment FD test failed");
+    assert!(
+        marker.exists(),
+        "isolated assessment FD test did not execute"
+    );
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn assessment_reopener_fails_closed_on_descendant_replacement() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let (temp, root) = setup_tree();
+    let moved = temp.path().join("moved-assessment-a");
+    let fired = Rc::new(Cell::new(false));
+    let hook_fired = Rc::clone(&fired);
+    let hook_root = root.clone();
+    let _hook = install_reopener_test_hook(move |phase, path| {
+        if phase == ReopenerTestPhase::AfterOpenBeforeValidation
+            && path == Path::new("a")
+            && !hook_fired.replace(true)
+        {
+            std::fs::rename(hook_root.join("a"), &moved).unwrap();
+            std::fs::create_dir(hook_root.join("a")).unwrap();
+        }
+    });
+    let error = assess(&temp, vec![], HeldTreeLimits::default()).unwrap_err();
+    assert!(
+        fired.get(),
+        "assessment did not use the root-relative reopener"
+    );
+    assert!(
+        matches!(error, HeldTreeError::IdentityChanged(ref path) if path == Path::new("a")),
+        "replacement returned {error:?}"
+    );
+}
+
+#[test]
+fn proving_manifest_is_stable_across_bounded_assessment() {
+    let (temp, _) = setup_tree();
+    let baseline = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    let baseline_fingerprint = baseline.fingerprint();
+    drop(baseline);
+
+    unwrap_tree_assessment(assess(&temp, vec![], HeldTreeLimits::default()).unwrap());
+    let proved = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    assert_eq!(proved.fingerprint(), baseline_fingerprint);
+    assert_eq!(proved.directories.len(), 3);
 }
 
 #[test]
@@ -237,7 +439,7 @@ fn unsearchable_source_parent_defers_the_entire_tree_policy_assessment() {
 }
 
 #[test]
-fn syntactic_root_policy_and_hard_cap_errors_precede_tree_policy_deferral() {
+fn syntactic_root_policy_and_tree_request_cap_errors_precede_tree_policy_deferral() {
     let (temp, _) = setup_tree();
     let invalid_root = certify_held_fd(open_directory(temp.path())).unwrap();
     let protected_root = certify_held_fd(open_directory(temp.path())).unwrap();
@@ -268,7 +470,7 @@ fn syntactic_root_policy_and_hard_cap_errors_precede_tree_policy_deferral() {
             OsStr::new("root"),
             vec![],
             HeldTreeLimits {
-                max_directories: HARD_DIRECTORY_CAP + 1,
+                max_directories: HARD_DIRECTORY_CAP,
                 ..HeldTreeLimits::default()
             },
         ),
@@ -360,8 +562,8 @@ fn assessment_and_prove_share_hardlink_protected_special_and_directory_cap_rejec
     );
 
     let (temp, root) = setup_tree();
-    for index in 0..256 {
-        std::fs::create_dir(root.join(format!("d{index:03}"))).unwrap();
+    for index in 0..MAX_TREE_DIRECTORIES {
+        std::fs::create_dir(root.join(format!("d{index:04}"))).unwrap();
     }
     assert_same_admission_error(
         collect(&temp, vec![], HeldTreeLimits::default()),
@@ -553,7 +755,7 @@ fn synthetic_owner_and_mount_reasons_remain_the_shared_traversal_errors() {
 }
 
 #[test]
-fn bounded_collect_retains_every_directory_and_exact_rewalks() {
+fn bounded_collect_records_every_directory_and_exact_rewalks() {
     let (temp, _) = setup_tree();
     let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
     assert_eq!(tree.entry_count(), 5);
@@ -573,16 +775,235 @@ fn bounded_collect_retains_every_directory_and_exact_rewalks() {
 }
 
 #[test]
-fn policy_wiring_preserves_clean_v2_fingerprint_across_fresh_collection() {
+fn directory_evidence_is_descriptor_free_data_and_clean_rewalk_succeeds() {
+    fn assert_data_only<T: Clone + Send + Sync + Eq + std::fmt::Debug>() {}
+    assert_data_only::<DirectoryEvidence>();
+
     let (temp, _) = setup_tree();
-    let first = collect(&temp, vec![], HeldTreeLimits::default())
+    collect(&temp, vec![], HeldTreeLimits::default())
         .unwrap()
-        .fingerprint();
-    let second = collect(&temp, vec![], HeldTreeLimits::default())
-        .unwrap()
-        .fingerprint();
-    assert_eq!(first.schema_version, CONTENT_PROOF_VERSION);
-    assert_eq!(first, second);
+        .rewalk_exact()
+        .unwrap();
+}
+
+#[test]
+fn directory_evidence_index_rejects_duplicate_paths() {
+    let (temp, _) = setup_tree();
+    let mut tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    let a = tree
+        .directories
+        .iter()
+        .position(|directory| directory.relative_path == Path::new("a"))
+        .unwrap();
+    let ab = tree
+        .directories
+        .iter()
+        .position(|directory| directory.relative_path == Path::new("a/b"))
+        .unwrap();
+    tree.directories[ab].relative_path = PathBuf::from("a");
+    tree.directories[ab].depth = tree.directories[a].depth;
+    assert!(matches!(
+        build_directory_index(&tree.directories),
+        Err(HeldTreeError::IdentityChanged(path)) if path == Path::new("a")
+    ));
+}
+
+#[test]
+fn confined_reopener_rejects_every_non_normal_relative_form() {
+    let (temp, _) = setup_tree();
+    let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    for invalid in ["../a", "/a", "./a", "a/../b", "a/./b", "a//b", "a/"] {
+        assert!(matches!(
+            tree.reopen_directory(Path::new(invalid)),
+            Err(HeldTreeError::InvalidDirectoryPath(path)) if path == Path::new(invalid)
+        ));
+    }
+    assert!(tree.reopen_directory(Path::new("")).is_ok());
+    assert!(tree.reopen_directory(Path::new("a/b")).is_ok());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn observed_process_fd_count() -> usize {
+    #[cfg(target_os = "linux")]
+    let directory = "/proc/self/fd";
+    #[cfg(target_os = "macos")]
+    let directory = "/dev/fd";
+    std::fs::read_dir(directory).unwrap().count()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_confined_reopener_process_fd_bound() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), Permissions::from_mode(0o700)).unwrap();
+    let root = temp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    for sibling in 0..239 {
+        std::fs::create_dir(root.join(format!("s{sibling}"))).unwrap();
+    }
+    let mut path = root.join("s0");
+    for depth in 1..=16 {
+        path.push(format!("d{depth}"));
+        std::fs::create_dir(&path).unwrap();
+    }
+
+    let before_inventory = observed_process_fd_count();
+    let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    let baseline = observed_process_fd_count();
+    assert_eq!(tree.directories.len(), 256);
+    assert_eq!(
+        baseline.checked_sub(before_inventory),
+        Some(2),
+        "production proving retains exactly the source parent and tree root FDs"
+    );
+
+    for target in [
+        PathBuf::from("s0"),
+        path.strip_prefix(temp.path().join("root"))
+            .unwrap()
+            .to_path_buf(),
+    ] {
+        let peak = Rc::new(Cell::new(baseline));
+        let fired = Rc::new(Cell::new(0_u64));
+        let observed_peak = Rc::clone(&peak);
+        let observed_fired = Rc::clone(&fired);
+        let _hook = install_reopener_test_hook(move |_, _| {
+            observed_fired.set(observed_fired.get() + 1);
+            observed_peak.set(observed_peak.get().max(observed_process_fd_count()));
+        });
+        REOPENER_MAX_NON_ROOT_FDS.with(|maximum| maximum.set(0));
+        drop(tree.reopen_directory(&target).unwrap());
+        assert!(
+            fired.get() > 0,
+            "the in-reopener observation hook did not fire"
+        );
+        let transient = peak
+            .get()
+            .checked_sub(baseline)
+            .expect("process FD count fell below the post-inventory baseline");
+        assert!(
+            transient <= 2,
+            "reopening depth {} used {transient} transient process FDs",
+            normal_relative_components(&target).unwrap().len()
+        );
+        let depth = normal_relative_components(&target).unwrap().len();
+        assert_eq!(transient, depth.min(2));
+        assert_eq!(
+            REOPENER_MAX_NON_ROOT_FDS.with(std::cell::Cell::get),
+            depth.min(2),
+            "the internal rolling-FD counter is only a secondary invariant"
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn confined_reopener_process_fd_delta_is_bounded_independent_of_depth() {
+    const CHILD_MARKER_ENV: &str = "DEGU_REOPENER_FD_OBSERVATION_CHILD_MARKER";
+    if let Some(marker) = std::env::var_os(CHILD_MARKER_ENV) {
+        assert_confined_reopener_process_fd_bound();
+        std::fs::write(marker, b"observed").unwrap();
+        return;
+    }
+
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir.path().join("completed");
+    let test_name = format!(
+        "{}::confined_reopener_process_fd_delta_is_bounded_independent_of_depth",
+        module_path!()
+            .strip_prefix("degu_core::")
+            .unwrap_or(module_path!())
+    );
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test_name, "--nocapture"])
+        .env(CHILD_MARKER_ENV, &marker)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "isolated FD observation subprocess failed"
+    );
+    assert!(
+        marker.exists(),
+        "isolated FD observation test did not execute"
+    );
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn in_reopener_namespace_replacement_move_and_detach_fail_closed() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    for phase in [
+        ReopenerTestPhase::AfterOpenBeforeValidation,
+        ReopenerTestPhase::AfterValidatedHopBeforeNextOperation,
+    ] {
+        let (temp, root) = setup_tree();
+        let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+        let moved = temp.path().join("moved");
+        let fired = Rc::new(Cell::new(false));
+        let hook_fired = Rc::clone(&fired);
+        let hook_root = root.clone();
+        let _hook = install_reopener_test_hook(move |observed_phase, path| {
+            if observed_phase == phase && path == Path::new("a") && !hook_fired.replace(true) {
+                std::fs::rename(hook_root.join("a"), &moved).unwrap();
+                if phase == ReopenerTestPhase::AfterOpenBeforeValidation {
+                    std::fs::create_dir(hook_root.join("a")).unwrap();
+                }
+            }
+        });
+        let error = tree.reopen_directory(Path::new("a/b")).unwrap_err();
+        assert!(fired.get(), "the requested in-reopener phase did not fire");
+        match phase {
+            ReopenerTestPhase::AfterOpenBeforeValidation => assert!(
+                matches!(error, HeldTreeError::IdentityChanged(ref path) if path == Path::new("a")),
+                "in-window replacement returned {error:?}"
+            ),
+            ReopenerTestPhase::AfterValidatedHopBeforeNextOperation => assert!(
+                matches!(error, HeldTreeError::Io { ref path, .. } if path == Path::new("a")),
+                "in-window move returned {error:?}"
+            ),
+        }
+    }
+
+    let (temp, root) = setup_tree();
+    let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    let detached = temp.path().join("detached-root");
+    let fired = Rc::new(Cell::new(false));
+    let hook_fired = Rc::clone(&fired);
+    let _hook = install_reopener_test_hook(move |phase, path| {
+        if phase == ReopenerTestPhase::AfterValidatedHopBeforeNextOperation
+            && path.as_os_str().is_empty()
+            && !hook_fired.replace(true)
+        {
+            std::fs::rename(&root, &detached).unwrap();
+        }
+    });
+    let error = tree.rewalk_exact().unwrap_err();
+    assert!(fired.get(), "the root-detach in-reopener hook did not fire");
+    assert!(
+        matches!(error, HeldTreeError::RootBindingChanged),
+        "in-window root detach returned {error:?}"
+    );
+}
+
+#[test]
+fn confined_reopener_compares_the_recorded_strong_incarnation() {
+    let (temp, _) = setup_tree();
+    let mut tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    let directory = tree
+        .directories
+        .iter_mut()
+        .find(|directory| directory.relative_path == Path::new("a"))
+        .unwrap();
+    directory.identity.incarnation ^= 1;
+    assert!(matches!(
+        tree.reopen_directory(Path::new("a")),
+        Err(HeldTreeError::IdentityChanged(path)) if path == Path::new("a")
+    ));
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -941,16 +1362,6 @@ fn reused_device_and_inode_with_a_new_incarnation_is_changed() {
 }
 
 #[test]
-fn fingerprint_is_stable_after_inventory_sorting() {
-    let (temp, _) = setup_tree();
-    let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
-    let first = tree.fingerprint();
-    let second = tree.fingerprint();
-    assert_eq!(first, second);
-    assert_eq!(first.entry_count, tree.entry_count());
-}
-
-#[test]
 #[allow(clippy::disallowed_methods)]
 fn content_proof_rejects_same_size_overwrite_and_symlink_target_change() {
     let (temp, root) = setup_tree();
@@ -1202,7 +1613,7 @@ fn rewalk_rejects_acl_planted_after_collect() {
         0x10, 0, 7, 0, 0xff, 0xff, 0xff, 0xff, // ACL_MASK
         0x20, 0, 5, 0, 0xff, 0xff, 0xff, 0xff, // ACL_OTHER
     ];
-    let result = with_fd(&tree.directories[0].held, |fd| {
+    let result = with_fd(&tree.root.held, |fd| {
         // SAFETY: the FD and ACL buffer remain live for this syscall.
         unsafe {
             libc::fsetxattr(

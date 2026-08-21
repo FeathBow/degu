@@ -352,9 +352,9 @@ pub(crate) enum StagingRenameError {
 }
 
 /// Nonforgeable live result of the held-FD seal/rename sequence. It retains
-/// the exact leased WAL, both parents, the staged root, and sealed directory
-/// descriptors, but exposes no
-/// namespace, restore, commit, purge, unlink, or deletion operation.
+/// the exact leased WAL, both parents, the staged root, and the data-only tree
+/// inventory with its root reopen anchor, but exposes no namespace, restore,
+/// commit, purge, unlink, or deletion operation.
 pub(crate) struct StagedUnverifiedTree<'a> {
     wal: &'a mut SealWal<RecoverySession>,
     startup_blocked: &'a mut bool,

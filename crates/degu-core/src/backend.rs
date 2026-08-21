@@ -546,6 +546,7 @@ fn map_tree_assessment_failure(e: held::HeldTreeError) -> HeldTreeAssessmentFail
     use held::{HeldTreeError as E, HeldTreeLimit as L};
     let (kind, path) = match e {
         E::InvalidRoot => (HeldTreeAssessmentFailureKind::InvalidRoot, None),
+        E::InvalidDirectoryPath(p) => (HeldTreeAssessmentFailureKind::IdentityChanged, Some(p)),
         E::InvalidDirectoryLimit => (HeldTreeAssessmentFailureKind::InvalidDirectoryLimit, None),
         E::Limit { kind, .. } => (
             match kind {

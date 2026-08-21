@@ -2,7 +2,8 @@ use super::*;
 use crate::seal::store::SealWalStore;
 use crate::seal::wal::{DurableRenameOutcome, ProductionAssociation};
 use crate::staging::recovery::{
-    RecoveryAnchors, RecoveryFilesystemAnchor, StagedVerificationOutcome, StartupRecoveryCapability,
+    RecoveryAnchors, RecoveryFilesystemAnchor, StagedVerificationFailure,
+    StagedVerificationOutcome, StartupRecoveryCapability, install_recovery_fd_observer,
 };
 use crate::staging::{
     ForwardFailureDisposition, SealedStagingEngine, StartupRecoveryAnchors,
@@ -156,6 +157,47 @@ fn set_mode(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
+fn assert_only_parent_seal_is_durable(fixture: &Fixture, transaction: TransactionId) {
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    let recovered = &replay.transactions[&transaction];
+    assert_eq!(recovered.permissions.len(), 1);
+    assert_eq!(recovered.permissions[0].mutation_id, 0);
+    assert_eq!(
+        recovered.permissions[0].evidence.relative_path(),
+        Path::new("source-parent")
+    );
+    assert_eq!(mode(&fixture.source_parent), 0o750);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn supplementary_group_other_than(current: u32) -> Option<u32> {
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count <= 0 {
+        return None;
+    }
+    let mut groups = vec![0 as libc::gid_t; count as usize];
+    let filled = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+    (filled == count)
+        .then_some(groups)
+        .into_iter()
+        .flatten()
+        .find(|group| *group != current)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn set_group(path: &Path, gid: u32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let directory = std::fs::File::open(path)?;
+    let result =
+        unsafe { libc::fchown(directory.as_raw_fd(), !0 as libc::uid_t, gid as libc::gid_t) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 #[test]
 fn exact_held_tree_reaches_only_staged_unverified() {
     let Some(fixture) = Fixture::new() else {
@@ -196,6 +238,23 @@ fn exact_held_tree_reaches_only_staged_unverified() {
             if identity == recovered.staging.as_ref().unwrap().root_identity()
     ));
     assert_eq!(recovered.permissions.len(), 3);
+    assert_eq!(
+        recovered
+            .permissions
+            .iter()
+            .map(|permission| permission.mutation_id)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "source parent remains mutation 0, then reverse-BFS child and root"
+    );
+    assert_eq!(
+        recovered.permissions[1].evidence.relative_path(),
+        Path::new("source-parent/root/child")
+    );
+    assert_eq!(
+        recovered.permissions[2].evidence.relative_path(),
+        Path::new("source-parent/root")
+    );
     assert!(recovered.tree_manifest.is_some());
     drop(lease);
 
@@ -215,6 +274,182 @@ fn exact_held_tree_reaches_only_staged_unverified() {
     assert_eq!(verified.transaction(), transaction);
     assert_eq!(verified.wal_state(), Some(TransactionState::StagedSealed));
     assert!(verified.startup_is_blocked());
+}
+
+#[test]
+fn transient_seal_race_fails_identity_before_fchmod_and_keeps_parent_anchor_stable() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let source_parent_identity = std::fs::metadata(&fixture.source_parent).unwrap();
+    let child = fixture.source_root.join("child");
+    let displaced = fixture.source_root.join("displaced-child");
+    let replacement = child.clone();
+    crate::backend::held::install_transient_seal_test_hook(move |path| {
+        assert_eq!(path, Path::new("child"));
+        std::fs::rename(&child, &displaced).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        set_mode(&replacement, 0o700);
+    });
+
+    let transaction = TransactionId([0xb7; 16]);
+    let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty());
+    let error = match engine.stage_prepared_root(transaction, fixture.prepare()) {
+        Ok(_) => panic!("identity replacement must fail before transient fchmod"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        StagingRenameError::TreeSeal(HeldTreeSealError::Tree(
+            HeldTreeError::IdentityChanged(ref path)
+        )) if path == Path::new("child")
+    ));
+    assert_eq!(mode(&fixture.source_root.join("displaced-child")), 0o770);
+    assert_eq!(mode(&fixture.source_root.join("child")), 0o700);
+    let after_parent = std::fs::metadata(&fixture.source_parent).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(source_parent_identity.dev(), after_parent.dev());
+    assert_eq!(source_parent_identity.ino(), after_parent.ino());
+
+    drop(engine);
+    assert_only_parent_seal_is_durable(&fixture, transaction);
+}
+
+#[test]
+fn transient_seal_mode_drift_fails_before_child_intent_or_fchmod() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let child = fixture.source_root.join("child");
+    let fired = Rc::new(Cell::new(false));
+    let hook_fired = Rc::clone(&fired);
+    crate::backend::held::install_transient_seal_test_hook(move |path| {
+        assert_eq!(path, Path::new("child"));
+        assert!(!hook_fired.replace(true), "transient hook fired twice");
+        set_mode(&child, 0o700);
+    });
+
+    let transaction = TransactionId([0xb8; 16]);
+    let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty());
+    let error = match engine.stage_prepared_root(transaction, fixture.prepare()) {
+        Ok(_) => panic!("mode drift must fail before transient fchmod"),
+        Err(error) => error,
+    };
+    assert!(fired.get(), "transient seal race hook did not fire");
+    assert!(matches!(
+        error,
+        StagingRenameError::TreeSeal(HeldTreeSealError::Tree(
+            HeldTreeError::IdentityChanged(ref path)
+        )) if path == Path::new("child")
+    ));
+    assert_eq!(mode(&fixture.source_root.join("child")), 0o700);
+
+    drop(engine);
+    assert_only_parent_seal_is_durable(&fixture, transaction);
+}
+
+#[test]
+fn transient_seal_rejects_drift_to_same_minimal_target_as_old_mode() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let child = fixture.source_root.join("child");
+    let fired = Rc::new(Cell::new(false));
+    let hook_fired = Rc::clone(&fired);
+    crate::backend::held::install_transient_seal_test_hook(move |path| {
+        assert_eq!(path, Path::new("child"));
+        assert!(!hook_fired.replace(true), "transient hook fired twice");
+        // 0770 seals to 0750. Planting 0750 proves the executor must not
+        // accept a new pre_mode merely because its target would be identical.
+        set_mode(&child, 0o750);
+    });
+
+    let transaction = TransactionId([0xb9; 16]);
+    let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty());
+    let error = match engine.stage_prepared_root(transaction, fixture.prepare()) {
+        Ok(_) => panic!("same-target pre-mode drift must fail before transient fchmod"),
+        Err(error) => error,
+    };
+    assert!(fired.get(), "transient seal race hook did not fire");
+    assert!(matches!(
+        error,
+        StagingRenameError::TreeSeal(HeldTreeSealError::Tree(
+            HeldTreeError::IdentityChanged(ref path)
+        )) if path == Path::new("child")
+    ));
+    assert_eq!(mode(&fixture.source_root.join("child")), 0o750);
+
+    drop(engine);
+    assert_only_parent_seal_is_durable(&fixture, transaction);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn transient_seal_group_drift_fails_before_child_intent_or_fchmod_when_permitted() {
+    use std::cell::Cell;
+    use std::os::unix::fs::MetadataExt;
+    use std::rc::Rc;
+
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let child = fixture.source_root.join("child");
+    let collected_gid = std::fs::metadata(&child).unwrap().gid();
+    let Some(alternate_gid) = supplementary_group_other_than(collected_gid) else {
+        eprintln!(
+            "group-drift fixture skipped: process has no supplementary group distinct from gid {collected_gid}"
+        );
+        return;
+    };
+    let probe = tempfile::tempdir_in(&fixture.base).unwrap();
+    if let Err(error) = set_group(probe.path(), alternate_gid) {
+        eprintln!(
+            "group-drift fixture skipped: platform refused fchown to supplementary gid {alternate_gid}: {error}"
+        );
+        return;
+    }
+    drop(probe);
+
+    let fired = Rc::new(Cell::new(false));
+    let hook_fired = Rc::clone(&fired);
+    crate::backend::held::install_transient_seal_test_hook(move |path| {
+        assert_eq!(path, Path::new("child"));
+        assert!(!hook_fired.replace(true), "transient hook fired twice");
+        set_group(&child, alternate_gid).unwrap();
+    });
+
+    let transaction = TransactionId([0xba; 16]);
+    let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty());
+    let error = match engine.stage_prepared_root(transaction, fixture.prepare()) {
+        Ok(_) => panic!("gid drift must fail before transient fchmod"),
+        Err(error) => error,
+    };
+    assert!(fired.get(), "transient seal race hook did not fire");
+    assert!(matches!(
+        error,
+        StagingRenameError::TreeSeal(HeldTreeSealError::Tree(
+            HeldTreeError::IdentityChanged(ref path)
+        )) if path == Path::new("child")
+    ));
+    assert_eq!(
+        std::fs::metadata(fixture.source_root.join("child"))
+            .unwrap()
+            .gid(),
+        alternate_gid
+    );
+
+    drop(engine);
+    assert_only_parent_seal_is_durable(&fixture, transaction);
 }
 
 #[test]
@@ -2162,4 +2397,139 @@ fn every_postorder_progress_boundary_stops_without_outcome_or_replacement_deleti
             (progress == 3).then_some(b"retain".as_slice())
         );
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_recovery_tree_seals_fit_bounded_process_fd_budget() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    for index in 0..240 {
+        let sibling = fixture.source_root.join(format!("bounded-{index:03}"));
+        std::fs::create_dir(&sibling).unwrap();
+        set_mode(&sibling, 0o770);
+    }
+
+    // This subprocess-only reduction never raises the inherited limit. The old
+    // rebound vector needed several descriptors per directory and deterministically
+    // exhausted this budget before staged verification or verified undo.
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    limit.rlim_cur = limit.rlim_cur.min(128);
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+    let fd_directory = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    let baseline = std::fs::read_dir(fd_directory).unwrap().count();
+    let peak = std::rc::Rc::new(std::cell::Cell::new(baseline));
+    let observed_peak = std::rc::Rc::clone(&peak);
+    let _observer = install_recovery_fd_observer(move || {
+        observed_peak.set(
+            observed_peak
+                .get()
+                .max(std::fs::read_dir(fd_directory).unwrap().count()),
+        );
+    });
+
+    let transaction = TransactionId([0xf6; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    let token = ready
+        .verified_undo_token(transaction, "undo-group")
+        .unwrap();
+    ready
+        .undo_verified(token, verified_undo_request(&fixture))
+        .unwrap();
+    assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+    assert!(fixture.source_root.is_dir());
+    assert!(
+        peak.get().saturating_sub(baseline) <= 24,
+        "recovery retained per-directory descriptors: baseline={baseline}, peak={}",
+        peak.get()
+    );
+    assert_eq!(
+        std::fs::read_dir(&fixture.source_root).unwrap().count(),
+        241,
+        "all 240 siblings plus the content-bearing child must survive undo"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn staged_verification_and_verified_undo_are_bounded_across_240_tree_seals() {
+    const CHILD_MARKER_ENV: &str = "DEGU_RECOVERY_FD_OBSERVATION_CHILD_MARKER";
+    if let Some(marker) = std::env::var_os(CHILD_MARKER_ENV) {
+        assert_recovery_tree_seals_fit_bounded_process_fd_budget();
+        std::fs::write(marker, b"observed").unwrap();
+        return;
+    }
+
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir.path().join("completed");
+    let test_name = format!(
+        "{}::staged_verification_and_verified_undo_are_bounded_across_240_tree_seals",
+        module_path!()
+            .strip_prefix("degu_core::")
+            .unwrap_or(module_path!())
+    );
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test_name, "--nocapture"])
+        .env(CHILD_MARKER_ENV, &marker)
+        .status()
+        .unwrap();
+    assert!(status.success(), "isolated recovery FD test failed");
+    assert!(marker.exists(), "isolated recovery FD test did not execute");
+}
+
+#[test]
+fn staged_recovery_descendant_replacement_is_quarantined_without_chmod_replacement() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xf7; 16]);
+    let binding = fixture.prepare();
+    let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty());
+    drop(engine.stage_prepared_root(transaction, binding).unwrap());
+    drop(engine);
+
+    let (mut recovered, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let candidate = report.into_candidates().pop().unwrap();
+    let capability = recovered
+        .prepare_startup_recovery(candidate, fixture.anchors())
+        .unwrap();
+    let StartupRecoveryCapability::PendingVerification(pending) = capability else {
+        panic!("applied rename must require staged verification")
+    };
+
+    let child = fixture.destination_root.join("child");
+    let detached = fixture.destination_root.join("detached-child");
+    std::fs::rename(&child, &detached).unwrap();
+    std::fs::create_dir(&child).unwrap();
+    set_mode(&child, 0o700);
+    let outcome = pending.verify_or_quarantine().unwrap();
+    assert!(matches!(
+        outcome,
+        StagedVerificationOutcome::Quarantined(StagedVerificationFailure::Rebind(
+            RecoveryRebindError::BindingChanged
+        ))
+    ));
+    assert_eq!(mode(&child), 0o700, "replacement must never be chmoded");
+    assert_eq!(mode(&detached), 0o750, "moved original remains sealed");
+    assert_eq!(
+        recovered.state(transaction),
+        Some(TransactionState::Quarantined)
+    );
 }

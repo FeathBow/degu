@@ -7,8 +7,8 @@ use degu_core::authority::TransactionState;
 use degu_core::ecosystem::DetectCtx;
 use degu_core::finding::{DispositionMode, Finding};
 use degu_core::oplog::{ObjectIdentity, OpOutcome};
-use degu_core::seal_wal::{ProductionAssociation, StagingLocator, TransactionId};
-use degu_core::sealed_staging::{
+use degu_core::seal::wal::{ProductionAssociation, StagingLocator, TransactionId};
+use degu_core::staging::{
     ForwardFailureDisposition, ForwardStagingRequest, ReadyStagingEngine,
     VerifiedPurgeFailureDisposition, VerifiedPurgeRequest, forward_filesystem_id,
 };
@@ -808,13 +808,12 @@ mod tests {
         }
         let finding = super::super::tests::finding_for_test(source.clone(), 4096, 2);
         let identity = EntryIdentity::capture(&source).unwrap();
-        let store = degu_core::seal_store::SealWalStore::open_or_create_for_integration_test(
+        let store = degu_core::seal::store::SealWalStore::open_or_create_for_integration_test(
             &ctx.xdg_state().join("degu/sealed-staging"),
         )
         .unwrap();
         let (engine, startup) =
-            degu_core::sealed_staging::SealedStagingEngine::open_for_integration_test(&store)
-                .unwrap();
+            degu_core::staging::SealedStagingEngine::open_for_integration_test(&store).unwrap();
         let (mut ready, _) = engine
             .recover_startup(startup, |_, _| {
                 Err(io::Error::other("empty recovery must not request anchors"))

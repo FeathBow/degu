@@ -4,11 +4,9 @@ use degu_core::finding::{
     FindingCandidate, FindingKind, FindingSource, Ownership, Recovery, RegenCost, finalize_findings,
 };
 use degu_core::oplog::{ObjectIdentity, OpOutcome};
-use degu_core::seal_store::SealWalStore;
-use degu_core::seal_wal::{ProductionAssociation, StagingLocator, TransactionId};
-use degu_core::sealed_staging::{
-    ForwardStagingRequest, SealedStagingEngine, forward_filesystem_id,
-};
+use degu_core::seal::store::SealWalStore;
+use degu_core::seal::wal::{ProductionAssociation, StagingLocator, TransactionId};
+use degu_core::staging::{ForwardStagingRequest, SealedStagingEngine, forward_filesystem_id};
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;

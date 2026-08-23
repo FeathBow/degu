@@ -3,7 +3,7 @@ use anyhow::Result;
 use degu_core::activation::{
     AuthorityClaimPublicationState, SelfAuthorityInitializationPostProvisionError,
 };
-use degu_core::local_backend::CertifiedLocalBackend;
+use degu_core::backend::CertifiedLocalBackend;
 use degu_core::provision::{
     ActivationAnchorProvisioningOutcome, ActivationAnchorProvisioningStatus,
 };

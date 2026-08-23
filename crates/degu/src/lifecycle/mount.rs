@@ -1,8 +1,8 @@
 //! Reopen mount-domain recovery anchors from WAL metadata; pathnames obtain FDs
 //! but never replace the core's fresh mount, backend, locator, and identity checks.
 
-use degu_core::seal_wal::StagingTransactionMetadata;
-use degu_core::sealed_staging::{ProductionStagingEntry, StartupRecoveryAnchors};
+use degu_core::seal::wal::StagingTransactionMetadata;
+use degu_core::staging::{ProductionStagingEntry, StartupRecoveryAnchors};
 use rustix::fd::OwnedFd;
 use std::io;
 use std::path::{Path, PathBuf};

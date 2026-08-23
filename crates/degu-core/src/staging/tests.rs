@@ -1,7 +1,7 @@
 use super::*;
 use crate::authority::PersistentRecoveryEvidence;
-use crate::local_backend::CertifiedLocalBackend;
-use crate::seal_wal::{
+use crate::backend::CertifiedLocalBackend;
+use crate::seal::wal::{
     ApplicationStatus, DurablePermission, DurableSourceParentStrategy, DurableTreeManifest,
     ObjectIncarnation, PermissionIntent, StagingLocator, StrongObjectIdentity,
 };

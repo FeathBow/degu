@@ -5,11 +5,11 @@
 //! module exposes no path-based permission or namespace mutation.
 
 use crate::authority::{PersistentRecoveryEvidence, TransactionState};
-use crate::local_backend::{
+use crate::backend::{
     HeldLocalBackendEvidence, HeldModeChangeOutcome, LocalModeRevalidationFailure,
     ModeSyscallFailure,
 };
-use crate::seal_wal::{
+use crate::seal::wal::{
     AppendError, ApplicationStatus, DurablePermission, DurableWrite, MutationAppendError,
     PermissionIntent, PermissionResolution, ResolveError, SealWal, TransactionId,
 };
@@ -231,7 +231,7 @@ fn execute_local_mode_mutation_inner<W: DurableWrite>(
         // constructed from `prepared` above.
         #[cfg(test)]
         if is_inverse
-            && crate::staging_recovery::UNDO_FAIL_STEP
+            && crate::staging::recovery::UNDO_FAIL_STEP
                 .with(|step| step.get() == Some("inverse-intent"))
         {
             return Err(io::Error::other("injected crash after inverse intent"));
@@ -241,7 +241,7 @@ fn execute_local_mode_mutation_inner<W: DurableWrite>(
         held_outcome = Some(outcome);
         #[cfg(test)]
         if is_inverse
-            && crate::staging_recovery::UNDO_FAIL_STEP
+            && crate::staging::recovery::UNDO_FAIL_STEP
                 .with(|step| step.get() == Some("inverse-fchmod"))
         {
             return Err(io::Error::other("injected crash after inverse fchmod"));
@@ -353,13 +353,13 @@ const _: fn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authority::local_mode::{
+    use crate::authority::mode::{
         ModeSealAssessment, ModeSealDenial, assess_mode_seal, assess_process_capability,
     };
     use crate::authority::{CapabilityAssessment, UnknownReason};
-    use crate::local_backend::{CertificationError, certify_held_fd};
-    use crate::seal_store::SealWalStore;
-    use crate::seal_wal::{RecoveryWork, decide_recovery};
+    use crate::backend::{CertificationError, certify_held_fd};
+    use crate::seal::store::SealWalStore;
+    use crate::seal::wal::{RecoveryWork, decide_recovery};
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 

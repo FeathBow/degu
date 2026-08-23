@@ -6,10 +6,11 @@
 //! agree; macOS accepts APFS only. Its sole mutation seam is a held-FD
 //! `fchmod` primitive reserved for degu-core's durable WAL wrapper.
 
-use crate::seal_wal::TransactionId;
+use crate::seal::wal::TransactionId;
 
 #[allow(dead_code)] // closed, authority-neutral traversal API
-pub(crate) mod held_tree;
+pub(crate) mod held;
+pub(crate) mod roles;
 use rustix::fd::{AsFd, OwnedFd};
 use std::collections::BTreeSet;
 #[cfg(target_os = "linux")]

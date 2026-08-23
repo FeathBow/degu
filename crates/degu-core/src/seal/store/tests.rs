@@ -1,6 +1,6 @@
 use super::*;
 use crate::authority::TransactionState;
-use crate::seal_wal::{RecoveryLockError, TransactionId};
+use crate::seal::wal::{RecoveryLockError, TransactionId};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write as _};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -428,7 +428,7 @@ fn resume_requires_replay_from_the_same_session() {
     };
     assert!(matches!(
         error,
-        crate::seal_wal::AppendError::InvalidState(_)
+        crate::seal::wal::AppendError::InvalidState(_)
     ));
     store.try_lease().unwrap();
 }

@@ -4,7 +4,7 @@
 //! freshness, identity, and transaction state separate so no one dimension is
 //! mistaken for permission to mutate.
 
-pub mod local_mode;
+pub mod mode;
 
 use serde::Serialize;
 use serde::ser::{SerializeSeq, Serializer};

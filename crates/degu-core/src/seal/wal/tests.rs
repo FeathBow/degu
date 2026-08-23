@@ -2382,7 +2382,7 @@ fn purge_authorization_sync_failure_never_publishes_purgeable() {
         .unwrap();
 
     wal.writer.fail_sync_at = Some((wal.writer.sync_count, libc::EIO));
-    let proof = crate::staging_recovery::ExactPurgeVerification::for_test(transaction, manifest);
+    let proof = crate::staging::recovery::ExactPurgeVerification::for_test(transaction, manifest);
     assert!(matches!(
         wal.record_purgeable(proof),
         Err(AppendError::Io(_))

@@ -5,7 +5,7 @@
 //! be substituted for another. These values are not live authority: callers
 //! must still retain and revalidate the exact held descriptors for the role.
 
-use crate::local_backend::CertifiedLocalBackend;
+use crate::backend::CertifiedLocalBackend;
 
 macro_rules! local_role_backend {
     ($(#[$doc:meta])* $name:ident) => {

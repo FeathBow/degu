@@ -1,13 +1,13 @@
 use super::*;
-use crate::seal_store::SealWalStore;
-use crate::seal_wal::{DurableRenameOutcome, ProductionAssociation};
-use crate::sealed_staging::{
+use crate::seal::store::SealWalStore;
+use crate::seal::wal::{DurableRenameOutcome, ProductionAssociation};
+use crate::staging::recovery::{
+    RecoveryAnchors, RecoveryFilesystemAnchor, StagedVerificationOutcome, StartupRecoveryCapability,
+};
+use crate::staging::{
     ForwardFailureDisposition, SealedStagingEngine, StartupRecoveryAnchors,
     VerifiedPurgeFailureDisposition, VerifiedPurgeRequest, VerifiedUndoFailureDisposition,
     VerifiedUndoRequest,
-};
-use crate::staging_recovery::{
-    RecoveryAnchors, RecoveryFilesystemAnchor, StagedVerificationOutcome, StartupRecoveryCapability,
 };
 use std::os::unix::fs::PermissionsExt;
 
@@ -115,8 +115,8 @@ impl Fixture {
         &self,
         source_basename: &str,
         destination_basename: &str,
-    ) -> crate::sealed_staging::ForwardStagingRequest {
-        crate::sealed_staging::ForwardStagingRequest::new(
+    ) -> crate::staging::ForwardStagingRequest {
+        crate::staging::ForwardStagingRequest::new(
             std::fs::File::open(&self.base).unwrap().into(),
             std::fs::File::open(&self.source_parent).unwrap().into(),
             StagingLocator::new(
@@ -138,7 +138,7 @@ impl Fixture {
         )
     }
 
-    fn ready_engine(&self) -> crate::sealed_staging::ReadyStagingEngine {
+    fn ready_engine(&self) -> crate::staging::ReadyStagingEngine {
         let (engine, report) = SealedStagingEngine::open(&self.store).unwrap();
         assert!(report.is_empty());
         engine
@@ -244,10 +244,10 @@ fn forward_coordinator_reaches_verified_commit_before_returning() {
 fn stage_production(
     fixture: &Fixture,
     transaction: TransactionId,
-) -> crate::sealed_staging::ReadyStagingEngine {
+) -> crate::staging::ReadyStagingEngine {
     set_mode(&fixture.source_parent, 0o700);
     let mut ready = fixture.ready_engine();
-    let association = crate::seal_wal::ProductionAssociation::new("undo-group".into()).unwrap();
+    let association = crate::seal::wal::ProductionAssociation::new("undo-group".into()).unwrap();
     ready
         .stage_to_verified_commit(
             transaction,
@@ -430,9 +430,9 @@ fn purge_partial_unlink_failure_stays_at_intent_and_restart_fails_closed() {
     let authority = ready
         .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
         .unwrap();
-    crate::local_backend::held_tree::PURGE_FAIL_AFTER_REMOVALS.with(|limit| limit.set(Some(1)));
+    crate::backend::held::PURGE_FAIL_AFTER_REMOVALS.with(|limit| limit.set(Some(1)));
     let error = ready.execute_verified_purge(authority).unwrap_err();
-    crate::local_backend::held_tree::PURGE_FAIL_AFTER_REMOVALS.with(|limit| limit.set(None));
+    crate::backend::held::PURGE_FAIL_AFTER_REMOVALS.with(|limit| limit.set(None));
 
     assert_eq!(
         error.disposition(),
@@ -470,9 +470,9 @@ fn purge_parent_fsync_failure_records_no_outcome_or_purged_guess() {
     let authority = ready
         .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
         .unwrap();
-    crate::local_backend::held_tree::PURGE_FAIL_PARENT_FSYNC.with(|fail| fail.set(true));
+    crate::backend::held::PURGE_FAIL_PARENT_FSYNC.with(|fail| fail.set(true));
     let error = ready.execute_verified_purge(authority).unwrap_err();
-    crate::local_backend::held_tree::PURGE_FAIL_PARENT_FSYNC.with(|fail| fail.set(false));
+    crate::backend::held::PURGE_FAIL_PARENT_FSYNC.with(|fail| fail.set(false));
 
     assert_eq!(
         error.disposition(),
@@ -507,9 +507,9 @@ fn durable_claim_precedes_every_namespace_mutation() {
     let authority = ready
         .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
         .unwrap();
-    crate::staging_recovery::PURGE_FAIL_AFTER_CLAIM.with(|fail| fail.set(true));
+    crate::staging::recovery::PURGE_FAIL_AFTER_CLAIM.with(|fail| fail.set(true));
     let error = ready.execute_verified_purge(authority).unwrap_err();
-    crate::staging_recovery::PURGE_FAIL_AFTER_CLAIM.with(|fail| fail.set(false));
+    crate::staging::recovery::PURGE_FAIL_AFTER_CLAIM.with(|fail| fail.set(false));
 
     assert_eq!(
         error.disposition(),
@@ -551,9 +551,9 @@ fn progress_sync_failure_stops_before_another_unlink_and_replays_bounded_progres
     let authority = ready
         .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
         .unwrap();
-    crate::staging_recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(Some(1)));
+    crate::staging::recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(Some(1)));
     let error = ready.execute_verified_purge(authority).unwrap_err();
-    crate::staging_recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(None));
+    crate::staging::recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(None));
 
     assert_eq!(
         error.disposition(),
@@ -580,9 +580,9 @@ fn durable_purge_outcome_restart_finalizes_without_namespace_lookup() {
     let authority = ready
         .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
         .unwrap();
-    crate::staging_recovery::PURGE_FAIL_AFTER_OUTCOME.with(|fail| fail.set(true));
+    crate::staging::recovery::PURGE_FAIL_AFTER_OUTCOME.with(|fail| fail.set(true));
     let error = ready.execute_verified_purge(authority).unwrap_err();
-    crate::staging_recovery::PURGE_FAIL_AFTER_OUTCOME.with(|fail| fail.set(false));
+    crate::staging::recovery::PURGE_FAIL_AFTER_OUTCOME.with(|fail| fail.set(false));
 
     assert_eq!(
         error.disposition(),
@@ -794,7 +794,7 @@ fn verified_undo_noreplace_race_reaches_durable_undo_conflict() {
     let transaction = TransactionId([0xdb; 16]);
     let mut ready = stage_production(&fixture, transaction);
     let collision = fixture.source_root.clone();
-    crate::staging_recovery::BEFORE_UNDO_RENAME.with(|slot| {
+    crate::staging::recovery::BEFORE_UNDO_RENAME.with(|slot| {
         *slot.borrow_mut() = Some(Box::new(move || {
             std::fs::create_dir(&collision).unwrap();
             std::fs::write(collision.join("replacement"), b"foreign").unwrap();
@@ -914,11 +914,11 @@ fn verified_undo_crash_boundaries_replay_without_path_guessing() {
         let token = ready
             .verified_undo_token(transaction, "undo-group")
             .unwrap();
-        crate::staging_recovery::UNDO_FAIL_STEP.with(|slot| slot.set(Some(step)));
+        crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(Some(step)));
         let error = ready
             .undo_verified(token, verified_undo_request(&fixture))
             .unwrap_err();
-        crate::staging_recovery::UNDO_FAIL_STEP.with(|slot| slot.set(None));
+        crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(None));
         assert_eq!(
             error.disposition(),
             VerifiedUndoFailureDisposition::RecoveryBlocked
@@ -960,11 +960,11 @@ fn undo_rename_crash_window_becomes_manual_recovery_without_namespace_lookup() {
         let token = ready
             .verified_undo_token(transaction, "undo-group")
             .unwrap();
-        crate::staging_recovery::UNDO_FAIL_STEP.with(|slot| slot.set(Some(step)));
+        crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(Some(step)));
         let error = ready
             .undo_verified(token, verified_undo_request(&fixture))
             .unwrap_err();
-        crate::staging_recovery::UNDO_FAIL_STEP.with(|slot| slot.set(None));
+        crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(None));
         assert_eq!(
             error.disposition(),
             VerifiedUndoFailureDisposition::RecoveryBlocked,
@@ -1003,11 +1003,11 @@ fn durable_undo_terminal_survives_crash_before_oplog_append_without_replay_work(
     let token = ready
         .verified_undo_token(transaction, "undo-group")
         .unwrap();
-    crate::staging_recovery::UNDO_FAIL_STEP.with(|slot| slot.set(Some("terminal")));
+    crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(Some("terminal")));
     let error = ready
         .undo_verified(token, verified_undo_request(&fixture))
         .unwrap_err();
-    crate::staging_recovery::UNDO_FAIL_STEP.with(|slot| slot.set(None));
+    crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(None));
     assert_eq!(
         error.disposition(),
         VerifiedUndoFailureDisposition::Terminal(TransactionState::Restored)
@@ -1323,7 +1323,7 @@ fn quarantine_root_cause_survives_a_later_restore_failure() {
     });
     let source_parent = fixture.source_parent.clone();
     let detached = fixture.base.join("detached-source-parent");
-    crate::sealed_staging::AFTER_FORWARD_QUARANTINE.with(|hook| {
+    crate::staging::AFTER_FORWARD_QUARANTINE.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move || {
             std::fs::rename(&source_parent, &detached).unwrap();
             std::fs::create_dir(&source_parent).unwrap();
@@ -2126,9 +2126,9 @@ fn every_postorder_progress_boundary_stops_without_outcome_or_replacement_deleti
         let authority = ready
             .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
             .unwrap();
-        crate::staging_recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(Some(progress)));
+        crate::staging::recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(Some(progress)));
         assert!(ready.execute_verified_purge(authority).is_err());
-        crate::staging_recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(None));
+        crate::staging::recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(None));
         assert_eq!(
             ready.state(transaction),
             Some(TransactionState::PurgeIntent)

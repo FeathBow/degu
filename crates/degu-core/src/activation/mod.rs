@@ -14,26 +14,26 @@
 //! to create an empty one under a changed XDG. Mutation sessions retain every
 //! existing candidate lock as well as the selected WAL lease.
 //!
-//! The trust boundary is the same as `seal_store`: root and malicious same-EUID
+//! The trust boundary is the same as `seal::store`: root and malicious same-EUID
 //! processes are out of scope. Foreign users are excluded by no-follow,
 //! EUID-owned 0700 directories, EUID-owned 0600 single-link records, absent
 //! ACLs, certified local backends, strong birth identity, and held-FD checks.
 
-use crate::fs_role_backend::{ActivationAnchorBackend, WalStoreBackend};
-use crate::local_backend::{CertificationError, CertifiedLocalBackend, require_held_fd_acl_absent};
-use crate::seal_store::{
+use crate::backend::roles::{ActivationAnchorBackend, WalStoreBackend};
+use crate::backend::{CertificationError, CertifiedLocalBackend, require_held_fd_acl_absent};
+use crate::seal::store::{
     SealWalStore, StoreError, open_authenticated_parent,
     probe_store_parent_backend_for_activation_support, validate_directory,
 };
-use crate::seal_wal::{
+use crate::seal::wal::{
     ExclusiveFileLock, RecoveryLockError, StagingTransactionMetadata, StrongObjectIdentity,
     TransactionId,
 };
-use crate::sealed_staging::{
+use crate::staging::recovery::strong_identity_fd;
+use crate::staging::{
     ReadyStagingEngine, SealedStagingEngine, StagingEngineError, StartupRecoveryAnchors,
     StartupRecoveryError, StartupRecoveryReport, StartupRecoverySummary,
 };
-use crate::staging_recovery::strong_identity_fd;
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
 use std::ffi::OsString;
@@ -830,8 +830,7 @@ fn lock_activation_provisioning(
         ));
     }
     require_held_fd_acl_absent(&directory).map_err(StoreActivationError::Backend)?;
-    crate::local_backend::certify_held_fd_backend(&directory)
-        .map_err(StoreActivationError::Backend)?;
+    crate::backend::certify_held_fd_backend(&directory).map_err(StoreActivationError::Backend)?;
     let entry = rustix::fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(io::Error::from)
         .map_err(|source| StoreActivationError::Io {
@@ -937,7 +936,7 @@ fn open_activation_anchor(
     validate_directory(&directory, authority_path).map_err(StoreActivationError::UnsafeAnchor)?;
     let identity = strong_identity_fd(&directory).map_err(|_| StoreActivationError::Identity)?;
     let backend = ActivationAnchorBackend::certified_local(
-        crate::local_backend::certify_held_fd_backend(&directory)
+        crate::backend::certify_held_fd_backend(&directory)
             .map_err(StoreActivationError::Backend)?,
     );
     let lock = try_lock_directory(&directory).map_err(|source| StoreActivationError::Io {
@@ -982,7 +981,7 @@ fn validate_activation_anchor_binding(
     kind: AnchorKind,
 ) -> Result<(), StoreActivationError> {
     validate_directory(directory, path).map_err(StoreActivationError::UnsafeAnchor)?;
-    let backend = crate::local_backend::certify_held_fd_backend(directory)
+    let backend = crate::backend::certify_held_fd_backend(directory)
         .map_err(StoreActivationError::Backend)?;
     let identity = strong_identity_fd(directory).map_err(|_| StoreActivationError::Identity)?;
     if backend != expected_backend.local_backend() || identity != expected_identity {
@@ -1494,7 +1493,7 @@ fn take_identity(input: &mut &[u8]) -> Option<StrongObjectIdentity> {
     Some(StrongObjectIdentity::new_with_mount(
         u64::from_be_bytes(take_array::<8>(input)?),
         u64::from_be_bytes(take_array::<8>(input)?),
-        crate::seal_wal::ObjectIncarnation::new(u64::from_be_bytes(take_array::<8>(input)?)),
+        crate::seal::wal::ObjectIncarnation::new(u64::from_be_bytes(take_array::<8>(input)?)),
         u64::from_be_bytes(take_array::<8>(input)?),
     ))
 }

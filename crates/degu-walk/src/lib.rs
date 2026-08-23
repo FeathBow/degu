@@ -6,19 +6,19 @@
 
 mod accounting;
 mod fstype;
+mod guard;
 mod metadata;
 pub mod mount;
-mod mutation_guard;
-mod safe_read;
+mod read;
 mod trusted;
 mod walker;
 
-pub use mutation_guard::{
+pub use guard::{
     directory_grants_foreign_mutation, find_named_entry_single_mount,
     reject_protected_in_owned_single_mount_tree, validate_owned_single_mount_tree,
     validate_single_mount_tree, validate_trusted_parent_namespace,
 };
-pub use safe_read::{
+pub use read::{
     CappedBytes, open_regular_capped, open_regular_capped_nofollow, read_regular_capped,
     read_regular_capped_nofollow,
 };

@@ -75,11 +75,26 @@ fn public_clean_tree_is_assessed_but_never_claims_seal_validation() {
 }
 
 #[test]
-fn public_default_directory_cap_and_hardlink_are_structured_failures() {
+fn public_default_directory_boundary_and_hardlink_are_structured() {
+    const MAX_TREE_DIRECTORIES: usize = 1_023;
+
     let (temp, root) = setup();
-    for index in 0..257 {
-        std::fs::create_dir(root.join(format!("d{index:03}"))).unwrap();
+    // The root is included, so 1,022 children are exactly the production bound.
+    for index in 0..(MAX_TREE_DIRECTORIES - 1) {
+        std::fs::create_dir(root.join(format!("d{index:04}"))).unwrap();
     }
+    let Some(parent) = certified(temp.path()) else {
+        return;
+    };
+    let outcome = assess_held_tree_policy_metadata(parent, OsStr::new("root")).unwrap();
+    let HeldTreePolicyAssessmentOutcome::TreePolicyAssessed { tree, .. } = outcome else {
+        panic!("searchable boundary tree assessment unexpectedly deferred")
+    };
+    assert_eq!(tree.directories, MAX_TREE_DIRECTORIES as u64);
+
+    // One more child makes 1,024 total tree directories. Recovery also needs
+    // one source-parent permission, so policy must reject this boundary.
+    std::fs::create_dir(root.join("over-limit")).unwrap();
     let Some(parent) = certified(temp.path()) else {
         return;
     };

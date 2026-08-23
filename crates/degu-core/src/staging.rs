@@ -17,9 +17,10 @@ pub(crate) mod rename;
 use crate::authority::TransactionState;
 use crate::seal::store::{SealWalStore, StoreError};
 use crate::seal::wal::{
-    AppendError, ProductionAssociation, RecoveryIdentity, RecoverySession, RecoveryWork,
-    ReplayError, ReplayedTransaction, SealWal, StagingTransactionMetadata, StrongObjectIdentity,
-    TransactionId, decide_recovery, quarantined_transaction_retains_active_permission_seals,
+    AppendError, ProductionAssociation, RECOVERY_MAX_ACTIVE_PERMISSIONS, RecoveryIdentity,
+    RecoverySession, RecoveryWork, ReplayError, ReplayedTransaction, SealWal,
+    StagingTransactionMetadata, StrongObjectIdentity, TransactionId, decide_recovery,
+    quarantined_transaction_retains_active_permission_seals,
 };
 use crate::staging::recovery::{
     RecoveryAnchors, RecoveryFilesystemAnchor, RecoveryRebindError, StagedVerificationFailure,
@@ -47,7 +48,6 @@ std::thread_local! {
 const MAX_RECOVERY_STEPS_PER_TRANSACTION: usize = 4;
 const MAX_RECOVERY_TRANSACTIONS: usize = 64;
 const MAX_RECOVERY_PERMISSION_RECORDS: usize = 4096;
-const MAX_RECOVERY_PERMISSION_OPERATIONS: usize = 1024;
 const MAX_RECOVERY_PATH_COMPONENTS: usize = 128;
 const MAX_RECOVERY_PATH_BYTES: usize = 64 * 1024;
 
@@ -1238,11 +1238,9 @@ fn validate_recovery_workload(snapshot: &ReplayedTransaction) -> io::Result<()> 
                 })
         })
         .count();
-    if unresolved > MAX_RECOVERY_PERMISSION_OPERATIONS
-        || active > MAX_RECOVERY_PERMISSION_OPERATIONS
-    {
+    if unresolved > RECOVERY_MAX_ACTIVE_PERMISSIONS || active > RECOVERY_MAX_ACTIVE_PERMISSIONS {
         return Err(io::Error::other(format!(
-            "transaction exceeds the {MAX_RECOVERY_PERMISSION_OPERATIONS}-operation permission recovery limit"
+            "transaction exceeds the {RECOVERY_MAX_ACTIVE_PERMISSIONS}-operation permission recovery limit"
         )));
     }
     let validate_path = |path: &Path| -> io::Result<()> {
@@ -1294,7 +1292,7 @@ impl SealedStagingEngine {
             ));
         }
         // Enumerate candidate recovery ordering without granting authority. Every
-        // item is subsequently required to pass staging::recovery's fresh held-FD
+        // item is subsequently required to pass staging_recovery's fresh held-FD
         // rebind; this callback cannot itself authorize chmod or namespace work.
         let recovery_generation = NEXT_RECOVERY_GENERATION.fetch_add(1, Ordering::Relaxed);
         let mut work = replay

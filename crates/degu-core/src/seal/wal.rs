@@ -26,6 +26,10 @@ const CONTENT_PROOF_MANIFEST_VERSION: u16 = 2;
 const HEADER_LEN: usize = 20;
 const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 const MAX_WAL_LEN: u64 = 64 * 1024 * 1024;
+/// Maximum permission mutations that startup recovery may need to resolve or
+/// reverse for one transaction. Forward staging reserves one operation for the
+/// source-parent seal; every tree-directory seal consumes one more.
+pub(crate) const RECOVERY_MAX_ACTIVE_PERMISSIONS: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TransactionId(pub [u8; 16]);

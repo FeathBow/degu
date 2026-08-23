@@ -14,6 +14,7 @@ fn open_dir(path: &Path) -> OwnedFd {
 
 struct Fixture {
     _temp: tempfile::TempDir,
+    base: PathBuf,
     source_anchor: OwnedFd,
     destination_anchor: OwnedFd,
     metadata: StagingTransactionMetadata,
@@ -23,8 +24,9 @@ struct Fixture {
 
 fn fixture(staged: bool) -> Option<Fixture> {
     let temp = crate::secure_test_tempdir().unwrap();
-    let source = temp.path().join("source");
-    let destination = temp.path().join("destination");
+    let base = temp.path().canonicalize().unwrap();
+    let source = base.join("source");
+    let destination = base.join("destination");
     fs::create_dir(&source).unwrap();
     fs::create_dir(&destination).unwrap();
     fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
@@ -37,16 +39,23 @@ fn fixture(staged: bool) -> Option<Fixture> {
     fs::create_dir(&root).unwrap();
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
 
-    let source_anchor = open_dir(temp.path());
-    let destination_anchor = open_dir(temp.path());
+    let source_anchor = open_dir(&base);
+    let destination_anchor = open_dir(&base);
     let backend = match certify_held_fd_backend(&source_anchor) {
         Ok(backend) => backend,
-        Err(_) => return None,
+        Err(
+            error @ (CertificationError::UnsupportedPlatform
+            | CertificationError::UnsupportedFilesystem),
+        ) => {
+            eprintln!("SKIP staging-recovery fixture: {error:?}");
+            return None;
+        }
+        Err(error) => panic!("staging-recovery fixture certification failed: {error:?}"),
     };
-    let filesystem_id = held_filesystem_id(&source_anchor).ok()?;
-    let source_identity = strong_identity_fd(&open_dir(&source)).ok()?;
-    let destination_identity = strong_identity_fd(&open_dir(&destination)).ok()?;
-    let root_identity = strong_identity_fd(&open_dir(&root)).ok()?;
+    let filesystem_id = held_filesystem_id(&source_anchor).unwrap();
+    let source_identity = strong_identity_fd(&open_dir(&source)).unwrap();
+    let destination_identity = strong_identity_fd(&open_dir(&destination)).unwrap();
+    let root_identity = strong_identity_fd(&open_dir(&root)).unwrap();
     let metadata = StagingTransactionMetadata::new(
         StagingLocator::new(PathBuf::from("source"), filesystem_id.clone()).unwrap(),
         source_identity,
@@ -61,6 +70,7 @@ fn fixture(staged: bool) -> Option<Fixture> {
     .unwrap();
     Some(Fixture {
         _temp: temp,
+        base,
         source_anchor,
         destination_anchor,
         metadata,
@@ -160,7 +170,7 @@ fn exact_name_replacement_is_rejected_even_on_same_backend() {
     let Some(fixture) = fixture(false) else {
         return;
     };
-    let source = fixture._temp.path().join("source");
+    let source = fixture.base.as_path().join("source");
     fs::rename(source.join("root"), source.join("old-root")).unwrap();
     fs::create_dir(source.join("root")).unwrap();
     let result = rebind_work(
@@ -193,7 +203,7 @@ fn capability_rechecks_name_immediately_before_use() {
     let ReboundWork::VerifyStaged(staged) = rebound else {
         panic!("expected staged capability");
     };
-    let destination = fixture._temp.path().join("destination");
+    let destination = fixture.base.as_path().join("destination");
     fs::rename(destination.join("staged"), destination.join("old-staged")).unwrap();
     fs::create_dir(destination.join("staged")).unwrap();
     assert!(matches!(
@@ -221,7 +231,7 @@ fn recovery_capability_rechecks_final_namespace_controller_exclusivity() {
         panic!("expected staged capability");
     };
     fs::set_permissions(
-        fixture._temp.path().join("destination"),
+        fixture.base.as_path().join("destination"),
         fs::Permissions::from_mode(0o770),
     )
     .unwrap();
@@ -236,7 +246,7 @@ fn recovery_rebind_rejects_writable_anchor_controller() {
     let Some(fixture) = fixture(true) else {
         return;
     };
-    fs::set_permissions(fixture._temp.path(), fs::Permissions::from_mode(0o770)).unwrap();
+    fs::set_permissions(fixture.base.as_path(), fs::Permissions::from_mode(0o770)).unwrap();
     assert!(matches!(
         rebind_work(
             &fixture.metadata,
@@ -278,6 +288,85 @@ fn mount_drift_between_authenticated_anchors_fails_closed() {
     ));
 }
 
+fn permission_for_directory(
+    fixture: &Fixture,
+    path: &Path,
+    relative_path: &str,
+) -> DurablePermission {
+    let identity = strong_identity_fd(&open_dir(path)).unwrap();
+    DurablePermission {
+        mutation_id: 1,
+        phase: TransactionState::TreeSealIntent,
+        evidence: PersistentRecoveryEvidence::new(
+            PathBuf::from(relative_path),
+            Some(fixture.filesystem_id.clone()),
+            identity.device(),
+            identity.inode(),
+            Some(identity.incarnation().get()),
+            0o700,
+        )
+        .unwrap(),
+        pre_mode: 0o700,
+        expected_mode: 0o700,
+        reverses_mutation_id: None,
+        application: ApplicationStatus::Applied,
+    }
+}
+
+#[test]
+fn build_permission_plan_rejects_group_writable_intermediate_ancestor_in_three_level_path() {
+    let Some(fixture) = fixture(false) else {
+        return;
+    };
+    let root = fixture.base.join("source/root");
+    let child = root.join("child");
+    fs::create_dir(&child).unwrap();
+    fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
+    let permission = permission_for_directory(&fixture, &child, "source/root/child");
+    let recovery_anchors = anchors(&fixture);
+
+    assert!(matches!(
+        build_permission_plan(
+            &recovery_anchors.source,
+            RecoveryAnchorSide::Source,
+            PathBuf::from("source/root/child"),
+            permission,
+            0o700,
+            &fixture.metadata,
+        ),
+        Err(RecoveryRebindError::LocatorControllerNotExclusive)
+    ));
+}
+
+#[test]
+fn reopen_permission_plan_rejects_group_writable_intermediate_ancestor_in_three_level_path() {
+    let Some(fixture) = fixture(false) else {
+        return;
+    };
+    let root = fixture.base.join("source/root");
+    let child = root.join("child");
+    fs::create_dir(&child).unwrap();
+    fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+    let permission = permission_for_directory(&fixture, &child, "source/root/child");
+    let recovery_anchors = anchors(&fixture);
+    let plan = build_permission_plan(
+        &recovery_anchors.source,
+        RecoveryAnchorSide::Source,
+        PathBuf::from("source/root/child"),
+        permission,
+        0o700,
+        &fixture.metadata,
+    )
+    .unwrap();
+
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(matches!(
+        reopen_permission_plan(&recovery_anchors.source, &plan, &fixture.metadata),
+        Err(RecoveryRebindError::LocatorControllerNotExclusive)
+    ));
+}
+
 #[test]
 fn unknown_rename_outcome_forbids_all_source_destination_lookup() {
     assert!(recovery_lookup_is_forbidden(
@@ -302,7 +391,7 @@ fn uncertain_staging_intent_resolves_before_after_and_at_fresh_resolution() {
         let Some(fixture) = fixture(false) else {
             return;
         };
-        let source_path = fixture._temp.path().join("source");
+        let source_path = fixture.base.as_path().join("source");
         fs::set_permissions(&source_path, fs::Permissions::from_mode(0o770)).unwrap();
         let wal_temp = crate::secure_test_tempdir().unwrap();
         let store = SealWalStore::open_or_create(
@@ -432,9 +521,9 @@ fn uncertain_inverse_intents_resolve_before_and_after_fchmod_in_every_restore_ph
             let Some(fixture) = fixture(false) else {
                 return;
             };
-            let source_path = fixture._temp.path().join("source");
+            let source_path = fixture.base.as_path().join("source");
             let root_path = source_path.join("root");
-            let staged_path = fixture._temp.path().join("destination/staged");
+            let staged_path = fixture.base.as_path().join("destination/staged");
             fs::set_permissions(&source_path, fs::Permissions::from_mode(0o770)).unwrap();
             fs::set_permissions(&root_path, fs::Permissions::from_mode(0o770)).unwrap();
             let wal_temp = crate::secure_test_tempdir().unwrap();
@@ -696,7 +785,7 @@ fn exact_staging_snapshot_restores_all_applied_permissions_and_reaches_restored(
     let Some(fixture) = fixture(false) else {
         return;
     };
-    let source_path = fixture._temp.path().join("source");
+    let source_path = fixture.base.as_path().join("source");
     let root_path = source_path.join("root");
     fs::set_permissions(&source_path, fs::Permissions::from_mode(0o770)).unwrap();
     fs::set_permissions(&root_path, fs::Permissions::from_mode(0o770)).unwrap();
@@ -816,8 +905,8 @@ fn quarantined_active_seals_restore_in_place_and_unblock_without_unquarantining(
     let Some(fixture) = fixture(true) else {
         return;
     };
-    let source_path = fixture._temp.path().join("source");
-    let staged_path = fixture._temp.path().join("destination/staged");
+    let source_path = fixture.base.as_path().join("source");
+    let staged_path = fixture.base.as_path().join("destination/staged");
     fs::set_permissions(&source_path, fs::Permissions::from_mode(0o770)).unwrap();
     fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o770)).unwrap();
     let wal_temp = crate::secure_test_tempdir().unwrap();
@@ -1011,18 +1100,18 @@ fn staged_pending(
 ) -> Option<(Fixture, SealWal<RecoverySession>, bool, TransactionId)> {
     let fixture = fixture(true)?;
     let transaction = TransactionId([0xa3; 16]);
-    let store_path = fixture._temp.path().join("verifier-wal");
-    let store = SealWalStore::open_or_create(&store_path).ok()?;
-    let mut wal = store.try_lease().ok()?.into_new_wal().ok()?;
+    let store_path = fixture.base.as_path().join("verifier-wal");
+    let store = SealWalStore::open_or_create(&store_path).unwrap();
+    let mut wal = store.try_lease().unwrap().into_new_wal().unwrap();
     wal.begin_staging(transaction, fixture.metadata.clone())
-        .ok()?;
+        .unwrap();
 
-    let source = fixture._temp.path().join("source");
-    fs::set_permissions(&source, fs::Permissions::from_mode(0o770)).ok()?;
+    let source = fixture.base.as_path().join("source");
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o770)).unwrap();
     let source_identity = fixture.metadata.source_parent_identity();
     let source_fd = open_dir(&source);
     wal.transition_staging_for_test(transaction, TransactionState::ParentSealIntent)
-        .ok()?;
+        .unwrap();
     wal.apply_staging_permission_mutation(
         PermissionIntent {
             transaction,
@@ -1034,25 +1123,26 @@ fn staged_pending(
                 source_identity.inode(),
                 Some(source_identity.incarnation().get()),
                 0o750,
-            )?,
+            )
+            .unwrap(),
             pre_mode: 0o770,
             expected_mode: 0o750,
             reverses_mutation_id: None,
         },
         || rustix::fs::fchmod(&source_fd, Mode::from_raw_mode(0o750)).map_err(io::Error::from),
     )
-    .ok()?;
+    .unwrap();
     wal.transition_staging_for_test(transaction, TransactionState::ParentSealed)
-        .ok()?;
+        .unwrap();
     wal.transition_staging_for_test(transaction, TransactionState::TreeSealIntent)
-        .ok()?;
+        .unwrap();
 
-    let destination = fixture._temp.path().join("destination");
+    let destination = fixture.base.as_path().join("destination");
     let staged = destination.join("staged");
     let child = staged.join("child");
-    fs::create_dir(&child).ok()?;
-    fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).ok()?;
-    let child_identity = strong_identity_fd(&open_dir(&child)).ok()?;
+    fs::create_dir(&child).unwrap();
+    fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+    let child_identity = strong_identity_fd(&open_dir(&child)).unwrap();
     let root_identity = fixture.metadata.root_identity();
     if include_tree_seal {
         let root_fd = open_dir(&staged);
@@ -1067,14 +1157,15 @@ fn staged_pending(
                     root_identity.inode(),
                     Some(root_identity.incarnation().get()),
                     0o500,
-                )?,
+                )
+                .unwrap(),
                 pre_mode: 0o700,
                 expected_mode: 0o500,
                 reverses_mutation_id: None,
             },
             || rustix::fs::fchmod(&root_fd, Mode::from_raw_mode(0o500)).map_err(io::Error::from),
         )
-        .ok()?;
+        .unwrap();
         let child_fd = open_dir(&child);
         wal.apply_staging_permission_mutation(
             PermissionIntent {
@@ -1087,26 +1178,28 @@ fn staged_pending(
                     child_identity.inode(),
                     Some(child_identity.incarnation().get()),
                     0o500,
-                )?,
+                )
+                .unwrap(),
                 pre_mode: 0o700,
                 expected_mode: 0o500,
                 reverses_mutation_id: None,
             },
             || rustix::fs::fchmod(&child_fd, Mode::from_raw_mode(0o500)).map_err(io::Error::from),
         )
-        .ok()?;
+        .unwrap();
     }
-    let inventory = HeldTreeInventory::collect(
-        certify_held_fd(open_dir(&destination)).ok()?,
+    let inventory = HeldTreeInventory::collect_for_schema(
+        certify_held_fd(open_dir(&destination)).unwrap(),
         OsStr::new("staged"),
         crate::safety::PROTECTED_DESCENDANT_DIR_NAMES
             .iter()
             .map(OsString::from)
             .collect(),
         HeldTreeLimits::default(),
+        2,
     )
-    .ok()?;
-    let fingerprint = inventory.fingerprint();
+    .unwrap();
+    let fingerprint = inventory.fingerprint_for_schema(2).unwrap();
     let manifest = DurableTreeManifest {
         schema_version: 2,
         entry_count: fingerprint.entry_count,
@@ -1116,13 +1209,13 @@ fn staged_pending(
             [0x55; 32]
         },
     };
-    wal.complete_tree_manifest(transaction, manifest).ok()?;
+    wal.complete_tree_manifest(transaction, manifest).unwrap();
     wal.transition_staging_for_test(transaction, TransactionState::TreeSealed)
-        .ok()?;
-    wal.record_rename_intent(transaction).ok()?;
-    wal.record_applied_rename_for_test(transaction).ok()?;
+        .unwrap();
+    wal.record_rename_intent(transaction).unwrap();
+    wal.record_applied_rename_for_test(transaction).unwrap();
     wal.transition_staging_for_test(transaction, TransactionState::StagedUnverified)
-        .ok()?;
+        .unwrap();
     Some((fixture, wal, true, transaction))
 }
 
@@ -1176,7 +1269,7 @@ fn dropping_pending_before_transition_replays_staged_unverified() {
     drop(capability);
     drop(wal);
 
-    let store = SealWalStore::open_or_create(&fixture._temp.path().join("verifier-wal")).unwrap();
+    let store = SealWalStore::open_or_create(&fixture.base.as_path().join("verifier-wal")).unwrap();
     let (reopened, report) = crate::staging::SealedStagingEngine::open(&store).unwrap();
     assert_eq!(report.candidates().len(), 1);
     assert_eq!(
@@ -1208,7 +1301,7 @@ fn durable_staged_sealed_replays_without_commit_promotion() {
     ));
     drop(wal);
 
-    let store = SealWalStore::open_or_create(&fixture._temp.path().join("verifier-wal")).unwrap();
+    let store = SealWalStore::open_or_create(&fixture.base.as_path().join("verifier-wal")).unwrap();
     let (reopened, report) = crate::staging::SealedStagingEngine::open(&store).unwrap();
     assert_eq!(report.candidates().len(), 1);
     assert_eq!(
@@ -1227,7 +1320,7 @@ fn manifest_mismatch_is_durably_quarantined_without_mode_restore() {
     else {
         return;
     };
-    let staged = fixture._temp.path().join("destination/staged");
+    let staged = fixture.base.as_path().join("destination/staged");
     let mode_before = fs::metadata(&staged).unwrap().permissions().mode() & 0o7777;
     let capability = prepare_startup_recovery(
         &mut wal,
@@ -1271,7 +1364,7 @@ fn mode_drift_after_capability_creation_is_durably_quarantined() {
         panic!("expected pending verification");
     };
     fs::set_permissions(
-        fixture._temp.path().join("destination/staged/child"),
+        fixture.base.as_path().join("destination/staged/child"),
         fs::Permissions::from_mode(0o700),
     )
     .unwrap();
@@ -1291,7 +1384,7 @@ fn added_entry_after_manifest_is_durably_quarantined() {
     else {
         return;
     };
-    let staged = fixture._temp.path().join("destination/staged");
+    let staged = fixture.base.as_path().join("destination/staged");
     fs::set_permissions(&staged, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(staged.join("added"), b"late").unwrap();
     // Re-seal so the extra entry is the only divergence from the manifest.

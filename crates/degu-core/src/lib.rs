@@ -9,24 +9,17 @@
 
 pub mod activation;
 pub mod authority;
+pub mod backend;
 pub mod config;
 pub mod disposition;
 pub mod ecosystem;
 pub mod finding;
-mod fs_role_backend;
-pub mod local_backend;
 pub mod oplog;
 pub mod plan;
 pub mod provision;
 pub mod safety;
-pub mod seal_executor;
-pub mod seal_store;
-pub mod seal_wal;
-pub mod sealed_staging;
-#[allow(dead_code)] // crate-private lifecycle/held-core integration seam
-mod staging_recovery;
-#[allow(dead_code)] // crate-private held-rename implementation; no public entry point
-mod staging_rename;
+pub mod seal;
+pub mod staging;
 
 #[cfg(test)]
 pub(crate) fn secure_test_tempdir() -> std::io::Result<tempfile::TempDir> {

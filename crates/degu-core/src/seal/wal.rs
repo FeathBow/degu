@@ -6,13 +6,13 @@
 //! permission or namespace mutation.
 
 use crate::authority::{PersistentRecoveryEvidence, TransactionState};
-use crate::fs_role_backend::StagingMountBackend;
-use crate::local_backend::CertifiedLocalBackend;
-use crate::staging_recovery::{
+use crate::backend::CertifiedLocalBackend;
+use crate::backend::roles::StagingMountBackend;
+use crate::staging::recovery::{
     ExactPurgeVerification, ExactSourceParentRestoreIntent, ExactSourceParentRestored,
     ExactStagedVerification, ExactVerifiedCommit,
 };
-use crate::staging_rename::{FreshlyConfirmedSourceResident, ParentsSyncedAppliedRename};
+use crate::staging::rename::{FreshlyConfirmedSourceResident, ParentsSyncedAppliedRename};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -1856,7 +1856,7 @@ pub struct RecoverySession {
 
 impl RecoverySession {
     /// The caller must securely open and validate the WAL and its private parent
-    /// directory. [`crate::seal_store::SealWalStore`] is the supported path-based
+    /// directory. [`crate::seal::store::SealWalStore`] is the supported path-based
     /// constructor.
     pub(crate) fn try_acquire(file: File) -> Result<Self, RecoveryLockError> {
         Ok(Self {

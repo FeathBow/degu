@@ -188,7 +188,7 @@ pub enum ModeSealDenial {
     EvidenceUnverified,
 }
 
-fn mode_facts(evidence: &crate::local_backend::HeldLocalBackendEvidence) -> DirectoryModeFacts {
+fn mode_facts(evidence: &crate::backend::HeldLocalBackendEvidence) -> DirectoryModeFacts {
     DirectoryModeFacts {
         mode: evidence.mode(),
         owner_uid: evidence.owner_uid(),
@@ -199,9 +199,7 @@ fn mode_facts(evidence: &crate::local_backend::HeldLocalBackendEvidence) -> Dire
 /// Assess only evidence produced by degu-walk's strict held-FD backend probe.
 /// The token constructor is private to that probe, so callers cannot assert
 /// certification, ACL absence, or process credentials themselves.
-pub fn assess_mode_seal(
-    evidence: &crate::local_backend::HeldLocalBackendEvidence,
-) -> ModeSealAssessment {
+pub fn assess_mode_seal(evidence: &crate::backend::HeldLocalBackendEvidence) -> ModeSealAssessment {
     if !evidence.mode_is_verified() {
         return ModeSealAssessment::Denied(ModeSealDenial::EvidenceUnverified);
     }
@@ -219,7 +217,7 @@ pub fn assess_mode_seal(
 /// binding. This remains a pure capability dimension: it creates no mutation
 /// unit, staging, or purge authority.
 pub fn assess_process_capability(
-    evidence: &crate::local_backend::HeldLocalBackendEvidence,
+    evidence: &crate::backend::HeldLocalBackendEvidence,
     binding_owner_uid: Option<u32>,
 ) -> CapabilityAssessment {
     if !evidence.mode_is_verified() {

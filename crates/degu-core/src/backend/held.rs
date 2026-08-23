@@ -5,14 +5,14 @@
 //! and descriptor-derived incarnations. This module performs no rename, restore,
 //! purge, unlink, or deletion and returns no lifecycle authority token.
 
-use crate::local_backend::{
+use crate::backend::{
     CertificationError, CertifiedLocalBackend, HeldLocalBackendEvidence, certify_held_fd,
 };
-use crate::seal_executor::{
+use crate::seal::executor::{
     LocalModeExecutionError, LocalModeMutationRequest, LocalModeMutationResult, LocalModeTransform,
     RecoveryLocator, execute_staging_local_mode_mutation,
 };
-use crate::seal_wal::{DurableWrite, SealWal, StrongObjectIdentity, TransactionId};
+use crate::seal::wal::{DurableWrite, SealWal, StrongObjectIdentity, TransactionId};
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -427,7 +427,7 @@ impl HeldTreeInventory {
         StrongObjectIdentity::new_with_mount(
             self.root_identity.device,
             self.root_identity.inode,
-            crate::seal_wal::ObjectIncarnation::new(self.root_identity.incarnation),
+            crate::seal::wal::ObjectIncarnation::new(self.root_identity.incarnation),
             self.mount_id,
         )
     }
@@ -867,7 +867,7 @@ fn inspect_at(
         requested,
     )
     .map_err(|error| io_error(path, error))?;
-    let backend = crate::local_backend::certify_held_fd_backend(parent).map_err(|reason| {
+    let backend = crate::backend::certify_held_fd_backend(parent).map_err(|reason| {
         HeldTreeError::Certification {
             path: path.to_path_buf(),
             reason,
@@ -941,7 +941,7 @@ fn inspect_at(
     let c_name = CString::new(name.as_bytes()).map_err(|_| HeldTreeError::InvalidRoot)?;
     let stat = rustix::fs::statat(parent, c_name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| io_error(path, error))?;
-    let backend = crate::local_backend::certify_held_fd_backend(parent).map_err(|reason| {
+    let backend = crate::backend::certify_held_fd_backend(parent).map_err(|reason| {
         HeldTreeError::Certification {
             path: path.to_path_buf(),
             reason,
@@ -1060,7 +1060,7 @@ fn inspect_regular_content(
     })
     .map_err(|error| io_error(path, error))?;
     require_fd_extended_metadata_absent(&fd, path)?;
-    crate::local_backend::require_held_fd_acl_absent(&fd)
+    crate::backend::require_held_fd_acl_absent(&fd)
         .map_err(|_| HeldTreeError::NonDirectoryExtendedMetadata(path.to_path_buf()))?;
     let opened = inspect_raw_fd(&fd, parent.backend(), path)?;
     if !before.stable_content_fields_equal(&opened) || opened.identity.kind != NodeKind::Regular {
@@ -1346,22 +1346,19 @@ fn require_exclusive_parent(
     parent: &HeldLocalBackendEvidence,
     backend: CertifiedLocalBackend,
 ) -> Result<(), HeldTreeError> {
-    with_fd(parent, |fd| {
-        crate::local_backend::require_held_fd_acl_absent(fd)
-    })
-    .map_err(|reason| HeldTreeError::Certification {
-        path: PathBuf::new(),
-        reason,
+    with_fd(parent, |fd| crate::backend::require_held_fd_acl_absent(fd)).map_err(|reason| {
+        HeldTreeError::Certification {
+            path: PathBuf::new(),
+            reason,
+        }
     })?;
     let stat = with_fd(parent, |fd| rustix::fs::fstat(fd))
         .map_err(|error| io_error(Path::new(""), error))?;
-    let actual_backend = with_fd(parent, |fd| {
-        crate::local_backend::certify_held_fd_backend(fd)
-    })
-    .map_err(|reason| HeldTreeError::Certification {
-        path: PathBuf::new(),
-        reason,
-    })?;
+    let actual_backend = with_fd(parent, |fd| crate::backend::certify_held_fd_backend(fd))
+        .map_err(|reason| HeldTreeError::Certification {
+            path: PathBuf::new(),
+            reason,
+        })?;
     if parent.backend() != backend
         || actual_backend != backend
         || stat.st_uid != rustix::process::geteuid().as_raw()
@@ -1379,7 +1376,7 @@ fn require_directory_current(
     mount_id: u64,
 ) -> Result<(), HeldTreeError> {
     with_fd(&directory.held, |fd| {
-        crate::local_backend::require_held_fd_acl_absent(fd)
+        crate::backend::require_held_fd_acl_absent(fd)
     })
     .map_err(|reason| HeldTreeError::Certification {
         path: directory.path.clone(),

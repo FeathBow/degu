@@ -8,11 +8,11 @@
 //! validation plus fail-closed ACL absence prevents a foreign UID from gaining
 //! namespace authority and detaching the durable WAL.
 
-use crate::fs_role_backend::WalStoreBackend;
-use crate::local_backend::{
+use crate::backend::roles::WalStoreBackend;
+use crate::backend::{
     HeldLocalBackendEvidence, certify_held_fd, certify_held_fd_backend, require_held_fd_acl_absent,
 };
-use crate::seal_wal::{ExclusiveFileLock, RecoveryLockError, RecoverySession};
+use crate::seal::wal::{ExclusiveFileLock, RecoveryLockError, RecoverySession};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{FileType, Mode, OFlags, RenameFlags};
 use std::ffi::OsString;
@@ -54,12 +54,12 @@ pub enum StoreError {
     #[error("seal WAL store parent backend could not be certified at {path}: {reason:?}")]
     ParentBackend {
         path: PathBuf,
-        reason: crate::local_backend::CertificationError,
+        reason: crate::backend::CertificationError,
     },
     #[error("seal WAL store backend inspection was uncertain at {path}: {reason:?}")]
     BackendInspection {
         path: PathBuf,
-        reason: crate::local_backend::CertificationError,
+        reason: crate::backend::CertificationError,
     },
     #[error("activated seal WAL store is missing at {path}")]
     MissingStore { path: PathBuf },
@@ -88,7 +88,7 @@ impl SealWalStore {
     /// Production construction stays inside the activation selector.
     ///
     /// ```compile_fail,E0624
-    /// let _ = degu_core::seal_store::SealWalStore::open_or_create(
+    /// let _ = degu_core::seal::store::SealWalStore::open_or_create(
     ///     std::path::Path::new("/tmp/unbound-store"),
     /// );
     /// ```
@@ -408,8 +408,8 @@ pub(crate) fn probe_store_parent_backend_for_activation_support(
     validate_parent_structure(&parent, &parent_path)?;
     match certify_held_fd_backend(&parent) {
         Err(
-            reason @ (crate::local_backend::CertificationError::UnsupportedPlatform
-            | crate::local_backend::CertificationError::UnsupportedFilesystem),
+            reason @ (crate::backend::CertificationError::UnsupportedPlatform
+            | crate::backend::CertificationError::UnsupportedFilesystem),
         ) => Err(StoreError::ParentBackend {
             path: parent_path,
             reason,
@@ -642,12 +642,10 @@ pub(crate) const DIRECTORY_BACKEND_MISMATCH_REASON: &str =
 fn require_directory_acl_absent(fd: &OwnedFd, path: &Path) -> Result<(), StoreError> {
     match require_held_fd_acl_absent(fd) {
         Ok(()) => Ok(()),
-        Err(crate::local_backend::CertificationError::AclPresent) => {
-            Err(StoreError::UnsafeDirectory {
-                path: path.to_path_buf(),
-                reason: DIRECTORY_ACL_PRESENT_REASON,
-            })
-        }
+        Err(crate::backend::CertificationError::AclPresent) => Err(StoreError::UnsafeDirectory {
+            path: path.to_path_buf(),
+            reason: DIRECTORY_ACL_PRESENT_REASON,
+        }),
         Err(reason) => Err(StoreError::BackendInspection {
             path: path.to_path_buf(),
             reason,
@@ -660,7 +658,7 @@ fn certify_directory(fd: &OwnedFd, path: &Path) -> Result<HeldLocalBackendEviden
     let duplicate =
         rustix::io::fcntl_dupfd_cloexec(fd, 0).map_err(|error| io_error(path, error.into()))?;
     certify_held_fd(duplicate).map_err(|reason| {
-        if reason == crate::local_backend::CertificationError::UnsupportedFilesystem {
+        if reason == crate::backend::CertificationError::UnsupportedFilesystem {
             StoreError::UnsafeDirectory {
                 path: path.to_path_buf(),
                 reason: DIRECTORY_UNSUPPORTED_BACKEND_REASON,
@@ -679,13 +677,13 @@ fn certify_directory(fd: &OwnedFd, path: &Path) -> Result<HeldLocalBackendEviden
     })
 }
 
-fn backend_failure_is_definite(reason: &crate::local_backend::CertificationError) -> bool {
+fn backend_failure_is_definite(reason: &crate::backend::CertificationError) -> bool {
     matches!(
         reason,
-        crate::local_backend::CertificationError::UnsupportedFilesystem
-            | crate::local_backend::CertificationError::FilesystemMagicMismatch
-            | crate::local_backend::CertificationError::NotDirectory
-            | crate::local_backend::CertificationError::AclPresent
+        crate::backend::CertificationError::UnsupportedFilesystem
+            | crate::backend::CertificationError::FilesystemMagicMismatch
+            | crate::backend::CertificationError::NotDirectory
+            | crate::backend::CertificationError::AclPresent
     )
 }
 
@@ -746,7 +744,7 @@ fn validate_wal<Fd: AsFd>(
     let stat = rustix::fs::fstat(&fd).map_err(|error| io_error(path, error.into()))?;
     match require_held_fd_acl_absent(&fd) {
         Ok(()) => {}
-        Err(crate::local_backend::CertificationError::AclPresent) => {
+        Err(crate::backend::CertificationError::AclPresent) => {
             return Err(StoreError::UnsafeWal {
                 path: path.to_path_buf(),
                 reason: "WAL ACL is present or could not be verified absent",

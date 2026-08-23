@@ -182,7 +182,7 @@ pub(crate) fn path_mount_id(path: &Path) -> std::result::Result<u64, String> {
             path.display()
         )
     })?;
-    degu_core::sealed_staging::forward_mount_id(&fd).map_err(|error| {
+    degu_core::staging::forward_mount_id(&fd).map_err(|error| {
         format!(
             "failed to inspect mount identity at {}: {error}",
             path.display()

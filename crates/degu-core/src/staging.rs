@@ -9,20 +9,25 @@
 //! may freshly verify that exact held object, durably admit `Purgeable`, and
 //! consume one-shot authority for bounded FD-relative deletion through `Purged`.
 
+#[allow(dead_code)] // crate-private lifecycle/held-core integration seam
+pub(crate) mod recovery;
+#[allow(dead_code)] // crate-private held-rename implementation; no public entry point
+pub(crate) mod rename;
+
 use crate::authority::TransactionState;
-use crate::seal_store::{SealWalStore, StoreError};
-use crate::seal_wal::{
+use crate::seal::store::{SealWalStore, StoreError};
+use crate::seal::wal::{
     AppendError, ProductionAssociation, RecoveryIdentity, RecoverySession, RecoveryWork,
     ReplayError, ReplayedTransaction, SealWal, StagingTransactionMetadata, StrongObjectIdentity,
     TransactionId, decide_recovery, quarantined_transaction_retains_active_permission_seals,
 };
-use crate::staging_recovery::{
+use crate::staging::recovery::{
     RecoveryAnchors, RecoveryFilesystemAnchor, RecoveryRebindError, StagedVerificationFailure,
     StagedVerificationOutcome, StartupRecoveryCapability, VerifiedPurgeAuthorityMaterial,
     certify_verified_commit, prepare_startup_recovery, prepare_verified_purge,
     prepare_verified_undo, recovery_transaction, strong_identity_fd,
 };
-use crate::staging_rename::{
+use crate::staging::rename::{
     PreparedRootBinding, StagedUnverifiedTree, StagingRenameError, execute_prepared_rename,
 };
 use rustix::fd::OwnedFd;
@@ -153,14 +158,14 @@ struct RecoveryTerminalOutcome {
 /// Derives the kernel filesystem identifier required by forward locators from
 /// a held descriptor. Callers cannot supply pathname-derived identity.
 pub fn forward_filesystem_id(fd: &OwnedFd) -> io::Result<String> {
-    crate::staging_recovery::held_filesystem_id(fd)
+    crate::staging::recovery::held_filesystem_id(fd)
         .map_err(|error| io::Error::other(error.to_string()))
 }
 
 /// Derives the held mount identity used to keep per-mount trash discovery from
 /// crossing bind or nested mount boundaries that share a device number.
 pub fn forward_mount_id(fd: &OwnedFd) -> io::Result<u64> {
-    crate::staging_recovery::strong_identity_fd(fd)
+    crate::staging::recovery::strong_identity_fd(fd)
         .map(|identity| identity.mount_id())
         .map_err(|error| io::Error::other(error.to_string()))
 }
@@ -222,11 +227,11 @@ pub fn probe_forward_directory_identity(
 pub struct ForwardStagingRequest {
     source_anchor: OwnedFd,
     source_parent: OwnedFd,
-    source_parent_locator: crate::seal_wal::StagingLocator,
+    source_parent_locator: crate::seal::wal::StagingLocator,
     source_basename: std::ffi::OsString,
     destination_anchor: OwnedFd,
     destination_parent: OwnedFd,
-    destination_parent_locator: crate::seal_wal::StagingLocator,
+    destination_parent_locator: crate::seal::wal::StagingLocator,
     destination_basename: std::ffi::OsString,
     production_association: Option<ProductionAssociation>,
     recovery_anchor: Option<PathBuf>,
@@ -237,11 +242,11 @@ impl ForwardStagingRequest {
     pub fn new(
         source_anchor: OwnedFd,
         source_parent: OwnedFd,
-        source_parent_locator: crate::seal_wal::StagingLocator,
+        source_parent_locator: crate::seal::wal::StagingLocator,
         source_basename: std::ffi::OsString,
         destination_anchor: OwnedFd,
         destination_parent: OwnedFd,
-        destination_parent_locator: crate::seal_wal::StagingLocator,
+        destination_parent_locator: crate::seal::wal::StagingLocator,
         destination_basename: std::ffi::OsString,
     ) -> Self {
         Self {
@@ -368,7 +373,7 @@ pub struct PurgeAuthority {
     engine_generation: u64,
     // Duplicated from the leased WAL descriptor; never path-reopened. Keeping
     // this open retains the exact kernel lease with the one-shot object material.
-    _wal_lease: crate::seal_wal::RecoveryLeaseGuard,
+    _wal_lease: crate::seal::wal::RecoveryLeaseGuard,
     held: VerifiedPurgeAuthorityMaterial,
 }
 
@@ -650,9 +655,9 @@ impl ForwardStagingError {
 pub struct ProductionStagingEntry {
     transaction: TransactionId,
     state: TransactionState,
-    source_parent: crate::seal_wal::StagingLocator,
+    source_parent: crate::seal::wal::StagingLocator,
     source_basename: std::ffi::OsString,
-    destination_parent: crate::seal_wal::StagingLocator,
+    destination_parent: crate::seal::wal::StagingLocator,
     destination_basename: std::ffi::OsString,
     root_identity: StrongObjectIdentity,
     reclamation_id: String,
@@ -668,7 +673,7 @@ impl ProductionStagingEntry {
         self.state
     }
 
-    pub fn source_parent(&self) -> &crate::seal_wal::StagingLocator {
+    pub fn source_parent(&self) -> &crate::seal::wal::StagingLocator {
         &self.source_parent
     }
 
@@ -676,7 +681,7 @@ impl ProductionStagingEntry {
         &self.source_basename
     }
 
-    pub fn destination_parent(&self) -> &crate::seal_wal::StagingLocator {
+    pub fn destination_parent(&self) -> &crate::seal::wal::StagingLocator {
         &self.destination_parent
     }
 
@@ -1218,17 +1223,17 @@ fn validate_recovery_workload(snapshot: &ReplayedTransaction) -> io::Result<()> 
         .iter()
         .filter(|permission| {
             permission.application
-                == crate::seal_wal::ApplicationStatus::IntentDurableApplicationUnknown
+                == crate::seal::wal::ApplicationStatus::IntentDurableApplicationUnknown
         })
         .count();
     let active = snapshot
         .permissions
         .iter()
         .filter(|permission| {
-            permission.application == crate::seal_wal::ApplicationStatus::Applied
+            permission.application == crate::seal::wal::ApplicationStatus::Applied
                 && permission.reverses_mutation_id.is_none()
                 && !snapshot.permissions.iter().any(|inverse| {
-                    inverse.application == crate::seal_wal::ApplicationStatus::Applied
+                    inverse.application == crate::seal::wal::ApplicationStatus::Applied
                         && inverse.reverses_mutation_id == Some(permission.mutation_id)
                 })
         })
@@ -1289,7 +1294,7 @@ impl SealedStagingEngine {
             ));
         }
         // Enumerate candidate recovery ordering without granting authority. Every
-        // item is subsequently required to pass staging_recovery's fresh held-FD
+        // item is subsequently required to pass staging::recovery's fresh held-FD
         // rebind; this callback cannot itself authorize chmod or namespace work.
         let recovery_generation = NEXT_RECOVERY_GENERATION.fetch_add(1, Ordering::Relaxed);
         let mut work = replay
@@ -1538,10 +1543,10 @@ impl SealedStagingEngine {
             }
             if let RecoveryWork::FinalizeVerifiedUndo { outcome, .. } = work {
                 let terminal = match outcome {
-                    crate::seal_wal::DurableUndoRenameOutcome::AppliedAndParentsSynced(_) => {
+                    crate::seal::wal::DurableUndoRenameOutcome::AppliedAndParentsSynced(_) => {
                         TransactionState::Restored
                     }
-                    crate::seal_wal::DurableUndoRenameOutcome::ConfirmedCollisionAtStaged(_) => {
+                    crate::seal::wal::DurableUndoRenameOutcome::ConfirmedCollisionAtStaged(_) => {
                         TransactionState::UndoConflict
                     }
                 };

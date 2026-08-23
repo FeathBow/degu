@@ -23,7 +23,7 @@ use degu_core::activation::{
 use degu_core::ecosystem::DetectCtx;
 use degu_core::finding::Finding;
 use degu_core::safety::Guard;
-use degu_core::sealed_staging::{
+use degu_core::staging::{
     ForwardDirectoryIdentityProbe, VerifiedPurgeRequest, probe_forward_directory_identity,
 };
 use std::path::{Path, PathBuf};
@@ -455,7 +455,7 @@ fn sealed_mutation_authority_active(state: degu_core::authority::TransactionStat
 
 fn sealed_legacy_undo_block(
     path: &Path,
-    sealed_destinations: &[(Option<PathBuf>, degu_core::seal_wal::StrongObjectIdentity)],
+    sealed_destinations: &[(Option<PathBuf>, degu_core::seal::wal::StrongObjectIdentity)],
     anchors_authenticated: bool,
 ) -> Option<String> {
     let normalized = path

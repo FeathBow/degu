@@ -393,7 +393,7 @@ fn xdg_drift_cannot_rediscover_a_new_empty_store() {
             .kind(),
         StoreActivationKind::Lost
     );
-    assert!(changed.join(crate::seal_store::WAL_FILE_NAME).is_file());
+    assert!(changed.join(crate::seal::store::WAL_FILE_NAME).is_file());
 }
 
 #[test]
@@ -709,7 +709,7 @@ fn busy_store_parent_is_returned_as_error_not_corrupt_state() {
     assert!(matches!(
         discover_store_activation(&fixture.anchor, &fixture.store),
         Err(StoreActivationError::Store(StoreError::Lease(
-            crate::seal_wal::RecoveryLockError::Busy
+            crate::seal::wal::RecoveryLockError::Busy
         )))
     ));
     drop(parent);

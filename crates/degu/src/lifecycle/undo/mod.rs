@@ -10,8 +10,8 @@ use anyhow::{Context, Result};
 use degu_core::authority::TransactionState;
 use degu_core::ecosystem::DetectCtx;
 use degu_core::oplog::OpOutcome;
-use degu_core::seal_wal::TransactionId;
-use degu_core::sealed_staging::{
+use degu_core::seal::wal::TransactionId;
+use degu_core::staging::{
     ProductionStagingEntry, ReadyStagingEngine, VerifiedUndoFailureDisposition, VerifiedUndoRequest,
 };
 

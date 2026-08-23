@@ -6,18 +6,16 @@
 //! and rechecks that binding immediately before any held-FD mode restoration.
 
 use crate::authority::TransactionState;
-use crate::local_backend::held_tree::{
-    HeldTreeError, HeldTreeInventory, HeldTreeLimits, HeldTreePurgeError,
-};
-use crate::local_backend::{
+use crate::backend::held::{HeldTreeError, HeldTreeInventory, HeldTreeLimits, HeldTreePurgeError};
+use crate::backend::{
     CertificationError, CertifiedLocalBackend, HeldLocalBackendEvidence,
     LocalModeRevalidationFailure, certify_held_fd, certify_held_fd_backend,
 };
-use crate::seal_executor::{
+use crate::seal::executor::{
     LocalModeExecutionError, LocalModeMutationRequest, LocalModeTransform, RecoveryLocator,
     execute_staging_local_mode_mutation,
 };
-use crate::seal_wal::{
+use crate::seal::wal::{
     AppendError, ApplicationStatus, DurablePermission, DurableTreeManifest,
     DurableUndoRenameOutcome, PermissionResolution, RecoverySession, RecoveryWork, ResolveError,
     SealWal, StagingLocator, StagingTransactionMetadata, StrongObjectIdentity, TransactionId,
@@ -1229,8 +1227,8 @@ pub(crate) fn prepare_startup_recovery<'a>(
         let snapshot = wal
             .recovery_snapshot(transaction)
             .ok_or(RecoveryRebindError::TransactionMismatch)?;
-        let work = crate::seal_wal::decide_recovery(&snapshot, |_| {
-            crate::seal_wal::RecoveryIdentity::Reestablished
+        let work = crate::seal::wal::decide_recovery(&snapshot, |_| {
+            crate::seal::wal::RecoveryIdentity::Reestablished
         });
         // Preserve the typed RenameIntent+missing-outcome ambiguity. Repeated
         // attempts must never turn it into a generic state that permits lookup.
@@ -1239,27 +1237,27 @@ pub(crate) fn prepare_startup_recovery<'a>(
         }
         if let RecoveryWork::RecoveryRequired { reason, .. } = &work {
             return match reason {
-                crate::seal_wal::RecoveryRequiredReason::LegacySchemaMissingMountIdentity {
+                crate::seal::wal::RecoveryRequiredReason::LegacySchemaMissingMountIdentity {
                     version,
                 } => fail_closed(
                     wal,
                     transaction,
                     RecoveryRebindError::LegacySchemaMissingMountIdentity(*version),
                 ),
-                crate::seal_wal::RecoveryRequiredReason::RecordedRecoveryRequired => {
+                crate::seal::wal::RecoveryRequiredReason::RecordedRecoveryRequired => {
                     Err(RecoveryRebindError::RecordedRecoveryRequired)
                 }
-                crate::seal_wal::RecoveryRequiredReason::InsufficientPersistentIdentity => {
+                crate::seal::wal::RecoveryRequiredReason::InsufficientPersistentIdentity => {
                     fail_closed(
                         wal,
                         transaction,
                         RecoveryRebindError::StrongIdentityUnavailable,
                     )
                 }
-                crate::seal_wal::RecoveryRequiredReason::RenameOutcomeUnknown => {
+                crate::seal::wal::RecoveryRequiredReason::RenameOutcomeUnknown => {
                     unreachable!("rename ambiguity handled before recovery-required dispatch")
                 }
-                crate::seal_wal::RecoveryRequiredReason::InterruptedPurge => fail_closed(
+                crate::seal::wal::RecoveryRequiredReason::InterruptedPurge => fail_closed(
                     wal,
                     transaction,
                     RecoveryRebindError::RecordedRecoveryRequired,
@@ -1468,7 +1466,7 @@ fn resolve_uncertain_permissions(
         let expected = StrongObjectIdentity::new_with_mount(
             permission.evidence.device(),
             permission.evidence.inode(),
-            crate::seal_wal::ObjectIncarnation::new(
+            crate::seal::wal::ObjectIncarnation::new(
                 permission
                     .evidence
                     .generation_or_btime()
@@ -1532,7 +1530,7 @@ fn uncertain_permission_location<'a>(
         .iter()
         .find(|candidate| candidate.mutation_id == original_id)
         .ok_or(RecoveryRebindError::TransactionMismatch)?;
-    if original.application != crate::seal_wal::ApplicationStatus::Applied
+    if original.application != crate::seal::wal::ApplicationStatus::Applied
         || original.reverses_mutation_id.is_some()
         || !matches!(
             original.phase,
@@ -1802,7 +1800,7 @@ fn recovery_lookup_is_forbidden(work: &RecoveryWork) -> bool {
     matches!(
         work,
         RecoveryWork::RecoveryRequired {
-            reason: crate::seal_wal::RecoveryRequiredReason::RenameOutcomeUnknown,
+            reason: crate::seal::wal::RecoveryRequiredReason::RenameOutcomeUnknown,
             ..
         }
     )
@@ -1904,7 +1902,7 @@ fn rebind_staged_tree_seals(
         let expected = StrongObjectIdentity::new_with_mount(
             permission.evidence.device(),
             permission.evidence.inode(),
-            crate::seal_wal::ObjectIncarnation::new(
+            crate::seal::wal::ObjectIncarnation::new(
                 permission
                     .evidence
                     .generation_or_btime()
@@ -1980,7 +1978,7 @@ fn rebind_verified_undo_tree_seals(
         let expected = StrongObjectIdentity::new_with_mount(
             original.evidence.device(),
             original.evidence.inode(),
-            crate::seal_wal::ObjectIncarnation::new(
+            crate::seal::wal::ObjectIncarnation::new(
                 original
                     .evidence
                     .generation_or_btime()
@@ -2026,7 +2024,7 @@ fn rebind_permissions(
             let expected = StrongObjectIdentity::new_with_mount(
                 permission.evidence.device(),
                 permission.evidence.inode(),
-                crate::seal_wal::ObjectIncarnation::new(
+                crate::seal::wal::ObjectIncarnation::new(
                     permission
                         .evidence
                         .generation_or_btime()
@@ -2080,7 +2078,7 @@ fn rebind_quarantined_permissions(
             let expected = StrongObjectIdentity::new_with_mount(
                 permission.evidence.device(),
                 permission.evidence.inode(),
-                crate::seal_wal::ObjectIncarnation::new(
+                crate::seal::wal::ObjectIncarnation::new(
                     permission
                         .evidence
                         .generation_or_btime()
@@ -2450,7 +2448,7 @@ pub(crate) fn strong_identity_fd(
     Ok(StrongObjectIdentity::new_with_mount(
         stat.st_dev,
         statx.stx_ino,
-        crate::seal_wal::ObjectIncarnation::new(incarnation),
+        crate::seal::wal::ObjectIncarnation::new(incarnation),
         statx.stx_mnt_id,
     ))
 }
@@ -2476,7 +2474,7 @@ pub(crate) fn strong_identity_fd(
     Ok(StrongObjectIdentity::new_with_mount(
         mount_id,
         stat.st_ino,
-        crate::seal_wal::ObjectIncarnation::new(incarnation),
+        crate::seal::wal::ObjectIncarnation::new(incarnation),
         mount_id,
     ))
 }

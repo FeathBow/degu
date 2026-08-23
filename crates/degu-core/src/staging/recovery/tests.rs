@@ -1,7 +1,7 @@
 use super::*;
 use crate::authority::PersistentRecoveryEvidence;
-use crate::seal_store::SealWalStore;
-use crate::seal_wal::{
+use crate::seal::store::SealWalStore;
+use crate::seal::wal::{
     ApplicationStatus, DurableSourceParentStrategy, DurableTreeManifest, ObjectIncarnation,
     PermissionIntent, RecoveryIdentity, RecoveryRequiredReason, decide_recovery,
 };
@@ -350,7 +350,7 @@ fn uncertain_staging_intent_resolves_before_after_and_at_fresh_resolution() {
         );
         assert!(matches!(
             result,
-            Err(crate::seal_wal::MutationAppendError::Mutation(_))
+            Err(crate::seal::wal::MutationAppendError::Mutation(_))
         ));
         drop(wal);
 
@@ -625,7 +625,7 @@ fn uncertain_inverse_intents_resolve_before_and_after_fchmod_in_every_restore_ph
             );
             assert!(matches!(
                 result,
-                Err(crate::seal_wal::MutationAppendError::Mutation(_))
+                Err(crate::seal::wal::MutationAppendError::Mutation(_))
             ));
             drop(wal);
 
@@ -905,7 +905,7 @@ fn quarantined_active_seals_restore_in_place_and_unblock_without_unquarantining(
     restore.execute().unwrap();
     let snapshot = wal.recovery_snapshot(transaction).unwrap();
     assert_eq!(snapshot.state, TransactionState::Quarantined);
-    assert!(!crate::seal_wal::quarantined_transaction_retains_active_permission_seals(&snapshot));
+    assert!(!crate::seal::wal::quarantined_transaction_retains_active_permission_seals(&snapshot));
     assert!(!startup_blocked);
     assert_eq!(
         fs::metadata(source_path).unwrap().permissions().mode() & 0o7777,
@@ -1177,7 +1177,7 @@ fn dropping_pending_before_transition_replays_staged_unverified() {
     drop(wal);
 
     let store = SealWalStore::open_or_create(&fixture._temp.path().join("verifier-wal")).unwrap();
-    let (reopened, report) = crate::sealed_staging::SealedStagingEngine::open(&store).unwrap();
+    let (reopened, report) = crate::staging::SealedStagingEngine::open(&store).unwrap();
     assert_eq!(report.candidates().len(), 1);
     assert_eq!(
         reopened.state(transaction),
@@ -1209,7 +1209,7 @@ fn durable_staged_sealed_replays_without_commit_promotion() {
     drop(wal);
 
     let store = SealWalStore::open_or_create(&fixture._temp.path().join("verifier-wal")).unwrap();
-    let (reopened, report) = crate::sealed_staging::SealedStagingEngine::open(&store).unwrap();
+    let (reopened, report) = crate::staging::SealedStagingEngine::open(&store).unwrap();
     assert_eq!(report.candidates().len(), 1);
     assert_eq!(
         reopened.state(transaction),

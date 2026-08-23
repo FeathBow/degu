@@ -26,7 +26,7 @@ pub(crate) fn execute_clean(
     plan: &CapturedCleanPlan,
     purge: bool,
     recheck: &dyn Fn(&Finding) -> Result<(), String>,
-    sealed_staging: Option<&mut degu_core::sealed_staging::ReadyStagingEngine>,
+    sealed_staging: Option<&mut degu_core::staging::ReadyStagingEngine>,
 ) -> anyhow::Result<Vec<CleanExecution>> {
     let reclamation_id = reclamation_id();
     if let Some(engine) = sealed_staging {

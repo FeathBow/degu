@@ -5,12 +5,12 @@
 //! rejects root. Layout, ownership, and path selection are never caller supplied;
 //! existing objects are authenticated and never repaired or replaced.
 
-use crate::local_backend::{
+use crate::backend::{
     CertificationError, CertifiedLocalBackend, certify_held_fd_backend, require_held_fd_acl_absent,
 };
-use crate::seal_store::{StoreError, open_authenticated_parent};
-use crate::seal_wal::{ExclusiveFileLock, RecoveryLockError, StrongObjectIdentity};
-use crate::staging_recovery::strong_identity_fd;
+use crate::seal::store::{StoreError, open_authenticated_parent};
+use crate::seal::wal::{ExclusiveFileLock, RecoveryLockError, StrongObjectIdentity};
+use crate::staging::recovery::strong_identity_fd;
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
 use std::ffi::{OsStr, OsString};

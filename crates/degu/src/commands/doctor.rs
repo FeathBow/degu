@@ -5,8 +5,8 @@ use degu_core::activation::{
     ActivationAuthorityMode, CurrentEuidAuthorityReadiness, StoreActivationError,
     StoreActivationKind, check_current_euid_authority_readiness,
 };
-use degu_core::local_backend::{CertificationError, CertifiedLocalBackend};
-use degu_core::seal_store::StoreError;
+use degu_core::backend::{CertificationError, CertifiedLocalBackend};
+use degu_core::seal::store::StoreError;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 

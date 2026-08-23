@@ -6,21 +6,19 @@
 //! or delete, and its only success state is `StagedUnverified`.
 
 use crate::authority::TransactionState;
-use crate::local_backend::held_tree::{
-    HeldTreeError, HeldTreeInventory, HeldTreeLimits, HeldTreeSealError,
-};
-use crate::local_backend::{
+use crate::backend::held::{HeldTreeError, HeldTreeInventory, HeldTreeLimits, HeldTreeSealError};
+use crate::backend::{
     CertificationError, HeldLocalBackendEvidence, LocalModeRevalidationFailure, certify_held_fd,
 };
-use crate::seal_executor::{
+use crate::seal::executor::{
     LocalModeExecutionError, LocalModeMutationRequest, LocalModeMutationResult, LocalModeTransform,
     RecoveryLocator, execute_staging_local_mode_mutation,
 };
-use crate::seal_wal::{
+use crate::seal::wal::{
     AppendError, DurableSourceParentStrategy, DurableTreeManifest, RecoverySession, SealWal,
     StagingLocator, StagingTransactionMetadata, StrongObjectIdentity, TransactionId,
 };
-use crate::staging_recovery::{
+use crate::staging::recovery::{
     RecoveryFilesystemAnchor, RecoveryRebindError, held_filesystem_id, strong_identity_fd,
 };
 use rustix::fd::OwnedFd;
@@ -132,7 +130,7 @@ impl PreparedRootBinding {
         destination_parent: OwnedFd,
         destination_parent_locator: StagingLocator,
         destination_basename: OsString,
-        production_association: Option<crate::seal_wal::ProductionAssociation>,
+        production_association: Option<crate::seal::wal::ProductionAssociation>,
         recovery_anchor: Option<PathBuf>,
     ) -> Result<Self, PreparedRootError> {
         if !normal_basename(&source_basename) || !normal_basename(&destination_basename) {

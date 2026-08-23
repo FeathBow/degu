@@ -119,8 +119,8 @@ fn trash_purge_colors_the_permanent_deletion_plan() {
     assert!(out.stdout.windows(2).any(|window| window == b"\x1b["));
     assert!(
         out.stdout
-            .windows(b"will be permanently deleted".len())
-            .any(|window| window == b"will be permanently deleted")
+            .windows(b"purge-supported entries".len())
+            .any(|window| window == b"purge-supported entries")
     );
 }
 

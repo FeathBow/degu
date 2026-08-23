@@ -139,7 +139,7 @@ fn print_plan(plan: &TrashPurgePlan, home: &Path, color_enabled: bool) -> Result
     }
     let noun = if plan.len() == 1 { "entry" } else { "entries" };
     stdoutln!(
-        "Purge plan: {} reviewed trash {noun} will be considered; purge-supported entries {action}, while sealed internal-hardlink entries are retained and remain undoable.",
+        "Purge plan: {} reviewed trash {noun} will be considered; purge-supported entries {action}, while sealed entries with unsupported purge topology are retained and remain undoable.",
         plan.len(),
     )?;
     for entry in plan.entries() {

@@ -3,8 +3,9 @@
 //!
 //! This module deliberately owns no filesystem handles and grants no mutation
 //! authority. Callers collect facts; this module only explains whether the
-//! current content-proof format can represent them. Hard-link topology and
-//! xattr value digests remain future schema work.
+//! current content-proof format can represent them. Regular-file hard-link
+//! topology is finalized at tree scope. Ordinary regular-file xattrs are admitted
+//! only when their names and values are committed by proof schema v3.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EntryKind {
@@ -96,6 +97,24 @@ pub(crate) enum RejectReason<'a> {
 pub(crate) enum Admission<'a> {
     Admit,
     Reject(RejectReason<'a>),
+}
+
+/// Whether proof schema v3 may bind this ordinary regular-file xattr by name
+/// and value. Authority-bearing, platform-unknown, and directory/symlink xattrs
+/// are deliberately outside this allowlist.
+pub(crate) fn ordinary_regular_xattr_is_admitted(platform: XattrPlatform, name: &[u8]) -> bool {
+    match classify_xattr(platform, name) {
+        #[cfg(any(target_os = "linux", test))]
+        XattrNameClass::LinuxUser => true,
+        #[cfg(any(target_os = "macos", test))]
+        XattrNameClass::MacOsQuarantine
+        | XattrNameClass::MacOsProvenance
+        | XattrNameClass::MacOsMetadata
+        | XattrNameClass::MacOsLastUsedDate
+        | XattrNameClass::MacOsFinderInfo
+        | XattrNameClass::MacOsResourceFork => true,
+        _ => false,
+    }
 }
 
 /// Apply the current, deliberately conservative content-proof policy.
@@ -390,6 +409,44 @@ mod tests {
                 assess_content(&facts),
                 Admission::Reject(RejectReason::ExtendedAttributePresent { name, class }),
                 "{platform:?} {name:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_v3_allowlist_excludes_authority_and_unknown_namespaces() {
+        let admitted: &[(XattrPlatform, &[u8])] = &[
+            (XattrPlatform::Linux, b"user.comment"),
+            (XattrPlatform::MacOs, b"com.apple.quarantine"),
+            (XattrPlatform::MacOs, b"com.apple.provenance"),
+            (
+                XattrPlatform::MacOs,
+                b"com.apple.metadata:kMDItemWhereFroms",
+            ),
+            (XattrPlatform::MacOs, b"com.apple.lastuseddate#PS"),
+            (XattrPlatform::MacOs, b"com.apple.FinderInfo"),
+            (XattrPlatform::MacOs, b"com.apple.ResourceFork"),
+        ];
+        for &(platform, name) in admitted {
+            assert!(
+                ordinary_regular_xattr_is_admitted(platform, name),
+                "{name:?}"
+            );
+        }
+
+        let rejected: &[(XattrPlatform, &[u8])] = &[
+            (XattrPlatform::Linux, b"system.posix_acl_access"),
+            (XattrPlatform::Linux, b"trusted.overlay.opaque"),
+            (XattrPlatform::Linux, b"security.capability"),
+            (XattrPlatform::Linux, b"security.selinux"),
+            (XattrPlatform::Linux, b"vendor.attribute"),
+            (XattrPlatform::MacOs, b"com.apple.unknown"),
+            (XattrPlatform::Other, b"user.comment"),
+        ];
+        for &(platform, name) in rejected {
+            assert!(
+                !ordinary_regular_xattr_is_admitted(platform, name),
+                "{name:?}"
             );
         }
     }

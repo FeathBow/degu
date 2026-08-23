@@ -319,5 +319,4 @@ fn contextual_error(operation: &str, path: &Path, error: io::Error) -> io::Error
 }
 
 #[cfg(test)]
-#[path = "mutation_guard/tests.rs"]
 mod tests;

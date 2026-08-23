@@ -1,5 +1,6 @@
 mod execution;
 mod plan;
+mod policy;
 mod production;
 mod purge;
 #[cfg(test)]
@@ -38,6 +39,12 @@ pub(crate) fn execute_clean(
             engine,
             purge,
         };
+        if plan.requires_atomic_batch_preflight()
+            && let Some(rejected) = production::batch_preflight(ctx, plan)
+        {
+            return Ok(rejected);
+        }
+
         let mut executed = Vec::with_capacity(plan.items().len());
         let mut blocked = false;
         for (finding, identity) in plan.items_with_identities() {
@@ -45,7 +52,7 @@ pub(crate) fn execute_clean(
                 // A prior item poisoned the WAL lease for the rest of this run;
                 // report each remaining finding as not attempted rather than
                 // silently dropping it from the results.
-                executed.push(CleanExecution::plain_stage_failed(
+                executed.push(CleanExecution::not_attempted(
                     finding,
                     "sealed-staging recovery was blocked earlier in this run; not attempted"
                         .to_string(),

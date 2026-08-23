@@ -3,8 +3,8 @@ use crate::findings::{FindingsTableOptions, print as print_findings_table};
 use crate::output::stdoutln;
 use crate::presentation::semantic::Tone;
 use crate::presentation::{
-    any_hardlinked, cleanup, lower_bound_bytes, print_hardlink_summary,
-    print_scan_incomplete_warning, semantic,
+    any_hardlinked, cleanup, display_path, escape_terminal_text, lower_bound_bytes,
+    print_hardlink_summary, print_scan_incomplete_warning, semantic,
 };
 use crate::runtime::{Headline, HeadlineLead};
 use anyhow::Result;
@@ -84,28 +84,53 @@ fn print_dry_run_header(prepared: &PreparedClean) -> Result<()> {
 }
 
 fn print_selected(prepared: &PreparedClean) -> Result<()> {
-    let stats = cleanup::FindingStats::from_findings(prepared.plan.items());
-    print_selection_summary(prepared, stats)?;
-    print_selected_group(prepared, DispositionMode::Eligible)?;
-    print_selected_group(prepared, DispositionMode::OptIn)?;
-    if any_hardlinked(prepared.plan.items()) {
-        stdoutln!("")?;
+    let assessed = prepared.preview_tree_policy_assessed();
+    let assessed_owned = assessed
+        .iter()
+        .map(|finding| (*finding).clone())
+        .collect::<Vec<_>>();
+    if !assessed_owned.is_empty() {
+        let stats = cleanup::FindingStats::from_findings(&assessed_owned);
+        print_selection_summary(prepared, stats, &assessed_owned)?;
+        print_selected_group(prepared, DispositionMode::Eligible)?;
+        print_selected_group(prepared, DispositionMode::OptIn)?;
+        if prepared.settings.dry_run {
+            stdoutln!(
+                "{}",
+                prepared.settings.ui.toned_prose(
+                    0,
+                    "Tree policy metadata assessed; source-parent seal, regular-file content reads, and runtime checks remain for execution.",
+                    Tone::Secondary,
+                )
+            )?;
+        }
+        if any_hardlinked(&assessed_owned) {
+            stdoutln!("")?;
+        }
+        print_hardlink_summary(
+            &assessed_owned,
+            assessed_owned
+                .iter()
+                .any(|finding| finding.measurement_incomplete()),
+            prepared.settings.ui,
+        )?;
     }
-    print_hardlink_summary(
-        prepared.plan.items(),
-        prepared.plan_lower_bound(),
-        prepared.settings.ui,
-    )
+    print_preflight_group(prepared, true)?;
+    print_preflight_group(prepared, false)
 }
 
-fn print_selection_summary(prepared: &PreparedClean, stats: cleanup::FindingStats) -> Result<()> {
+fn print_selection_summary(
+    prepared: &PreparedClean,
+    stats: cleanup::FindingStats,
+    findings: &[degu_core::finding::Finding],
+) -> Result<()> {
     if !prepared.settings.dry_run {
         return print_selected_summary(prepared, stats);
     }
     if prepared.settings.purge {
-        print_permanent_preview(prepared, stats)
+        print_permanent_preview(prepared, stats, findings)
     } else {
-        print_staging_preview(prepared, stats)
+        print_staging_preview(prepared, stats, findings)
     }
 }
 
@@ -123,13 +148,17 @@ fn print_selected_summary(prepared: &PreparedClean, stats: cleanup::FindingStats
     )
 }
 
-fn print_permanent_preview(prepared: &PreparedClean, stats: cleanup::FindingStats) -> Result<()> {
+fn print_permanent_preview(
+    prepared: &PreparedClean,
+    stats: cleanup::FindingStats,
+    findings: &[degu_core::finding::Finding],
+) -> Result<()> {
     stdoutln!(
         "{}",
         semantic::paint(
             prepared.settings.ui.prose(&format!(
                 "Would permanently delete {} after exact authority verification",
-                planned_bytes(prepared)
+                preview_bytes(prepared, findings)
             )),
             Tone::Destructive,
             prepared.settings.ui.colors.stdout
@@ -146,12 +175,16 @@ fn print_permanent_preview(prepared: &PreparedClean, stats: cleanup::FindingStat
     )
 }
 
-fn print_staging_preview(prepared: &PreparedClean, stats: cleanup::FindingStats) -> Result<()> {
+fn print_staging_preview(
+    prepared: &PreparedClean,
+    stats: cleanup::FindingStats,
+    findings: &[degu_core::finding::Finding],
+) -> Result<()> {
     stdoutln!(
         "{}",
         prepared.settings.ui.headline(
             Headline::new(
-                format!("Would move {}", planned_bytes(prepared)),
+                format!("Would move {}", preview_bytes(prepared, findings)),
                 HeadlineLead::Phrase("to")
             )
             .stat("Degu trash")
@@ -196,6 +229,11 @@ fn print_selected_group(prepared: &PreparedClean, mode: DispositionMode) -> Resu
         .items()
         .iter()
         .filter(|finding| finding.disposition().mode == mode)
+        .filter(|finding| {
+            prepared
+                .preview_assessment(finding)
+                .is_none_or(|assessment| assessment.is_tree_policy_assessed())
+        })
         .cloned()
         .collect::<Vec<_>>();
     if findings.is_empty() {
@@ -234,6 +272,77 @@ fn table_options(prepared: &PreparedClean) -> FindingsTableOptions<'_> {
         prepared.settings.ui,
         prepared.settings.details,
         &prepared.ctx.home,
+    )
+}
+
+fn print_preflight_group(prepared: &PreparedClean, blocked: bool) -> Result<()> {
+    let rows = prepared
+        .plan
+        .items()
+        .iter()
+        .zip(prepared.preview_assessments())
+        .filter(|(_, assessment)| {
+            if blocked {
+                assessment.is_blocked()
+            } else {
+                assessment.needs_execution_validation()
+            }
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let findings = rows
+        .iter()
+        .map(|(finding, _)| (*finding).clone())
+        .collect::<Vec<_>>();
+    let stats = cleanup::FindingStats::from_findings(&findings);
+    let label = if blocked {
+        "Blocked by sealed staging preflight"
+    } else {
+        "Needs execution validation"
+    };
+    let mode = if blocked {
+        DispositionMode::ReportOnly
+    } else {
+        DispositionMode::OptIn
+    };
+    stdoutln!(
+        "\n{}",
+        cleanup::group_header(
+            prepared.settings.ui,
+            cleanup::Group {
+                label,
+                mode,
+                stats,
+                scan_lower_bound: findings
+                    .iter()
+                    .any(|finding| finding.measurement_incomplete()),
+                indent: 0,
+            },
+        )
+    )?;
+    for (finding, assessment) in rows {
+        let path = escape_terminal_text(&display_path(finding.path(), &prepared.ctx.home));
+        let reason = assessment
+            .reason()
+            .unwrap_or("execution validation required");
+        stdoutln!("  {path}")?;
+        stdoutln!("    {reason}")?;
+    }
+    Ok(())
+}
+
+fn preview_bytes(prepared: &PreparedClean, findings: &[degu_core::finding::Finding]) -> String {
+    lower_bound_bytes(
+        findings
+            .iter()
+            .any(|finding| finding.measurement_incomplete()),
+        findings
+            .iter()
+            .map(|finding| finding.bytes_allocated())
+            .sum(),
+        prepared.settings.ui.glyphs,
     )
 }
 

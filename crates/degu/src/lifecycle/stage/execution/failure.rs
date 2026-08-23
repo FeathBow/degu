@@ -2,6 +2,9 @@ use std::path::Path;
 
 #[derive(Clone, Copy)]
 pub(crate) enum CleanExecutionFailure<'a> {
+    NotAttempted {
+        reason: &'a str,
+    },
     StageFailed {
         reason: &'a str,
     },
@@ -36,7 +39,8 @@ pub(crate) enum CleanExecutionFailure<'a> {
 impl<'a> CleanExecutionFailure<'a> {
     pub(crate) fn reason(self) -> &'a str {
         match self {
-            Self::StageFailed { reason }
+            Self::NotAttempted { reason }
+            | Self::StageFailed { reason }
             | Self::Quarantined { reason, .. }
             | Self::RecoveryBlocked { reason, .. }
             | Self::UnverifiedDestination { reason, .. }

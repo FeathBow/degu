@@ -2,8 +2,6 @@
 mod common;
 #[path = "support/elapsed.rs"]
 mod elapsed;
-#[path = "support/human_bytes.rs"]
-mod human_bytes;
 #[path = "support/next_command.rs"]
 mod next_command;
 #[path = "support/oplog_records.rs"]
@@ -51,5 +49,7 @@ mod review_preview;
 mod safety;
 #[path = "clean/scope.rs"]
 mod scope;
+#[path = "clean/sealed_admission.rs"]
+mod sealed_admission;
 #[path = "clean/support.rs"]
 mod support;

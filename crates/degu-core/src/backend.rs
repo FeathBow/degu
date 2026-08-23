@@ -13,11 +13,15 @@ pub(crate) mod held;
 pub(crate) mod roles;
 use rustix::fd::{AsFd, OwnedFd};
 use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
+use std::fmt;
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 const LINUX_MAGIC_MASK: u64 = u32::MAX as u64;
 const EXT4_MAGIC: u64 = 0x0000_EF53;
@@ -243,6 +247,370 @@ pub(crate) enum HeldModeChangeOutcome {
         syscall: ModeSyscallFailure,
         post_failure: LocalModeRevalidationFailure,
     },
+}
+
+/// Data-only outcome of metadata-only tree policy assessment. Regular-file
+/// contents are not read or hashed, the source-parent seal/fchmod is not
+/// executed, and mutation runtime must repeat its complete production preflight.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HeldTreePolicyAssessmentOutcome {
+    TreePolicyAssessed {
+        tree: HeldTreePolicySummary,
+        source_parent_seal: SourceParentSealAssessment,
+    },
+    TreePolicyDeferredUntilSourceParentSeal {
+        reason: HeldTreePolicyDeferralReason,
+        source_parent_seal: SourceParentSealAssessment,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeldTreePolicySummary {
+    pub entries: u64,
+    pub directories: u64,
+    pub path_bytes: u64,
+    pub manifest_bytes: u64,
+    pub content_bytes_from_metadata: u64,
+    pub assessed_at: SystemTime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceParentSealAssessment {
+    pub original_mode: u32,
+    pub projected_mode: u32,
+    pub validation: SourceParentSealAssessmentStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceParentSealAssessmentStatus {
+    RequiresExecutionValidation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeldTreePolicyDeferralReason {
+    SourceParentSearchRequiresExecutionSeal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeldTreeAssessmentFailureCategory {
+    Input,
+    ResourceLimit,
+    TreePolicy,
+    PlatformEvidence,
+    RaceOrIo,
+    InternalFailClosed,
+}
+
+impl HeldTreeAssessmentFailureCategory {
+    /// Stable machine-readable category label for logs and API adapters.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::ResourceLimit => "resource_limit",
+            Self::TreePolicy => "tree_policy",
+            Self::PlatformEvidence => "platform_evidence",
+            Self::RaceOrIo => "race_or_io",
+            Self::InternalFailClosed => "internal_fail_closed",
+        }
+    }
+}
+
+impl fmt::Display for HeldTreeAssessmentFailureCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str((*self).as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeldTreeAssessmentFailureKind {
+    InvalidRoot,
+    InvalidDirectoryLimit,
+    EntryLimitExceeded,
+    DirectoryLimitExceeded,
+    DepthLimitExceeded,
+    PathBytesLimitExceeded,
+    ManifestBytesLimitExceeded,
+    ContentBytesLimitExceeded,
+    SourceParentPolicyRejected,
+    SourceParentStateChanged,
+    ForeignOwner,
+    ProtectedName,
+    BackendBoundary,
+    IdentityChanged,
+    StrongIncarnationUnavailable,
+    ExternalHardLink,
+    NonDirectoryExtendedMetadata,
+    MetadataEvidenceUnavailable,
+    AclPresent,
+    UnsupportedContentKind,
+    ContentOrMetadataChanged,
+    RootNotDirectory,
+    CertificationFailed,
+    IoFailure,
+    ProveOnlyStateObserved,
+    RootBindingChanged,
+}
+
+impl HeldTreeAssessmentFailureKind {
+    /// Stable machine-readable kind label for logs and API adapters.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRoot => "invalid_root",
+            Self::InvalidDirectoryLimit => "invalid_directory_limit",
+            Self::EntryLimitExceeded => "entry_limit_exceeded",
+            Self::DirectoryLimitExceeded => "directory_limit_exceeded",
+            Self::DepthLimitExceeded => "depth_limit_exceeded",
+            Self::PathBytesLimitExceeded => "path_bytes_limit_exceeded",
+            Self::ManifestBytesLimitExceeded => "manifest_bytes_limit_exceeded",
+            Self::ContentBytesLimitExceeded => "content_bytes_limit_exceeded",
+            Self::SourceParentPolicyRejected => "source_parent_policy_rejected",
+            Self::SourceParentStateChanged => "source_parent_state_changed",
+            Self::ForeignOwner => "foreign_owner",
+            Self::ProtectedName => "protected_name",
+            Self::BackendBoundary => "backend_boundary",
+            Self::IdentityChanged => "identity_changed",
+            Self::StrongIncarnationUnavailable => "strong_incarnation_unavailable",
+            Self::ExternalHardLink => "external_hard_link",
+            Self::NonDirectoryExtendedMetadata => "non_directory_extended_metadata",
+            Self::MetadataEvidenceUnavailable => "metadata_evidence_unavailable",
+            Self::AclPresent => "acl_present",
+            Self::UnsupportedContentKind => "unsupported_content_kind",
+            Self::ContentOrMetadataChanged => "content_or_metadata_changed",
+            Self::RootNotDirectory => "root_not_directory",
+            Self::CertificationFailed => "certification_failed",
+            Self::IoFailure => "io_failure",
+            Self::ProveOnlyStateObserved => "prove_only_state_observed",
+            Self::RootBindingChanged => "root_binding_changed",
+        }
+    }
+
+    /// Short human-readable phrase suitable for a user-facing error.
+    pub fn user_message(self) -> &'static str {
+        match self {
+            Self::InvalidRoot => "invalid root",
+            Self::InvalidDirectoryLimit => "invalid directory limit",
+            Self::EntryLimitExceeded => "entry limit exceeded",
+            Self::DirectoryLimitExceeded => "directory limit exceeded",
+            Self::DepthLimitExceeded => "depth limit exceeded",
+            Self::PathBytesLimitExceeded => "path-byte limit exceeded",
+            Self::ManifestBytesLimitExceeded => "manifest-byte limit exceeded",
+            Self::ContentBytesLimitExceeded => "content-byte limit exceeded",
+            Self::SourceParentPolicyRejected => "source parent policy rejected",
+            Self::SourceParentStateChanged => "source parent state changed",
+            Self::ForeignOwner => "entry has a foreign owner",
+            Self::ProtectedName => "protected name encountered",
+            Self::BackendBoundary => "backend boundary encountered",
+            Self::IdentityChanged => "entry identity changed",
+            Self::StrongIncarnationUnavailable => "strong entry incarnation unavailable",
+            Self::ExternalHardLink => "external hard link encountered",
+            Self::NonDirectoryExtendedMetadata => "unsupported extended metadata",
+            Self::MetadataEvidenceUnavailable => "extended-metadata evidence unavailable",
+            Self::AclPresent => "ACL present",
+            Self::UnsupportedContentKind => "unsupported content kind",
+            Self::ContentOrMetadataChanged => "content or metadata changed",
+            Self::RootNotDirectory => "root is not a directory",
+            Self::CertificationFailed => "directory certification failed",
+            Self::IoFailure => "filesystem operation failed",
+            Self::ProveOnlyStateObserved => "unproven tree change observed",
+            Self::RootBindingChanged => "root binding changed",
+        }
+    }
+
+    pub fn category(self) -> HeldTreeAssessmentFailureCategory {
+        use HeldTreeAssessmentFailureCategory as C;
+        match self {
+            Self::InvalidRoot | Self::InvalidDirectoryLimit => C::Input,
+            Self::EntryLimitExceeded
+            | Self::DirectoryLimitExceeded
+            | Self::DepthLimitExceeded
+            | Self::PathBytesLimitExceeded
+            | Self::ManifestBytesLimitExceeded
+            | Self::ContentBytesLimitExceeded => C::ResourceLimit,
+            Self::SourceParentPolicyRejected
+            | Self::ForeignOwner
+            | Self::ProtectedName
+            | Self::ExternalHardLink
+            | Self::NonDirectoryExtendedMetadata
+            | Self::AclPresent
+            | Self::UnsupportedContentKind
+            | Self::RootNotDirectory => C::TreePolicy,
+            Self::BackendBoundary
+            | Self::StrongIncarnationUnavailable
+            | Self::CertificationFailed => C::PlatformEvidence,
+            Self::SourceParentStateChanged
+            | Self::IdentityChanged
+            | Self::MetadataEvidenceUnavailable
+            | Self::ContentOrMetadataChanged
+            | Self::IoFailure
+            | Self::RootBindingChanged => C::RaceOrIo,
+            Self::ProveOnlyStateObserved => C::InternalFailClosed,
+        }
+    }
+}
+
+impl fmt::Display for HeldTreeAssessmentFailureKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str((*self).user_message())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeldTreeAssessmentFailure {
+    kind: HeldTreeAssessmentFailureKind,
+    relative_path: Option<PathBuf>,
+}
+impl HeldTreeAssessmentFailure {
+    pub fn kind(&self) -> HeldTreeAssessmentFailureKind {
+        self.kind
+    }
+    pub fn category(&self) -> HeldTreeAssessmentFailureCategory {
+        self.kind.category()
+    }
+    /// The confined path is relative to the certified source parent. `None`
+    /// means the failure concerns the root or a whole-tree invariant.
+    pub fn relative_path(&self) -> Option<&Path> {
+        self.relative_path.as_deref()
+    }
+}
+impl fmt::Display for HeldTreeAssessmentFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "held-tree assessment failed: {}",
+            self.kind.user_message()
+        )?;
+        if let Some(path) = &self.relative_path {
+            write!(f, " at {}", path.display())?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for HeldTreeAssessmentFailure {}
+
+pub(crate) fn held_tree_protected_names() -> Vec<OsString> {
+    crate::safety::PROTECTED_DESCENDANT_DIR_NAMES
+        .iter()
+        .map(OsString::from)
+        .collect()
+}
+
+/// Consumes certified source-parent evidence and applies the exact production
+/// limits and protected-name policy. The caller cannot weaken either policy,
+/// and the output cannot construct staging, WAL, or mutation authority.
+pub fn assess_held_tree_policy_metadata(
+    source_parent: HeldLocalBackendEvidence,
+    root_basename: &OsStr,
+) -> Result<HeldTreePolicyAssessmentOutcome, HeldTreeAssessmentFailure> {
+    held::assess_tree_admission(
+        source_parent,
+        root_basename,
+        held_tree_protected_names(),
+        held::HeldTreeLimits::default(),
+    )
+    .map(map_tree_assessment)
+    .map_err(map_tree_assessment_failure)
+}
+
+fn map_tree_assessment(a: held::HeldTreeAdmissionAssessment) -> HeldTreePolicyAssessmentOutcome {
+    let seal = |s: held::SourceParentSealProjection| SourceParentSealAssessment {
+        original_mode: s.original_mode,
+        projected_mode: s.projected_mode,
+        validation: SourceParentSealAssessmentStatus::RequiresExecutionValidation,
+    };
+    match a {
+        held::HeldTreeAdmissionAssessment::TreePolicyAssessed {
+            tree,
+            source_parent_seal,
+        } => HeldTreePolicyAssessmentOutcome::TreePolicyAssessed {
+            tree: HeldTreePolicySummary {
+                entries: tree.entries,
+                directories: tree.directories,
+                path_bytes: tree.path_bytes,
+                manifest_bytes: tree.manifest_bytes,
+                content_bytes_from_metadata: tree.content_bytes,
+                assessed_at: tree.assessed_at,
+            },
+            source_parent_seal: seal(source_parent_seal),
+        },
+        held::HeldTreeAdmissionAssessment::TreePolicyDeferredUntilSourceParentSeal {
+            reason: held::TreePolicyDeferralReason::SourceParentSearchRequiresExecutionSeal,
+            source_parent_seal,
+        } => HeldTreePolicyAssessmentOutcome::TreePolicyDeferredUntilSourceParentSeal {
+            reason: HeldTreePolicyDeferralReason::SourceParentSearchRequiresExecutionSeal,
+            source_parent_seal: seal(source_parent_seal),
+        },
+    }
+}
+
+fn map_tree_assessment_failure(e: held::HeldTreeError) -> HeldTreeAssessmentFailure {
+    use held::{HeldTreeError as E, HeldTreeLimit as L};
+    let (kind, path) = match e {
+        E::InvalidRoot => (HeldTreeAssessmentFailureKind::InvalidRoot, None),
+        E::InvalidDirectoryLimit => (HeldTreeAssessmentFailureKind::InvalidDirectoryLimit, None),
+        E::Limit { kind, .. } => (
+            match kind {
+                L::Entries => HeldTreeAssessmentFailureKind::EntryLimitExceeded,
+                L::Directories => HeldTreeAssessmentFailureKind::DirectoryLimitExceeded,
+                L::Depth => HeldTreeAssessmentFailureKind::DepthLimitExceeded,
+                L::PathBytes => HeldTreeAssessmentFailureKind::PathBytesLimitExceeded,
+                L::ManifestBytes => HeldTreeAssessmentFailureKind::ManifestBytesLimitExceeded,
+                L::ContentBytes => HeldTreeAssessmentFailureKind::ContentBytesLimitExceeded,
+            },
+            None,
+        ),
+        E::ParentPolicyRejected => (
+            HeldTreeAssessmentFailureKind::SourceParentPolicyRejected,
+            None,
+        ),
+        E::ParentNotExclusive => (
+            HeldTreeAssessmentFailureKind::SourceParentStateChanged,
+            None,
+        ),
+        E::ForeignOwner(p) => (HeldTreeAssessmentFailureKind::ForeignOwner, Some(p)),
+        E::ProtectedName(p) => (HeldTreeAssessmentFailureKind::ProtectedName, Some(p)),
+        E::BackendBoundary(p) => (HeldTreeAssessmentFailureKind::BackendBoundary, Some(p)),
+        E::IdentityChanged(p) => (HeldTreeAssessmentFailureKind::IdentityChanged, Some(p)),
+        E::StrongIncarnationUnavailable(p) => (
+            HeldTreeAssessmentFailureKind::StrongIncarnationUnavailable,
+            Some(p),
+        ),
+        E::ExternalHardLink(p) => (HeldTreeAssessmentFailureKind::ExternalHardLink, Some(p)),
+        E::NonDirectoryExtendedMetadata(p) => (
+            HeldTreeAssessmentFailureKind::NonDirectoryExtendedMetadata,
+            Some(p),
+        ),
+        E::NonDirectoryMetadataUnavailable(p) => (
+            HeldTreeAssessmentFailureKind::MetadataEvidenceUnavailable,
+            Some(p),
+        ),
+        E::UnsupportedContentProof(p) => (
+            HeldTreeAssessmentFailureKind::UnsupportedContentKind,
+            Some(p),
+        ),
+        E::ContentChangedDuringHash(p) => (
+            HeldTreeAssessmentFailureKind::ContentOrMetadataChanged,
+            Some(p),
+        ),
+        E::RootNotDirectory => (HeldTreeAssessmentFailureKind::RootNotDirectory, None),
+        E::Certification { path, reason } => (
+            match reason {
+                CertificationError::AclPresent => HeldTreeAssessmentFailureKind::AclPresent,
+                CertificationError::NotDirectory => HeldTreeAssessmentFailureKind::RootNotDirectory,
+                _ => HeldTreeAssessmentFailureKind::CertificationFailed,
+            },
+            Some(path),
+        ),
+        E::Io { path, .. } => (HeldTreeAssessmentFailureKind::IoFailure, Some(path)),
+        E::PostAdded(p) | E::PostRemoved(p) | E::PostChanged(p) => (
+            HeldTreeAssessmentFailureKind::ProveOnlyStateObserved,
+            Some(p),
+        ),
+        E::RootBindingChanged => (HeldTreeAssessmentFailureKind::RootBindingChanged, None),
+    };
+    HeldTreeAssessmentFailure {
+        kind,
+        relative_path: path.filter(|p| !p.as_os_str().is_empty()),
+    }
 }
 
 #[derive(Debug)]
@@ -986,6 +1354,106 @@ fn raw_mode_u32(mode: rustix::fs::RawMode) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_public_assessment_failure_kind_has_the_expected_category() {
+        use HeldTreeAssessmentFailureCategory as C;
+        use HeldTreeAssessmentFailureKind as K;
+
+        let cases = [
+            (K::InvalidRoot, C::Input),
+            (K::InvalidDirectoryLimit, C::Input),
+            (K::EntryLimitExceeded, C::ResourceLimit),
+            (K::DirectoryLimitExceeded, C::ResourceLimit),
+            (K::DepthLimitExceeded, C::ResourceLimit),
+            (K::PathBytesLimitExceeded, C::ResourceLimit),
+            (K::ManifestBytesLimitExceeded, C::ResourceLimit),
+            (K::ContentBytesLimitExceeded, C::ResourceLimit),
+            (K::SourceParentPolicyRejected, C::TreePolicy),
+            (K::SourceParentStateChanged, C::RaceOrIo),
+            (K::ForeignOwner, C::TreePolicy),
+            (K::ProtectedName, C::TreePolicy),
+            (K::BackendBoundary, C::PlatformEvidence),
+            (K::IdentityChanged, C::RaceOrIo),
+            (K::StrongIncarnationUnavailable, C::PlatformEvidence),
+            (K::ExternalHardLink, C::TreePolicy),
+            (K::NonDirectoryExtendedMetadata, C::TreePolicy),
+            (K::MetadataEvidenceUnavailable, C::RaceOrIo),
+            (K::AclPresent, C::TreePolicy),
+            (K::UnsupportedContentKind, C::TreePolicy),
+            (K::ContentOrMetadataChanged, C::RaceOrIo),
+            (K::RootNotDirectory, C::TreePolicy),
+            (K::CertificationFailed, C::PlatformEvidence),
+            (K::IoFailure, C::RaceOrIo),
+            (K::ProveOnlyStateObserved, C::InternalFailClosed),
+            (K::RootBindingChanged, C::RaceOrIo),
+        ];
+        let mut labels = std::collections::BTreeSet::new();
+        for (kind, category) in cases {
+            assert_eq!(kind.category(), category, "{kind:?}");
+            assert!(
+                labels.insert(kind.as_str()),
+                "duplicate kind label for {kind:?}"
+            );
+        }
+        assert_eq!(labels.len(), 26);
+    }
+
+    #[test]
+    fn stable_parent_policy_and_transient_metadata_map_in_the_right_direction() {
+        for (error, expected_kind, expected_category) in [
+            (
+                held::HeldTreeError::ParentPolicyRejected,
+                HeldTreeAssessmentFailureKind::SourceParentPolicyRejected,
+                HeldTreeAssessmentFailureCategory::TreePolicy,
+            ),
+            (
+                held::HeldTreeError::NonDirectoryMetadataUnavailable(PathBuf::from("file")),
+                HeldTreeAssessmentFailureKind::MetadataEvidenceUnavailable,
+                HeldTreeAssessmentFailureCategory::RaceOrIo,
+            ),
+            (
+                held::HeldTreeError::Certification {
+                    path: PathBuf::new(),
+                    reason: CertificationError::AclPresent,
+                },
+                HeldTreeAssessmentFailureKind::AclPresent,
+                HeldTreeAssessmentFailureCategory::TreePolicy,
+            ),
+            (
+                held::HeldTreeError::Certification {
+                    path: PathBuf::new(),
+                    reason: CertificationError::NotDirectory,
+                },
+                HeldTreeAssessmentFailureKind::RootNotDirectory,
+                HeldTreeAssessmentFailureCategory::TreePolicy,
+            ),
+        ] {
+            let mapped = map_tree_assessment_failure(error);
+            assert_eq!(mapped.kind(), expected_kind);
+            assert_eq!(mapped.category(), expected_category);
+        }
+    }
+
+    #[test]
+    fn prove_only_failures_map_to_one_explicit_fail_closed_public_kind() {
+        for error in [
+            held::HeldTreeError::PostAdded(PathBuf::from("added")),
+            held::HeldTreeError::PostRemoved(PathBuf::from("removed")),
+            held::HeldTreeError::PostChanged(PathBuf::from("changed")),
+        ] {
+            let mapped = map_tree_assessment_failure(error);
+            assert_eq!(
+                mapped.kind(),
+                HeldTreeAssessmentFailureKind::ProveOnlyStateObserved
+            );
+            assert_eq!(
+                mapped.category(),
+                HeldTreeAssessmentFailureCategory::InternalFailClosed
+            );
+            assert!(mapped.relative_path().is_some());
+        }
+    }
 
     fn snapshot() -> VerifiedLocalModeSnapshot {
         VerifiedLocalModeSnapshot {

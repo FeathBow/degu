@@ -1,4 +1,5 @@
 use super::super::CollectionRunOptions;
+use super::preview::PreviewStagingAssessment;
 use crate::cli::CleanArgs;
 use crate::collection::{
     CollectionRequest, ScanStatus, collect_profiled, validate_clean_plan_disablement,
@@ -33,6 +34,9 @@ pub(super) struct PreparedClean {
     pub(super) ctx: DetectCtx,
     pub(super) config: Config,
     pub(super) plan: CapturedCleanPlan,
+    /// Present only for dry-run previews and indexed exactly like `plan.items()`.
+    /// These are display/API facts, never execution inputs.
+    pub(super) staging_preflight: Option<Box<[PreviewStagingAssessment]>>,
     pub(super) exclusions: CleanExclusions,
     pub(super) scan_status: ScanStatus,
     /// Protected-cause regions the completeness gate consulted and skipped;
@@ -60,6 +64,37 @@ impl PreparedClean {
             .items()
             .iter()
             .any(Finding::measurement_incomplete)
+    }
+
+    pub(super) fn preview_assessments(&self) -> &[PreviewStagingAssessment] {
+        self.staging_preflight.as_deref().unwrap_or(&[])
+    }
+
+    pub(super) fn preview_assessment(
+        &self,
+        finding: &Finding,
+    ) -> Option<&PreviewStagingAssessment> {
+        let assessments = self.staging_preflight.as_deref()?;
+        self.plan
+            .items()
+            .iter()
+            .position(|item| item.path() == finding.path())
+            .and_then(|index| assessments.get(index))
+    }
+
+    pub(super) fn preview_tree_policy_assessed(&self) -> Vec<&Finding> {
+        match &self.staging_preflight {
+            None => self.plan.items().iter().collect(),
+            Some(assessments) => self
+                .plan
+                .items()
+                .iter()
+                .zip(assessments)
+                .filter_map(|(finding, assessment)| {
+                    assessment.is_tree_policy_assessed().then_some(finding)
+                })
+                .collect(),
+        }
     }
 
     pub(super) fn lock(&self) -> Result<MutationSession> {
@@ -162,12 +197,20 @@ pub(super) fn prepare(args: CleanArgs, ui: Ui) -> Result<PreparedClean> {
         request.scope.include_review(),
     )?;
     let (planned, unrepresentable) = partition_representable(planned);
+    let staging_preflight = request.settings.dry_run.then(|| {
+        planned
+            .iter()
+            .map(|finding| PreviewStagingAssessment::assess(finding, request.scope.has_paths()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    });
     let plan = capture_clean_plan(
         planned,
         &exclusions,
         scan_status,
         &incomplete_regions,
         &request.scope,
+        staging_preflight.as_deref(),
     )?;
     // Only a gate that actually ran (incomplete scan, non-empty plan) can
     // have excluded protected regions from its completeness proof.
@@ -176,12 +219,16 @@ pub(super) fn prepare(args: CleanArgs, ui: Ui) -> Result<PreparedClean> {
     } else {
         0
     };
+    // Guard identity is independent of sealed-staging availability. Preview
+    // must check the complete plan just like execution, including blocked,
+    // deferred, and unavailable items.
     validate_guard(&ctx, &config, plan.items())?;
     validate_invocation(request.settings)?;
     Ok(PreparedClean {
         ctx,
         config,
         plan,
+        staging_preflight,
         exclusions,
         scan_status,
         protected_regions_excluded,
@@ -321,6 +368,7 @@ fn capture_clean_plan(
     status: ScanStatus,
     incomplete_regions: &IncompleteRegions,
     scope: &CleanScope,
+    preview: Option<&[PreviewStagingAssessment]>,
 ) -> Result<CapturedCleanPlan> {
     if status.is_truncated() {
         anyhow::bail!(
@@ -358,7 +406,23 @@ fn capture_clean_plan(
             return Err(refuse_incomplete_scope(incomplete_regions));
         }
     }
-    CapturedCleanPlan::capture(Plan::new(planned, scope.include_review())?)
+    let plan = Plan::new(planned, scope.include_review())?;
+    if let Some(preview) = preview {
+        if !plan
+            .items()
+            .iter()
+            .zip(preview)
+            .all(|(finding, assessment)| finding.path() == assessment.path())
+            || plan.items().len() != preview.len()
+        {
+            anyhow::bail!("staging preview assessment does not match captured clean plan");
+        }
+        CapturedCleanPlan::capture_preview(plan, scope.has_paths())
+    } else if scope.has_paths() {
+        CapturedCleanPlan::capture_atomic_selection(plan)
+    } else {
+        CapturedCleanPlan::capture(plan)
+    }
 }
 
 /// Observability mirror of the --path relaxation info: names how many
@@ -551,6 +615,11 @@ fn disjointness_refusal(
 }
 
 fn validate_guard(ctx: &DetectCtx, config: &Config, findings: &[Finding]) -> Result<()> {
+    let findings = findings.iter().collect::<Vec<_>>();
+    validate_guard_refs(ctx, config, &findings)
+}
+
+fn validate_guard_refs(ctx: &DetectCtx, config: &Config, findings: &[&Finding]) -> Result<()> {
     let guard = build_guard(ctx, config)?;
     for finding in findings {
         guard.check_identity(finding.path())?;

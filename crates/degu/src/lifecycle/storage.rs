@@ -67,19 +67,36 @@ pub(crate) fn resolve_trash_dir(
     ctx: &DetectCtx,
     path: &Path,
 ) -> std::result::Result<PathBuf, String> {
-    let canonical = std::fs::canonicalize(path)
-        .map_err(|err| format!("failed to canonicalize {}: {err}", path.display()))?;
-    let source_mount = path_mount_id(&canonical)?;
-    let mount_owner_anchor = resolve_mount_owner_anchor(&canonical, source_mount)?;
     let state_dir = ensure_state_dir(ctx).map_err(|err| {
         format!(
             "failed to prepare state dir {}: {err}",
             ctx.xdg_state().display()
         )
     })?;
-    let state_dir = std::fs::canonicalize(&state_dir).map_err(|err| {
+    resolve_trash_dir_with_state(ctx, path, &state_dir)
+}
+
+/// Read-only trash routing for sealed admission after mutation-session
+/// activation. Unlike the legacy resolver, this never creates the state root.
+pub(crate) fn resolve_existing_trash_dir(
+    ctx: &DetectCtx,
+    path: &Path,
+) -> std::result::Result<PathBuf, String> {
+    resolve_trash_dir_with_state(ctx, path, &ctx.xdg_state())
+}
+
+fn resolve_trash_dir_with_state(
+    ctx: &DetectCtx,
+    path: &Path,
+    state_dir: &Path,
+) -> std::result::Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|err| format!("failed to canonicalize {}: {err}", path.display()))?;
+    let source_mount = path_mount_id(&canonical)?;
+    let mount_owner_anchor = resolve_mount_owner_anchor(&canonical, source_mount)?;
+    let state_dir = std::fs::canonicalize(state_dir).map_err(|err| {
         format!(
-            "failed to canonicalize state dir {}: {err}",
+            "failed to canonicalize existing state dir {}: {err}",
             state_dir.display()
         )
     })?;

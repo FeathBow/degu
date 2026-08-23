@@ -84,6 +84,11 @@ impl AgeFixture {
 #[test]
 fn clean_min_size_excludes_small_findings_and_totals_only_planned_items() {
     let fixture = SizeFixture::new();
+    // The blocked-preflight assertions below require sealed admission to run;
+    // apply the same certified-backend skip semantics as the sealed fixtures.
+    if require_sealed_fixture_backend(fixture.home.path()).is_none() {
+        return;
+    }
     let json = run_clean(
         &fixture.home,
         &fixture.state,
@@ -91,7 +96,9 @@ fn clean_min_size_excludes_small_findings_and_totals_only_planned_items() {
     );
     assert!(json.status.success());
     let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
-    let planned_bytes = assert_size_report(&fixture, &report);
+    assert_size_report(&fixture, &report);
+    assert_eq!(report["staging_preflight"][0]["status"], "blocked");
+    assert_eq!(report["staging_preflight"][0]["kind"], "external_hard_link");
 
     let human = run_clean(
         &fixture.home,
@@ -101,7 +108,6 @@ fn clean_min_size_excludes_small_findings_and_totals_only_planned_items() {
     assert!(human.status.success());
     assert_size_human_output(
         &String::from_utf8(human.stdout).unwrap(),
-        planned_bytes,
         &fixture.small_path,
     );
 }
@@ -136,7 +142,7 @@ impl SizeFixture {
     }
 }
 
-fn assert_size_report(fixture: &SizeFixture, report: &serde_json::Value) -> u64 {
+fn assert_size_report(fixture: &SizeFixture, report: &serde_json::Value) {
     let planned = report["planned"].as_array().unwrap();
     assert_eq!(planned.len(), 1);
     assert_eq!(planned[0]["ecosystem"], "pip");
@@ -150,24 +156,28 @@ fn assert_size_report(fixture: &SizeFixture, report: &serde_json::Value) -> u64 
                 finding["ecosystem"] == "go-build" && finding["path"] == fixture.small_path
             })
     );
-    planned[0]["bytes_allocated"].as_u64().unwrap()
 }
 
-fn assert_size_human_output(stdout: &str, planned_bytes: u64, small_path: &str) {
-    assert!(stdout.contains("Ready to clean - 1 location - "));
+fn assert_size_human_output(stdout: &str, small_path: &str) {
+    assert!(
+        !stdout.contains("Ready to clean - 1 location - "),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Blocked by sealed staging preflight - 1 location - "),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("external hard link encountered"),
+        "{stdout}"
+    );
     assert!(stdout.contains("Hidden by filters: 1 location"));
     assert!(!stdout.contains(small_path));
-    let line = stdout
-        .lines()
-        .find(|line| line.starts_with("Would move "))
-        .unwrap();
-    let displayed = line
-        .strip_prefix("Would move ")
-        .unwrap()
-        .strip_suffix(" to Degu trash")
-        .unwrap();
-    assert_human_bytes(displayed, planned_bytes);
-    assert!(stdout.contains("is hardlink-shared; reclaimed space may be lower."));
+    assert!(!stdout.contains("Would move "), "{stdout}");
+    assert!(
+        !stdout.contains("is hardlink-shared; reclaimed space may be lower."),
+        "blocked bytes must not be described as reclaimable: {stdout}"
+    );
 }
 
 #[test]

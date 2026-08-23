@@ -52,6 +52,8 @@ fn boundary_recheck(prepared: &PreparedClean) -> impl Fn(&Finding) -> Result<(),
 
 fn run_json(prepared: PreparedClean) -> Result<()> {
     if prepared.settings.dry_run {
+        // Expiry preview intentionally reads existing operation/trash state.
+        // Dry-run forbids mutation; it does not suppress this lifecycle view.
         let plan = Lifecycle::new(&prepared.ctx).plan_expired()?;
         let expiry_observation = not_attempted_action(
             ActionResultOwner::CleanCommand,
@@ -146,6 +148,7 @@ fn run_human(prepared: PreparedClean) -> Result<()> {
 }
 
 fn run_human_preview(prepared: &PreparedClean) -> Result<()> {
+    // Keep the existing read-only expiry preview in human dry-runs too.
     let expiry_plan = Lifecycle::new(&prepared.ctx).plan_expired()?;
     output::print_plan(prepared)?;
     output::print_expiry_plan(&expiry_plan, prepared, true)?;
@@ -157,7 +160,7 @@ fn print_preview_next(prepared: &PreparedClean) -> Result<()> {
         output: OutputMode::Human(prepared.settings.ui),
         workflow: Workflow::CleanPreview(CleanPreviewState {
             scope: &prepared.scope,
-            planned: prepared.plan.items().len(),
+            planned: prepared.preview_tree_policy_assessed().len(),
             direct_purge_requested: prepared.settings.purge,
         }),
         home: Some(&prepared.ctx.home),

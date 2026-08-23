@@ -557,14 +557,10 @@ fn collect_source_tree(
     binding: &PreparedRootBinding,
 ) -> Result<HeldTreeInventory, StagingRenameError> {
     let parent = certify_duplicate(&binding.source_parent)?;
-    let protected_names = crate::safety::PROTECTED_DESCENDANT_DIR_NAMES
-        .iter()
-        .map(OsString::from)
-        .collect();
     Ok(HeldTreeInventory::collect(
         parent,
         binding.metadata.source_basename(),
-        protected_names,
+        crate::backend::held_tree_protected_names(),
         HeldTreeLimits::default(),
     )?)
 }

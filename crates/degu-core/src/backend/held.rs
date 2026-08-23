@@ -5,6 +5,13 @@
 //! and descriptor-derived incarnations. This module performs no rename, restore,
 //! purge, unlink, or deletion and returns no lifecycle authority token.
 
+use crate::admission::{
+    Admission, EntryFacts, EntryKind, Evidence, LinkCount, RejectReason, XattrPlatform, Xattrs,
+    assess_content,
+};
+use crate::authority::mode::{
+    ModeSealAssessment, ModeSealDenial, assess_mode_seal, minimal_sealed_mode,
+};
 use crate::backend::{
     CertificationError, CertifiedLocalBackend, HeldLocalBackendEvidence, certify_held_fd,
 };
@@ -32,6 +39,11 @@ const MANIFEST_DOMAIN_V2: &[u8] = b"degu-held-tree-manifest-v2-content\0";
 const CONTENT_PROOF_VERSION: u16 = 2;
 /// A transient EINTR is retried, but every namespace operation remains bounded.
 const PURGE_IO_ATTEMPTS: usize = 3;
+/// Xattr name enumeration is diagnostic policy input only. Any oversized,
+/// unstable, malformed, or unreadable list remains the same fail-closed result.
+const XATTR_LIST_ATTEMPTS: usize = 3;
+const MAX_XATTR_NAME_LIST_BYTES: usize = 64 * 1024;
+const MAX_XATTR_NAMES: usize = 1_024;
 #[cfg(test)]
 std::thread_local! {
     pub(crate) static PURGE_FAIL_AFTER_REMOVALS: std::cell::Cell<Option<u64>> =
@@ -94,7 +106,9 @@ pub(crate) enum HeldTreeError {
     InvalidDirectoryLimit,
     #[error("held tree exceeded its {kind:?} limit of {limit}")]
     Limit { kind: HeldTreeLimit, limit: u64 },
-    #[error("source parent does not exclude foreign namespace writers")]
+    #[error("source parent policy rejects sealing by this process")]
+    ParentPolicyRejected,
+    #[error("source parent identity, backend, or mode changed")]
     ParentNotExclusive,
     #[error("entry is not owned by the effective UID at {0}")]
     ForeignOwner(PathBuf),
@@ -108,8 +122,10 @@ pub(crate) enum HeldTreeError {
     StrongIncarnationUnavailable(PathBuf),
     #[error("regular file has an external hard link at {0}")]
     ExternalHardLink(PathBuf),
-    #[error("non-directory ACL, xattr, or capability is present or cannot be proven absent at {0}")]
+    #[error("non-directory ACL, xattr, or capability is present at {0}")]
     NonDirectoryExtendedMetadata(PathBuf),
+    #[error("non-directory ACL or xattr evidence is unavailable at {0}")]
+    NonDirectoryMetadataUnavailable(PathBuf),
     #[error("non-directory content proof is unsupported at {0}")]
     UnsupportedContentProof(PathBuf),
     #[error("entry changed while its content was hashed at {0}")]
@@ -217,6 +233,99 @@ pub(crate) struct HeldTreeFingerprint {
     pub(crate) sha256: [u8; 32],
 }
 
+/// A non-authorizing outcome of attempting metadata-only tree policy
+/// assessment. No outcome claims that the source-parent seal has executed or
+/// that staging is ready.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HeldTreeAdmissionAssessment {
+    /// Tree policy was assessed; the separate seal projection remains untested.
+    TreePolicyAssessed {
+        tree: HeldTreePolicyAssessment,
+        source_parent_seal: SourceParentSealProjection,
+    },
+    /// No tree-policy facts were obtained because traversal requires the seal.
+    TreePolicyDeferredUntilSourceParentSeal {
+        reason: TreePolicyDeferralReason,
+        source_parent_seal: SourceParentSealProjection,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HeldTreePolicyAssessment {
+    pub(crate) entries: u64,
+    pub(crate) directories: u64,
+    pub(crate) path_bytes: u64,
+    pub(crate) manifest_bytes: u64,
+    pub(crate) content_bytes: u64,
+    pub(crate) assessed_at: std::time::SystemTime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SourceParentSealProjection {
+    pub(crate) original_mode: u32,
+    pub(crate) projected_mode: u32,
+    pub(crate) validation: SourceParentSealValidation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceParentSealValidation {
+    RequiresExecutionValidation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TreePolicyDeferralReason {
+    SourceParentSearchRequiresExecutionSeal,
+}
+
+#[derive(Clone, Debug)]
+struct AssessedEntry {
+    path: PathBuf,
+    identity: NodeIdentity,
+}
+
+/// Data-only admission uses the production v2 namespace traversal, admission
+/// policy, and budgets, but substitutes metadata inspection for content proof.
+pub(crate) fn assess_tree_admission(
+    parent: HeldLocalBackendEvidence,
+    root_name: &OsStr,
+    protected_names: Vec<OsString>,
+    limits: HeldTreeLimits,
+) -> Result<HeldTreeAdmissionAssessment, HeldTreeError> {
+    validate_v2_inputs(root_name, &protected_names, limits)?;
+    let projected = projected_parent_seal(&parent)?;
+    let source_parent_seal = SourceParentSealProjection {
+        original_mode: projected.original_mode,
+        projected_mode: projected.projected_mode,
+        validation: SourceParentSealValidation::RequiresExecutionValidation,
+    };
+    if projected.original_mode & 0o100 == 0 {
+        return Ok(
+            HeldTreeAdmissionAssessment::TreePolicyDeferredUntilSourceParentSeal {
+                reason: TreePolicyDeferralReason::SourceParentSearchRequiresExecutionSeal,
+                source_parent_seal,
+            },
+        );
+    }
+    let walked = traverse_v2::<AssessTraversal>(
+        parent,
+        root_name,
+        protected_names,
+        limits,
+        ParentAdmission::Projected(projected),
+    )?;
+    Ok(HeldTreeAdmissionAssessment::TreePolicyAssessed {
+        tree: HeldTreePolicyAssessment {
+            entries: walked.budget.entries,
+            directories: walked.budget.directories,
+            path_bytes: walked.budget.path_bytes,
+            manifest_bytes: walked.budget.manifest_bytes,
+            content_bytes: walked.budget.content_bytes,
+            assessed_at: std::time::SystemTime::now(),
+        },
+        source_parent_seal,
+    })
+}
+
 /// Data-only ordering for deterministic recovery. It carries neither an
 /// FD nor WAL/lease/transaction authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -254,6 +363,300 @@ pub(crate) struct HeldTreeInventory {
     manifest: Vec<ManifestEntry>,
 }
 
+#[derive(Clone, Copy)]
+struct ProjectedParentSeal {
+    original_mode: u32,
+    projected_mode: u32,
+}
+
+#[derive(Clone, Copy)]
+enum ParentAdmission {
+    CurrentExclusive,
+    Projected(ProjectedParentSeal),
+}
+
+trait V2Traversal {
+    type Entry;
+
+    fn make_root(inspected: Inspection) -> Self::Entry;
+    fn inspect_entry(
+        parent: &HeldLocalBackendEvidence,
+        name: &OsStr,
+        path: &Path,
+        inspected: &Inspection,
+        budget: &mut Budget,
+    ) -> Result<Self::Entry, HeldTreeError>;
+    fn path(entry: &Self::Entry) -> &Path;
+    fn identity(entry: &Self::Entry) -> NodeIdentity;
+}
+
+struct ProveTraversal;
+struct AssessTraversal;
+
+impl V2Traversal for ProveTraversal {
+    type Entry = ManifestEntry;
+
+    fn make_root(inspected: Inspection) -> Self::Entry {
+        inspected.into_manifest(PathBuf::new(), ContentProof::Directory)
+    }
+
+    fn inspect_entry(
+        parent: &HeldLocalBackendEvidence,
+        name: &OsStr,
+        path: &Path,
+        inspected: &Inspection,
+        budget: &mut Budget,
+    ) -> Result<Self::Entry, HeldTreeError> {
+        let content = inspect_content_at(parent, name, path, inspected, budget)?;
+        Ok(inspected.clone().into_manifest(path.to_path_buf(), content))
+    }
+
+    fn path(entry: &Self::Entry) -> &Path {
+        &entry.path
+    }
+
+    fn identity(entry: &Self::Entry) -> NodeIdentity {
+        entry.identity
+    }
+}
+
+impl V2Traversal for AssessTraversal {
+    type Entry = AssessedEntry;
+
+    fn make_root(inspected: Inspection) -> Self::Entry {
+        AssessedEntry {
+            path: PathBuf::new(),
+            identity: inspected.identity,
+        }
+    }
+
+    fn inspect_entry(
+        parent: &HeldLocalBackendEvidence,
+        name: &OsStr,
+        path: &Path,
+        inspected: &Inspection,
+        budget: &mut Budget,
+    ) -> Result<Self::Entry, HeldTreeError> {
+        inspect_content_admission(parent, name, path, inspected, budget)?;
+        Ok(AssessedEntry {
+            path: path.to_path_buf(),
+            identity: inspected.identity,
+        })
+    }
+
+    fn path(entry: &Self::Entry) -> &Path {
+        &entry.path
+    }
+
+    fn identity(entry: &Self::Entry) -> NodeIdentity {
+        entry.identity
+    }
+}
+
+struct V2Walk<M: V2Traversal> {
+    parent: HeldLocalBackendEvidence,
+    root_name: OsString,
+    root_identity: NodeIdentity,
+    backend: CertifiedLocalBackend,
+    mount_id: u64,
+    protected_names: Vec<OsString>,
+    limits: HeldTreeLimits,
+    directories: Vec<HeldDirectory>,
+    entries: Vec<M::Entry>,
+    budget: Budget,
+}
+
+fn validate_v2_inputs(
+    root_name: &OsStr,
+    protected_names: &[OsString],
+    limits: HeldTreeLimits,
+) -> Result<(), HeldTreeError> {
+    require_one_component(root_name)?;
+    validate_policy(protected_names)?;
+    if limits.max_directories > HARD_DIRECTORY_CAP {
+        return Err(HeldTreeError::InvalidDirectoryLimit);
+    }
+    if protected_names.iter().any(|name| name == root_name) {
+        return Err(HeldTreeError::ProtectedName(PathBuf::new()));
+    }
+    Ok(())
+}
+
+fn collect_proven_v2(
+    parent: HeldLocalBackendEvidence,
+    root_name: &OsStr,
+    protected_names: Vec<OsString>,
+    limits: HeldTreeLimits,
+) -> Result<HeldTreeInventory, HeldTreeError> {
+    let walked = traverse_v2::<ProveTraversal>(
+        parent,
+        root_name,
+        protected_names,
+        limits,
+        ParentAdmission::CurrentExclusive,
+    )?;
+    Ok(HeldTreeInventory {
+        parent: walked.parent,
+        root_name: walked.root_name,
+        root_identity: walked.root_identity,
+        backend: walked.backend,
+        mount_id: walked.mount_id,
+        protected_names: walked.protected_names,
+        limits: walked.limits,
+        manifest_schema: CONTENT_PROOF_VERSION,
+        directories: walked.directories,
+        manifest: walked.entries,
+    })
+}
+
+fn traverse_v2<M: V2Traversal>(
+    parent: HeldLocalBackendEvidence,
+    root_name: &OsStr,
+    protected_names: Vec<OsString>,
+    limits: HeldTreeLimits,
+    parent_admission: ParentAdmission,
+) -> Result<V2Walk<M>, HeldTreeError> {
+    validate_v2_inputs(root_name, &protected_names, limits)?;
+    let backend = parent.backend();
+    require_parent_admission(&parent, backend, parent_admission)?;
+    let euid = rustix::process::geteuid().as_raw();
+    let root_path = PathBuf::new();
+    let inspected = with_fd(&parent, |fd| inspect_at(fd, root_name, &root_path))?;
+    if inspected.identity.kind != NodeKind::Directory {
+        return Err(HeldTreeError::RootNotDirectory);
+    }
+    require_owner(&root_path, inspected.uid, euid)?;
+    require_boundary(&root_path, backend, parent.mount_id(), &inspected)?;
+    let fd = with_fd(&parent, |parent_fd| {
+        rustix::fs::openat(parent_fd, root_name, OPEN_DIRECTORY, Mode::empty())
+    })
+    .map_err(|error| io_error(&root_path, error))?;
+    let held = certify_held_fd(fd).map_err(|reason| HeldTreeError::Certification {
+        path: root_path.clone(),
+        reason,
+    })?;
+    let opened = inspect_held(&held, &root_path)?;
+    require_same_identity(&root_path, inspected.identity, opened.identity)?;
+    require_owner(&root_path, opened.uid, euid)?;
+    if held.backend() != backend || held.mount_id() != parent.mount_id() {
+        return Err(HeldTreeError::BackendBoundary(root_path));
+    }
+    let root_identity = opened.identity;
+    let root_entry = M::make_root(opened);
+    let mut budget = Budget::new(limits, CONTENT_PROOF_VERSION);
+    budget.add_path(M::path(&root_entry), 0)?;
+    budget.add_directory()?;
+    let mut walked = V2Walk::<M> {
+        parent,
+        root_name: root_name.to_os_string(),
+        root_identity,
+        backend,
+        mount_id: held.mount_id(),
+        protected_names,
+        limits,
+        directories: vec![HeldDirectory {
+            held,
+            path: PathBuf::new(),
+            depth: 0,
+            incarnation: root_identity.incarnation,
+        }],
+        entries: vec![root_entry],
+        budget,
+    };
+    let mut index = 0;
+    while index < walked.directories.len() {
+        read_v2_children::<M>(&mut walked, index)?;
+        index += 1;
+    }
+    walked
+        .entries
+        .sort_by(|left, right| M::path(left).cmp(M::path(right)));
+    require_parent_admission(&walked.parent, walked.backend, parent_admission)?;
+    let rebound = with_fd(&walked.parent, |fd| {
+        inspect_at(fd, &walked.root_name, Path::new(""))
+    })
+    .map_err(|_| HeldTreeError::RootBindingChanged)?;
+    if !root_binding_matches(
+        walked.root_identity,
+        walked.mount_id,
+        walked.backend,
+        &rebound,
+    ) {
+        return Err(HeldTreeError::RootBindingChanged);
+    }
+    Ok(walked)
+}
+
+fn read_v2_children<M: V2Traversal>(
+    walked: &mut V2Walk<M>,
+    index: usize,
+) -> Result<(), HeldTreeError> {
+    let parent_path = walked.directories[index].path.clone();
+    let parent_depth = walked.directories[index].depth;
+    require_directory_current(&walked.directories[index], walked.backend, walked.mount_id)?;
+    let fresh = with_fd(&walked.directories[index].held, |fd| {
+        rustix::fs::openat(fd, c".", OPEN_DIRECTORY, Mode::empty())
+    })
+    .map_err(|error| io_error(&parent_path, error))?;
+    let entries = Dir::new(fresh).map_err(|error| io_error(&parent_path, error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| io_error(&parent_path, error))?;
+        if matches!(entry.file_name().to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let name = OsStr::from_bytes(entry.file_name().to_bytes());
+        let path = parent_path.join(name);
+        require_unprotected(&walked.protected_names, name, &path)?;
+        let inspected = with_fd(&walked.directories[index].held, |fd| {
+            inspect_at(fd, name, &path)
+        })?;
+        require_owner(&path, inspected.uid, rustix::process::geteuid().as_raw())?;
+        require_boundary(&path, walked.backend, walked.mount_id, &inspected)?;
+        let depth = parent_depth.saturating_add(1);
+        let child = if inspected.identity.kind == NodeKind::Directory {
+            let fd = with_fd(&walked.directories[index].held, |parent_fd| {
+                rustix::fs::openat(parent_fd, name, OPEN_DIRECTORY, Mode::empty())
+            })
+            .map_err(|error| io_error(&path, error))?;
+            let held = certify_held_fd(fd).map_err(|reason| HeldTreeError::Certification {
+                path: path.clone(),
+                reason,
+            })?;
+            let opened = inspect_held(&held, &path)?;
+            require_same_identity(&path, inspected.identity, opened.identity)?;
+            require_owner(&path, opened.uid, rustix::process::geteuid().as_raw())?;
+            if held.backend() != walked.backend || held.mount_id() != walked.mount_id {
+                return Err(HeldTreeError::BackendBoundary(path));
+            }
+            Some(held)
+        } else {
+            None
+        };
+        let result = M::inspect_entry(
+            &walked.directories[index].held,
+            name,
+            &path,
+            &inspected,
+            &mut walked.budget,
+        )?;
+        walked.budget.add_path(M::path(&result), depth)?;
+        if child.is_some() {
+            walked.budget.add_directory()?;
+        }
+        let incarnation = M::identity(&result).incarnation;
+        walked.entries.push(result);
+        if let Some(held) = child {
+            walked.directories.push(HeldDirectory {
+                held,
+                path,
+                depth,
+                incarnation,
+            });
+        }
+    }
+    Ok(())
+}
+
 impl HeldTreeInventory {
     /// Accepts the protected policy exactly once and uses it for both walks.
     pub(crate) fn collect(
@@ -281,7 +684,10 @@ impl HeldTreeInventory {
         limits: HeldTreeLimits,
         manifest_schema: u16,
     ) -> Result<Self, HeldTreeError> {
-        if !matches!(manifest_schema, 1 | CONTENT_PROOF_VERSION) {
+        if manifest_schema == CONTENT_PROOF_VERSION {
+            return collect_proven_v2(parent, root_name, protected_names, limits);
+        }
+        if manifest_schema != 1 {
             return Err(HeldTreeError::UnsupportedContentProof(PathBuf::new()));
         }
         require_one_component(root_name)?;
@@ -324,7 +730,7 @@ impl HeldTreeInventory {
         };
         let root_entry = opened.into_manifest(PathBuf::new(), root_content);
         let mut budget = Budget::new(limits, manifest_schema);
-        budget.add(&root_entry, 0)?;
+        budget.add_path(&root_entry.path, 0)?;
         budget.add_directory()?;
         let mut tree = Self {
             parent,
@@ -641,7 +1047,7 @@ impl HeldTreeInventory {
         };
         let root = inspect_held(&self.directories[0].held, Path::new(""))?
             .into_manifest(PathBuf::new(), root_content);
-        budget.add(&root, 0)?;
+        budget.add_path(&root.path, 0)?;
         budget.add_directory()?;
         actual.insert(PathBuf::new(), root);
         for directory in &self.directories {
@@ -671,7 +1077,7 @@ impl HeldTreeInventory {
                     &mut budget,
                 )?;
                 let value = inspected.into_manifest(path.clone(), content);
-                budget.add(&value, directory.depth.saturating_add(1))?;
+                budget.add_path(&value.path, directory.depth.saturating_add(1))?;
                 if value.identity.kind == NodeKind::Directory {
                     budget.add_directory()?;
                 }
@@ -745,7 +1151,7 @@ impl HeldTreeInventory {
                 budget,
             )?;
             let manifest = inspected.into_manifest(path.clone(), content);
-            budget.add(&manifest, depth)?;
+            budget.add_path(&manifest.path, depth)?;
             if child.is_some() {
                 budget.add_directory()?;
             }
@@ -1032,23 +1438,74 @@ fn inspect_content_at(
         return Err(HeldTreeError::UnsupportedContentProof(path.to_path_buf()));
     }
     match before.identity.kind {
-        NodeKind::Directory => Ok(ContentProof::Directory),
+        NodeKind::Directory => {
+            require_content_admitted(
+                EntryFacts {
+                    kind: EntryKind::Directory,
+                    nlink: LinkCount::Unknown,
+                    acl: Evidence::Unknown,
+                    xattr_platform: current_xattr_platform(),
+                    xattrs: Xattrs::Unknown,
+                },
+                path,
+            )?;
+            Ok(ContentProof::Directory)
+        }
         NodeKind::Regular => inspect_regular_content(parent, name, path, before, budget),
         NodeKind::Symlink => inspect_symlink_content(parent, name, path, before, budget),
-        NodeKind::Other => Err(HeldTreeError::UnsupportedContentProof(path.to_path_buf())),
+        NodeKind::Other => {
+            require_content_admitted(
+                EntryFacts {
+                    kind: EntryKind::Other,
+                    nlink: LinkCount::Unknown,
+                    acl: Evidence::Unknown,
+                    xattr_platform: current_xattr_platform(),
+                    xattrs: Xattrs::Unknown,
+                },
+                path,
+            )?;
+            // Special files have no v2 content-proof representation. Keep the
+            // schema boundary fail-closed even if a later policy admits them.
+            Err(HeldTreeError::UnsupportedContentProof(path.to_path_buf()))
+        }
     }
 }
 
-fn inspect_regular_content(
+fn inspect_content_admission(
     parent: &HeldLocalBackendEvidence,
     name: &OsStr,
     path: &Path,
     before: &Inspection,
     budget: &mut Budget,
-) -> Result<ContentProof, HeldTreeError> {
-    if before.nlink != 1 {
-        return Err(HeldTreeError::ExternalHardLink(path.to_path_buf()));
+) -> Result<(), HeldTreeError> {
+    if !before.content_fields_available {
+        return Err(HeldTreeError::UnsupportedContentProof(path.to_path_buf()));
     }
+    match before.identity.kind {
+        NodeKind::Directory => Ok(()),
+        NodeKind::Regular => assess_regular_content(parent, name, path, before, budget),
+        NodeKind::Symlink => assess_symlink_content(parent, name, path, before, budget),
+        NodeKind::Other => Err(HeldTreeError::UnsupportedContentProof(path.to_path_buf())),
+    }
+}
+
+fn assess_regular_content(
+    parent: &HeldLocalBackendEvidence,
+    name: &OsStr,
+    path: &Path,
+    before: &Inspection,
+    budget: &mut Budget,
+) -> Result<(), HeldTreeError> {
+    require_content_admitted(
+        EntryFacts {
+            kind: EntryKind::Regular,
+            nlink: LinkCount::Known(before.nlink),
+            acl: Evidence::Absent,
+            xattr_platform: current_xattr_platform(),
+            xattrs: Xattrs::Names(&[]),
+        },
+        path,
+    )?;
     budget.add_content(before.size)?;
     let fd = with_fd(parent, |parent_fd| {
         rustix::fs::openat(
@@ -1059,9 +1516,58 @@ fn inspect_regular_content(
         )
     })
     .map_err(|error| io_error(path, error))?;
-    require_fd_extended_metadata_absent(&fd, path)?;
-    crate::backend::require_held_fd_acl_absent(&fd)
-        .map_err(|_| HeldTreeError::NonDirectoryExtendedMetadata(path.to_path_buf()))?;
+    require_fd_metadata_admitted(&fd, path, EntryKind::Regular, true)?;
+    let opened = inspect_raw_fd(&fd, parent.backend(), path)?;
+    if !before.stable_content_fields_equal(&opened) || opened.identity.kind != NodeKind::Regular {
+        return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
+    }
+    require_fd_metadata_admitted(&fd, path, EntryKind::Regular, false)?;
+    let final_inspection = inspect_raw_fd(&fd, parent.backend(), path)?;
+    if !opened.stable_content_fields_equal(&final_inspection) || final_inspection.nlink != 1 {
+        return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn assess_symlink_content(
+    parent: &HeldLocalBackendEvidence,
+    name: &OsStr,
+    path: &Path,
+    before: &Inspection,
+    budget: &mut Budget,
+) -> Result<(), HeldTreeError> {
+    let target = read_stable_symlink_target(parent, name, path, before)?;
+    budget.add_content(target.len() as u64)
+}
+
+fn inspect_regular_content(
+    parent: &HeldLocalBackendEvidence,
+    name: &OsStr,
+    path: &Path,
+    before: &Inspection,
+    budget: &mut Budget,
+) -> Result<ContentProof, HeldTreeError> {
+    require_content_admitted(
+        EntryFacts {
+            kind: EntryKind::Regular,
+            nlink: LinkCount::Known(before.nlink),
+            acl: Evidence::Absent,
+            xattr_platform: current_xattr_platform(),
+            xattrs: Xattrs::Names(&[]),
+        },
+        path,
+    )?;
+    budget.add_content(before.size)?;
+    let fd = with_fd(parent, |parent_fd| {
+        rustix::fs::openat(
+            parent_fd,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+    })
+    .map_err(|error| io_error(path, error))?;
+    require_fd_metadata_admitted(&fd, path, EntryKind::Regular, true)?;
     let opened = inspect_raw_fd(&fd, parent.backend(), path)?;
     if !before.stable_content_fields_equal(&opened) || opened.identity.kind != NodeKind::Regular {
         return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
@@ -1087,7 +1593,7 @@ fn inspect_regular_content(
         digest.update(&buffer[..read]);
     }
     let after = inspect_raw_fd(&file, parent.backend(), path)?;
-    require_fd_extended_metadata_absent(&file, path)?;
+    require_fd_metadata_admitted(&file, path, EntryKind::Regular, false)?;
     let final_inspection = inspect_raw_fd(&file, parent.backend(), path)?;
     if total != before.size
         || !before.stable_content_fields_equal(&after)
@@ -1115,18 +1621,28 @@ fn inspect_symlink_content(
     before: &Inspection,
     budget: &mut Budget,
 ) -> Result<ContentProof, HeldTreeError> {
-    require_symlink_extended_metadata_absent(parent, name, path)?;
+    let target = read_stable_symlink_target(parent, name, path, before)?;
+    budget.add_content(target.len() as u64)?;
+    Ok(ContentProof::Symlink { target })
+}
+
+fn read_stable_symlink_target(
+    parent: &HeldLocalBackendEvidence,
+    name: &OsStr,
+    path: &Path,
+    before: &Inspection,
+) -> Result<Vec<u8>, HeldTreeError> {
+    require_symlink_metadata_admitted(parent, name, path)?;
     let target = with_fd(parent, |fd| rustix::fs::readlinkat(fd, name, Vec::new()))
         .map_err(|error| io_error(path, error))?
         .into_bytes();
-    budget.add_content(target.len() as u64)?;
     let middle = with_fd(parent, |fd| inspect_at(fd, name, path))?;
-    require_symlink_extended_metadata_absent(parent, name, path)?;
+    require_symlink_metadata_admitted(parent, name, path)?;
     let target_again = with_fd(parent, |fd| rustix::fs::readlinkat(fd, name, Vec::new()))
         .map_err(|error| io_error(path, error))?
         .into_bytes();
     let after = with_fd(parent, |fd| inspect_at(fd, name, path))?;
-    require_symlink_extended_metadata_absent(parent, name, path)?;
+    require_symlink_metadata_admitted(parent, name, path)?;
     let final_inspection = with_fd(parent, |fd| inspect_at(fd, name, path))?;
     if !before.stable_content_fields_equal(&middle)
         || !before.stable_content_fields_equal(&after)
@@ -1135,7 +1651,7 @@ fn inspect_symlink_content(
     {
         return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
     }
-    Ok(ContentProof::Symlink { target })
+    Ok(target)
 }
 
 #[cfg(target_os = "linux")]
@@ -1170,48 +1686,179 @@ fn inspect_raw_fd<Fd: rustix::fd::AsFd>(
     Err(HeldTreeError::UnsupportedContentProof(path.to_path_buf()))
 }
 
-#[cfg(target_os = "linux")]
-fn require_fd_extended_metadata_absent<Fd: rustix::fd::AsFd>(
+fn require_content_admitted(facts: EntryFacts<'_>, path: &Path) -> Result<(), HeldTreeError> {
+    match assess_content(&facts) {
+        Admission::Admit => Ok(()),
+        Admission::Reject(reason) => Err(match reason {
+            RejectReason::UnsupportedEntryKind | RejectReason::RegularFileLinkCountUnknown => {
+                HeldTreeError::UnsupportedContentProof(path.to_path_buf())
+            }
+            RejectReason::RegularFileLinkCountNotOne { .. } => {
+                HeldTreeError::ExternalHardLink(path.to_path_buf())
+            }
+            RejectReason::AclPresent
+            | RejectReason::AclUnknown
+            | RejectReason::ExtendedAttributePresent { .. }
+            | RejectReason::ExtendedAttributesUnknown => {
+                HeldTreeError::NonDirectoryExtendedMetadata(path.to_path_buf())
+            }
+        }),
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum CollectedXattrs {
+    Names(Vec<Vec<u8>>),
+    Unknown,
+}
+
+fn require_fd_metadata_admitted<Fd: rustix::fd::AsFd>(
     fd: &Fd,
     path: &Path,
+    kind: EntryKind,
+    inspect_acl: bool,
 ) -> Result<(), HeldTreeError> {
-    // SAFETY: the borrowed descriptor remains live and no output buffer is supplied.
-    let result = unsafe { libc::flistxattr(fd.as_fd().as_raw_fd(), std::ptr::null_mut(), 0) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(HeldTreeError::NonDirectoryExtendedMetadata(
+    let collected = collect_fd_xattr_names(fd);
+    assess_collected_metadata(fd, path, kind, inspect_acl, &collected)
+}
+
+fn assess_collected_metadata<Fd: rustix::fd::AsFd>(
+    fd: &Fd,
+    path: &Path,
+    kind: EntryKind,
+    inspect_acl: bool,
+    collected: &CollectedXattrs,
+) -> Result<(), HeldTreeError> {
+    match collected {
+        CollectedXattrs::Unknown => Err(HeldTreeError::NonDirectoryMetadataUnavailable(
             path.to_path_buf(),
-        ))
+        )),
+        CollectedXattrs::Names(names) => {
+            let name_refs = names.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            // Preserve the former syscall order: a present/uncertain xattr list
+            // rejects before the separate ACL probe is attempted.
+            let acl = if inspect_acl && names.is_empty() {
+                acl_evidence(fd)
+            } else {
+                Evidence::Absent
+            };
+            if acl == Evidence::Unknown {
+                return Err(HeldTreeError::NonDirectoryMetadataUnavailable(
+                    path.to_path_buf(),
+                ));
+            }
+            require_content_admitted(
+                EntryFacts {
+                    kind,
+                    nlink: LinkCount::Known(1),
+                    acl,
+                    xattr_platform: current_xattr_platform(),
+                    xattrs: Xattrs::Names(&name_refs),
+                },
+                path,
+            )
+        }
     }
+}
+
+fn acl_evidence<Fd: rustix::fd::AsFd>(fd: &Fd) -> Evidence {
+    match crate::backend::require_held_fd_acl_absent(fd) {
+        Ok(()) => Evidence::Absent,
+        Err(CertificationError::AclPresent) => Evidence::Present,
+        Err(CertificationError::AclProbeUnknown) => Evidence::Unknown,
+        Err(_) => Evidence::Unknown,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_fd_xattr_names<Fd: rustix::fd::AsFd>(fd: &Fd) -> CollectedXattrs {
+    let raw_fd = fd.as_fd().as_raw_fd();
+    collect_xattr_names(|buffer, size| {
+        // SAFETY: fd is live for the call and buffer is either null for a size
+        // query or points to the supplied writable allocation.
+        xattr_count_result(unsafe { libc::flistxattr(raw_fd, buffer, size) })
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn require_fd_extended_metadata_absent<Fd: rustix::fd::AsFd>(
-    fd: &Fd,
-    path: &Path,
-) -> Result<(), HeldTreeError> {
-    // SAFETY: the borrowed descriptor remains live and no output buffer is supplied.
-    let result = unsafe { libc::flistxattr(fd.as_fd().as_raw_fd(), std::ptr::null_mut(), 0, 0) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(HeldTreeError::NonDirectoryExtendedMetadata(
-            path.to_path_buf(),
-        ))
-    }
+fn collect_fd_xattr_names<Fd: rustix::fd::AsFd>(fd: &Fd) -> CollectedXattrs {
+    let raw_fd = fd.as_fd().as_raw_fd();
+    collect_xattr_names(|buffer, size| {
+        // SAFETY: fd is live for the call and buffer is either null for a size
+        // query or points to the supplied writable allocation.
+        xattr_count_result(unsafe { libc::flistxattr(raw_fd, buffer, size, 0) })
+    })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn require_fd_extended_metadata_absent<Fd: rustix::fd::AsFd>(
-    _fd: &Fd,
-    path: &Path,
-) -> Result<(), HeldTreeError> {
-    Err(HeldTreeError::UnsupportedContentProof(path.to_path_buf()))
+fn collect_fd_xattr_names<Fd: rustix::fd::AsFd>(_fd: &Fd) -> CollectedXattrs {
+    CollectedXattrs::Unknown
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn xattr_count_result(result: libc::ssize_t) -> io::Result<usize> {
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        usize::try_from(result).map_err(|_| io::Error::other("xattr byte count does not fit usize"))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn collect_xattr_names(
+    mut list: impl FnMut(*mut libc::c_char, usize) -> io::Result<usize>,
+) -> CollectedXattrs {
+    let mut rejection_observed = false;
+    for _ in 0..XATTR_LIST_ATTEMPTS {
+        let size = match list(std::ptr::null_mut(), 0) {
+            Ok(size) => size,
+            Err(error) if error.raw_os_error() == Some(libc::EINTR) => {
+                rejection_observed = true;
+                continue;
+            }
+            Err(_) => return CollectedXattrs::Unknown,
+        };
+        if size == 0 {
+            return if rejection_observed {
+                CollectedXattrs::Unknown
+            } else {
+                CollectedXattrs::Names(Vec::new())
+            };
+        }
+        rejection_observed = true;
+        if size > MAX_XATTR_NAME_LIST_BYTES {
+            return CollectedXattrs::Unknown;
+        }
+
+        let mut bytes = vec![0_u8; size];
+        let read = match list(bytes.as_mut_ptr().cast(), bytes.len()) {
+            Ok(read) => read,
+            Err(error) if matches!(error.raw_os_error(), Some(libc::EINTR | libc::ERANGE)) => {
+                continue;
+            }
+            Err(_) => return CollectedXattrs::Unknown,
+        };
+        if read == 0 || read > bytes.len() {
+            return CollectedXattrs::Unknown;
+        }
+        bytes.truncate(read);
+        let Some((&0, body)) = bytes.split_last() else {
+            return CollectedXattrs::Unknown;
+        };
+        let mut names = Vec::new();
+        for name in body.split(|byte| *byte == 0) {
+            if name.is_empty() || names.len() == MAX_XATTR_NAMES {
+                return CollectedXattrs::Unknown;
+            }
+            names.push(name.to_vec());
+        }
+        return CollectedXattrs::Names(names);
+    }
+    CollectedXattrs::Unknown
 }
 
 #[cfg(target_os = "linux")]
-fn require_symlink_extended_metadata_absent(
+fn require_symlink_metadata_admitted(
     parent: &HeldLocalBackendEvidence,
     name: &OsStr,
     path: &Path,
@@ -1224,19 +1871,16 @@ fn require_symlink_extended_metadata_absent(
         CString::new(bytes)
     })
     .map_err(|_| HeldTreeError::UnsupportedContentProof(path.to_path_buf()))?;
-    // SAFETY: the NUL-terminated path remains live and no output buffer is supplied.
-    let result = unsafe { libc::llistxattr(proc_path.as_ptr(), std::ptr::null_mut(), 0) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(HeldTreeError::NonDirectoryExtendedMetadata(
-            path.to_path_buf(),
-        ))
-    }
+    let collected = collect_xattr_names(|buffer, size| {
+        // SAFETY: proc_path is NUL-terminated and names the symlink through the
+        // held parent FD; llistxattr inspects the link itself without following.
+        xattr_count_result(unsafe { libc::llistxattr(proc_path.as_ptr(), buffer, size) })
+    });
+    assess_symlink_xattrs(path, &collected)
 }
 
 #[cfg(target_os = "macos")]
-fn require_symlink_extended_metadata_absent(
+fn require_symlink_metadata_admitted(
     parent: &HeldLocalBackendEvidence,
     name: &OsStr,
     path: &Path,
@@ -1245,8 +1889,8 @@ fn require_symlink_extended_metadata_absent(
     let name = CString::new(name.as_bytes())
         .map_err(|_| HeldTreeError::UnsupportedContentProof(path.to_path_buf()))?;
     let raw = with_fd(parent, |fd| {
-        // SAFETY: parent/name remain live; macOS O_SYMLINK opens the link
-        // itself rather than following it to the target.
+        // SAFETY: parent/name remain live; O_SYMLINK opens the link itself rather
+        // than following its target.
         unsafe {
             libc::openat(
                 fd.as_raw_fd(),
@@ -1256,22 +1900,60 @@ fn require_symlink_extended_metadata_absent(
         }
     });
     if raw < 0 {
-        return Err(HeldTreeError::NonDirectoryExtendedMetadata(
-            path.to_path_buf(),
-        ));
+        return Err(HeldTreeError::Io {
+            path: path.to_path_buf(),
+            source: io::Error::last_os_error(),
+        });
     }
     // SAFETY: openat returned a new uniquely-owned descriptor.
     let fd = unsafe { rustix::fd::OwnedFd::from_raw_fd(raw) };
-    require_fd_extended_metadata_absent(&fd, path)
+    let collected = collect_fd_xattr_names(&fd);
+    assess_symlink_xattrs(path, &collected)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn require_symlink_extended_metadata_absent(
+fn require_symlink_metadata_admitted(
     _parent: &HeldLocalBackendEvidence,
     _name: &OsStr,
     path: &Path,
 ) -> Result<(), HeldTreeError> {
     Err(HeldTreeError::UnsupportedContentProof(path.to_path_buf()))
+}
+
+fn assess_symlink_xattrs(path: &Path, collected: &CollectedXattrs) -> Result<(), HeldTreeError> {
+    match collected {
+        CollectedXattrs::Unknown => Err(HeldTreeError::NonDirectoryMetadataUnavailable(
+            path.to_path_buf(),
+        )),
+        CollectedXattrs::Names(names) => {
+            let name_refs = names.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            require_content_admitted(
+                EntryFacts {
+                    kind: EntryKind::Symlink,
+                    nlink: LinkCount::Unknown,
+                    acl: Evidence::Absent,
+                    xattr_platform: current_xattr_platform(),
+                    xattrs: Xattrs::Names(&name_refs),
+                },
+                path,
+            )
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const fn current_xattr_platform() -> XattrPlatform {
+    XattrPlatform::Linux
+}
+
+#[cfg(target_os = "macos")]
+const fn current_xattr_platform() -> XattrPlatform {
+    XattrPlatform::MacOs
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const fn current_xattr_platform() -> XattrPlatform {
+    XattrPlatform::Other
 }
 
 fn incarnation_from_timestamp(seconds: i64, nanos: u32, path: &Path) -> Result<u64, HeldTreeError> {
@@ -1340,6 +2022,67 @@ fn require_same_identity(
 
 fn grants_namespace_write(mode: u32) -> bool {
     mode & 0o030 == 0o030 || mode & 0o003 == 0o003
+}
+
+fn projected_parent_seal(
+    parent: &HeldLocalBackendEvidence,
+) -> Result<ProjectedParentSeal, HeldTreeError> {
+    let (original_mode, sealed_mode) = match assess_mode_seal(parent) {
+        ModeSealAssessment::Candidate {
+            original_mode,
+            sealed_mode,
+        } => (original_mode, sealed_mode),
+        ModeSealAssessment::Denied(ModeSealDenial::NotOwner) => {
+            return Err(HeldTreeError::ParentPolicyRejected);
+        }
+        ModeSealAssessment::Denied(ModeSealDenial::EvidenceUnverified) => {
+            return Err(HeldTreeError::ParentNotExclusive);
+        }
+    };
+    // Production seals the source parent with owner write/search acquisition.
+    let projected_mode = minimal_sealed_mode(sealed_mode | 0o300);
+    Ok(ProjectedParentSeal {
+        original_mode,
+        projected_mode,
+    })
+}
+
+fn require_parent_admission(
+    parent: &HeldLocalBackendEvidence,
+    backend: CertifiedLocalBackend,
+    admission: ParentAdmission,
+) -> Result<(), HeldTreeError> {
+    match admission {
+        ParentAdmission::CurrentExclusive => require_exclusive_parent(parent, backend),
+        ParentAdmission::Projected(projected) => {
+            with_fd(parent, |fd| crate::backend::require_held_fd_acl_absent(fd)).map_err(
+                |reason| HeldTreeError::Certification {
+                    path: PathBuf::new(),
+                    reason,
+                },
+            )?;
+            let stat = with_fd(parent, |fd| rustix::fs::fstat(fd))
+                .map_err(|error| io_error(Path::new(""), error))?;
+            let actual_backend = with_fd(parent, |fd| crate::backend::certify_held_fd_backend(fd))
+                .map_err(|reason| HeldTreeError::Certification {
+                    path: PathBuf::new(),
+                    reason,
+                })?;
+            let refreshed = projected_parent_seal(parent)?;
+            if parent.backend() != backend
+                || actual_backend != backend
+                || stat.st_uid != rustix::process::geteuid().as_raw()
+                || super::raw_mode_u32(stat.st_mode) & 0o7777 != projected.original_mode
+                || refreshed.original_mode != projected.original_mode
+                || refreshed.projected_mode != projected.projected_mode
+                || grants_namespace_write(projected.projected_mode)
+            {
+                Err(HeldTreeError::ParentNotExclusive)
+            } else {
+                Ok(())
+            }
+        }
+    }
 }
 
 fn require_exclusive_parent(
@@ -1522,8 +2265,8 @@ impl Budget {
         }
     }
 
-    fn add(&mut self, entry: &ManifestEntry, depth: u32) -> Result<(), HeldTreeError> {
-        let path_len = entry.path.as_os_str().as_bytes().len() as u64;
+    fn add_path(&mut self, path: &Path, depth: u32) -> Result<(), HeldTreeError> {
+        let path_len = path.as_os_str().as_bytes().len() as u64;
         self.entries = self.entries.saturating_add(1);
         self.path_bytes = self.path_bytes.saturating_add(path_len);
         self.manifest_bytes = self

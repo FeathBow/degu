@@ -10,7 +10,6 @@ const EXPIRED_AGE: std::time::Duration =
 
 pub(super) use crate::common::isolated_config_home as test_config_home;
 pub(super) use crate::common::isolated_degu as degu;
-pub(super) use crate::human_bytes::assert_human_bytes;
 pub(super) use crate::next_command::assert_next_command;
 pub(super) use crate::oplog_records::oplog_records;
 pub(super) use crate::sgr_assertion::assert_sgr_color;
@@ -260,4 +259,65 @@ spawn -noecho $env(DEGU_BIN) clean --dry-run --path $env(CLEAN_PATH)
         state_home: state.path(),
         extra_env: &extra_env,
     })
+}
+
+pub(super) fn assert_activation_and_wal(anchor: &std::path::Path, state: &std::path::Path) {
+    for name in [
+        "sealed-staging.authority",
+        "sealed-staging.prepare",
+        "sealed-staging.active",
+    ] {
+        assert!(anchor.join(name).is_file(), "missing {name}");
+    }
+    let store = state.join("degu/sealed-staging");
+    assert!(store.join("store.activation").is_file());
+    assert!(store.join("seal.wal").is_file());
+}
+
+pub(super) fn certify_backend(
+    path: &std::path::Path,
+) -> Result<degu_core::backend::CertifiedLocalBackend, degu_core::backend::CertificationError> {
+    let directory = std::fs::File::open(path)
+        .map_err(|_| degu_core::backend::CertificationError::InspectionFailed)?;
+    degu_core::backend::certify_held_fd_backend(&directory)
+}
+
+/// Sealed-admission fixtures require a certified backend. Linux may skip only
+/// an unsupported fixture filesystem; macOS asserts APFS so coverage cannot
+/// silently vanish; every other failure is a test failure.
+pub(super) fn require_sealed_fixture_backend(
+    path: &std::path::Path,
+) -> Option<degu_core::backend::CertifiedLocalBackend> {
+    match certify_backend(path) {
+        Ok(backend) => {
+            #[cfg(target_os = "macos")]
+            assert_eq!(
+                backend,
+                degu_core::backend::CertifiedLocalBackend::Apfs,
+                "macOS sealed fixtures must execute on APFS"
+            );
+            Some(backend)
+        }
+        #[cfg(target_os = "linux")]
+        Err(
+            degu_core::backend::CertificationError::UnsupportedFilesystem
+            | degu_core::backend::CertificationError::UnsupportedPlatform,
+        ) => {
+            eprintln!(
+                "skipping sealed fixture: uncertified filesystem at {}",
+                path.display()
+            );
+            None
+        }
+        Err(error) => panic!("sealed fixture certification failed: {error:?}"),
+    }
+}
+
+pub(super) fn assert_output_success(output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

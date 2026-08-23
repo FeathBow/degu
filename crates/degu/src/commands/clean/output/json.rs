@@ -16,7 +16,7 @@ pub(crate) fn print(
         .iter()
         .map(execution_json)
         .collect::<Result<Vec<_>>>()?;
-    let report = serde_json::json!({
+    let mut report = serde_json::json!({
         "completeness": completeness_label(prepared, omitted),
         "omitted": omitted,
         "planned": planned,
@@ -29,11 +29,32 @@ pub(crate) fn print(
             "expiry_purge": crate::native::json(&expiry.observation),
         },
     });
+    // Existing fields remain frozen. Dry-run reports add one parallel array,
+    // indexed by `planned`, so old consumers can keep reading findings while
+    // new consumers can distinguish blocked/deferred/unavailable previews.
+    if prepared.settings.dry_run {
+        report["staging_preflight"] = serde_json::Value::Array(
+            prepared
+                .preview_assessments()
+                .iter()
+                .map(|assessment| assessment.json())
+                .collect(),
+        );
+    }
     stdoutln!("{}", serde_json::to_string_pretty(&report)?)
 }
 
 pub(crate) fn validate_prepared(prepared: &PreparedClean) -> Result<()> {
     let _ = prepared_findings_json(prepared)?;
+    if prepared.settings.dry_run {
+        let _ = serde_json::to_value(
+            prepared
+                .preview_assessments()
+                .iter()
+                .map(|assessment| assessment.json())
+                .collect::<Vec<_>>(),
+        )?;
+    }
     let lifecycle = Lifecycle::new(&prepared.ctx);
     for finding in prepared.plan.items() {
         let trash_dir = lifecycle

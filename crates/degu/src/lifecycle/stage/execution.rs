@@ -26,6 +26,9 @@ struct ResourceSnapshot {
 }
 
 enum CleanState {
+    NotAttempted {
+        reason: String,
+    },
     StageFailed {
         reason: String,
     },
@@ -139,6 +142,10 @@ impl CleanExecution {
         Self::stage_failed(finding, reason)
     }
 
+    pub(super) fn not_attempted(finding: &Finding, reason: String) -> Self {
+        Self::with_state(finding, CleanState::NotAttempted { reason })
+    }
+
     fn unverified_destination(finding: &Finding, entry: PathBuf, reason: String) -> Self {
         Self::with_state(
             finding,
@@ -182,7 +189,7 @@ impl CleanExecution {
 
     pub(crate) fn trash_entry(&self) -> Option<&Path> {
         match &self.state {
-            CleanState::StageFailed { .. } => None,
+            CleanState::NotAttempted { .. } | CleanState::StageFailed { .. } => None,
             CleanState::Quarantined { entry, .. } | CleanState::RecoveryBlocked { entry, .. } => {
                 entry.as_deref()
             }
@@ -202,6 +209,9 @@ impl CleanExecution {
 
     pub(crate) fn failure(&self) -> Option<CleanExecutionFailure<'_>> {
         match &self.state {
+            CleanState::NotAttempted { reason } => {
+                Some(CleanExecutionFailure::NotAttempted { reason })
+            }
             CleanState::StageFailed { reason } => {
                 Some(CleanExecutionFailure::StageFailed { reason })
             }
@@ -256,6 +266,7 @@ impl CleanExecution {
 
     pub(crate) fn state_label(&self) -> &'static str {
         match &self.state {
+            CleanState::NotAttempted { .. } => "not_attempted",
             CleanState::StageFailed { .. } => "stage_failed",
             CleanState::Quarantined { .. } => "quarantined",
             CleanState::RecoveryBlocked { .. } => "recovery_blocked",

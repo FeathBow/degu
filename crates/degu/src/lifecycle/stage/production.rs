@@ -4,8 +4,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use degu_core::authority::TransactionState;
+use degu_core::backend::{
+    HeldTreePolicyAssessmentOutcome, assess_held_tree_policy_metadata, certify_held_fd,
+};
 use degu_core::ecosystem::DetectCtx;
-use degu_core::finding::{DispositionMode, Finding};
+use degu_core::finding::Finding;
 use degu_core::oplog::{ObjectIdentity, OpOutcome};
 use degu_core::seal::wal::{ProductionAssociation, StagingLocator, TransactionId};
 use degu_core::staging::{
@@ -18,8 +21,9 @@ use rustix::fs::{AtFlags, Mode, OFlags};
 use super::super::identity;
 use super::super::journal::{OperationLog, TrashRecord, trash_record};
 use super::super::{mount, storage};
-use super::EntryIdentity;
 use super::execution::CleanExecution;
+use super::policy::{self, PreparedPolicy, confined_relative};
+use super::{CapturedCleanPlan, EntryIdentity};
 
 const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
@@ -48,10 +52,94 @@ pub(super) struct ProductionOutcome {
     pub(super) recovery_blocked: bool,
 }
 
-struct PreparedPolicy {
-    recovery_anchor: PathBuf,
-    canonical_source: PathBuf,
-    trash_root: PathBuf,
+/// Performs the data-only admission pass for every item after the caller has
+/// activated and recovered the mutation session, but before this clean batch
+/// may mutate a source, prepare a trash root, reserve a claim, allocate a
+/// transaction, or append a transaction WAL frame. Store activation/recovery
+/// may already have written bookkeeping. The returned assessment is deliberately
+/// discarded: production execution repeats the complete policy and held-tree
+/// checks to retain all race detection and authority boundaries.
+pub(super) fn batch_preflight(
+    ctx: &DetectCtx,
+    plan: &CapturedCleanPlan,
+) -> Option<Vec<CleanExecution>> {
+    let first_failure =
+        plan.items_with_identities()
+            .enumerate()
+            .find_map(|(index, (finding, identity))| {
+                preflight_item(ctx, finding, identity)
+                    .and_then(require_batch_assessment)
+                    .err()
+                    .map(|reason| (index, finding.path().to_path_buf(), reason))
+            })?;
+
+    Some(
+        plan.items()
+            .iter()
+            .enumerate()
+            .map(|(index, finding)| {
+                if index == first_failure.0 {
+                    CleanExecution::plain_stage_failed(
+                        finding,
+                        format!(
+                            "sealed batch preflight rejected {}: {}",
+                            finding.path().display(),
+                            first_failure.2
+                        ),
+                    )
+                } else {
+                    CleanExecution::not_attempted(
+                        finding,
+                        format!(
+                            "sealed batch preflight did not attempt {} because {} failed preflight: {}",
+                            finding.path().display(),
+                            first_failure.1.display(),
+                            first_failure.2
+                        ),
+                    )
+                }
+            })
+            .collect(),
+    )
+}
+
+fn require_batch_assessment(outcome: HeldTreePolicyAssessmentOutcome) -> Result<(), String> {
+    match outcome {
+        HeldTreePolicyAssessmentOutcome::TreePolicyAssessed { .. } => Ok(()),
+        HeldTreePolicyAssessmentOutcome::TreePolicyDeferredUntilSourceParentSeal {
+            reason, ..
+        } => Err(format!(
+            "tree policy assessment was deferred until the source-parent seal ({reason:?}); atomic selected clean requires every tree policy to be evaluable before execution"
+        )),
+    }
+}
+
+fn preflight_item(
+    ctx: &DetectCtx,
+    finding: &Finding,
+    identity: &EntryIdentity,
+) -> Result<HeldTreePolicyAssessmentOutcome, String> {
+    // Match ordinary production's primary-failure order exactly. In particular,
+    // a pathname policy failure must not be masked by a held-tree deferral or
+    // assessment error that ordinary `execute` would never reach first.
+    let _policy = preflight_policy(ctx, finding, identity)?;
+
+    let lexical_parent = finding
+        .path()
+        .parent()
+        .ok_or_else(|| "sealed staging source has no parent".to_string())?;
+    let canonical_parent = std::fs::canonicalize(lexical_parent)
+        .map_err(|error| format!("failed to canonicalize sealed staging source parent: {error}"))?;
+    let root_basename = finding
+        .path()
+        .file_name()
+        .ok_or_else(|| "sealed staging source has no basename".to_string())?;
+    let source_parent = open_directory(&canonical_parent)
+        .map_err(|error| format!("failed to hold sealed staging source parent: {error}"))?;
+    let parent_evidence = certify_held_fd(source_parent)
+        .map_err(|error| format!("sealed staging source-parent certification failed: {error:?}"))?;
+    assess_held_tree_policy_metadata(parent_evidence, root_basename)
+        .map_err(|error| error.to_string())
 }
 
 struct HeldReservation {
@@ -592,78 +680,9 @@ fn preflight_policy(
     finding: &Finding,
     identity: &EntryIdentity,
 ) -> Result<PreparedPolicy, String> {
-    if !matches!(
-        finding.disposition().mode,
-        DispositionMode::Eligible | DispositionMode::OptIn
-    ) {
-        return Err("sealed staging accepts only explicitly Eligible or opted-in findings".into());
-    }
-    let metadata = std::fs::symlink_metadata(finding.path())
-        .map_err(|error| format!("failed to inspect sealed staging source: {error}"))?;
-    if !metadata.is_dir() {
-        return Err("sealed staging currently supports directories only".into());
-    }
-    if !identity
-        .matches(finding.path())
-        .map_err(|error| error.to_string())?
-    {
-        return Err("clean item identity changed before sealed staging policy checks".into());
-    }
-    let canonical_source = std::fs::canonicalize(finding.path())
-        .map_err(|error| format!("failed to canonicalize sealed staging source: {error}"))?;
-    let canonical_source_parent = canonical_source
-        .parent()
-        .ok_or_else(|| "sealed staging source has no canonical parent".to_string())?;
-
-    let lexical_trash = storage::resolve_trash_dir(ctx, &canonical_source)?;
-    let lexical_parent = lexical_trash
-        .parent()
-        .ok_or_else(|| "trash root has no parent".to_string())?;
-    let canonical_parent = std::fs::canonicalize(lexical_parent)
-        .map_err(|error| format!("failed to canonicalize prospective trash parent: {error}"))?;
-    let trash_name = lexical_trash
-        .file_name()
-        .ok_or_else(|| "trash root has no name".to_string())?;
-    let trash_root = canonical_parent.join(trash_name);
-
-    let source_mount = storage::path_mount_id(&canonical_source)?;
-    let destination_mount = storage::path_mount_id(&canonical_parent)?;
-    if source_mount != destination_mount {
-        return Err("sealed staging requires the source and trash destination on one mount".into());
-    }
-    let mount_owner_anchor = storage::resolve_mount_owner_anchor(&canonical_source, source_mount)?;
-    let mount_owner_anchor = std::fs::canonicalize(&mount_owner_anchor)
-        .map_err(|error| format!("failed to canonicalize mount owner anchor: {error}"))?;
-    let owner_confines_both = confined_relative(&mount_owner_anchor, canonical_source_parent)
-        .and_then(|_| confined_relative(&mount_owner_anchor, &trash_root))
-        .is_ok();
-    let recovery_anchor = if owner_confines_both {
-        mount_owner_anchor
-    } else {
-        let parent = mount_owner_anchor.parent().ok_or_else(|| {
-            "mount-domain anchor has no parent for non-empty recovery locators".to_string()
-        })?;
-        if storage::path_mount_id(parent)
-            .map(|mount| mount != source_mount)
-            .unwrap_or(true)
-        {
-            return Err(
-                "source parent equals the writable mount root and no same-mount recovery ancestor exists"
-                    .into(),
-            );
-        }
-        std::fs::canonicalize(parent)
-            .map_err(|error| format!("failed to canonicalize mount-domain anchor: {error}"))?
-    };
-    confined_relative(&recovery_anchor, canonical_source_parent)?;
-    confined_relative(&recovery_anchor, &trash_root)?;
-    degu_walk::resolve_trusted_directory(&recovery_anchor, "sealed-staging mount-domain anchor")
-        .map_err(|error| format!("mount-domain anchor cannot be reopened safely: {error}"))?;
-    Ok(PreparedPolicy {
-        recovery_anchor,
-        canonical_source,
-        trash_root,
-    })
+    let source = policy::assess_source(finding, identity)?;
+    let lexical_trash = storage::resolve_existing_trash_dir(ctx, source.canonical_source())?;
+    policy::complete(source, lexical_trash)
 }
 
 fn next_sequence(destination_parent: &OwnedFd) -> io::Result<u64> {
@@ -684,28 +703,6 @@ fn next_sequence(destination_parent: &OwnedFd) -> io::Result<u64> {
     maximum
         .checked_add(1)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "trash sequence overflow"))
-}
-
-fn confined_relative(anchor: &Path, path: &Path) -> Result<PathBuf, String> {
-    let relative = path.strip_prefix(anchor).map_err(|_| {
-        format!(
-            "sealed staging path is outside its mount-domain anchor: {}",
-            path.display()
-        )
-    })?;
-    if relative.as_os_str().is_empty() {
-        return Ok(PathBuf::new());
-    }
-    let mut components = relative.components();
-    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
-        || !components.all(|component| matches!(component, std::path::Component::Normal(_)))
-    {
-        return Err(format!(
-            "sealed staging path is not a confined mount-domain descendant: {}",
-            path.display()
-        ));
-    }
-    Ok(relative.to_path_buf())
 }
 
 fn open_directory(path: &Path) -> io::Result<OwnedFd> {
@@ -756,6 +753,80 @@ fn failed(finding: &Finding, reason: String, recovery_blocked: bool) -> Producti
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn deferred_tree_assessment_is_always_rejected_by_atomic_preflight() {
+        use degu_core::backend::{
+            HeldTreePolicyDeferralReason, SourceParentSealAssessment,
+            SourceParentSealAssessmentStatus,
+        };
+
+        let deferred =
+            || HeldTreePolicyAssessmentOutcome::TreePolicyDeferredUntilSourceParentSeal {
+                reason: HeldTreePolicyDeferralReason::SourceParentSearchRequiresExecutionSeal,
+                source_parent_seal: SourceParentSealAssessment {
+                    original_mode: 0o400,
+                    projected_mode: 0o700,
+                    validation: SourceParentSealAssessmentStatus::RequiresExecutionValidation,
+                },
+            };
+
+        let rejection = require_batch_assessment(deferred()).unwrap_err();
+        assert!(rejection.contains("atomic selected clean"), "{rejection}");
+        assert!(
+            rejection.contains("SourceParentSearchRequiresExecutionSeal"),
+            "{rejection}"
+        );
+    }
+
+    #[test]
+    fn real_0400_parent_preserves_ordinary_path_policy_as_primary_failure() {
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipping 0400 policy-order fixture while running as root");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let state = home.path().join("state");
+        let parent = home.path().join("source-parent");
+        let source = parent.join("root");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("payload"), b"data").unwrap();
+        for path in [
+            home.path(),
+            state.as_path(),
+            parent.as_path(),
+            source.as_path(),
+        ] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let state = state.canonicalize().unwrap();
+        let ctx = DetectCtx::for_test(
+            home.path().canonicalize().unwrap(),
+            [("XDG_STATE_HOME", state.as_os_str())],
+        );
+        let finding = super::super::tests::finding_for_test(source.clone(), 1, 1);
+        let identity = EntryIdentity::capture(&source).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        // The preview/core companion test proves this same 0400 shape can
+        // produce a held-tree deferral when assessment is tried first. Atomic
+        // production must nevertheless preserve ordinary pathname policy.
+        let ordinary = preflight_policy(&ctx, &finding, &identity).unwrap_err();
+        let atomic = preflight_item(&ctx, &finding, &identity).unwrap_err();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(atomic, ordinary);
+        assert!(
+            atomic.contains("failed to inspect sealed staging source")
+                || atomic.contains("failed to canonicalize sealed staging source"),
+            "{atomic}"
+        );
+        assert!(!atomic.contains("deferred"), "{atomic}");
+        assert!(!state.join("degu/trash").exists());
+        assert!(!state.join("degu/sealed-staging").exists());
+    }
 
     #[test]
     fn quarantined_and_recovery_blocked_outcomes_stop_the_batch_and_keep_the_entry() {
@@ -951,15 +1022,5 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert!(error.to_string().contains("entropy source failed"));
-    }
-
-    #[test]
-    fn mount_root_itself_is_a_valid_v11_recovery_anchor() {
-        let anchor = Path::new("/mount-root");
-        assert_eq!(confined_relative(anchor, anchor).unwrap(), PathBuf::new());
-        assert_eq!(
-            confined_relative(anchor, &anchor.join(".degu-trash")).unwrap(),
-            PathBuf::from(".degu-trash")
-        );
     }
 }

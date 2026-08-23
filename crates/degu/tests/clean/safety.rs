@@ -189,7 +189,7 @@ fn clean_guard_abort_rejects_protected_paths_before_mutation_or_logging() {
 }
 
 #[test]
-fn relative_xdg_config_home_cannot_bypass_home_protection() {
+fn blocked_preview_item_cannot_bypass_guard_with_relative_xdg_config_home() {
     let home = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
@@ -198,6 +198,7 @@ fn relative_xdg_config_home_cannot_bypass_home_protection() {
     #[cfg(not(target_os = "macos"))]
     let cache_subdir = ".cache/pip";
     let (cache, _) = fake_pip_cache(&home, cache_subdir);
+    std::fs::hard_link(cache.join("wheel.whl"), cache.join("wheel-alias.whl")).unwrap();
     std::fs::create_dir_all(home.path().join(".config/degu")).unwrap();
     std::fs::write(
         home.path().join(".config/degu/config.toml"),

@@ -11,6 +11,10 @@ pub(super) fn note(item: &CleanExecution) -> Option<(Severity, String)> {
 fn render(path: &Path, failure: CleanExecutionFailure<'_>) -> (Severity, String) {
     let path = escaped_path(path);
     match failure {
+        CleanExecutionFailure::NotAttempted { reason } => (
+            Severity::Error,
+            format!("not attempted {path}: {}", escape_terminal_text(reason)),
+        ),
         CleanExecutionFailure::StageFailed { reason } => (
             Severity::Error,
             format!("failed to stage {path}: {}", escape_terminal_text(reason)),
@@ -129,6 +133,18 @@ mod tests {
             staged,
             "failed to stage /cache\\n\\u{1b}[31m: probe failed\\rretry"
         );
+        let (severity, not_attempted) = render(
+            Path::new("/cache"),
+            CleanExecutionFailure::NotAttempted {
+                reason: "another selected path failed preflight",
+            },
+        );
+        assert!(matches!(severity, Severity::Error));
+        assert_eq!(
+            not_attempted,
+            "not attempted /cache: another selected path failed preflight"
+        );
+        assert!(!not_attempted.contains("failed to stage"));
         let (severity, unverified) = render(
             Path::new("/cache"),
             CleanExecutionFailure::UnverifiedDestination {

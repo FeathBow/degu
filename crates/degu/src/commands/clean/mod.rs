@@ -1,6 +1,7 @@
 mod execution;
 mod output;
 mod preparation;
+mod preview;
 
 use crate::cli::CleanArgs;
 use crate::runtime::Ui;

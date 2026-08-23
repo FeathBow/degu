@@ -8,6 +8,7 @@
 //!    plan**, never skips the item — silent skipping hides planner bugs.
 
 pub mod activation;
+mod admission;
 pub mod authority;
 pub mod backend;
 pub mod config;

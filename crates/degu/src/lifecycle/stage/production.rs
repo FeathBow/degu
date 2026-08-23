@@ -537,7 +537,7 @@ fn execute_reserved(
     // the oplog record, undercount freed space, and wedge undo. Only a poisoned WAL
     // escalates to recovery-blocked; every other purge failure degrades to "staged
     // in trash, not deleted" and still writes the durable oplog record.
-    let mut purge_admission_failure: Option<String> = None;
+    let mut purge_admission_failure: Option<(String, bool)> = None;
     let purge_request = if run.purge {
         match mount::open_pair_fds(&policy.recovery_anchor) {
             Ok((source_anchor, destination_anchor)) => Some(VerifiedPurgeRequest::new(
@@ -547,8 +547,11 @@ fn execute_reserved(
                 destination_anchor,
             )),
             Err(error) => {
-                purge_admission_failure = Some(format!(
-                    "failed to retain purge mount-domain anchors after VerifiedCommitted: {error}"
+                purge_admission_failure = Some((
+                    format!(
+                        "failed to retain purge mount-domain anchors after VerifiedCommitted: {error}"
+                    ),
+                    false,
                 ));
                 None
             }
@@ -613,9 +616,10 @@ fn execute_reserved(
             // The object stays durably staged in trash; a non-recovery admission
             // failure is not a stage failure and must not skip the oplog record.
             Err(error) => {
-                purge_admission_failure = Some(format!(
-                    "purge admission failed during {}: {error}",
-                    error.stage()
+                let unsupported_internal_hard_links = error.is_unsupported_internal_hard_links();
+                purge_admission_failure = Some((
+                    format!("purge admission failed during {}: {error}", error.stage()),
+                    unsupported_internal_hard_links,
                 ));
                 false
             }
@@ -638,7 +642,7 @@ fn execute_reserved(
             entry,
             (!failures.is_empty()).then(|| failures.join("; ")),
         ))
-    } else if let Some(admission) = purge_admission_failure {
+    } else if let Some((admission, unsupported_internal_hard_links)) = purge_admission_failure {
         let mut reason = format!(
             "object is durably staged in trash but sealed purge failed, so it was not deleted and can be restored with `degu undo`: {admission}"
         );
@@ -648,9 +652,15 @@ fn execute_reserved(
         if let Some(error) = jsonl_projection_failure {
             reason.push_str(&format!("; operation-log projection failed: {error}"));
         }
-        Ok(CleanExecution::production_purge_admission_failed(
-            finding, entry, reason,
-        ))
+        if unsupported_internal_hard_links {
+            Ok(CleanExecution::production_purge_unsupported(
+                finding, entry, reason,
+            ))
+        } else {
+            Ok(CleanExecution::production_purge_admission_failed(
+                finding, entry, reason,
+            ))
+        }
     } else {
         Ok(CleanExecution::production_staged(
             finding,

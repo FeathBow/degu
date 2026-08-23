@@ -80,7 +80,10 @@ fn assert_same_admission_error(
             HeldTreeError::Limit { kind: a, limit: x },
             HeldTreeError::Limit { kind: b, limit: y },
         ) => assert_eq!((a, x), (b, y)),
-        (HeldTreeError::ExternalHardLink(a), HeldTreeError::ExternalHardLink(b))
+        (
+            HeldTreeError::ExternalOrUnenumeratedHardLink(a),
+            HeldTreeError::ExternalOrUnenumeratedHardLink(b),
+        )
         | (
             HeldTreeError::NonDirectoryExtendedMetadata(a),
             HeldTreeError::NonDirectoryExtendedMetadata(b),
@@ -533,10 +536,15 @@ fn unsearchable_parent_does_not_claim_non_directory_or_special_content_was_check
 fn assessment_and_prove_share_hardlink_protected_special_and_directory_cap_rejections() {
     let (temp, root) = setup_tree();
     std::fs::hard_link(root.join("a/file"), root.join("a/other")).unwrap();
-    assert_same_admission_error(
-        collect(&temp, vec![], HeldTreeLimits::default()),
-        assess(&temp, vec![], HeldTreeLimits::default()),
+    let inventory = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    let (assessment, _) =
+        unwrap_tree_assessment(assess(&temp, vec![], HeldTreeLimits::default()).unwrap());
+    assert_eq!(
+        inventory.regular_hard_link_topology(),
+        assessment.regular_hard_links
     );
+    assert_eq!(assessment.regular_hard_links.multi_link_groups, 1);
+    assert_eq!(assessment.regular_hard_links.linked_entries, 2);
 
     let (temp, _) = setup_tree();
     assert_same_admission_error(
@@ -1254,16 +1262,20 @@ fn schema_one_inventory_preserves_legacy_hardlink_semantics() {
     legacy.rewalk_exact().unwrap();
 
     let held_parent = certify_held_fd(open_directory(temp.path())).unwrap();
-    assert!(matches!(
-        HeldTreeInventory::collect_for_schema(
-            held_parent,
-            OsStr::new("root"),
-            vec![],
-            HeldTreeLimits::default(),
-            CONTENT_PROOF_VERSION,
-        ),
-        Err(HeldTreeError::ExternalHardLink(path)) if path == Path::new("a/file") || path == Path::new("a/hardlink")
-    ));
+    let v2 = HeldTreeInventory::collect_for_schema(
+        held_parent,
+        OsStr::new("root"),
+        vec![],
+        HeldTreeLimits::default(),
+        CONTENT_PROOF_VERSION,
+    )
+    .unwrap();
+    assert_eq!(v2.regular_hard_link_topology().multi_link_groups, 1);
+    assert_eq!(v2.regular_hard_link_topology().linked_entries, 2);
+    // Downgrade residual: the v2 manifest codec/version is intentionally
+    // unchanged. An older binary recollecting this tree rejects its complete
+    // internal topology under its historical policy, so it fails closed; no
+    // backward operational compatibility claim is made.
 }
 
 #[test]
@@ -1377,13 +1389,265 @@ fn content_proof_rejects_same_size_overwrite_and_symlink_target_change() {
 }
 
 #[test]
-fn collection_rejects_external_regular_file_hardlinks() {
+fn complete_topology_distinguishes_internal_alias_sets() {
+    for arrange in [
+        |root: &Path| {
+            std::fs::hard_link(root.join("a/file"), root.join("a/alias")).unwrap();
+        },
+        |root: &Path| {
+            std::fs::hard_link(root.join("a/file"), root.join("a/b/alias")).unwrap();
+        },
+        |root: &Path| {
+            std::fs::hard_link(root.join("a/file"), root.join("a/alias-one")).unwrap();
+            std::fs::hard_link(root.join("a/file"), root.join("a/b/alias-two")).unwrap();
+        },
+    ] {
+        let (temp, root) = setup_tree();
+        arrange(&root);
+        let inventory = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+        let (assessment, _) =
+            unwrap_tree_assessment(assess(&temp, vec![], HeldTreeLimits::default()).unwrap());
+        let topology = inventory.regular_hard_link_topology();
+        assert_eq!(topology, assessment.regular_hard_links);
+        assert_eq!(topology.multi_link_groups, 1);
+        assert_eq!(
+            topology.linked_entries,
+            inventory
+                .manifest
+                .iter()
+                .filter(|entry| entry.identity.kind == NodeKind::Regular)
+                .count() as u64
+        );
+        inventory.rewalk_exact().unwrap();
+    }
+}
+
+#[test]
+fn complete_topology_distinguishes_external_and_mixed_alias_sets() {
     let (temp, root) = setup_tree();
-    std::fs::hard_link(root.join("a/file"), root.join("a/alias")).unwrap();
+    std::fs::hard_link(root.join("a/file"), temp.path().join("external")).unwrap();
     assert!(matches!(
         collect(&temp, vec![], HeldTreeLimits::default()),
-        Err(HeldTreeError::ExternalHardLink(_))
+        Err(HeldTreeError::ExternalOrUnenumeratedHardLink(path)) if path == Path::new("a/file")
     ));
+
+    let (temp, root) = setup_tree();
+    std::fs::hard_link(root.join("a/file"), root.join("a/alias")).unwrap();
+    std::fs::hard_link(root.join("a/file"), temp.path().join("external")).unwrap();
+    assert_same_admission_error(
+        collect(&temp, vec![], HeldTreeLimits::default()),
+        assess(&temp, vec![], HeldTreeLimits::default()),
+    );
+    assert!(matches!(
+        assess(&temp, vec![], HeldTreeLimits::default()),
+        Err(HeldTreeError::ExternalOrUnenumeratedHardLink(path)) if path == Path::new("a/alias")
+    ));
+}
+
+#[test]
+fn static_policy_and_limits_precede_deferred_hardlink_classification() {
+    let (temp, root) = setup_tree();
+    std::fs::hard_link(root.join("a/file"), root.join("a/alias")).unwrap();
+    std::fs::create_dir(root.join("protected")).unwrap();
+    assert!(matches!(
+        collect(
+            &temp,
+            vec![OsString::from("protected")],
+            HeldTreeLimits::default(),
+        ),
+        Err(HeldTreeError::ProtectedName(path)) if path == Path::new("protected")
+    ));
+    assert!(matches!(
+        assess(
+            &temp,
+            vec![],
+            HeldTreeLimits {
+                max_entries: 2,
+                ..HeldTreeLimits::default()
+            },
+        ),
+        Err(HeldTreeError::Limit {
+            kind: HeldTreeLimit::Entries,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn link_count_drift_between_alias_observations_fails_as_race() {
+    let (temp, root) = setup_tree();
+    std::fs::hard_link(root.join("a/file"), root.join("a/alias")).unwrap();
+    let source = root.join("a/file");
+    let external = temp.path().join("late-external");
+    let mut fired = false;
+    let _hook = install_regular_link_observation_test_hook(move |_| {
+        if !fired {
+            std::fs::hard_link(&source, &external).unwrap();
+            fired = true;
+        }
+    });
+    assert!(matches!(
+        collect(&temp, vec![], HeldTreeLimits::default()),
+        Err(HeldTreeError::ContentChangedDuringHash(_))
+    ));
+}
+
+#[test]
+fn external_link_after_last_initial_alias_observation_fails_final_reobservation() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let (temp, root) = setup_tree();
+    std::fs::hard_link(root.join("a/file"), root.join("a/alias")).unwrap();
+    let source = root.join("a/file");
+    let external = temp.path().join("post-traversal-external");
+    let fired = Rc::new(Cell::new(false));
+    let observed_fired = Rc::clone(&fired);
+    let _hook = install_final_regular_reobservation_test_hook(move || {
+        std::fs::hard_link(&source, &external).unwrap();
+        observed_fired.set(true);
+    });
+
+    let result = collect(&temp, vec![], HeldTreeLimits::default());
+    assert!(fired.get(), "final re-observation hook did not fire");
+    assert!(matches!(
+        result,
+        Err(HeldTreeError::ContentChangedDuringHash(_))
+            | Err(HeldTreeError::ExternalOrUnenumeratedHardLink(_))
+    ));
+}
+
+#[test]
+fn alias_mutation_between_hashes_fails_and_observation_hook_fires() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let (temp, root) = setup_tree();
+    let source = root.join("a/file");
+    std::fs::hard_link(&source, root.join("a/alias")).unwrap();
+    let fired = Rc::new(Cell::new(false));
+    let observed_fired = Rc::clone(&fired);
+    let _hook = install_regular_link_observation_test_hook(move |_| {
+        if !observed_fired.replace(true) {
+            std::fs::write(&source, b"two").unwrap();
+        }
+    });
+
+    assert!(matches!(
+        collect(&temp, vec![], HeldTreeLimits::default()),
+        Err(HeldTreeError::ContentChangedDuringHash(_))
+    ));
+    assert!(fired.get(), "alias observation hook did not fire");
+}
+
+#[test]
+fn alias_group_rejects_differing_proved_content_hashes() {
+    let identity = NodeIdentity {
+        kind: NodeKind::Regular,
+        device: 7,
+        inode: 11,
+        incarnation: 13,
+    };
+    let observation = RegularFileObservation {
+        identity,
+        uid: 17,
+        gid: 19,
+        mode: 0o600,
+        size: 3,
+        nlink: 2,
+        mtime_sec: 23,
+        mtime_nsec: 29,
+        ctime_sec: 31,
+        ctime_nsec: 37,
+        sha256: Some([0x41; 32]),
+    };
+    let aliases = [
+        RegularFileReobservation {
+            path: Path::new("a/alias"),
+            observation,
+        },
+        RegularFileReobservation {
+            path: Path::new("a/file"),
+            observation: RegularFileObservation {
+                sha256: Some([0x42; 32]),
+                ..observation
+            },
+        },
+    ];
+    assert!(matches!(
+        classify_regular_file_topology(&aliases),
+        Err(HeldTreeError::ContentChangedDuringHash(path)) if path == Path::new("a/alias")
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn internal_non_utf8_alias_path_is_preserved() {
+    let (temp, root) = setup_tree();
+    let first = OsString::from_vec(vec![0xfe]);
+    let second = OsString::from_vec(vec![0xff]);
+    std::fs::write(root.join("a").join(&first), b"links").unwrap();
+    std::fs::hard_link(root.join("a").join(&first), root.join("a").join(&second)).unwrap();
+    let (assessment, _) =
+        unwrap_tree_assessment(assess(&temp, vec![], HeldTreeLimits::default()).unwrap());
+    assert_eq!(assessment.regular_hard_links.multi_link_groups, 1);
+    assert_eq!(assessment.regular_hard_links.linked_entries, 2);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_many_internal_groups_use_bounded_descriptor_retention() {
+    let (temp, root) = setup_tree();
+    for index in 0_u32..300 {
+        let original = root.join("a").join(format!("group-{index:03}-a"));
+        let alias = root.join("a/b").join(format!("group-{index:03}-b"));
+        std::fs::write(&original, index.to_be_bytes()).unwrap();
+        std::fs::hard_link(&original, &alias).unwrap();
+    }
+    let baseline = observed_process_fd_count();
+    let inventory = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    assert_eq!(
+        inventory.regular_hard_link_topology().multi_link_groups,
+        300
+    );
+    assert_eq!(inventory.regular_hard_link_topology().linked_entries, 600);
+    // The inventory retains only source-parent and root descriptors regardless
+    // of group count; all regular descriptors are transient per path.
+    assert_eq!(
+        observed_process_fd_count().checked_sub(baseline),
+        Some(2),
+        "production proving must retain exactly source-parent and root FDs"
+    );
+    inventory.rewalk_exact().unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn many_internal_groups_are_summarized_with_bounded_descriptor_retention() {
+    const CHILD_MARKER_ENV: &str = "DEGU_HARDLINK_GROUP_FD_OBSERVATION_CHILD_MARKER";
+    if let Some(marker) = std::env::var_os(CHILD_MARKER_ENV) {
+        assert_many_internal_groups_use_bounded_descriptor_retention();
+        std::fs::write(marker, b"observed").unwrap();
+        return;
+    }
+
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir.path().join("completed");
+    let test_name = format!(
+        "{}::many_internal_groups_are_summarized_with_bounded_descriptor_retention",
+        module_path!()
+            .strip_prefix("degu_core::")
+            .unwrap_or(module_path!())
+    );
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test_name, "--nocapture"])
+        .env(CHILD_MARKER_ENV, &marker)
+        .status()
+        .unwrap();
+    assert!(status.success(), "isolated hardlink-group FD test failed");
+    assert!(
+        marker.exists(),
+        "isolated hardlink-group FD test did not execute"
+    );
 }
 
 #[test]

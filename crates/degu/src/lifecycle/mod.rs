@@ -145,6 +145,20 @@ pub(crate) struct MutationSession {
     _unsupported_legacy_lease: Option<UnsupportedNeverActivatedLease>,
 }
 
+#[derive(Debug)]
+enum SealedPurgeOutcome {
+    Legacy,
+    Purged,
+    RetainedUnsupported(String),
+    Blocked(String),
+}
+
+#[derive(Default)]
+struct SealedPurgeBatchOutcome {
+    retained: std::collections::HashMap<PathBuf, String>,
+    blocked: Option<String>,
+}
+
 impl MutationSession {
     pub(crate) fn uses_sealed_staging_for_clean(&self) -> bool {
         self.forward_clean
@@ -179,37 +193,37 @@ impl MutationSession {
         purge::plan_all_trash(&self.lifecycle.ctx)
     }
 
-    /// Post-confirmation classification and sealed execution. Each matching
-    /// entry is removed only through freshly rebound authority; any recovery
-    /// block stops the remaining batch before legacy claim or housekeeping.
-    pub(crate) fn authorize_purge_all(&mut self, plan: &TrashPurgePlan) -> Option<String> {
-        for path in plan.entries() {
-            if let Some(reason) = self.classify_explicit_purge(path) {
-                return Some(format!(
-                    "{reason}; no later claim, deletion, or housekeeping was attempted for this batch"
-                ));
-            }
-        }
-        None
-    }
-
+    /// Post-confirmation classification and sealed execution. Unsupported
+    /// proof topologies are retained per entry and do not prevent unrelated
+    /// work. A recovery blocker still stops the batch before any later legacy
+    /// claim, deletion, or housekeeping.
     pub(crate) fn execute_explicit_purge_all(&mut self, mut plan: TrashPurgePlan) -> PurgeReport {
-        let blocked = self.authorize_purge_all(&plan);
+        let sealed = self.execute_sealed_purge_batch(plan.entries());
         let purged = plan.take_already_purged(&self.authority_purged);
-        if let Some(reason) = blocked {
+        if let Some(reason) = sealed.blocked {
             return PurgeReport {
                 purged,
                 failed: plan
                     .entries()
-                    .map(|path| (path.to_path_buf(), reason.clone()))
+                    .map(|path| {
+                        let reason = sealed.retained.get(path).unwrap_or(&reason).clone();
+                        (path.to_path_buf(), reason)
+                    })
                     .collect(),
             };
         }
+        let blocker = |path: &Path| {
+            sealed
+                .retained
+                .get(path)
+                .cloned()
+                .or_else(|| self.sealed_entry_block(path))
+        };
         let mut report = PurgeReport {
             purged,
             failed: Vec::new(),
         };
-        let legacy = self.execute_purge_all(plan);
+        let legacy = purge::execute_purge_plan(&self.lifecycle.ctx, "trash purge", plan, &blocker);
         report.purged.extend(legacy.purged);
         report.failed.extend(legacy.failed);
         report
@@ -225,25 +239,56 @@ impl MutationSession {
     }
 
     pub(crate) fn execute_expiry(&mut self, plan: &ExpiryPlan) -> PurgeReport {
-        for path in plan.entries().map(Path::to_path_buf).collect::<Vec<_>>() {
-            if let Some(reason) = self.classify_explicit_purge(&path) {
-                let reason =
-                    format!("{reason}; no later expiry mutation or housekeeping was attempted");
-                let (purged, failed): (Vec<_>, Vec<_>) = plan
-                    .entries()
-                    .map(Path::to_path_buf)
-                    .partition(|path| self.authority_purged.contains(path));
-                return PurgeReport {
-                    purged,
-                    failed: failed
-                        .into_iter()
-                        .map(|path| (path, reason.clone()))
-                        .collect(),
-                };
+        let sealed = self.execute_sealed_purge_batch(plan.entries());
+        if let Some(reason) = sealed.blocked {
+            let (purged, failed): (Vec<_>, Vec<_>) = plan
+                .entries()
+                .map(Path::to_path_buf)
+                .partition(|path| self.authority_purged.contains(path));
+            return PurgeReport {
+                purged,
+                failed: failed
+                    .into_iter()
+                    .map(|path| {
+                        let reason = sealed.retained.get(&path).unwrap_or(&reason).clone();
+                        (path, reason)
+                    })
+                    .collect(),
+            };
+        }
+        let blocker = |path: &Path| {
+            sealed
+                .retained
+                .get(path)
+                .cloned()
+                .or_else(|| self.sealed_entry_block(path))
+        };
+        purge::execute_expiry_plan(&self.lifecycle.ctx, plan, &blocker, &self.authority_purged)
+    }
+
+    fn execute_sealed_purge_batch<'a>(
+        &mut self,
+        paths: impl Iterator<Item = &'a Path>,
+    ) -> SealedPurgeBatchOutcome {
+        let mut outcome = SealedPurgeBatchOutcome::default();
+        for path in paths.map(Path::to_path_buf).collect::<Vec<_>>() {
+            match self.execute_sealed_purge_entry(&path) {
+                SealedPurgeOutcome::Legacy => {}
+                SealedPurgeOutcome::Purged => {
+                    self.authority_purged.insert(path);
+                }
+                SealedPurgeOutcome::RetainedUnsupported(reason) => {
+                    outcome.retained.insert(path, reason);
+                }
+                SealedPurgeOutcome::Blocked(reason) => {
+                    outcome.blocked = Some(format!(
+                        "{reason}; no later claim, deletion, or housekeeping was attempted for this batch"
+                    ));
+                    break;
+                }
             }
         }
-        let blocker = |path: &Path| self.sealed_entry_block(path);
-        purge::execute_expiry_plan(&self.lifecycle.ctx, plan, &blocker, &self.authority_purged)
+        outcome
     }
 
     pub(crate) fn undo_latest(&mut self) -> Result<Option<UndoReport>> {
@@ -282,25 +327,31 @@ impl MutationSession {
         )
     }
 
-    /// Returns a blocker for any sealed candidate that was not durably purged.
-    /// An unassociated legacy entry returns `None`; every sealed admission or
-    /// execution failure remains outside the legacy claim/delete path.
-    fn classify_explicit_purge(&mut self, path: &Path) -> Option<String> {
-        let engine = self.sealed_staging.as_mut()?;
+    /// Executes the sealed portion of one purge decision. Unsupported hardlink
+    /// topology is a typed retained result; all uncertainty remains a
+    /// fail-closed blocker and an unassociated entry remains legacy work.
+    fn execute_sealed_purge_entry(&mut self, path: &Path) -> SealedPurgeOutcome {
+        let Some(engine) = self.sealed_staging.as_mut() else {
+            return SealedPurgeOutcome::Legacy;
+        };
         let entries = engine.production_entries();
         if entries.is_empty() {
-            return None;
+            return SealedPurgeOutcome::Legacy;
         }
         let normalized = match (path.parent(), path.file_name()) {
             (Some(parent), Some(name)) => match std::fs::canonicalize(parent) {
                 Ok(parent) => parent.join(name),
                 Err(error) => {
-                    return Some(format!(
+                    return SealedPurgeOutcome::Blocked(format!(
                         "sealed staging could not authenticate the explicit purge parent: {error}"
                     ));
                 }
             },
-            _ => return Some("sealed staging rejected an unlocatable explicit purge entry".into()),
+            _ => {
+                return SealedPurgeOutcome::Blocked(
+                    "sealed staging rejected an unlocatable explicit purge entry".into(),
+                );
+            }
         };
         let mut matched = None;
         for entry in entries
@@ -310,7 +361,7 @@ impl MutationSession {
             let anchor = match mount::entry_anchor(&self.lifecycle.ctx.home, &entry) {
                 Ok(anchor) => anchor,
                 Err(error) => {
-                    return Some(format!(
+                    return SealedPurgeOutcome::Blocked(format!(
                         "sealed staging could not authenticate a mount-domain anchor for explicit purge: {error}"
                     ));
                 }
@@ -324,24 +375,28 @@ impl MutationSession {
             }
         }
         let Some((entry, anchor)) = matched else {
-            return self.sealed_entry_block(path);
+            return self
+                .sealed_entry_block(path)
+                .map_or(SealedPurgeOutcome::Legacy, SealedPurgeOutcome::Blocked);
         };
         if !matches!(
             entry.state(),
             degu_core::authority::TransactionState::VerifiedCommitted
                 | degu_core::authority::TransactionState::Purgeable
         ) {
-            return sealed_mutation_authority_active(entry.state()).then(|| {
-                format!(
+            return if sealed_mutation_authority_active(entry.state()) {
+                SealedPurgeOutcome::Blocked(format!(
                     "sealed staging transaction is {:?} and cannot admit explicit purge",
                     entry.state()
-                )
-            });
+                ))
+            } else {
+                SealedPurgeOutcome::Legacy
+            };
         }
         let (source_anchor, destination_anchor) = match mount::open_pair_fds(&anchor) {
             Ok(anchors) => anchors,
             Err(error) => {
-                return Some(format!(
+                return SealedPurgeOutcome::Blocked(format!(
                     "failed to retain explicit purge mount-domain anchors: {error}"
                 ));
             }
@@ -359,17 +414,26 @@ impl MutationSession {
                 match engine.execute_verified_purge(authority) {
                     Ok(commit) => {
                         debug_assert_eq!(commit.transaction(), entry.transaction());
-                        self.authority_purged.insert(path.to_path_buf());
-                        None
+                        SealedPurgeOutcome::Purged
                     }
-                    Err(error) => Some(format!(
+                    Err(error) => SealedPurgeOutcome::Blocked(format!(
                         "sealed staging explicit purge execution failed during {} ({:?}): {error}",
                         error.stage(),
                         error.disposition()
                     )),
                 }
             }
-            Err(error) => Some(format!(
+            Err(error)
+                if matches!(
+                    error.disposition(),
+                    degu_core::staging::VerifiedPurgeFailureDisposition::NotStarted
+                ) && error.is_unsupported_internal_hard_links() =>
+            {
+                SealedPurgeOutcome::RetainedUnsupported(format!(
+                    "retained and remains undoable because permanent purge is unsupported: {error}"
+                ))
+            }
+            Err(error) => SealedPurgeOutcome::Blocked(format!(
                 "sealed staging explicit purge admission failed during {} ({:?}): {error}",
                 error.stage(),
                 error.disposition()

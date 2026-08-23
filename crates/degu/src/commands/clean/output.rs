@@ -34,6 +34,17 @@ pub(super) fn print_mutation_scope(
     flush_stdout()
 }
 
+fn plan_has_purge_unsupported(prepared: &PreparedClean) -> bool {
+    prepared
+        .preview_tree_policy_assessed()
+        .iter()
+        .any(|finding| {
+            prepared
+                .preview_assessment(finding)
+                .is_some_and(|assessment| !assessment.purge_supported())
+        })
+}
+
 fn print_mechanism(prepared: &PreparedClean, sealed_staging: bool) -> Result<()> {
     let ui = prepared.settings.ui;
     let trash_dirs = clean_plan_trash_dirs(prepared)?;
@@ -55,11 +66,21 @@ fn print_mechanism(prepared: &PreparedClean, sealed_staging: bool) -> Result<()>
     for trash_dir in &trash_dirs {
         stdoutln!("  {trash_dir}")?;
     }
-    let mechanism = if prepared.settings.purge {
+    let mechanism = if prepared.settings.purge && plan_has_purge_unsupported(prepared) {
+        ui.toned_prose(
+            0,
+            "Purge-supported items are sealed, staged, and permanently deleted through exact object-bound authority. Internal-hardlink items remain staged and undoable because permanent purge is unsupported.",
+            Tone::Destructive,
+        )
+    } else if prepared.settings.purge {
         ui.toned_prose(
             0,
             "Sealed, staged, and permanently deleted through exact object-bound authority; not restorable.",
             Tone::Destructive,
+        )
+    } else if sealed_staging && plan_has_purge_unsupported(prepared) {
+        ui.prose(
+            "Restorable with degu undo. Internal-hardlink entries remain staged because permanent purge is unsupported; unrelated purge-supported entries may be purged after seven days. Legacy path-based cleanup cannot delete sealed entries."
         )
     } else if sealed_staging {
         ui.prose(&format!(
@@ -78,12 +99,20 @@ fn print_mechanism_sentence(
     trash_dirs: &[String],
     sealed_staging: bool,
 ) -> Result<()> {
-    let mechanism = if prepared.settings.purge {
+    let mechanism = if prepared.settings.purge && plan_has_purge_unsupported(prepared) {
+        semantic::paint(
+            "purge-supported items are sealed, staged, and permanently deleted through exact object-bound authority; internal-hardlink items remain staged and undoable because permanent purge is unsupported.",
+            Tone::Destructive,
+            prepared.settings.ui.colors.stdout,
+        )
+    } else if prepared.settings.purge {
         semantic::paint(
             "sealed, staged, and permanently deleted through exact object-bound authority; not restorable.",
             Tone::Destructive,
             prepared.settings.ui.colors.stdout,
         )
+    } else if sealed_staging && plan_has_purge_unsupported(prepared) {
+        "restorable with degu undo; internal-hardlink entries remain staged because permanent purge is unsupported, while unrelated purge-supported entries may be purged after seven days. Legacy path-based cleanup cannot delete sealed entries.".to_string()
     } else if sealed_staging {
         format!(
             "restorable with degu undo; a later clean may purge it after {TRASH_RETENTION_DAYS} days. Legacy path-based cleanup cannot delete it."
@@ -121,7 +150,7 @@ pub(super) fn print_expiry_plan(
     );
     let noun = if plan.len() == 1 { "entry" } else { "entries" };
     stdoutln!(
-        "Expired trash: {} {noun} {action} (at least {} days old).",
+        "Expired trash: {} {noun} will be considered (at least {} days old); purge-supported entries {action}, while sealed internal-hardlink entries are retained and remain undoable.",
         plan.len(),
         TRASH_RETENTION_DAYS
     )?;
@@ -198,7 +227,11 @@ pub(super) fn print_execution(
             stdoutln!(
                 "{}",
                 ui.prose(
-                    "Still counts against quota while staged; restore with 'degu undo'. A later clean may purge it after seven days; legacy path-based cleanup cannot delete it."
+                    if plan_has_purge_unsupported(prepared) {
+                        "Still counts against quota while staged; restore with 'degu undo'. Internal-hardlink entries are retained because permanent purge is unsupported; unrelated purge-supported entries may be purged after seven days."
+                    } else {
+                        "Still counts against quota while staged; restore with 'degu undo'. A later clean may purge it after seven days; legacy path-based cleanup cannot delete it."
+                    }
                 )
             )?;
         } else if executed.iter().all(|item| !item.requires_manual_recovery()) {

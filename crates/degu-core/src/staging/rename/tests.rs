@@ -10,7 +10,7 @@ use crate::staging::{
     VerifiedPurgeFailureDisposition, VerifiedPurgeRequest, VerifiedUndoFailureDisposition,
     VerifiedUndoRequest,
 };
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 struct Fixture {
     _temp: tempfile::TempDir,
@@ -195,6 +195,61 @@ fn set_group(path: &Path, gid: u32) -> std::io::Result<()> {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
+    }
+}
+
+#[test]
+fn internal_pair_cross_directory_and_three_aliases_fingerprint_and_restart_verify() {
+    for (case, aliases) in [(0_u8, 2_u64), (1, 2), (2, 3)] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let original = fixture.source_root.join("child/data");
+        match case {
+            0 => std::fs::hard_link(&original, fixture.source_root.join("child/alias")).unwrap(),
+            1 => std::fs::hard_link(&original, fixture.source_root.join("cross-alias")).unwrap(),
+            2 => {
+                std::fs::hard_link(&original, fixture.source_root.join("child/alias-one")).unwrap();
+                std::fs::hard_link(&original, fixture.source_root.join("alias-two")).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let binding = fixture.prepare();
+        let transaction = TransactionId([0xc0 + case; 16]);
+        let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+        assert!(report.is_empty());
+        let staged = engine.stage_prepared_root(transaction, binding).unwrap();
+        assert_eq!(staged.wal_state(), Some(TransactionState::StagedUnverified));
+        drop(staged);
+        drop(engine);
+
+        let mut lease = fixture.store.try_lease().unwrap();
+        let replay = lease.replay_and_repair().unwrap();
+        let manifest = replay.transactions[&transaction].tree_manifest.unwrap();
+        assert!(manifest.has_content_proof());
+        assert_ne!(manifest.sha256, [0; 32]);
+        assert_eq!(
+            std::fs::metadata(fixture.destination_root.join("child/data"))
+                .unwrap()
+                .nlink(),
+            aliases
+        );
+        drop(lease);
+
+        let (mut recovered, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+        let candidate = report.into_candidates().pop().unwrap();
+        let capability = recovered
+            .prepare_startup_recovery(candidate, fixture.anchors())
+            .unwrap();
+        let StartupRecoveryCapability::PendingVerification(pending) = capability else {
+            panic!("internal alias case {case} did not resume exact verification")
+        };
+        let StagedVerificationOutcome::StagedSealed(verified) =
+            pending.verify_or_quarantine().unwrap()
+        else {
+            panic!("internal alias case {case} did not verify after restart")
+        };
+        assert_eq!(verified.wal_state(), Some(TransactionState::StagedSealed));
     }
 }
 
@@ -599,6 +654,98 @@ fn verified_purge_mints_one_use_authority_after_durable_terminal_transition() {
     ready.execute_verified_purge(authority).unwrap();
     assert_eq!(ready.state(transaction), Some(TransactionState::Purged));
     assert!(!fixture.destination_root.exists());
+}
+
+#[test]
+fn internal_hardlink_purge_is_rejected_before_authority_and_restart_undo_preserves_aliases() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let original = fixture.source_root.join("child/data");
+    let alias = fixture.source_root.join("child/data-alias");
+    std::fs::hard_link(&original, &alias).unwrap();
+    let transaction = TransactionId([0xeb; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+
+    let error = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap_err();
+    assert!(error.is_unsupported_internal_hard_links(), "{error}");
+    assert_eq!(
+        error.disposition(),
+        VerifiedPurgeFailureDisposition::NotStarted
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    for path in [
+        fixture.destination_root.join("child/data"),
+        fixture.destination_root.join("child/data-alias"),
+    ] {
+        assert!(path.is_file());
+        assert_eq!(std::fs::metadata(path).unwrap().nlink(), 2);
+    }
+    drop(ready);
+
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    let staged = &replay.transactions[&transaction];
+    assert_eq!(staged.state, TransactionState::VerifiedCommitted);
+    assert_eq!(staged.purge_removed_entries, 0);
+    assert!(staged.purge_last_path.is_none());
+    drop(lease);
+
+    // A fresh engine generation must still regard the committed transaction as
+    // healthy and permit exact undo without any recovery/quarantine promotion.
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty());
+    let (mut ready, summary) = engine
+        .recover_startup(report, |_, _| {
+            Err(std::io::Error::other(
+                "VerifiedCommitted must not request startup recovery anchors",
+            ))
+        })
+        .unwrap();
+    assert!(summary.recovered.is_empty());
+    let token = ready
+        .verified_undo_token(transaction, "undo-group")
+        .unwrap();
+    ready
+        .undo_verified(token, verified_undo_request(&fixture))
+        .unwrap();
+    let restored = std::fs::metadata(&original).unwrap();
+    let restored_alias = std::fs::metadata(&alias).unwrap();
+    assert_eq!(restored.ino(), restored_alias.ino());
+    assert_eq!(restored.nlink(), 2);
+    assert_eq!(restored_alias.nlink(), 2);
+    assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+}
+
+#[test]
+fn hardlink_topology_drift_after_stage_uses_existing_recovery_required_tamper_path() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xec; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let outside = fixture.base.join("post-stage-external-alias");
+    std::fs::hard_link(fixture.destination_root.join("child/data"), &outside).unwrap();
+
+    let error = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap_err();
+    assert!(!error.is_unsupported_internal_hard_links());
+    assert_eq!(
+        error.disposition(),
+        VerifiedPurgeFailureDisposition::Terminal(TransactionState::RecoveryRequired)
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::RecoveryRequired)
+    );
+    assert!(fixture.destination_root.join("child/data").is_file());
+    assert!(outside.is_file());
 }
 
 #[test]

@@ -22,12 +22,6 @@ pub(crate) enum Evidence {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LinkCount {
-    Known(u64),
-    Unknown,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum XattrPlatform {
     #[cfg(any(target_os = "linux", test))]
     Linux,
@@ -81,7 +75,6 @@ pub(crate) enum Xattrs<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct EntryFacts<'a> {
     pub(crate) kind: EntryKind,
-    pub(crate) nlink: LinkCount,
     pub(crate) acl: Evidence,
     pub(crate) xattr_platform: XattrPlatform,
     pub(crate) xattrs: Xattrs<'a>,
@@ -90,11 +83,6 @@ pub(crate) struct EntryFacts<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RejectReason<'a> {
     UnsupportedEntryKind,
-    /// The current proof schema represents only single-link regular files.
-    RegularFileLinkCountNotOne {
-        observed: u64,
-    },
-    RegularFileLinkCountUnknown,
     AclPresent,
     AclUnknown,
     ExtendedAttributePresent {
@@ -113,27 +101,14 @@ pub(crate) enum Admission<'a> {
 /// Apply the current, deliberately conservative content-proof policy.
 ///
 /// Directory metadata is outside this policy's scope: held-tree directory
-/// authority is certified separately. Link count applies only to regular
-/// files. Non-directory ACL and xattr uncertainty fails closed.
+/// authority is certified separately. Regular-file link topology is classified
+/// only after the bounded traversal has a complete stable set of per-entry
+/// observations. Non-directory ACL and xattr uncertainty fails closed here.
 pub(crate) fn assess_content<'a>(facts: &EntryFacts<'a>) -> Admission<'a> {
     match facts.kind {
         EntryKind::Directory => Admission::Admit,
         EntryKind::Other => Admission::Reject(RejectReason::UnsupportedEntryKind),
-        EntryKind::Regular => {
-            match facts.nlink {
-                LinkCount::Known(1) => {}
-                LinkCount::Known(observed) => {
-                    return Admission::Reject(RejectReason::RegularFileLinkCountNotOne {
-                        observed,
-                    });
-                }
-                LinkCount::Unknown => {
-                    return Admission::Reject(RejectReason::RegularFileLinkCountUnknown);
-                }
-            }
-            assess_non_directory_metadata(facts)
-        }
-        EntryKind::Symlink => assess_non_directory_metadata(facts),
+        EntryKind::Regular | EntryKind::Symlink => assess_non_directory_metadata(facts),
     }
 }
 
@@ -222,7 +197,6 @@ mod tests {
             EntryKind::Symlink,
             EntryKind::Other,
         ];
-        let links = [LinkCount::Known(1), LinkCount::Known(2), LinkCount::Unknown];
         let acls = [Evidence::Absent, Evidence::Present, Evidence::Unknown];
         let xattrs = [
             Xattrs::Names(NO_XATTRS),
@@ -232,53 +206,32 @@ mod tests {
 
         let mut cases = 0;
         for kind in kinds {
-            for nlink in links {
-                for acl in acls {
-                    for xattrs in xattrs {
-                        cases += 1;
-                        let facts = EntryFacts {
-                            kind,
-                            nlink,
-                            acl,
-                            xattr_platform: XattrPlatform::Linux,
-                            xattrs,
-                        };
-                        assert_eq!(
-                            assess_content(&facts),
-                            expected(kind, nlink, acl, xattrs),
-                            "{facts:?}"
-                        );
-                    }
+            for acl in acls {
+                for xattrs in xattrs {
+                    cases += 1;
+                    let facts = EntryFacts {
+                        kind,
+                        acl,
+                        xattr_platform: XattrPlatform::Linux,
+                        xattrs,
+                    };
+                    assert_eq!(
+                        assess_content(&facts),
+                        expected(kind, acl, xattrs),
+                        "{facts:?}"
+                    );
                 }
             }
         }
-        assert_eq!(cases, 108);
+        assert_eq!(cases, 36);
     }
 
-    fn expected<'a>(
-        kind: EntryKind,
-        nlink: LinkCount,
-        acl: Evidence,
-        xattrs: Xattrs<'a>,
-    ) -> Admission<'a> {
+    fn expected<'a>(kind: EntryKind, acl: Evidence, xattrs: Xattrs<'a>) -> Admission<'a> {
         if kind == EntryKind::Directory {
             return Admission::Admit;
         }
         if kind == EntryKind::Other {
             return Admission::Reject(RejectReason::UnsupportedEntryKind);
-        }
-        if kind == EntryKind::Regular {
-            match nlink {
-                LinkCount::Known(1) => {}
-                LinkCount::Known(observed) => {
-                    return Admission::Reject(RejectReason::RegularFileLinkCountNotOne {
-                        observed,
-                    });
-                }
-                LinkCount::Unknown => {
-                    return Admission::Reject(RejectReason::RegularFileLinkCountUnknown);
-                }
-            }
         }
         match xattrs {
             Xattrs::Names([]) => {}
@@ -429,7 +382,6 @@ mod tests {
             let names = [name];
             let facts = EntryFacts {
                 kind: EntryKind::Symlink,
-                nlink: LinkCount::Unknown,
                 acl: Evidence::Absent,
                 xattr_platform: platform,
                 xattrs: Xattrs::Names(&names),
@@ -450,7 +402,6 @@ mod tests {
         );
         let facts = EntryFacts {
             kind: EntryKind::Regular,
-            nlink: LinkCount::Known(1),
             acl: Evidence::Absent,
             xattr_platform: XattrPlatform::Other,
             xattrs: Xattrs::Names(&[b"user.example"]),
@@ -468,14 +419,13 @@ mod tests {
     fn rejection_precedence_is_stable() {
         let facts = EntryFacts {
             kind: EntryKind::Regular,
-            nlink: LinkCount::Unknown,
             acl: Evidence::Unknown,
             xattr_platform: XattrPlatform::Linux,
             xattrs: Xattrs::Unknown,
         };
         assert_eq!(
             assess_content(&facts),
-            Admission::Reject(RejectReason::RegularFileLinkCountUnknown)
+            Admission::Reject(RejectReason::ExtendedAttributesUnknown)
         );
     }
 
@@ -485,7 +435,6 @@ mod tests {
         let reversed = [b"security.selinux".as_slice(), b"user.comment".as_slice()];
         let facts = |names| EntryFacts {
             kind: EntryKind::Symlink,
-            nlink: LinkCount::Unknown,
             acl: Evidence::Absent,
             xattr_platform: XattrPlatform::Linux,
             xattrs: Xattrs::Names(names),
@@ -499,38 +448,9 @@ mod tests {
     }
 
     #[test]
-    fn non_single_and_unknown_link_counts_have_distinct_reasons() {
-        for observed in [0, 2, u64::MAX] {
-            let facts = EntryFacts {
-                kind: EntryKind::Regular,
-                nlink: LinkCount::Known(observed),
-                acl: Evidence::Absent,
-                xattr_platform: XattrPlatform::Linux,
-                xattrs: Xattrs::Names(NO_XATTRS),
-            };
-            assert_eq!(
-                assess_content(&facts),
-                Admission::Reject(RejectReason::RegularFileLinkCountNotOne { observed })
-            );
-        }
-        let unknown = EntryFacts {
-            kind: EntryKind::Regular,
-            nlink: LinkCount::Unknown,
-            acl: Evidence::Absent,
-            xattr_platform: XattrPlatform::Linux,
-            xattrs: Xattrs::Names(NO_XATTRS),
-        };
-        assert_eq!(
-            assess_content(&unknown),
-            Admission::Reject(RejectReason::RegularFileLinkCountUnknown)
-        );
-    }
-
-    #[test]
     fn directory_metadata_is_deliberately_outside_content_admission() {
         let facts = EntryFacts {
             kind: EntryKind::Directory,
-            nlink: LinkCount::Unknown,
             acl: Evidence::Present,
             xattr_platform: XattrPlatform::Other,
             xattrs: Xattrs::Unknown,
@@ -543,7 +463,6 @@ mod tests {
         let names = [b"user.example".as_slice()];
         let facts = EntryFacts {
             kind: EntryKind::Regular,
-            nlink: LinkCount::Known(1),
             acl: Evidence::Present,
             xattr_platform: XattrPlatform::Linux,
             xattrs: Xattrs::Names(&names),

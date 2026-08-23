@@ -462,6 +462,17 @@ impl VerifiedPurgeError {
     pub fn disposition(&self) -> VerifiedPurgeFailureDisposition {
         self.disposition
     }
+
+    pub fn is_unsupported_internal_hard_links(&self) -> bool {
+        self.source
+            .downcast_ref::<crate::staging::recovery::RecoveryRebindError>()
+            .is_some_and(|source| {
+                matches!(
+                    source,
+                    crate::staging::recovery::RecoveryRebindError::PurgeUnsupportedInternalHardLinks
+                )
+            })
+    }
 }
 
 /// Opaque, one-use authority for the exact WAL association and transaction.
@@ -850,8 +861,12 @@ impl ReadyStagingEngine {
         let held = session.authorize().map_err(|source| {
             let state = self.engine.wal.transaction_state(transaction);
             self.engine.startup_blocked = !self.engine.wal.can_begin_staging_transaction();
-            let disposition = match state {
-                Some(TransactionState::RecoveryRequired) => {
+            let disposition = match (&source, state) {
+                (
+                    crate::staging::recovery::RecoveryRebindError::PurgeUnsupportedInternalHardLinks,
+                    Some(TransactionState::VerifiedCommitted),
+                ) if !self.engine.startup_blocked => VerifiedPurgeFailureDisposition::NotStarted,
+                (_, Some(TransactionState::RecoveryRequired)) => {
                     VerifiedPurgeFailureDisposition::Terminal(TransactionState::RecoveryRequired)
                 }
                 _ => VerifiedPurgeFailureDisposition::RecoveryBlocked,

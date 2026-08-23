@@ -97,8 +97,18 @@ fn clean_min_size_excludes_small_findings_and_totals_only_planned_items() {
     assert!(json.status.success());
     let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     assert_size_report(&fixture, &report);
-    assert_eq!(report["staging_preflight"][0]["status"], "blocked");
-    assert_eq!(report["staging_preflight"][0]["kind"], "external_hard_link");
+    assert_eq!(
+        report["staging_preflight"][0]["status"],
+        "tree_policy_assessed"
+    );
+    assert_eq!(
+        report["staging_preflight"][0]["regular_hard_links"]["topology"],
+        "internal_complete"
+    );
+    assert_eq!(
+        report["staging_preflight"][0]["purge_admission"]["supported"],
+        false
+    );
 
     let human = run_clean(
         &fixture.home,
@@ -160,23 +170,27 @@ fn assert_size_report(fixture: &SizeFixture, report: &serde_json::Value) {
 
 fn assert_size_human_output(stdout: &str, small_path: &str) {
     assert!(
-        !stdout.contains("Ready to clean - 1 location - "),
+        stdout.contains("Ready to clean - 1 location - "),
         "{stdout}"
     );
     assert!(
-        stdout.contains("Blocked by sealed staging preflight - 1 location - "),
+        !stdout.contains("Blocked by sealed staging preflight"),
         "{stdout}"
     );
     assert!(
-        stdout.contains("external hard link encountered"),
+        stdout.contains("staging and undo are supported"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("later permanent purge is unsupported"),
         "{stdout}"
     );
     assert!(stdout.contains("Hidden by filters: 1 location"));
     assert!(!stdout.contains(small_path));
-    assert!(!stdout.contains("Would move "), "{stdout}");
+    assert!(stdout.contains("Would move "), "{stdout}");
     assert!(
-        !stdout.contains("is hardlink-shared; reclaimed space may be lower."),
-        "blocked bytes must not be described as reclaimable: {stdout}"
+        stdout.contains("is hardlink-shared; reclaimed space may be lower."),
+        "assessed hardlink bytes must retain their accounting caveat: {stdout}"
     );
 }
 

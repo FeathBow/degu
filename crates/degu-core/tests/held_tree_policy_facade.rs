@@ -118,13 +118,28 @@ fn public_default_directory_boundary_and_hardlink_are_structured() {
     let Some(parent) = certified(temp.path()) else {
         return;
     };
+    let outcome = assess_held_tree_policy_metadata(parent, OsStr::new("root")).unwrap();
+    let HeldTreePolicyAssessmentOutcome::TreePolicyAssessed { tree, .. } = outcome else {
+        panic!("internal hardlink assessment unexpectedly deferred")
+    };
+    assert_eq!(tree.regular_hard_links.multi_link_groups, 1);
+    assert_eq!(tree.regular_hard_links.linked_entries, 2);
+    assert!(tree.regular_hard_links.contains_multi_link_group());
+
+    let (temp, root) = setup();
+    std::fs::hard_link(root.join("file"), temp.path().join("outside")).unwrap();
+    let Some(parent) = certified(temp.path()) else {
+        return;
+    };
     let error = assess_held_tree_policy_metadata(parent, OsStr::new("root")).unwrap_err();
     assert_eq!(
         error.kind(),
-        HeldTreeAssessmentFailureKind::ExternalHardLink
+        HeldTreeAssessmentFailureKind::ExternalOrUnenumeratedHardLink
     );
-    assert!(
-        matches!(error.relative_path(), Some(path) if path == std::path::Path::new("file") || path == std::path::Path::new("other"))
+    assert_eq!(error.kind().as_str(), "external_or_unenumerated_hard_link");
+    assert_eq!(
+        error.category(),
+        HeldTreeAssessmentFailureCategory::TreePolicy
     );
 }
 

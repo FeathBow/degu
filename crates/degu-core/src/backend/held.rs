@@ -6,8 +6,7 @@
 //! purge, unlink, or deletion and returns no lifecycle authority token.
 
 use crate::admission::{
-    Admission, EntryFacts, EntryKind, Evidence, LinkCount, RejectReason, XattrPlatform, Xattrs,
-    assess_content,
+    Admission, EntryFacts, EntryKind, Evidence, RejectReason, XattrPlatform, Xattrs, assess_content,
 };
 use crate::authority::mode::{
     ModeSealAssessment, ModeSealDenial, assess_mode_seal, minimal_sealed_mode,
@@ -60,6 +59,10 @@ pub(crate) enum ReopenerTestPhase {
 #[cfg(test)]
 type ReopenerTestCallback = Box<dyn FnMut(ReopenerTestPhase, &Path)>;
 #[cfg(test)]
+type RegularLinkTestCallback = Box<dyn FnMut(&Path)>;
+#[cfg(test)]
+type FinalRegularReobservationTestCallback = Box<dyn FnOnce()>;
+#[cfg(test)]
 type TransientSealTestCallback = Box<dyn FnOnce(&Path)>;
 
 #[cfg(test)]
@@ -76,6 +79,10 @@ std::thread_local! {
         const { std::cell::RefCell::new(None) };
     static BEFORE_TRANSIENT_SEAL: std::cell::RefCell<Option<TransientSealTestCallback>> =
         const { std::cell::RefCell::new(None) };
+    static AFTER_REGULAR_LINK_OBSERVATION: std::cell::RefCell<Option<RegularLinkTestCallback>> =
+        const { std::cell::RefCell::new(None) };
+    static BEFORE_FINAL_REGULAR_REOBSERVATION: std::cell::RefCell<Option<FinalRegularReobservationTestCallback>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -85,6 +92,8 @@ pub(crate) struct ReopenerTestHookGuard;
 impl Drop for ReopenerTestHookGuard {
     fn drop(&mut self) {
         REOPENER_TEST_CALLBACK.with(|slot| *slot.borrow_mut() = None);
+        AFTER_REGULAR_LINK_OBSERVATION.with(|slot| *slot.borrow_mut() = None);
+        BEFORE_FINAL_REGULAR_REOBSERVATION.with(|slot| *slot.borrow_mut() = None);
     }
 }
 
@@ -107,6 +116,64 @@ fn fire_transient_seal_test_hook(path: &Path) {
         }
     });
 }
+
+#[cfg(test)]
+pub(crate) fn install_regular_link_observation_test_hook(
+    callback: impl FnMut(&Path) + 'static,
+) -> ReopenerTestHookGuard {
+    AFTER_REGULAR_LINK_OBSERVATION.with(|slot| {
+        let previous = slot.borrow_mut().replace(Box::new(callback));
+        assert!(
+            previous.is_none(),
+            "a regular-link observation test hook is already installed"
+        );
+    });
+    ReopenerTestHookGuard
+}
+
+#[cfg(test)]
+fn fire_regular_link_observation_test_hook(path: &Path) {
+    let callback = AFTER_REGULAR_LINK_OBSERVATION.with(|slot| slot.borrow_mut().take());
+    if let Some(mut callback) = callback {
+        callback(path);
+        AFTER_REGULAR_LINK_OBSERVATION.with(|slot| {
+            let previous = slot.borrow_mut().replace(callback);
+            assert!(
+                previous.is_none(),
+                "regular-link observation hook was replaced"
+            );
+        });
+    }
+}
+
+#[cfg(not(test))]
+fn fire_regular_link_observation_test_hook(_path: &Path) {}
+
+#[cfg(test)]
+pub(crate) fn install_final_regular_reobservation_test_hook(
+    callback: impl FnOnce() + 'static,
+) -> ReopenerTestHookGuard {
+    BEFORE_FINAL_REGULAR_REOBSERVATION.with(|slot| {
+        let previous = slot.borrow_mut().replace(Box::new(callback));
+        assert!(
+            previous.is_none(),
+            "a final regular re-observation test hook is already installed"
+        );
+    });
+    ReopenerTestHookGuard
+}
+
+#[cfg(test)]
+fn fire_final_regular_reobservation_test_hook() {
+    BEFORE_FINAL_REGULAR_REOBSERVATION.with(|slot| {
+        if let Some(callback) = slot.borrow_mut().take() {
+            callback();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn fire_final_regular_reobservation_test_hook() {}
 
 #[cfg(test)]
 pub(crate) fn install_reopener_test_hook(
@@ -209,8 +276,8 @@ pub(crate) enum HeldTreeError {
     IdentityChanged(PathBuf),
     #[error("strong kernel incarnation is unavailable at {0}")]
     StrongIncarnationUnavailable(PathBuf),
-    #[error("regular file has an external hard link at {0}")]
-    ExternalHardLink(PathBuf),
+    #[error("regular file has an external or unenumerated hard link at {0}")]
+    ExternalOrUnenumeratedHardLink(PathBuf),
     #[error("non-directory ACL, xattr, or capability is present at {0}")]
     NonDirectoryExtendedMetadata(PathBuf),
     #[error("non-directory ACL or xattr evidence is unavailable at {0}")]
@@ -258,7 +325,7 @@ pub(crate) enum HeldTreeSealError {
     ConfirmedNotApplied(PathBuf),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum NodeKind {
     Directory,
     Regular,
@@ -266,7 +333,7 @@ enum NodeKind {
     Other,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct NodeIdentity {
     kind: NodeKind,
     device: u64,
@@ -341,6 +408,18 @@ pub(crate) enum HeldTreeAdmissionAssessment {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RegularHardLinkTopology {
+    pub(crate) multi_link_groups: u64,
+    pub(crate) linked_entries: u64,
+}
+
+impl RegularHardLinkTopology {
+    pub(crate) fn contains_multi_link_group(self) -> bool {
+        self.multi_link_groups != 0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HeldTreePolicyAssessment {
     pub(crate) entries: u64,
@@ -348,6 +427,7 @@ pub(crate) struct HeldTreePolicyAssessment {
     pub(crate) path_bytes: u64,
     pub(crate) manifest_bytes: u64,
     pub(crate) content_bytes: u64,
+    pub(crate) regular_hard_links: RegularHardLinkTopology,
     pub(crate) assessed_at: std::time::SystemTime,
 }
 
@@ -368,10 +448,33 @@ pub(crate) enum TreePolicyDeferralReason {
     SourceParentSearchRequiresExecutionSeal,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RegularFileObservation {
+    identity: NodeIdentity,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    size: u64,
+    nlink: u64,
+    mtime_sec: i64,
+    mtime_nsec: u32,
+    ctime_sec: i64,
+    ctime_nsec: u32,
+    /// Present only for proving traversal. Assessment never reads regular bytes.
+    sha256: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Debug)]
+struct ProvedEntry {
+    manifest: ManifestEntry,
+    regular: Option<RegularFileObservation>,
+}
+
 #[derive(Clone, Debug)]
 struct AssessedEntry {
     path: PathBuf,
     identity: NodeIdentity,
+    regular: Option<RegularFileObservation>,
 }
 
 /// Data-only admission uses the production v2 namespace traversal, admission
@@ -411,6 +514,7 @@ pub(crate) fn assess_tree_admission(
             path_bytes: walked.budget.path_bytes,
             manifest_bytes: walked.budget.manifest_bytes,
             content_bytes: walked.budget.content_bytes,
+            regular_hard_links: walked.regular_hard_links,
             assessed_at: std::time::SystemTime::now(),
         },
         source_parent_seal,
@@ -500,6 +604,7 @@ pub(crate) struct HeldTreeInventory {
     protected_names: Vec<OsString>,
     limits: HeldTreeLimits,
     manifest_schema: u16,
+    regular_hard_links: RegularHardLinkTopology,
     /// Prevalidated lookup evidence. `directories` remains in BFS order for
     /// deterministic mutation ordering; it contains no retained descriptors.
     /// The separately retained `root` is the only tree-directory authority.
@@ -534,16 +639,20 @@ trait V2Traversal {
     ) -> Result<Self::Entry, HeldTreeError>;
     fn path(entry: &Self::Entry) -> &Path;
     fn identity(entry: &Self::Entry) -> NodeIdentity;
+    fn regular_observation(entry: &Self::Entry) -> Option<RegularFileObservation>;
 }
 
 struct ProveTraversal;
 struct AssessTraversal;
 
 impl V2Traversal for ProveTraversal {
-    type Entry = ManifestEntry;
+    type Entry = ProvedEntry;
 
     fn make_root(inspected: Inspection) -> Self::Entry {
-        inspected.into_manifest(PathBuf::new(), ContentProof::Directory)
+        ProvedEntry {
+            manifest: inspected.into_manifest(PathBuf::new(), ContentProof::Directory),
+            regular: None,
+        }
     }
 
     fn inspect_entry(
@@ -554,15 +663,26 @@ impl V2Traversal for ProveTraversal {
         budget: &mut Budget,
     ) -> Result<Self::Entry, HeldTreeError> {
         let content = inspect_content_at(parent, name, path, inspected, budget)?;
-        Ok(inspected.clone().into_manifest(path.to_path_buf(), content))
+        let sha256 = match &content {
+            ContentProof::Regular { sha256, .. } => Some(*sha256),
+            _ => None,
+        };
+        Ok(ProvedEntry {
+            manifest: inspected.clone().into_manifest(path.to_path_buf(), content),
+            regular: inspected.regular_file_observation(sha256),
+        })
     }
 
     fn path(entry: &Self::Entry) -> &Path {
-        &entry.path
+        &entry.manifest.path
     }
 
     fn identity(entry: &Self::Entry) -> NodeIdentity {
-        entry.identity
+        entry.manifest.identity
+    }
+
+    fn regular_observation(entry: &Self::Entry) -> Option<RegularFileObservation> {
+        entry.regular
     }
 }
 
@@ -573,6 +693,7 @@ impl V2Traversal for AssessTraversal {
         AssessedEntry {
             path: PathBuf::new(),
             identity: inspected.identity,
+            regular: None,
         }
     }
 
@@ -587,6 +708,7 @@ impl V2Traversal for AssessTraversal {
         Ok(AssessedEntry {
             path: path.to_path_buf(),
             identity: inspected.identity,
+            regular: inspected.regular_file_observation(None),
         })
     }
 
@@ -596,6 +718,10 @@ impl V2Traversal for AssessTraversal {
 
     fn identity(entry: &Self::Entry) -> NodeIdentity {
         entry.identity
+    }
+
+    fn regular_observation(entry: &Self::Entry) -> Option<RegularFileObservation> {
+        entry.regular
     }
 }
 
@@ -617,6 +743,7 @@ struct V2Walk<M: V2Traversal> {
     directories: Vec<WalkDirectory>,
     entries: Vec<M::Entry>,
     budget: Budget,
+    regular_hard_links: RegularHardLinkTopology,
 }
 
 fn validate_v2_inputs(
@@ -664,10 +791,15 @@ fn collect_proven_v2(
         protected_names: walked.protected_names,
         limits: walked.limits,
         manifest_schema: CONTENT_PROOF_VERSION,
+        regular_hard_links: walked.regular_hard_links,
         directory_index,
         directories,
         root,
-        manifest: walked.entries,
+        manifest: walked
+            .entries
+            .into_iter()
+            .map(|entry| entry.manifest)
+            .collect(),
     })
 }
 
@@ -728,6 +860,7 @@ fn traverse_v2<M: V2Traversal>(
         }],
         entries: vec![root_entry],
         budget,
+        regular_hard_links: RegularHardLinkTopology::default(),
     };
     let mut index = 0;
     while index < walked.directories.len() {
@@ -750,7 +883,200 @@ fn traverse_v2<M: V2Traversal>(
     ) {
         return Err(HeldTreeError::RootBindingChanged);
     }
+    fire_final_regular_reobservation_test_hook();
+    let regular_files = final_reobserve_regular_files(&walked)?;
+    // A same-UID writer can still create an alias after a path's final check.
+    // Without retaining one FD per inode or excluding that writer, this is the
+    // narrow residual race; classification deliberately uses the last bounded
+    // no-follow observations rather than the earlier traversal snapshots.
+    walked.regular_hard_links = classify_regular_file_topology(&regular_files)?;
     Ok(walked)
+}
+
+#[derive(Clone, Copy)]
+struct RegularFileReobservation<'a> {
+    path: &'a Path,
+    observation: RegularFileObservation,
+}
+
+#[derive(Clone, Copy)]
+struct RegularFileGroup<'a> {
+    first_path: &'a Path,
+    observation: RegularFileObservation,
+    enumerated: u64,
+}
+
+/// Reopen every recorded regular path from the retained root capability. This
+/// pass is metadata-only: it neither charges content budget again nor reads file
+/// bytes, and it retains only the bounded parent/file descriptors for one path.
+fn final_reobserve_regular_files<'a, M: V2Traversal>(
+    walked: &'a V2Walk<M>,
+) -> Result<Vec<RegularFileReobservation<'a>>, HeldTreeError> {
+    let mut regular_files = Vec::new();
+    let euid = rustix::process::geteuid().as_raw();
+    for entry in &walked.entries {
+        let Some(recorded) = M::regular_observation(entry) else {
+            continue;
+        };
+        let path = M::path(entry);
+        let parent_path = path
+            .parent()
+            .ok_or_else(|| HeldTreeError::ContentChangedDuringHash(path.to_path_buf()))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| HeldTreeError::ContentChangedDuringHash(path.to_path_buf()))?;
+        let reopened = reopen_directory_from_root(
+            &walked.root,
+            parent_path,
+            |candidate| walked.directory_index.get(candidate),
+            walked.backend,
+            walked.mount_id,
+            || {
+                verify_root_binding_fields(
+                    &walked.parent,
+                    &walked.root_name,
+                    walked.root_identity,
+                    walked.mount_id,
+                    walked.backend,
+                )
+            },
+            false,
+        )?;
+        let parent = reopened.held();
+
+        let before = with_fd(parent, |fd| inspect_at(fd, name, path))?;
+        require_owner(path, before.uid, euid)?;
+        require_boundary(path, walked.backend, walked.mount_id, &before)?;
+        if before.regular_file_observation(recorded.sha256) != Some(recorded) {
+            return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
+        }
+
+        let fd = with_fd(parent, |parent_fd| {
+            rustix::fs::openat(
+                parent_fd,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+        })
+        .map_err(|error| io_error(path, error))?;
+        let fresh_backend = crate::backend::certify_held_fd_backend(&fd).map_err(|reason| {
+            HeldTreeError::Certification {
+                path: path.to_path_buf(),
+                reason,
+            }
+        })?;
+        if fresh_backend != walked.backend {
+            return Err(HeldTreeError::BackendBoundary(path.to_path_buf()));
+        }
+        require_fd_metadata_admitted(&fd, path, EntryKind::Regular, true)?;
+        let opened = inspect_raw_fd(&fd, fresh_backend, path)?;
+        require_owner(path, opened.uid, euid)?;
+        require_boundary(path, walked.backend, walked.mount_id, &opened)?;
+        if opened.regular_file_observation(recorded.sha256) != Some(recorded) {
+            return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
+        }
+
+        require_fd_metadata_admitted(&fd, path, EntryKind::Regular, false)?;
+        let final_fd = inspect_raw_fd(&fd, fresh_backend, path)?;
+        require_owner(path, final_fd.uid, euid)?;
+        require_boundary(path, walked.backend, walked.mount_id, &final_fd)?;
+        let final_observation = final_fd
+            .regular_file_observation(recorded.sha256)
+            .ok_or_else(|| HeldTreeError::ContentChangedDuringHash(path.to_path_buf()))?;
+        if final_observation != recorded {
+            return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
+        }
+
+        let rebound = with_fd(parent, |parent_fd| inspect_at(parent_fd, name, path))?;
+        require_owner(path, rebound.uid, euid)?;
+        require_boundary(path, walked.backend, walked.mount_id, &rebound)?;
+        if rebound.regular_file_observation(recorded.sha256) != Some(final_observation) {
+            return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
+        }
+        regular_files.push(RegularFileReobservation {
+            path,
+            observation: final_observation,
+        });
+    }
+    Ok(regular_files)
+}
+
+/// Classify topology only after traversal, budget enforcement, source-parent
+/// revalidation, root-binding revalidation, and deterministic path sorting are
+/// complete. The existing strong identity is sufficient as the group key:
+/// every entry has already been confined to one certified backend and mount,
+/// while `NodeIdentity` binds device, inode, incarnation, and regular-file kind.
+fn classify_regular_file_topology(
+    regular_files: &[RegularFileReobservation<'_>],
+) -> Result<RegularHardLinkTopology, HeldTreeError> {
+    // This holds at most one fixed-size, data-only value per already-budgeted
+    // entry and borrows its representative path from the bounded entry vector.
+    let mut groups = BTreeMap::<NodeIdentity, RegularFileGroup<'_>>::new();
+    for regular in regular_files {
+        let observation = regular.observation;
+        let path = regular.path;
+        match groups.entry(observation.identity) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(RegularFileGroup {
+                    first_path: path,
+                    observation,
+                    enumerated: 1,
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                let group = slot.get_mut();
+                if group.observation != observation {
+                    return Err(HeldTreeError::ContentChangedDuringHash(
+                        group.first_path.to_path_buf(),
+                    ));
+                }
+                group.enumerated = group.enumerated.checked_add(1).ok_or_else(|| {
+                    HeldTreeError::ContentChangedDuringHash(group.first_path.to_path_buf())
+                })?;
+            }
+        }
+    }
+
+    // Entries are path-sorted, so this preserves deterministic error selection
+    // without changing manifest ordering or retaining any per-inode descriptor.
+    let mut topology = RegularHardLinkTopology::default();
+    for regular in regular_files {
+        let observation = regular.observation;
+        let group = groups
+            .get(&observation.identity)
+            .expect("every regular observation was grouped");
+        match group.enumerated.cmp(&observation.nlink) {
+            std::cmp::Ordering::Equal if group.enumerated == 1 => {}
+            std::cmp::Ordering::Equal => {
+                // Count each complete internal group once, while retaining only
+                // aggregate data in the inventory/assessment boundary.
+                if regular.path == group.first_path {
+                    topology.multi_link_groups =
+                        topology.multi_link_groups.checked_add(1).ok_or_else(|| {
+                            HeldTreeError::ContentChangedDuringHash(group.first_path.to_path_buf())
+                        })?;
+                    topology.linked_entries = topology
+                        .linked_entries
+                        .checked_add(group.enumerated)
+                        .ok_or_else(|| {
+                            HeldTreeError::ContentChangedDuringHash(group.first_path.to_path_buf())
+                        })?;
+                }
+            }
+            std::cmp::Ordering::Less => {
+                return Err(HeldTreeError::ExternalOrUnenumeratedHardLink(
+                    group.first_path.to_path_buf(),
+                ));
+            }
+            std::cmp::Ordering::Greater => {
+                return Err(HeldTreeError::ContentChangedDuringHash(
+                    group.first_path.to_path_buf(),
+                ));
+            }
+        }
+    }
+    Ok(topology)
 }
 
 fn read_v2_children<M: V2Traversal>(
@@ -823,6 +1149,9 @@ fn read_v2_children<M: V2Traversal>(
             None
         };
         let result = M::inspect_entry(parent, name, &path, &inspected, &mut walked.budget)?;
+        if M::regular_observation(&result).is_some() {
+            fire_regular_link_observation_test_hook(&path);
+        }
         walked.budget.add_path(M::path(&result), depth)?;
         if child.is_some() {
             walked.budget.add_directory()?;
@@ -944,6 +1273,7 @@ impl HeldTreeInventory {
             protected_names,
             limits,
             manifest_schema,
+            regular_hard_links: RegularHardLinkTopology::default(),
             directory_index: BTreeMap::from([(PathBuf::new(), 0)]),
             directories: vec![root_evidence],
             root,
@@ -963,6 +1293,10 @@ impl HeldTreeInventory {
 
     pub(crate) fn entry_count(&self) -> u64 {
         self.manifest.len() as u64
+    }
+
+    pub(crate) fn regular_hard_link_topology(&self) -> RegularHardLinkTopology {
+        self.regular_hard_links
     }
 
     /// Hashes the complete, already-sorted manifest using a fixed binary codec.
@@ -1499,6 +1833,24 @@ fn retry_interrupted<T>(
 }
 
 impl Inspection {
+    fn regular_file_observation(&self, sha256: Option<[u8; 32]>) -> Option<RegularFileObservation> {
+        (self.identity.kind == NodeKind::Regular && self.content_fields_available).then_some(
+            RegularFileObservation {
+                identity: self.identity,
+                uid: self.uid,
+                gid: self.gid,
+                mode: self.mode,
+                size: self.size,
+                nlink: self.nlink,
+                mtime_sec: self.mtime_sec,
+                mtime_nsec: self.mtime_nsec,
+                ctime_sec: self.ctime_sec,
+                ctime_nsec: self.ctime_nsec,
+                sha256,
+            },
+        )
+    }
+
     fn into_manifest(self, path: PathBuf, content: ContentProof) -> ManifestEntry {
         ManifestEntry {
             path,
@@ -1721,14 +2073,17 @@ fn inspect_content_at(
     budget: &mut Budget,
 ) -> Result<ContentProof, HeldTreeError> {
     if !before.content_fields_available {
-        return Err(HeldTreeError::UnsupportedContentProof(path.to_path_buf()));
+        return Err(if before.identity.kind == NodeKind::Regular {
+            HeldTreeError::ContentChangedDuringHash(path.to_path_buf())
+        } else {
+            HeldTreeError::UnsupportedContentProof(path.to_path_buf())
+        });
     }
     match before.identity.kind {
         NodeKind::Directory => {
             require_content_admitted(
                 EntryFacts {
                     kind: EntryKind::Directory,
-                    nlink: LinkCount::Unknown,
                     acl: Evidence::Unknown,
                     xattr_platform: current_xattr_platform(),
                     xattrs: Xattrs::Unknown,
@@ -1743,7 +2098,6 @@ fn inspect_content_at(
             require_content_admitted(
                 EntryFacts {
                     kind: EntryKind::Other,
-                    nlink: LinkCount::Unknown,
                     acl: Evidence::Unknown,
                     xattr_platform: current_xattr_platform(),
                     xattrs: Xattrs::Unknown,
@@ -1765,7 +2119,11 @@ fn inspect_content_admission(
     budget: &mut Budget,
 ) -> Result<(), HeldTreeError> {
     if !before.content_fields_available {
-        return Err(HeldTreeError::UnsupportedContentProof(path.to_path_buf()));
+        return Err(if before.identity.kind == NodeKind::Regular {
+            HeldTreeError::ContentChangedDuringHash(path.to_path_buf())
+        } else {
+            HeldTreeError::UnsupportedContentProof(path.to_path_buf())
+        });
     }
     match before.identity.kind {
         NodeKind::Directory => Ok(()),
@@ -1785,7 +2143,6 @@ fn assess_regular_content(
     require_content_admitted(
         EntryFacts {
             kind: EntryKind::Regular,
-            nlink: LinkCount::Known(before.nlink),
             acl: Evidence::Absent,
             xattr_platform: current_xattr_platform(),
             xattrs: Xattrs::Names(&[]),
@@ -1809,7 +2166,7 @@ fn assess_regular_content(
     }
     require_fd_metadata_admitted(&fd, path, EntryKind::Regular, false)?;
     let final_inspection = inspect_raw_fd(&fd, parent.backend(), path)?;
-    if !opened.stable_content_fields_equal(&final_inspection) || final_inspection.nlink != 1 {
+    if !opened.stable_content_fields_equal(&final_inspection) {
         return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
     }
     Ok(())
@@ -1836,7 +2193,6 @@ fn inspect_regular_content(
     require_content_admitted(
         EntryFacts {
             kind: EntryKind::Regular,
-            nlink: LinkCount::Known(before.nlink),
             acl: Evidence::Absent,
             xattr_platform: current_xattr_platform(),
             xattrs: Xattrs::Names(&[]),
@@ -1889,7 +2245,6 @@ fn inspect_regular_content(
         || !before.stable_content_fields_equal(&after)
         || !opened.stable_content_fields_equal(&after)
         || !after.stable_content_fields_equal(&final_inspection)
-        || after.nlink != 1
     {
         return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
     }
@@ -1980,11 +2335,8 @@ fn require_content_admitted(facts: EntryFacts<'_>, path: &Path) -> Result<(), He
     match assess_content(&facts) {
         Admission::Admit => Ok(()),
         Admission::Reject(reason) => Err(match reason {
-            RejectReason::UnsupportedEntryKind | RejectReason::RegularFileLinkCountUnknown => {
+            RejectReason::UnsupportedEntryKind => {
                 HeldTreeError::UnsupportedContentProof(path.to_path_buf())
-            }
-            RejectReason::RegularFileLinkCountNotOne { .. } => {
-                HeldTreeError::ExternalHardLink(path.to_path_buf())
             }
             RejectReason::AclPresent
             | RejectReason::AclUnknown
@@ -2023,6 +2375,7 @@ fn assess_collected_metadata<Fd: rustix::fd::AsFd>(
         CollectedXattrs::Unknown => Err(HeldTreeError::NonDirectoryMetadataUnavailable(
             path.to_path_buf(),
         )),
+
         CollectedXattrs::Names(names) => {
             let name_refs = names.iter().map(Vec::as_slice).collect::<Vec<_>>();
             // Preserve the former syscall order: a present/uncertain xattr list
@@ -2040,7 +2393,6 @@ fn assess_collected_metadata<Fd: rustix::fd::AsFd>(
             require_content_admitted(
                 EntryFacts {
                     kind,
-                    nlink: LinkCount::Known(1),
                     acl,
                     xattr_platform: current_xattr_platform(),
                     xattrs: Xattrs::Names(&name_refs),
@@ -2215,12 +2567,12 @@ fn assess_symlink_xattrs(path: &Path, collected: &CollectedXattrs) -> Result<(),
         CollectedXattrs::Unknown => Err(HeldTreeError::NonDirectoryMetadataUnavailable(
             path.to_path_buf(),
         )),
+
         CollectedXattrs::Names(names) => {
             let name_refs = names.iter().map(Vec::as_slice).collect::<Vec<_>>();
             require_content_admitted(
                 EntryFacts {
                     kind: EntryKind::Symlink,
-                    nlink: LinkCount::Unknown,
                     acl: Evidence::Absent,
                     xattr_platform: current_xattr_platform(),
                     xattrs: Xattrs::Names(&name_refs),

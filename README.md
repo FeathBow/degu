@@ -51,6 +51,7 @@ Deleting the wrong files is the core risk, so degu earns every deletion:
 - **Corroboration, not names.** A directory becomes eligible only on structural evidence that it is regenerable — a tool's own cache marker, a build manifest — never because it is *named* `cache`, `target`, or `__pycache__`. Among locations degu discovers, anything it cannot corroborate is reported, never cleaned; degu is not a whole-disk file finder.
 - **Three tiers, conservative by default.** *Ready to clean* is cheap-to-regenerate cache. *Needs review* is regenerable but costly (model downloads, compile caches) and stays excluded until you preview an exact path. *Not managed* — your data, tool-coordinated caches, checkpoints — can never enter a plan.
 - **Fail closed.** If any selected location cannot be fully measured or classified, degu refuses the whole plan instead of guessing. Default cleanup is staged for undo; permanent purge is separately disclosed and confirmed.
+- **Preview matches execution.** `degu clean -n` runs the same sealed-staging admission checks that execution re-verifies: a location shown as *Ready to clean* has already passed them, and anything that sealed staging cannot execute — external hard links, unsupported metadata, inventory ceilings — is disclosed with its reason up front instead of failing later.
 
 ## How degu compares
 

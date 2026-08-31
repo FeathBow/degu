@@ -437,6 +437,43 @@ fn missing_wal_referenced_sidecar_is_durably_recovery_required_on_open() {
 }
 
 #[test]
+fn consumed_pre_seal_expectation_rejects_same_size_content_drift_before_post_proof() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let data = fixture.source_root.join("child/data");
+    AFTER_PRE_SEAL_INVENTORY_DROPPED.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::fs::write(data, b"evil!! staging").unwrap();
+        }));
+    });
+    let transaction = TransactionId([0xd9; 16]);
+    let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty());
+
+    let error = match engine.stage_prepared_root(transaction, fixture.prepare()) {
+        Ok(_) => panic!("post-seal content drift must not reach rename"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        StagingRenameError::HeldTree(HeldTreeError::PostChanged(path)) if path.as_os_str().is_empty()
+    ));
+    assert_eq!(
+        engine.state(transaction),
+        Some(TransactionState::TreeSealIntent)
+    );
+    assert!(fixture.source_root.is_dir());
+    assert!(!fixture.destination_root.exists());
+    drop(engine);
+
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    assert!(replay.transactions[&transaction].tree_manifest.is_none());
+    assert!(replay.transactions[&transaction].tree_sidecar.is_none());
+}
+
+#[test]
 fn transient_seal_race_fails_identity_before_fchmod_and_keeps_parent_anchor_stable() {
     let Some(fixture) = Fixture::new() else {
         return;

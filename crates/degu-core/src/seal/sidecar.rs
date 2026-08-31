@@ -22,6 +22,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod scratch;
+
 const MAGIC: &[u8; 4] = b"DHTS";
 const VERSION: u16 = 1;
 const HEADER_LEN: usize = 80;
@@ -59,6 +61,8 @@ pub(crate) enum TreeSidecarError {
     StoreBinding(#[from] StoreError),
     #[error("invalid held-tree sidecar segment: {0}")]
     InvalidSegment(&'static str),
+    #[error("invalid unpublished held-tree scratch data: {0}")]
+    InvalidScratch(&'static str),
     #[error("held-tree sidecar already exists at {0}")]
     AlreadyExists(PathBuf),
     #[error("held-tree sidecar is malformed at {path}: {reason}")]
@@ -616,7 +620,7 @@ impl TreeSidecarStore {
                 .map_err(io::Error::from)
                 .map_err(|error| io_error(&self.path, error))?;
             let name = entry.file_name().to_bytes();
-            if !valid_temp_name(name) {
+            if !valid_temp_name(name) && !scratch::valid_scratch_name(name) {
                 continue;
             }
             let name = OsStr::from_bytes(name);
@@ -1083,6 +1087,7 @@ fn raw_mode(mode: rustix::fs::RawMode) -> u32 {
 mod tests {
     use super::*;
     use crate::seal::store::SealWalStore;
+    use crate::seal::wal::DurableTreeManifest;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[derive(Clone, Copy)]
@@ -1564,5 +1569,506 @@ mod tests {
             Ok::<_, std::convert::Infallible>(())
         });
         assert!(matches!(result, Err(TreeSidecarFoldError::Sidecar(_))));
+    }
+    fn v3_directory_record(path: &[u8], inode: u64) -> Vec<u8> {
+        let mut record = Vec::new();
+        record.extend_from_slice(&(path.len() as u64).to_be_bytes());
+        record.extend_from_slice(path);
+        record.push(0);
+        record.extend_from_slice(&1_u64.to_be_bytes());
+        record.extend_from_slice(&inode.to_be_bytes());
+        record.extend_from_slice(&inode.to_be_bytes());
+        record.extend_from_slice(&1000_u32.to_be_bytes());
+        record.extend_from_slice(&1000_u32.to_be_bytes());
+        record.extend_from_slice(&0o700_u32.to_be_bytes());
+        record.push(0);
+        record
+    }
+
+    fn v3_regular_record(path: &[u8], inode: u64) -> Vec<u8> {
+        let mut record = Vec::new();
+        record.extend_from_slice(&(path.len() as u64).to_be_bytes());
+        record.extend_from_slice(path);
+        record.push(1);
+        record.extend_from_slice(&1_u64.to_be_bytes());
+        record.extend_from_slice(&inode.to_be_bytes());
+        record.extend_from_slice(&inode.to_be_bytes());
+        record.extend_from_slice(&1000_u32.to_be_bytes());
+        record.extend_from_slice(&1000_u32.to_be_bytes());
+        record.extend_from_slice(&0o600_u32.to_be_bytes());
+        record.push(1);
+        record.extend_from_slice(&inode.to_be_bytes());
+        record.extend_from_slice(&1_u64.to_be_bytes());
+        record.extend_from_slice(&2_i64.to_be_bytes());
+        record.extend_from_slice(&3_u32.to_be_bytes());
+        record.extend_from_slice(&4_i64.to_be_bytes());
+        record.extend_from_slice(&5_u32.to_be_bytes());
+        record.extend_from_slice(&[inode as u8; 32]);
+        record.extend_from_slice(&0_u64.to_be_bytes());
+        record.extend_from_slice(&0_u64.to_be_bytes());
+        record.extend_from_slice(&[0_u8; 32]);
+        record
+    }
+
+    fn v3_symlink_record(path: &[u8], inode: u64, target: &[u8]) -> Vec<u8> {
+        let mut record = Vec::new();
+        record.extend_from_slice(&(path.len() as u64).to_be_bytes());
+        record.extend_from_slice(path);
+        record.push(2);
+        record.extend_from_slice(&1_u64.to_be_bytes());
+        record.extend_from_slice(&inode.to_be_bytes());
+        record.extend_from_slice(&inode.to_be_bytes());
+        record.extend_from_slice(&1000_u32.to_be_bytes());
+        record.extend_from_slice(&1000_u32.to_be_bytes());
+        record.extend_from_slice(&0o777_u32.to_be_bytes());
+        record.push(2);
+        record.extend_from_slice(&(target.len() as u64).to_be_bytes());
+        record.extend_from_slice(target);
+        record
+    }
+
+    fn sorted_v3_manifest(records: &[Vec<u8>]) -> (Vec<Vec<u8>>, DurableTreeManifest) {
+        let mut sorted = records.to_vec();
+        sorted.sort_unstable_by(|left, right| {
+            scratch::record_path(left)
+                .unwrap()
+                .cmp(scratch::record_path(right).unwrap())
+        });
+        let mut digest = Sha256::new();
+        digest.update(b"degu-held-tree-manifest-v3-content-xattr\0");
+        digest.update((sorted.len() as u64).to_be_bytes());
+        for record in &sorted {
+            digest.update(record);
+        }
+        (
+            sorted,
+            DurableTreeManifest {
+                schema_version: 3,
+                entry_count: records.len() as u64,
+                sha256: digest.finalize().into(),
+            },
+        )
+    }
+
+    #[test]
+    fn scratch_builder_preserves_producer_error_type_and_leaves_only_unpublished_state() {
+        #[derive(Debug)]
+        enum ProducerFailure {
+            Scratch,
+            Stop,
+        }
+
+        impl From<TreeSidecarError> for ProducerFailure {
+            fn from(_error: TreeSidecarError) -> Self {
+                Self::Scratch
+            }
+        }
+
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(32);
+        let target = vec![b'x'; 600_000];
+        let result = store.build_sorted_manifest_scratch_with_output(
+            &mut wal,
+            transaction,
+            |emit| -> Result<(), ProducerFailure> {
+                emit(&v3_symlink_record(b"a", 2, &target))?;
+                emit(&v3_symlink_record(b"b", 3, &target))?;
+                Err(ProducerFailure::Stop)
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(scratch::TreeManifestScratchBuildError::Produce(
+                ProducerFailure::Stop
+            ))
+        ));
+        assert_eq!(wal.tree_sidecar_commitment(transaction), None);
+        assert!(!root.join(final_name(transaction)).exists());
+        assert_eq!(store.cleanup_unpublished(&mut wal).unwrap(), 1);
+    }
+
+    #[test]
+    fn sorted_scratch_fold_returns_producer_output_and_typed_records_only_after_validation() {
+        use crate::backend::held::ManifestV3RecordKind;
+
+        let (_temp, _root, store, mut wal) = fixture();
+        let transaction = tx(29);
+        let records = vec![
+            v3_regular_record(b"z", 3),
+            v3_directory_record(b"", 1),
+            v3_regular_record(b"a", 2),
+        ];
+        let (_, expected) = sorted_v3_manifest(&records);
+        let (mut scratch, producer_output) = store
+            .build_sorted_manifest_scratch_with_output(&mut wal, transaction, |emit| {
+                for record in &records {
+                    emit(record)?;
+                }
+                Ok::<_, TreeSidecarError>(73_u64)
+            })
+            .unwrap();
+        assert_eq!(producer_output, 73);
+
+        let visited = store
+            .read_sorted_manifest_scratch(
+                &mut wal,
+                transaction,
+                expected,
+                &mut scratch,
+                Vec::new(),
+                |mut visited, record| {
+                    visited.push((record.path.to_vec(), record.kind));
+                    Ok::<_, std::convert::Infallible>(visited)
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            visited,
+            vec![
+                (b"".to_vec(), ManifestV3RecordKind::Directory),
+                (b"a".to_vec(), ManifestV3RecordKind::Regular),
+                (b"z".to_vec(), ManifestV3RecordKind::Regular),
+            ]
+        );
+        assert_eq!(store.cleanup_unpublished(&mut wal).unwrap(), 1);
+    }
+
+    #[test]
+    fn sorted_scratch_fold_propagates_consumer_failure_without_returning_partial_state() {
+        #[derive(Debug, Eq, PartialEq)]
+        struct Stop;
+
+        let (_temp, _root, store, mut wal) = fixture();
+        let transaction = tx(30);
+        let records = vec![v3_regular_record(b"a", 2), v3_directory_record(b"", 1)];
+        let (_, expected) = sorted_v3_manifest(&records);
+        let mut scratch = store
+            .build_sorted_manifest_scratch(&mut wal, transaction, |emit| {
+                for record in &records {
+                    emit(record)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let visits = std::cell::Cell::new(0_u64);
+        let result = store.read_sorted_manifest_scratch(
+            &mut wal,
+            transaction,
+            expected,
+            &mut scratch,
+            (),
+            |(), _| {
+                visits.set(visits.get() + 1);
+                Err(Stop)
+            },
+        );
+        assert!(matches!(result, Err(TreeSidecarFoldError::Fold(Stop))));
+        assert_eq!(visits.get(), 1);
+        assert_eq!(store.cleanup_unpublished(&mut wal).unwrap(), 1);
+    }
+
+    #[test]
+    fn sorted_scratch_fold_withholds_accumulator_after_late_run_integrity_failure() {
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(31);
+        let records = vec![v3_directory_record(b"", 1), v3_regular_record(b"a", 2)];
+        let (_, expected) = sorted_v3_manifest(&records);
+        let mut scratch = store
+            .build_sorted_manifest_scratch(&mut wal, transaction, |emit| {
+                for record in &records {
+                    emit(record)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let run = root.join(&scratch.run_names_for_test()[0]);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(run)
+            .unwrap();
+        let last = file.seek(SeekFrom::End(-1)).unwrap();
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 1;
+        file.seek(SeekFrom::Start(last)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.flush().unwrap();
+
+        let visits = std::cell::Cell::new(0_u64);
+        let result = store.read_sorted_manifest_scratch(
+            &mut wal,
+            transaction,
+            expected,
+            &mut scratch,
+            Vec::<Vec<u8>>::new(),
+            |mut paths, record| {
+                visits.set(visits.get() + 1);
+                paths.push(record.path.to_vec());
+                Ok::<_, std::convert::Infallible>(paths)
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(TreeSidecarFoldError::Sidecar(
+                TreeSidecarError::InvalidScratch("scratch run integrity check failed")
+            ))
+        ));
+        assert_eq!(
+            visits.get(),
+            2,
+            "records may be observed but no accumulator returned"
+        );
+        assert_eq!(store.cleanup_unpublished(&mut wal).unwrap(), 1);
+    }
+
+    #[test]
+    fn scratch_external_sort_uses_many_runs_and_publishes_exact_v3_bytes() {
+        let (_temp, _root, store, mut wal) = fixture();
+        let transaction = tx(22);
+        let mut records = (0..72_u64)
+            .rev()
+            .map(|index| v3_regular_record(format!("f{index:02}").as_bytes(), index + 2))
+            .collect::<Vec<_>>();
+        records.push(v3_directory_record(b"", 1));
+        let (sorted, expected) = sorted_v3_manifest(&records);
+        let scratch = store
+            .build_sorted_manifest_scratch_with_budget(&mut wal, transaction, 128, |emit| {
+                for record in &records {
+                    emit(record)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            scratch.max_level_for_test() >= 2,
+            "fixture must exercise hierarchical bounded fan-in compaction"
+        );
+        // Runs hold their descriptors for their whole life, so live runs are
+        // live descriptors. Eager fan-in compaction keeps at most
+        // MERGE_FAN_IN - 1 runs per level, which bounds retention at
+        // O(log_fan_in) of the record count rather than O(runs produced).
+        let live_runs = scratch.run_names_for_test().len();
+        let level_ceiling = (usize::from(scratch.max_level_for_test()) + 1)
+            * (crate::seal::sidecar::scratch::MERGE_FAN_IN - 1);
+        assert!(
+            live_runs <= level_ceiling,
+            "held run descriptors must stay bounded by level: {live_runs} > {level_ceiling}"
+        );
+
+        let commitment = store
+            .publish_sorted_manifest_scratch(&mut wal, transaction, expected, scratch)
+            .unwrap();
+        let bytes = store
+            .read_fold(commitment, Vec::new(), |mut bytes, _, payload| {
+                bytes.extend_from_slice(payload);
+                Ok::<_, std::convert::Infallible>(bytes)
+            })
+            .unwrap();
+        assert_eq!(bytes, sorted.concat());
+        assert_eq!(store.cleanup_unpublished(&mut wal).unwrap(), 0);
+    }
+
+    #[test]
+    fn scratch_publisher_preserves_exact_legacy_segment_framing_and_commitment() {
+        let (_reference_temp, _reference_root, reference, mut reference_wal) = fixture();
+        let (_scratch_temp, _scratch_root, scratch_store, mut scratch_wal) = fixture();
+        let transaction = tx(28);
+        let target = vec![b'x'; 400_000];
+        let records = vec![
+            v3_symlink_record(b"d", 5, &target),
+            v3_symlink_record(b"c", 4, &target),
+            v3_symlink_record(b"b", 3, &target),
+            v3_symlink_record(b"a", 2, &target),
+            v3_directory_record(b"", 1),
+        ];
+        let (sorted, expected) = sorted_v3_manifest(&records);
+        let reference_commitment = reference
+            .publish_stream(&mut reference_wal, transaction, |emit| {
+                let mut payload = Vec::with_capacity(MAX_SEGMENT_PAYLOAD);
+                let mut count = 0_u64;
+                for record in &sorted {
+                    if count != 0 && payload.len() + record.len() > MAX_SEGMENT_PAYLOAD {
+                        emit(count, &payload)?;
+                        payload.clear();
+                        count = 0;
+                    }
+                    payload.extend_from_slice(record);
+                    count += 1;
+                }
+                if count != 0 {
+                    emit(count, &payload)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let scratch = scratch_store
+            .build_sorted_manifest_scratch(&mut scratch_wal, transaction, |emit| {
+                for record in &records {
+                    emit(record)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let scratch_commitment = scratch_store
+            .publish_sorted_manifest_scratch(&mut scratch_wal, transaction, expected, scratch)
+            .unwrap();
+
+        assert!(reference_commitment.segment_count() > 1);
+        assert_eq!(scratch_commitment, reference_commitment);
+    }
+
+    #[test]
+    fn scratch_duplicate_path_fails_before_publication_and_stays_unpublished() {
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(23);
+        let records = vec![
+            v3_directory_record(b"", 1),
+            v3_regular_record(b"same", 2),
+            v3_regular_record(b"same", 3),
+        ];
+        let (_, expected) = sorted_v3_manifest(&records);
+        let scratch = store
+            .build_sorted_manifest_scratch_with_budget(&mut wal, transaction, 128, |emit| {
+                for record in records.iter().rev() {
+                    emit(record)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            store.publish_sorted_manifest_scratch(&mut wal, transaction, expected, scratch),
+            Err(TreeSidecarError::InvalidScratch(
+                "scratch paths are not in strict raw-byte order"
+            ))
+        ));
+        assert!(!root.join(final_name(transaction)).exists());
+        assert_eq!(wal.tree_sidecar_commitment(transaction), None);
+        assert!(store.cleanup_unpublished(&mut wal).unwrap() >= 2);
+    }
+
+    #[test]
+    fn scratch_fingerprint_mismatch_never_publishes_a_final_sidecar() {
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(24);
+        let records = vec![v3_regular_record(b"z", 2), v3_directory_record(b"", 1)];
+        let (_, mut expected) = sorted_v3_manifest(&records);
+        expected.sha256[0] ^= 1;
+        let scratch = store
+            .build_sorted_manifest_scratch(&mut wal, transaction, |emit| {
+                for record in &records {
+                    emit(record)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            store.publish_sorted_manifest_scratch(&mut wal, transaction, expected, scratch),
+            Err(TreeSidecarError::InvalidScratch(
+                "merged v3 manifest fingerprint changed"
+            ))
+        ));
+        assert!(!root.join(final_name(transaction)).exists());
+        assert_eq!(wal.tree_sidecar_commitment(transaction), None);
+        assert!(store.cleanup_unpublished(&mut wal).unwrap() >= 2);
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // simulates out-of-protocol scratch replacement
+    fn replaced_scratch_inode_is_rejected_even_when_its_bytes_are_identical() {
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(27);
+        let records = vec![v3_directory_record(b"", 1), v3_regular_record(b"file", 2)];
+        let (_, expected) = sorted_v3_manifest(&records);
+        let scratch = store
+            .build_sorted_manifest_scratch(&mut wal, transaction, |emit| {
+                for record in &records {
+                    emit(record)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let run = root.join(&scratch.run_names_for_test()[0]);
+        let bytes = std::fs::read(&run).unwrap();
+        std::fs::remove_file(&run).unwrap();
+        std::fs::write(&run, bytes).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // The run holds its descriptor from creation, so replacement is caught
+        // through that descriptor rather than through a carried device/inode
+        // copy: unlinking the run drops its link count to zero, which the held
+        // descriptor observes directly. Nothing here depends on how the
+        // filesystem allocates inode numbers, so ext4 recycling the number into
+        // the replacement changes nothing.
+        assert!(matches!(
+            store.publish_sorted_manifest_scratch(&mut wal, transaction, expected, scratch),
+            Err(TreeSidecarError::Unsafe {
+                reason: "sidecar kind, owner, mode, or link count is invalid",
+                ..
+            })
+        ));
+        assert!(!root.join(final_name(transaction)).exists());
+        assert_eq!(wal.tree_sidecar_commitment(transaction), None);
+        assert!(store.cleanup_unpublished(&mut wal).unwrap() >= 2);
+    }
+
+    #[test]
+    fn corrupt_scratch_run_cannot_publish_or_become_wal_evidence() {
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(26);
+        let records = vec![v3_directory_record(b"", 1), v3_regular_record(b"file", 2)];
+        let (_, expected) = sorted_v3_manifest(&records);
+        let scratch = store
+            .build_sorted_manifest_scratch(&mut wal, transaction, |emit| {
+                for record in &records {
+                    emit(record)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let run = root.join(&scratch.run_names_for_test()[0]);
+        let length = std::fs::metadata(&run).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&run)
+            .unwrap()
+            .set_len(length - 1)
+            .unwrap();
+
+        assert!(
+            store
+                .publish_sorted_manifest_scratch(&mut wal, transaction, expected, scratch)
+                .is_err()
+        );
+        assert!(!root.join(final_name(transaction)).exists());
+        assert_eq!(wal.tree_sidecar_commitment(transaction), None);
+        assert!(store.cleanup_unpublished(&mut wal).unwrap() >= 2);
+    }
+
+    #[test]
+    fn replay_lease_cleanup_removes_canonical_scratch_but_not_lookalikes() {
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(25);
+        let scratch = store
+            .build_sorted_manifest_scratch(&mut wal, transaction, |emit| {
+                emit(&v3_directory_record(b"", 1))
+            })
+            .unwrap();
+        let run_names = scratch.run_names_for_test();
+        drop(scratch);
+        let lookalike = root.join(format!(
+            ".tree-scratch-v1-{}-0{}-01.tmp",
+            transaction_hex(transaction),
+            std::process::id()
+        ));
+        std::fs::write(&lookalike, b"keep").unwrap();
+        std::fs::set_permissions(&lookalike, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(
+            store.cleanup_unpublished(&mut wal).unwrap(),
+            run_names.len() as u64
+        );
+        assert!(run_names.iter().all(|name| !root.join(name).exists()));
+        assert!(lookalike.exists());
     }
 }

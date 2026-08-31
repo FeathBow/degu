@@ -1369,9 +1369,10 @@ impl SealedStagingEngine {
             .map(|transaction| transaction.id)
             .collect::<Vec<_>>();
         let mut wal = recovery.resume()?;
-        // Temp names can never be WAL-referenced. Replay completion and the
-        // matching mutable lease therefore prove they are safe to remove; final
-        // sidecars remain untouched until exact reachability is classified.
+        // Sidecar temp and scratch-run names can never be WAL-referenced. Replay
+        // completion and the matching mutable lease therefore prove they are safe
+        // to remove; final sidecars remain untouched until exact reachability is
+        // classified.
         sidecars
             .cleanup_unpublished(&mut wal)
             .map_err(|error| StagingEngineError::Sidecar(error.to_string()))?;

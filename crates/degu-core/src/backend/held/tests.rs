@@ -1471,6 +1471,45 @@ fn schema_one_inventory_preserves_legacy_hardlink_semantics() {
 }
 
 #[test]
+fn v3_directory_mode_projection_hashes_in_place_without_changing_codec_bytes() {
+    let (temp, _root) = setup_tree();
+    let inventory = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    let modes = inventory
+        .directories
+        .iter()
+        .map(|directory| {
+            (
+                directory.relative_path.clone(),
+                (directory.observed_mode & !0o777) | 0o500,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut projected = inventory.manifest.clone();
+    for entry in &mut projected {
+        if entry.identity.kind == NodeKind::Directory {
+            entry.mode = modes[&entry.path];
+        }
+    }
+
+    assert_eq!(
+        inventory.fingerprint_with_directory_modes(&modes).unwrap(),
+        fingerprint_manifest_v3(&projected)
+    );
+    let mut missing = modes.clone();
+    missing.remove(Path::new("a"));
+    assert!(matches!(
+        inventory.fingerprint_with_directory_modes(&missing),
+        Err(HeldTreeError::IdentityChanged(path)) if path == Path::new("a")
+    ));
+    let mut extra = modes;
+    extra.insert(PathBuf::from("not-present"), 0o500);
+    assert!(matches!(
+        inventory.fingerprint_with_directory_modes(&extra),
+        Err(HeldTreeError::IdentityChanged(path)) if path.as_os_str().is_empty()
+    ));
+}
+
+#[test]
 fn fingerprint_codec_is_domain_separated_raw_and_field_complete() {
     let base = ManifestEntry {
         path: PathBuf::from(OsString::from_vec(vec![b'a', 0xff])),
@@ -2298,6 +2337,146 @@ fn v3_segmented_round_trip_is_the_existing_fingerprint_stream() {
 }
 
 #[test]
+fn v3_record_stream_is_byte_identical_to_existing_codec_and_reuses_one_bound() {
+    let manifest = codec_manifest_fixture();
+    let mut records = Vec::new();
+    stream_manifest_v3_records(&manifest, |record| {
+        records.push(record.to_vec());
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .unwrap();
+
+    assert_eq!(records.len(), manifest.len());
+    for (record, entry) in records.iter().zip(&manifest) {
+        assert_eq!(record, &encoded_v3_record(entry));
+        assert!(record.len() <= MANIFEST_V3_MAX_SEGMENT_PAYLOAD);
+    }
+    let fingerprint = fingerprint_manifest_v3(&manifest);
+    let mut decoder = ManifestV3Decoder::new(fingerprint.entry_count).unwrap();
+    for record in records {
+        decoder.push_segment(1, &record).unwrap();
+    }
+    assert_eq!(
+        decoder.finish().unwrap(),
+        DurableTreeManifest {
+            schema_version: fingerprint.schema_version,
+            entry_count: fingerprint.entry_count,
+            sha256: fingerprint.sha256,
+        }
+    );
+}
+
+#[test]
+fn v3_typed_visitor_exposes_every_validated_field_without_owning_record_bytes() {
+    let manifest = codec_manifest_fixture();
+    let mut segments = Vec::new();
+    stream_manifest_v3_segments(&manifest, 180, |records, payload| {
+        segments.push((records, payload.to_vec()));
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .unwrap();
+    assert!(segments.len() > 1);
+    let mut visited = 0_usize;
+    let mut decoder = ManifestV3Decoder::new(manifest.len() as u64).unwrap();
+    for (record_count, payload) in segments {
+        decoder
+            .push_segment_with(record_count, &payload, |record| {
+                let expected = &manifest[visited];
+                assert_eq!(record.path, expected.path.as_os_str().as_bytes());
+                assert_eq!(record.device, expected.identity.device);
+                assert_eq!(record.inode, expected.identity.inode);
+                assert_eq!(record.incarnation, expected.identity.incarnation);
+                assert_eq!(record.uid, expected.uid);
+                assert_eq!(record.gid, expected.gid);
+                assert_eq!(record.mode, expected.mode);
+                match (&record.kind, &record.content, &expected.content) {
+                    (
+                        ManifestV3RecordKind::Directory,
+                        ManifestV3RecordContent::Directory,
+                        ContentProof::Directory,
+                    ) => {}
+                    (
+                        ManifestV3RecordKind::Regular,
+                        ManifestV3RecordContent::Regular {
+                            size,
+                            nlink,
+                            mtime_sec,
+                            mtime_nsec,
+                            ctime_sec,
+                            ctime_nsec,
+                            sha256,
+                            xattr_count,
+                            xattr_value_bytes,
+                            xattr_sha256,
+                        },
+                        ContentProof::Regular {
+                            size: expected_size,
+                            nlink: expected_nlink,
+                            mtime_sec: expected_mtime_sec,
+                            mtime_nsec: expected_mtime_nsec,
+                            ctime_sec: expected_ctime_sec,
+                            ctime_nsec: expected_ctime_nsec,
+                            sha256: expected_sha256,
+                            xattrs,
+                        },
+                    ) => {
+                        assert_eq!(size, expected_size);
+                        assert_eq!(nlink, expected_nlink);
+                        assert_eq!(mtime_sec, expected_mtime_sec);
+                        assert_eq!(mtime_nsec, expected_mtime_nsec);
+                        assert_eq!(ctime_sec, expected_ctime_sec);
+                        assert_eq!(ctime_nsec, expected_ctime_nsec);
+                        assert_eq!(sha256, expected_sha256);
+                        assert_eq!(*xattr_count, xattrs.attribute_count);
+                        assert_eq!(*xattr_value_bytes, xattrs.value_bytes);
+                        assert_eq!(*xattr_sha256, xattrs.sha256);
+                    }
+                    (
+                        ManifestV3RecordKind::Symlink,
+                        ManifestV3RecordContent::Symlink { target },
+                        ContentProof::Symlink {
+                            target: expected_target,
+                        },
+                    ) => assert_eq!(*target, expected_target),
+                    other => panic!("typed v3 record differs from encoded entry: {other:?}"),
+                }
+                visited += 1;
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .unwrap();
+    }
+    assert_eq!(visited, manifest.len());
+    assert_eq!(
+        decoder.finish().unwrap(),
+        DurableTreeManifest {
+            schema_version: CONTENT_PROOF_VERSION,
+            entry_count: manifest.len() as u64,
+            sha256: fingerprint_manifest_v3(&manifest).sha256,
+        }
+    );
+}
+
+#[test]
+fn v3_typed_visitor_propagates_consumer_failure_without_visiting_later_records() {
+    #[derive(Debug, Eq, PartialEq)]
+    struct Stop;
+
+    let manifest = codec_manifest_fixture();
+    let mut payload = Vec::new();
+    for entry in &manifest {
+        emit_manifest_entry_v3(entry, |field| payload.extend_from_slice(field));
+    }
+    let mut visited = 0_u64;
+    let mut decoder = ManifestV3Decoder::new(manifest.len() as u64).unwrap();
+    let result = decoder.push_segment_with(manifest.len() as u64, &payload, |_| {
+        visited += 1;
+        if visited == 2 { Err(Stop) } else { Ok(()) }
+    });
+    assert_eq!(result, Err(ManifestV3VisitError::Visit(Stop)));
+    assert_eq!(visited, 2);
+}
+
+#[test]
 fn v3_decoder_rejects_record_count_trailing_and_order_mismatches() {
     let manifest = codec_manifest_fixture();
     let root = encoded_v3_record(&manifest[0]);
@@ -2344,6 +2523,20 @@ fn v3_decoder_validates_paths_tags_modes_and_timestamps() {
     assert_eq!(
         decoder.push_segment(1, &bytes),
         Err(ManifestV3CodecError::InvalidPath)
+    );
+
+    let mut unsupported_kind = encoded_v3_record(&manifest[0]);
+    unsupported_kind[8] = 3;
+    let mut decoder = ManifestV3Decoder::new(1).unwrap();
+    assert_eq!(
+        decoder.push_segment(1, &unsupported_kind),
+        Err(ManifestV3CodecError::KindContentMismatch)
+    );
+    unsupported_kind[45] = 0xff;
+    let mut decoder = ManifestV3Decoder::new(1).unwrap();
+    assert_eq!(
+        decoder.push_segment(1, &unsupported_kind),
+        Err(ManifestV3CodecError::InvalidTag)
     );
 
     let mut invalid_mode = manifest[0].clone();

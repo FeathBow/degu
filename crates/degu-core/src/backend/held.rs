@@ -753,6 +753,36 @@ pub(crate) struct HeldTreeInventory {
     manifest: Vec<ManifestEntry>,
 }
 
+/// Fixed-size commitment to the exact post-seal manifest expected from a
+/// consumed pre-seal inventory. Consuming the inventory lets forward staging
+/// release its complete manifest before collecting the second full proof.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PostSealManifestExpectation {
+    root_identity: NodeIdentity,
+    backend: CertifiedLocalBackend,
+    mount_id: u64,
+    fingerprint: HeldTreeFingerprint,
+}
+
+impl PostSealManifestExpectation {
+    pub(crate) fn verify(
+        self,
+        post: &HeldTreeInventory,
+    ) -> Result<HeldTreeFingerprint, HeldTreeError> {
+        if self.backend != post.backend
+            || self.mount_id != post.mount_id
+            || self.root_identity != post.root_identity
+        {
+            return Err(HeldTreeError::RootBindingChanged);
+        }
+        let actual = post.fingerprint();
+        if self.fingerprint != actual {
+            return Err(HeldTreeError::PostChanged(PathBuf::new()));
+        }
+        Ok(actual)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ProjectedParentSeal {
     original_mode: u32,
@@ -1072,7 +1102,7 @@ fn traverse_v2<M: V2Traversal>(
     }
     walked
         .entries
-        .sort_by(|left, right| M::path(left).cmp(M::path(right)));
+        .sort_unstable_by(|left, right| M::path(left).cmp(M::path(right)));
     require_parent_admission(&walked.parent, walked.backend, parent_admission)?;
     let rebound = with_fd(&walked.parent, |fd| {
         inspect_at(fd, &walked.root_name, Path::new(""))
@@ -1547,7 +1577,7 @@ impl HeldTreeInventory {
             index += 1;
         }
         tree.manifest
-            .sort_by(|left, right| left.path.cmp(&right.path));
+            .sort_unstable_by(|left, right| left.path.cmp(&right.path));
         tree.directory_index = build_directory_index(&tree.directories)?;
         tree.verify_root_binding()?;
         Ok(tree)
@@ -1583,6 +1613,17 @@ impl HeldTreeInventory {
         )
     }
 
+    /// Emits one complete encoded v3 record at a time through a single reused
+    /// bounded buffer. The borrowed bytes remain authority-neutral and are
+    /// intended for the private unpublished external-sort spool.
+    pub(crate) fn stream_manifest_v3_records<E>(
+        &self,
+        emit_record: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), ManifestV3StreamError<E>> {
+        debug_assert_eq!(self.manifest_schema, CONTENT_PROOF_VERSION);
+        stream_manifest_v3_records(&self.manifest, emit_record)
+    }
+
     pub(crate) fn fingerprint_for_schema(
         &self,
         schema_version: u16,
@@ -1607,6 +1648,37 @@ impl HeldTreeInventory {
         &self,
         modes: &std::collections::BTreeMap<PathBuf, u32>,
     ) -> Result<HeldTreeFingerprint, HeldTreeError> {
+        if self.manifest_schema == CONTENT_PROOF_VERSION {
+            let mut digest = Sha256::new();
+            digest.update(MANIFEST_DOMAIN_V3);
+            digest.update((self.manifest.len() as u64).to_be_bytes());
+            let mut seen = 0_usize;
+            for entry in &self.manifest {
+                let mode = if entry.identity.kind == NodeKind::Directory {
+                    seen = seen
+                        .checked_add(1)
+                        .ok_or_else(|| HeldTreeError::IdentityChanged(entry.path.clone()))?;
+                    modes
+                        .get(&entry.path)
+                        .copied()
+                        .ok_or_else(|| HeldTreeError::IdentityChanged(entry.path.clone()))?
+                } else {
+                    entry.mode
+                };
+                emit_manifest_entry_v3_with_mode(entry, mode, |bytes| digest.update(bytes));
+            }
+            if seen != modes.len() {
+                return Err(HeldTreeError::IdentityChanged(PathBuf::new()));
+            }
+            return Ok(HeldTreeFingerprint {
+                schema_version: CONTENT_PROOF_VERSION,
+                entry_count: self.manifest.len() as u64,
+                sha256: digest.finalize().into(),
+            });
+        }
+
+        // Legacy recovery remains byte-for-byte compatible. Only v3 is the
+        // production streaming path; old schemas keep their existing clone.
         let mut manifest = self.manifest.clone();
         let mut seen = std::collections::BTreeSet::new();
         for entry in &mut manifest {
@@ -1683,7 +1755,7 @@ impl HeldTreeInventory {
             .iter()
             .filter(|entry| !entry.path.as_os_str().is_empty())
             .collect::<Vec<_>>();
-        entries.sort_by(|left, right| {
+        entries.sort_unstable_by(|left, right| {
             right
                 .path
                 .components()
@@ -1855,45 +1927,47 @@ impl HeldTreeInventory {
         Ok(mutation_id)
     }
 
-    /// Proves that a fresh post-seal inventory names the same objects and only
-    /// changes directory modes to the exact modes held by this inventory.
-    pub(crate) fn verify_post_seal_snapshot(
-        &self,
-        post: &HeldTreeInventory,
-    ) -> Result<(), HeldTreeError> {
-        if self.backend != post.backend
-            || self.mount_id != post.mount_id
-            || self.root_identity != post.root_identity
-            || self.manifest.len() != post.manifest.len()
-        {
-            return Err(HeldTreeError::RootBindingChanged);
+    /// Consumes the pre-seal inventory into a fixed-size commitment after its
+    /// directory evidence has been updated by WAL-bound chmod results. The v3
+    /// codec is hashed with those exact sealed directory modes and unchanged
+    /// non-directory records. Returning consumes and drops the complete
+    /// pre-seal manifest before the caller can collect a post-seal inventory.
+    pub(crate) fn into_post_seal_expectation(
+        self,
+    ) -> Result<PostSealManifestExpectation, HeldTreeError> {
+        if self.manifest_schema != CONTENT_PROOF_VERSION {
+            return Err(HeldTreeError::UnsupportedContentProof(PathBuf::new()));
         }
-        let sealed_modes = self
-            .directories
-            .iter()
-            .map(|directory| (directory.relative_path.as_path(), directory.observed_mode))
-            .collect::<BTreeMap<_, _>>();
-        for (before, after) in self.manifest.iter().zip(&post.manifest) {
-            if before.path != after.path
-                || before.identity != after.identity
-                || before.uid != after.uid
-                || before.gid != after.gid
-                || before.content != after.content
-            {
-                return Err(HeldTreeError::PostChanged(after.path.clone()));
-            }
-            let expected_mode = if before.identity.kind == NodeKind::Directory {
-                *sealed_modes
-                    .get(before.path.as_path())
-                    .ok_or_else(|| HeldTreeError::PostChanged(before.path.clone()))?
+        let mut digest = Sha256::new();
+        digest.update(MANIFEST_DOMAIN_V3);
+        digest.update((self.manifest.len() as u64).to_be_bytes());
+        for entry in &self.manifest {
+            let mode = if entry.identity.kind == NodeKind::Directory {
+                let position = self
+                    .directory_index
+                    .get(&entry.path)
+                    .copied()
+                    .ok_or_else(|| HeldTreeError::PostChanged(entry.path.clone()))?;
+                self.directories
+                    .get(position)
+                    .filter(|directory| directory.relative_path == entry.path)
+                    .map(|directory| directory.observed_mode)
+                    .ok_or_else(|| HeldTreeError::PostChanged(entry.path.clone()))?
             } else {
-                before.mode
+                entry.mode
             };
-            if after.mode != expected_mode {
-                return Err(HeldTreeError::PostChanged(after.path.clone()));
-            }
+            emit_manifest_entry_v3_with_mode(entry, mode, |bytes| digest.update(bytes));
         }
-        Ok(())
+        Ok(PostSealManifestExpectation {
+            root_identity: self.root_identity,
+            backend: self.backend,
+            mount_id: self.mount_id,
+            fingerprint: HeldTreeFingerprint {
+                schema_version: CONTENT_PROOF_VERSION,
+                entry_count: self.manifest.len() as u64,
+                sha256: digest.finalize().into(),
+            },
+        })
     }
 
     /// Performs a bounded second walk of namespace and stable metadata only.
@@ -1905,19 +1979,17 @@ impl HeldTreeInventory {
     /// link metadata are re-read because target length alone is not exact proof.
     pub(crate) fn rewalk_structure(&self) -> Result<(), HeldTreeError> {
         self.verify_root_binding()?;
-        let baseline = self
-            .manifest
-            .iter()
-            .map(|entry| (entry.path.clone(), entry.structure_evidence()))
-            .collect::<BTreeMap<_, _>>();
-        let mut actual = BTreeMap::new();
+        // The resident manifest is already canonical and sorted. Retain only
+        // one vector of fresh observations; cloning the whole baseline into a
+        // second path map would double path and symlink-target memory.
+        let mut actual = Vec::new();
         let mut budget = Budget::new(self.limits, self.manifest_schema);
         let reopened_root = self.reopen_directory(Path::new(""))?;
         let root = inspect_held(reopened_root.held(), Path::new(""))?;
         let root = root.structure_evidence(PathBuf::new(), self.manifest_schema)?;
         budget.add_path(&root.path, 0)?;
         budget.add_directory()?;
-        actual.insert(PathBuf::new(), root);
+        actual.push(root);
 
         for directory in &self.directories {
             let reopened = self.reopen_directory(&directory.relative_path)?;
@@ -1958,21 +2030,31 @@ impl HeldTreeInventory {
                 if value.identity.kind == NodeKind::Directory {
                     budget.add_directory()?;
                 }
-                if !baseline.contains_key(&path) {
-                    return Err(HeldTreeError::PostAdded(path));
-                }
-                if actual.insert(path.clone(), value).is_some() {
-                    return Err(HeldTreeError::PostChanged(path));
-                }
+                actual.push(value);
             }
         }
-        for (path, expected) in baseline {
-            let Some(found) = actual.get(&path) else {
-                return Err(HeldTreeError::PostRemoved(path));
+        actual.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        let mut actual = actual.into_iter();
+        for entry in &self.manifest {
+            let expected = entry.structure_evidence();
+            let Some(found) = actual.next() else {
+                return Err(HeldTreeError::PostRemoved(expected.path));
             };
-            if found != &expected {
-                return Err(HeldTreeError::PostChanged(path));
+            match expected.path.cmp(&found.path) {
+                std::cmp::Ordering::Less => {
+                    return Err(HeldTreeError::PostRemoved(expected.path));
+                }
+                std::cmp::Ordering::Greater => {
+                    return Err(HeldTreeError::PostAdded(found.path));
+                }
+                std::cmp::Ordering::Equal if expected != found => {
+                    return Err(HeldTreeError::PostChanged(expected.path));
+                }
+                std::cmp::Ordering::Equal => {}
             }
+        }
+        if let Some(extra) = actual.next() {
+            return Err(HeldTreeError::PostAdded(extra.path));
         }
         self.verify_root_binding()
     }
@@ -3792,6 +3874,55 @@ pub(crate) enum ManifestV3StreamError<E> {
     Emit(E),
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ManifestV3VisitError<E> {
+    Codec(ManifestV3CodecError),
+    Visit(E),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManifestV3RecordKind {
+    Directory,
+    Regular,
+    Symlink,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManifestV3RecordContent<'a> {
+    Directory,
+    Regular {
+        size: u64,
+        nlink: u64,
+        mtime_sec: i64,
+        mtime_nsec: u32,
+        ctime_sec: i64,
+        ctime_nsec: u32,
+        sha256: [u8; 32],
+        xattr_count: u64,
+        xattr_value_bytes: u64,
+        xattr_sha256: [u8; 32],
+    },
+    Symlink {
+        target: &'a [u8],
+    },
+}
+
+/// One fully validated, allocation-free view into a bounded v3 segment.
+/// Borrowed bytes cannot outlive the segment callback and carry no filesystem
+/// or recovery authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ManifestV3Record<'a> {
+    pub(crate) path: &'a [u8],
+    pub(crate) kind: ManifestV3RecordKind,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) incarnation: u64,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) mode: u32,
+    pub(crate) content: ManifestV3RecordContent<'a>,
+}
+
 /// Incremental decoder for the exact v3 fingerprint record stream. It retains
 /// only canonical directory paths (bounded by the existing directory limit),
 /// the previous path, counters, and the digest state; decoded entries grant no
@@ -3846,18 +3977,47 @@ impl ManifestV3Decoder {
         record_count: u64,
         payload: &[u8],
     ) -> Result<(), ManifestV3CodecError> {
+        match self.push_segment_with(record_count, payload, |_| {
+            Ok::<(), std::convert::Infallible>(())
+        }) {
+            Ok(()) => Ok(()),
+            Err(ManifestV3VisitError::Codec(error)) => Err(error),
+            Err(ManifestV3VisitError::Visit(never)) => match never {},
+        }
+    }
+
+    /// Visits each complete validated record without allocating its path,
+    /// symlink target, or content fields. A visitor error consumes partial
+    /// decoder state, so callers must discard the decoder on error. The visitor
+    /// must remain authority-neutral: the enclosing sidecar fold returns its
+    /// accumulator only after aggregate counts, root commitment, and EOF pass.
+    pub(crate) fn push_segment_with<E>(
+        &mut self,
+        record_count: u64,
+        payload: &[u8],
+        mut visit: impl FnMut(ManifestV3Record<'_>) -> Result<(), E>,
+    ) -> Result<(), ManifestV3VisitError<E>> {
         if record_count == 0 {
-            return Err(ManifestV3CodecError::RecordCountMismatch);
+            return Err(ManifestV3VisitError::Codec(
+                ManifestV3CodecError::RecordCountMismatch,
+            ));
         }
         if payload.len() > MANIFEST_V3_MAX_SEGMENT_PAYLOAD {
-            return Err(ManifestV3CodecError::RecordTooLarge);
+            return Err(ManifestV3VisitError::Codec(
+                ManifestV3CodecError::RecordTooLarge,
+            ));
         }
         let mut input = payload;
         for _ in 0..record_count {
-            self.decode_record(&mut input)?;
+            let record = self
+                .decode_record(&mut input)
+                .map_err(ManifestV3VisitError::Codec)?;
+            visit(record).map_err(ManifestV3VisitError::Visit)?;
         }
         if !input.is_empty() {
-            return Err(ManifestV3CodecError::TrailingBytes);
+            return Err(ManifestV3VisitError::Codec(
+                ManifestV3CodecError::TrailingBytes,
+            ));
         }
         Ok(())
     }
@@ -3873,16 +4033,19 @@ impl ManifestV3Decoder {
         })
     }
 
-    fn decode_record(&mut self, input: &mut &[u8]) -> Result<(), ManifestV3CodecError> {
-        let record = *input;
+    fn decode_record<'a>(
+        &mut self,
+        input: &mut &'a [u8],
+    ) -> Result<ManifestV3Record<'a>, ManifestV3CodecError> {
+        let encoded_record = *input;
         if self.decoded_entries >= self.expected_entries {
             return Err(ManifestV3CodecError::EntryCountMismatch);
         }
         let path_len = take_u64(input)?;
         let path_len =
             usize::try_from(path_len).map_err(|_| ManifestV3CodecError::LengthOverflow)?;
-        let path = take(input, path_len)?.to_vec();
-        validate_manifest_path(&path, self.limits.max_depth)?;
+        let path = take(input, path_len)?;
+        validate_manifest_path(path, self.limits.max_depth)?;
         if self.decoded_entries == 0 {
             if !path.is_empty() {
                 return Err(ManifestV3CodecError::InvalidRoot);
@@ -3894,29 +4057,47 @@ impl ManifestV3Decoder {
             if self
                 .previous_path
                 .as_deref()
-                .is_some_and(|previous| previous >= path.as_slice())
+                .is_some_and(|previous| previous >= path)
             {
                 return Err(ManifestV3CodecError::InvalidOrder);
             }
-            let parent = path_parent_bytes(&path).ok_or(ManifestV3CodecError::InvalidPath)?;
+            let parent = path_parent_bytes(path).ok_or(ManifestV3CodecError::InvalidPath)?;
             if !self.directories.contains(parent) {
                 return Err(ManifestV3CodecError::MissingParent);
             }
         }
 
-        let kind = *take(input, 1)?.first().unwrap();
-        if kind > 3 {
+        let kind_tag = *take(input, 1)?.first().unwrap();
+        if kind_tag > 3 {
             return Err(ManifestV3CodecError::InvalidTag);
         }
-        let fixed_identity_and_metadata = take(input, 24 + 4 + 4 + 4)?;
-        let mode = u32::from_be_bytes(fixed_identity_and_metadata[32..36].try_into().unwrap());
+        let fixed = take(input, 24 + 4 + 4 + 4)?;
+        let device = u64::from_be_bytes(fixed[0..8].try_into().unwrap());
+        let inode = u64::from_be_bytes(fixed[8..16].try_into().unwrap());
+        let incarnation = u64::from_be_bytes(fixed[16..24].try_into().unwrap());
+        let uid = u32::from_be_bytes(fixed[24..28].try_into().unwrap());
+        let gid = u32::from_be_bytes(fixed[28..32].try_into().unwrap());
+        let mode = u32::from_be_bytes(fixed[32..36].try_into().unwrap());
         if mode & !0o7777 != 0 {
             return Err(ManifestV3CodecError::InvalidMode);
         }
-        let content = *take(input, 1)?.first().unwrap();
-        match content {
-            0 if kind == 0 => {}
-            1 if kind == 1 => {
+        let content_tag = *take(input, 1)?.first().unwrap();
+        if kind_tag == 3 {
+            return Err(if content_tag <= 2 {
+                ManifestV3CodecError::KindContentMismatch
+            } else {
+                ManifestV3CodecError::InvalidTag
+            });
+        }
+        let kind = match kind_tag {
+            0 => ManifestV3RecordKind::Directory,
+            1 => ManifestV3RecordKind::Regular,
+            2 => ManifestV3RecordKind::Symlink,
+            _ => unreachable!("kind tag 3 returned above"),
+        };
+        let content = match (kind, content_tag) {
+            (ManifestV3RecordKind::Directory, 0) => ManifestV3RecordContent::Directory,
+            (ManifestV3RecordKind::Regular, 1) => {
                 let fields = take(input, 8 + 8 + 8 + 4 + 8 + 4 + 32 + 8 + 8 + 32)?;
                 let mtime_nsec = u32::from_be_bytes(fields[24..28].try_into().unwrap());
                 let ctime_nsec = u32::from_be_bytes(fields[36..40].try_into().unwrap());
@@ -3931,20 +4112,30 @@ impl ManifestV3Decoder {
                 if self.xattr_bytes > self.limits.max_xattr_bytes {
                     return Err(ManifestV3CodecError::Limit(HeldTreeLimit::ContentBytes));
                 }
+                ManifestV3RecordContent::Regular {
+                    size: u64::from_be_bytes(fields[0..8].try_into().unwrap()),
+                    nlink: u64::from_be_bytes(fields[8..16].try_into().unwrap()),
+                    mtime_sec: i64::from_be_bytes(fields[16..24].try_into().unwrap()),
+                    mtime_nsec,
+                    ctime_sec: i64::from_be_bytes(fields[28..36].try_into().unwrap()),
+                    ctime_nsec,
+                    sha256: fields[40..72].try_into().unwrap(),
+                    xattr_count: u64::from_be_bytes(fields[72..80].try_into().unwrap()),
+                    xattr_value_bytes,
+                    xattr_sha256: fields[88..120].try_into().unwrap(),
+                }
             }
-            2 if kind == 2 => {
+            (ManifestV3RecordKind::Symlink, 2) => {
                 let target_len = take_u64(input)?;
                 let target_len = usize::try_from(target_len)
                     .map_err(|_| ManifestV3CodecError::LengthOverflow)?;
-                take(input, target_len)?;
+                ManifestV3RecordContent::Symlink {
+                    target: take(input, target_len)?,
+                }
             }
-            0..=2 => return Err(ManifestV3CodecError::KindContentMismatch),
-            _ => return Err(ManifestV3CodecError::InvalidTag),
-        }
-        // Other nodes and legacy content cannot occur in a valid v3 inventory.
-        if kind == 3 {
-            return Err(ManifestV3CodecError::KindContentMismatch);
-        }
+            (_, 0..=2) => return Err(ManifestV3CodecError::KindContentMismatch),
+            (_, _) => return Err(ManifestV3CodecError::InvalidTag),
+        };
 
         let path_len_u64 =
             u64::try_from(path.len()).map_err(|_| ManifestV3CodecError::LengthOverflow)?;
@@ -3963,20 +4154,30 @@ impl ManifestV3Decoder {
         if self.manifest_bytes > self.limits.max_manifest_bytes {
             return Err(ManifestV3CodecError::Limit(HeldTreeLimit::ManifestBytes));
         }
-        if kind == 0 {
+        if kind == ManifestV3RecordKind::Directory {
             if self.directories.len() as u64 >= self.limits.max_directories {
                 return Err(ManifestV3CodecError::Limit(HeldTreeLimit::Directories));
             }
-            self.directories.insert(path.clone());
+            self.directories.insert(path.to_vec());
         }
-        if self.decoded_entries == 0 && kind != 0 {
+        if self.decoded_entries == 0 && kind != ManifestV3RecordKind::Directory {
             return Err(ManifestV3CodecError::InvalidRoot);
         }
-        let consumed = record.len() - input.len();
-        self.digest.update(&record[..consumed]);
-        self.previous_path = Some(path);
+        let consumed = encoded_record.len() - input.len();
+        self.digest.update(&encoded_record[..consumed]);
+        self.previous_path = Some(path.to_vec());
         self.decoded_entries += 1;
-        Ok(())
+        Ok(ManifestV3Record {
+            path,
+            kind,
+            device,
+            inode,
+            incarnation,
+            uid,
+            gid,
+            mode,
+            content,
+        })
     }
 }
 
@@ -4021,7 +4222,11 @@ fn path_parent_bytes(path: &[u8]) -> Option<&[u8]> {
         .map_or(Some(&[][..]), |position| Some(&path[..position]))
 }
 
-fn emit_manifest_entry_v3(entry: &ManifestEntry, mut emit: impl FnMut(&[u8])) {
+fn emit_manifest_entry_v3(entry: &ManifestEntry, emit: impl FnMut(&[u8])) {
+    emit_manifest_entry_v3_with_mode(entry, entry.mode, emit);
+}
+
+fn emit_manifest_entry_v3_with_mode(entry: &ManifestEntry, mode: u32, mut emit: impl FnMut(&[u8])) {
     let path = entry.path.as_os_str().as_bytes();
     emit(&(path.len() as u64).to_be_bytes());
     emit(path);
@@ -4036,7 +4241,7 @@ fn emit_manifest_entry_v3(entry: &ManifestEntry, mut emit: impl FnMut(&[u8])) {
     emit(&entry.identity.incarnation.to_be_bytes());
     emit(&entry.uid.to_be_bytes());
     emit(&entry.gid.to_be_bytes());
-    emit(&entry.mode.to_be_bytes());
+    emit(&mode.to_be_bytes());
     match &entry.content {
         ContentProof::Legacy => emit(&[0xff]),
         ContentProof::Directory => emit(&[0]),
@@ -4076,6 +4281,28 @@ fn manifest_entry_v3_len(entry: &ManifestEntry) -> Result<usize, ManifestV3Codec
         length = length.and_then(|current| current.checked_add(bytes.len()));
     });
     length.ok_or(ManifestV3CodecError::LengthOverflow)
+}
+
+/// Emits each complete canonical v3 record from one reused buffer. This is the
+/// unsplit record seam consumed by the unpublished external-sort spool.
+fn stream_manifest_v3_records<E>(
+    manifest: &[ManifestEntry],
+    mut emit_record: impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), ManifestV3StreamError<E>> {
+    let mut record = Vec::with_capacity(MANIFEST_V3_MAX_SEGMENT_PAYLOAD);
+    for entry in manifest {
+        let record_len = manifest_entry_v3_len(entry).map_err(ManifestV3StreamError::Codec)?;
+        if record_len > MANIFEST_V3_MAX_SEGMENT_PAYLOAD {
+            return Err(ManifestV3StreamError::Codec(
+                ManifestV3CodecError::RecordTooLarge,
+            ));
+        }
+        record.clear();
+        emit_manifest_entry_v3(entry, |bytes| record.extend_from_slice(bytes));
+        debug_assert_eq!(record.len(), record_len);
+        emit_record(&record).map_err(ManifestV3StreamError::Emit)?;
+    }
+    Ok(())
 }
 
 /// Emits complete canonical v3 records in segments no larger than 1 MiB. The

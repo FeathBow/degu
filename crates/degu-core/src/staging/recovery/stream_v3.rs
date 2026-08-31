@@ -1,13 +1,13 @@
 use super::*;
 use crate::backend::held::{
     HardlinkTopologyFold, HeldTreeV3CollectError, ManifestV3CodecError, ManifestV3Record,
-    ManifestV3RecordKind, PendingV3Inventory, StreamedV3Inventory, StructureEvidence,
-    decode_hardlink_scratch_record, hardlink_scratch_sentinel_record,
-    structure_evidence_from_v3_record,
+    ManifestV3RecordKind, ManifestV3StreamError, PendingV3Inventory, StreamedV3Inventory,
+    StructureEvidence, V3PurgePlanBuilder, decode_hardlink_scratch_record,
+    hardlink_scratch_sentinel_record, structure_evidence_from_v3_record,
 };
 use crate::seal::sidecar::{
-    TreeManifestFoldError, TreeManifestScratchBuildError, TreeSidecarCommitment, TreeSidecarError,
-    TreeSidecarFoldError, TreeSidecarStore, TreeStructureScratchCursor,
+    TreeManifestFoldError, TreeManifestScratchBuildError, TreePurgePlan, TreeSidecarCommitment,
+    TreeSidecarError, TreeSidecarFoldError, TreeSidecarStore, TreeStructureScratchCursor,
 };
 use std::convert::Infallible;
 use std::os::unix::ffi::OsStrExt;
@@ -184,6 +184,21 @@ fn authenticate_then_cleanup(
         .err()
         .or_else(|| cleanup.err())
         .unwrap_or(primary)
+}
+
+fn purge_plan_error_after_auth_cleanup(
+    wal: &mut SealWal<RecoverySession>,
+    sidecars: &TreeSidecarStore,
+    commitment: TreeSidecarCommitment,
+    manifest: DurableTreeManifest,
+    primary: TreeSidecarError,
+) -> RecoveryRebindError {
+    let authenticated = authenticate_manifest(sidecars, commitment, manifest);
+    let cleanup = sidecars.cleanup_unpublished(wal);
+    authenticated
+        .err()
+        .or_else(|| cleanup.err().map(RecoveryRebindError::PurgePlan))
+        .unwrap_or(RecoveryRebindError::PurgePlan(primary))
 }
 
 pub(super) struct ReboundV3Verification<'a> {
@@ -493,6 +508,82 @@ pub(super) fn verify_rebound_v3(
     }
     authenticate_manifest(sidecars, commitment, expected_manifest)?;
     Ok(tree)
+}
+
+pub(super) fn build_purge_plan(
+    wal: &mut SealWal<RecoverySession>,
+    sidecars: &TreeSidecarStore,
+    transaction: TransactionId,
+    commitment: TreeSidecarCommitment,
+    manifest: DurableTreeManifest,
+) -> Result<TreePurgePlan, RecoveryRebindError> {
+    #[cfg(test)]
+    if PURGE_PLAN_FAIL_BUILD.with(std::cell::Cell::get) {
+        return Err(RecoveryRebindError::PurgePlan(
+            TreeSidecarError::InvalidScratch("injected purge plan construction failure"),
+        ));
+    }
+    let built = sidecars.build_sorted_purge_scratch_with_output(wal, transaction, |emit_record| {
+        sidecars.read_manifest_v3_fold(
+            commitment,
+            manifest,
+            V3PurgePlanBuilder::new(),
+            |builder, record| builder.observe(record, |encoded| emit_record(encoded)),
+        )
+    });
+    let (scratch, _) = match built {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(match error {
+                TreeManifestScratchBuildError::Sidecar(error)
+                | TreeManifestScratchBuildError::Produce(TreeManifestFoldError::Fold(
+                    ManifestV3StreamError::Emit(error),
+                )) => {
+                    purge_plan_error_after_auth_cleanup(wal, sidecars, commitment, manifest, error)
+                }
+                TreeManifestScratchBuildError::Produce(TreeManifestFoldError::Sidecar(error)) => {
+                    authenticate_then_cleanup(
+                        wal,
+                        sidecars,
+                        commitment,
+                        manifest,
+                        sidecar_error(error),
+                    )
+                }
+                TreeManifestScratchBuildError::Produce(
+                    TreeManifestFoldError::Codec(_)
+                    | TreeManifestFoldError::FingerprintMismatch
+                    | TreeManifestFoldError::Fold(ManifestV3StreamError::Codec(_)),
+                ) => authenticate_then_cleanup(
+                    wal,
+                    sidecars,
+                    commitment,
+                    manifest,
+                    RecoveryRebindError::SidecarManifestChanged,
+                ),
+            });
+        }
+    };
+    #[cfg(test)]
+    if PURGE_PLAN_FAIL_AFTER_SCRATCH_BUILD.with(std::cell::Cell::get) {
+        return Err(purge_plan_error_after_auth_cleanup(
+            wal,
+            sidecars,
+            commitment,
+            manifest,
+            TreeSidecarError::InvalidScratch("injected failure after purge scratch build"),
+        ));
+    }
+    let plan = match sidecars.seal_sorted_purge_scratch(wal, transaction, scratch) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Err(purge_plan_error_after_auth_cleanup(
+                wal, sidecars, commitment, manifest, error,
+            ));
+        }
+    };
+    authenticate_manifest(sidecars, commitment, manifest)?;
+    Ok(plan)
 }
 
 struct StructureComparison {

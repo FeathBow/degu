@@ -10,6 +10,7 @@ use crate::staging::{
     VerifiedPurgeFailureDisposition, VerifiedPurgeRequest, VerifiedUndoFailureDisposition,
     VerifiedUndoRequest,
 };
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 struct Fixture {
@@ -885,6 +886,255 @@ fn recovery_blocked_engine_refuses_later_purge_admission() {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods)] // adversarially corrupts the published proof
+fn verified_purge_corrupt_sidecar_fails_closed_before_authority() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0x8d; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let store = fixture.base.join("wal-store");
+    let sidecar = std::fs::read_dir(&store)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension() == Some(OsStr::new("sidecar")))
+        .expect("verified commit must retain its sidecar");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(sidecar)
+        .unwrap();
+    file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+
+    let error = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap_err();
+    assert_eq!(
+        error.disposition(),
+        VerifiedPurgeFailureDisposition::Terminal(TransactionState::RecoveryRequired)
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::RecoveryRequired)
+    );
+    assert!(fixture.destination_root.is_dir());
+    assert!(
+        std::fs::read_dir(store)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .all(|name| !name.to_string_lossy().starts_with(".tree-scratch-v1-"))
+    );
+}
+
+#[test]
+fn purge_plan_construction_failure_is_retryable_before_authorization() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0x8b; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    crate::staging::recovery::PURGE_PLAN_FAIL_BUILD.with(|fail| fail.set(true));
+    let error = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap_err();
+    crate::staging::recovery::PURGE_PLAN_FAIL_BUILD.with(|fail| fail.set(false));
+    assert_eq!(
+        error.disposition(),
+        VerifiedPurgeFailureDisposition::NotStarted
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    assert!(fixture.destination_root.join("child/data").is_file());
+
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    ready.execute_verified_purge(authority).unwrap();
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purged));
+}
+
+#[test]
+fn purge_plan_failure_after_scratch_build_cleans_and_remains_retryable() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0x87; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    crate::staging::recovery::PURGE_PLAN_FAIL_AFTER_SCRATCH_BUILD.with(|fail| fail.set(true));
+    let error = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap_err();
+    crate::staging::recovery::PURGE_PLAN_FAIL_AFTER_SCRATCH_BUILD.with(|fail| fail.set(false));
+    assert_eq!(
+        error.disposition(),
+        VerifiedPurgeFailureDisposition::NotStarted
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    assert!(
+        std::fs::read_dir(fixture.base.join("wal-store"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .all(|name| !name.to_string_lossy().starts_with(".tree-scratch-v1-"))
+    );
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    ready.execute_verified_purge(authority).unwrap();
+}
+
+#[test]
+fn keyed_purge_plan_tamper_after_preflight_unlinks_nothing() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0x8c; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    crate::staging::recovery::AFTER_PURGE_PLAN_AUTH.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|plan| plan.corrupt_frame_for_test(0)));
+    });
+    let error = ready.execute_verified_purge(authority).unwrap_err();
+    assert_eq!(
+        error.disposition(),
+        VerifiedPurgeFailureDisposition::RecoveryBlocked
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::PurgeIntent)
+    );
+    assert!(fixture.destination_root.join("child/data").is_file());
+    drop(ready);
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    assert_eq!(replay.transactions[&transaction].purge_removed_entries, 0);
+}
+
+#[test]
+fn later_keyed_purge_plan_tamper_preserves_canonical_progress_prefix() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0x89; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    crate::staging::recovery::AFTER_PURGE_PLAN_AUTH.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|plan| plan.corrupt_frame_for_test(1)));
+    });
+    let error = ready.execute_verified_purge(authority).unwrap_err();
+    assert_eq!(
+        error.disposition(),
+        VerifiedPurgeFailureDisposition::RecoveryBlocked
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::PurgeIntent)
+    );
+    assert!(!fixture.destination_root.join("child/data").exists());
+    assert!(fixture.destination_root.join("child").is_dir());
+    drop(ready);
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    assert_eq!(replay.transactions[&transaction].purge_removed_entries, 1);
+    assert_eq!(
+        replay.transactions[&transaction].purge_last_path.as_deref(),
+        Some(Path::new("child/data"))
+    );
+}
+
+#[test]
+fn live_replacement_after_plan_preflight_is_never_unlinked() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0x8a; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    let data = fixture.destination_root.join("child/data");
+    let changed = data.clone();
+    crate::staging::recovery::AFTER_PURGE_PLAN_AUTH.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |_| {
+            std::fs::write(&changed, b"replacement after preflight").unwrap();
+        }));
+    });
+    let error = ready.execute_verified_purge(authority).unwrap_err();
+    assert_eq!(
+        error.disposition(),
+        VerifiedPurgeFailureDisposition::RecoveryBlocked
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::PurgeIntent)
+    );
+    assert_eq!(std::fs::read(data).unwrap(), b"replacement after preflight");
+    drop(ready);
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    assert_eq!(replay.transactions[&transaction].purge_removed_entries, 0);
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)] // constructs a root-only adversarial fixture
+fn streamed_v3_purge_handles_root_only_tree_without_named_plan_residue() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    std::fs::remove_file(fixture.source_root.join("child/data")).unwrap();
+    std::fs::remove_dir(fixture.source_root.join("child")).unwrap();
+    let transaction = TransactionId([0x8e; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    assert!(
+        std::fs::read_dir(fixture.base.join("wal-store"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .all(|name| {
+                let name = name.to_string_lossy();
+                !name.starts_with(".tree-scratch-v1-") && !name.starts_with(".tree-purge-v1-")
+            }),
+        "purge authority must retain only an anonymous plan FD"
+    );
+    let commit = ready.execute_verified_purge(authority).unwrap();
+    assert_eq!(commit.removed_entries(), 1);
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purged));
+    assert!(!fixture.destination_root.exists());
+}
+
+#[test]
+fn streamed_v3_purge_preserves_non_utf8_plan_paths() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let name = OsStr::from_bytes(b"non-utf8-\xff");
+    if let Err(error) = std::fs::write(fixture.source_root.join(name), b"opaque path") {
+        if error.raw_os_error() == Some(libc::EILSEQ) {
+            return;
+        }
+        panic!("failed to create non-UTF-8 purge fixture: {error}");
+    }
+    let transaction = TransactionId([0x8f; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    let commit = ready.execute_verified_purge(authority).unwrap();
+    assert_eq!(commit.removed_entries(), 4);
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purged));
+    assert!(!fixture.destination_root.exists());
+}
+
+#[test]
 fn verified_purge_mints_one_use_authority_after_durable_terminal_transition() {
     let Some(fixture) = Fixture::new() else {
         return;
@@ -1116,7 +1366,11 @@ fn purge_partial_unlink_failure_stays_at_intent_and_restart_fails_closed() {
     let mut lease = fixture.store.try_lease().unwrap();
     let replay = lease.replay_and_repair().unwrap();
     assert_eq!(replay.transactions[&transaction].purge_removed_entries, 1);
-    assert!(replay.transactions[&transaction].purge_last_path.is_some());
+    assert_eq!(
+        replay.transactions[&transaction].purge_last_path.as_deref(),
+        Some(std::path::Path::new("child/data")),
+        "streamed purge must preserve historical depth-descending reverse-path progress"
+    );
     drop(lease);
 
     let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
@@ -2851,6 +3105,43 @@ fn mode(path: &Path) -> u32 {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn verified_purge_rejects_admitted_regular_xattrs_without_leaving_committed_state() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let data = fixture.source_root.join("child/data");
+    let data = std::ffi::CString::new(data.as_os_str().as_bytes()).unwrap();
+    let value = b"ordinary metadata";
+    // SAFETY: the C path, name, and value buffer remain live for the syscall.
+    let result = unsafe {
+        libc::setxattr(
+            data.as_ptr(),
+            c"user.degu-test".as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    assert_eq!(result, 0, "failed to plant ordinary xattr");
+    let transaction = TransactionId([0x88; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let error = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap_err();
+    assert!(error.is_unsupported_regular_xattrs(), "{error}");
+    assert_eq!(
+        error.disposition(),
+        VerifiedPurgeFailureDisposition::NotStarted
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    assert!(fixture.destination_root.join("child/data").is_file());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn verified_purge_acl_drift_fails_closed_to_recovery_required() {
     use std::os::unix::ffi::OsStrExt;
 
@@ -3145,6 +3436,69 @@ fn deep_restart_verification_and_verified_undo_are_fd_bounded() {
     assert!(
         marker.exists(),
         "isolated deep recovery FD test did not execute"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_deep_streamed_purge_fits_process_fd_budget() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let mut directory = fixture.source_root.clone();
+    for _ in 0..96 {
+        directory.push("d");
+        std::fs::create_dir(&directory).unwrap();
+        set_mode(&directory, 0o770);
+    }
+    std::fs::write(directory.join("deep-data"), b"bounded purge").unwrap();
+    let transaction = TransactionId([0xfa; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    limit.rlim_cur = limit.rlim_cur.min(160);
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    let commit = ready.execute_verified_purge(authority).unwrap();
+    assert_eq!(commit.removed_entries(), 100);
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purged));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn deep_streamed_v3_purge_is_fd_bounded() {
+    const CHILD_MARKER_ENV: &str = "DEGU_DEEP_PURGE_FD_CHILD_MARKER";
+    if let Some(marker) = std::env::var_os(CHILD_MARKER_ENV) {
+        assert_deep_streamed_purge_fits_process_fd_budget();
+        std::fs::write(marker, b"observed").unwrap();
+        return;
+    }
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir.path().join("completed");
+    let test_name = format!(
+        "{}::deep_streamed_v3_purge_is_fd_bounded",
+        module_path!()
+            .strip_prefix("degu_core::")
+            .unwrap_or(module_path!())
+    );
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test_name, "--nocapture"])
+        .env(CHILD_MARKER_ENV, &marker)
+        .status()
+        .unwrap();
+    assert!(status.success(), "isolated deep purge FD test failed");
+    assert!(
+        marker.exists(),
+        "isolated deep purge FD test did not execute"
     );
 }
 

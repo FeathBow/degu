@@ -8,7 +8,10 @@
 mod stream_v3;
 
 use crate::authority::TransactionState;
-use crate::backend::held::{HeldTreeError, HeldTreeInventory, HeldTreeLimits, HeldTreePurgeError};
+use crate::backend::held::{
+    HeldTreeError, HeldTreeInventory, HeldTreeLimits, HeldTreePurgeError, StreamedV3Inventory,
+    StreamedV3Purger,
+};
 use crate::backend::{
     CertificationError, CertifiedLocalBackend, HeldLocalBackendEvidence,
     LocalModeRevalidationFailure, certify_held_fd, certify_held_fd_backend,
@@ -17,7 +20,9 @@ use crate::seal::executor::{
     LocalModeExecutionError, LocalModeMutationRequest, LocalModeTransform, RecoveryLocator,
     execute_staging_local_mode_mutation,
 };
-use crate::seal::sidecar::{TreeSidecarCommitment, TreeSidecarError, TreeSidecarStore};
+use crate::seal::sidecar::{
+    TreePurgePlan, TreeSidecarCommitment, TreeSidecarError, TreeSidecarStore,
+};
 use crate::seal::wal::{
     AppendError, ApplicationStatus, DurablePermission, DurableTreeManifest,
     DurableUndoRenameOutcome, PermissionResolution, RecoverySession, RecoveryWork, ResolveError,
@@ -31,6 +36,9 @@ use std::io;
 #[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+type AfterPurgePlanAuthHook = Box<dyn FnOnce(&mut TreePurgePlan)>;
+
 #[cfg(test)]
 std::thread_local! {
     static RECOVERY_NAME_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -48,6 +56,12 @@ std::thread_local! {
         const { std::cell::Cell::new(None) };
     pub(crate) static PURGE_FAIL_AFTER_OUTCOME: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    pub(crate) static PURGE_PLAN_FAIL_BUILD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    pub(crate) static PURGE_PLAN_FAIL_AFTER_SCRATCH_BUILD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    pub(crate) static AFTER_PURGE_PLAN_AUTH: std::cell::RefCell<Option<AfterPurgePlanAuthHook>> =
+        const { std::cell::RefCell::new(None) };
     static RECOVERY_FD_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -134,6 +148,8 @@ pub(crate) enum RecoveryRebindError {
     Sidecar(#[source] TreeSidecarError),
     #[error("published recovery tree sidecar does not match its durable manifest")]
     SidecarManifestChanged,
+    #[error("private purge planning failed before durable authorization: {0}")]
+    PurgePlan(#[source] TreeSidecarError),
     #[error("committed tree no longer exactly matches its sealed content manifest")]
     UndoManifestChanged,
     #[error("verified undo destination is occupied")]
@@ -886,11 +902,29 @@ pub(crate) struct VerifiedUndoRecoverySession<'a> {
 /// Held, one-use object material retained by the public PurgeAuthority. It is
 /// deliberately opaque outside the core crate and cannot be reconstructed from
 /// durable projections.
-#[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct VerifiedPurgeAuthorityMaterial {
     committed: ReboundVerifiedUndo,
-    inventory: HeldTreeInventory,
+    tree: VerifiedPurgeTree,
+}
+
+enum VerifiedPurgeTree {
+    Resident(Box<HeldTreeInventory>),
+    StreamedV3(Box<StreamedV3PurgeMaterial>),
+}
+
+struct StreamedV3PurgeMaterial {
+    purger: StreamedV3Purger,
+    plan: TreePurgePlan,
+}
+
+impl VerifiedPurgeTree {
+    fn root_strong_identity(&self) -> StrongObjectIdentity {
+        match self {
+            Self::Resident(inventory) => inventory.root_strong_identity(),
+            Self::StreamedV3(material) => material.purger.root_strong_identity(),
+        }
+    }
 }
 
 pub(crate) struct VerifiedPurgeSession<'a> {
@@ -903,17 +937,32 @@ pub(crate) struct VerifiedPurgeSession<'a> {
 
 impl VerifiedPurgeAuthorityMaterial {
     /// Executes the one-shot authority while the exact WAL lease, staged root,
-    /// trash parent, directory set and content-proven inventory are all live.
+    /// trash parent, and content-proven resident/streamed material are live.
     pub(crate) fn execute(
         self,
         wal: &mut SealWal<RecoverySession>,
         startup_blocked: &mut bool,
         transaction: TransactionId,
     ) -> Result<u64, RecoveryRebindError> {
+        let mut tree = self.tree;
         if wal.transaction_state(transaction) != Some(TransactionState::Purgeable)
-            || self.committed.metadata.root_identity() != self.inventory.root_strong_identity()
+            || self.committed.metadata.root_identity() != tree.root_strong_identity()
         {
             return Err(RecoveryRebindError::TransactionMismatch);
+        }
+        // No anonymous plan byte may drive mutation until its complete keyed
+        // frames, aggregate digest, canonical order, count, and EOF authenticate.
+        if let VerifiedPurgeTree::StreamedV3(material) = &mut tree {
+            material
+                .plan
+                .authenticate()
+                .map_err(RecoveryRebindError::PurgePlan)?;
+            #[cfg(test)]
+            AFTER_PURGE_PLAN_AUTH.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook(&mut material.plan);
+                }
+            });
         }
         // PurgeIntent is the last pre-mutation boundary. Any later error leaves
         // the engine blocked; restart records RecoveryRequired rather than
@@ -926,21 +975,63 @@ impl VerifiedPurgeAuthorityMaterial {
                 "injected crash after durable purge claim",
             )));
         }
-        let removed = self
-            .inventory
-            .purge_postorder(|removed, path| {
-                #[cfg(test)]
-                if PURGE_FAIL_PROGRESS_AT.with(|at| at.get() == Some(removed)) {
-                    return Err(AppendError::InvalidState(
-                        "injected crash before durable purge progress",
-                    ));
+        let removed = match tree {
+            VerifiedPurgeTree::Resident(inventory) => inventory
+                .purge_postorder(|removed, path| {
+                    #[cfg(test)]
+                    if PURGE_FAIL_PROGRESS_AT.with(|at| at.get() == Some(removed)) {
+                        return Err(AppendError::InvalidState(
+                            "injected crash before durable purge progress",
+                        ));
+                    }
+                    wal.record_purge_progress(transaction, removed, path)
+                })
+                .map_err(|error| match error {
+                    HeldTreePurgeError::Tree(error) => RecoveryRebindError::PurgeExecution(error),
+                    HeldTreePurgeError::Journal(error) => RecoveryRebindError::Wal(error),
+                })?,
+            VerifiedPurgeTree::StreamedV3(material) => {
+                let StreamedV3PurgeMaterial {
+                    mut purger,
+                    mut plan,
+                } = *material;
+                while let Some(record) = plan.next().map_err(RecoveryRebindError::Sidecar)? {
+                    purger
+                        .purge_plan_record(&record, |removed, path| {
+                            #[cfg(test)]
+                            if PURGE_FAIL_PROGRESS_AT.with(|at| at.get() == Some(removed)) {
+                                return Err(AppendError::InvalidState(
+                                    "injected crash before durable purge progress",
+                                ));
+                            }
+                            wal.record_purge_progress(transaction, removed, path)
+                        })
+                        .map_err(|error| match error {
+                            HeldTreePurgeError::Tree(error) => {
+                                RecoveryRebindError::PurgeExecution(error)
+                            }
+                            HeldTreePurgeError::Journal(error) => RecoveryRebindError::Wal(error),
+                        })?;
                 }
-                wal.record_purge_progress(transaction, removed, path)
-            })
-            .map_err(|error| match error {
-                HeldTreePurgeError::Tree(error) => RecoveryRebindError::PurgeExecution(error),
-                HeldTreePurgeError::Journal(error) => RecoveryRebindError::Wal(error),
-            })?;
+                plan.finish().map_err(RecoveryRebindError::Sidecar)?;
+                purger
+                    .finish(|removed, path| {
+                        #[cfg(test)]
+                        if PURGE_FAIL_PROGRESS_AT.with(|at| at.get() == Some(removed)) {
+                            return Err(AppendError::InvalidState(
+                                "injected crash before durable purge progress",
+                            ));
+                        }
+                        wal.record_purge_progress(transaction, removed, path)
+                    })
+                    .map_err(|error| match error {
+                        HeldTreePurgeError::Tree(error) => {
+                            RecoveryRebindError::PurgeExecution(error)
+                        }
+                        HeldTreePurgeError::Journal(error) => RecoveryRebindError::Wal(error),
+                    })?
+            }
+        };
         wal.record_purge_outcome(transaction)?;
         #[cfg(test)]
         if PURGE_FAIL_AFTER_OUTCOME.with(std::cell::Cell::get) {
@@ -957,43 +1048,90 @@ impl VerifiedPurgeAuthorityMaterial {
 impl VerifiedPurgeSession<'_> {
     pub(crate) fn authorize(self) -> Result<VerifiedPurgeAuthorityMaterial, RecoveryRebindError> {
         let transaction = self.transaction;
-        let verifier = VerifiedUndoRecoverySession {
+        let mut verifier = VerifiedUndoRecoverySession {
             wal: self.wal,
             sidecars: self.sidecars,
             startup_blocked: self.startup_blocked,
             transaction,
             undo: self.committed,
         };
-        let verified = verifier
-            .collect_exact_tree()
-            .and_then(|inventory| verifier.verify_purge_layout().map(|()| inventory));
-        let inventory = match verified {
-            Ok(inventory) => inventory,
-            Err(error) => {
-                // A request which reached the exact committed association but found
-                // replacement, inode reuse, ACL/mode/content drift, or mount/parent
-                // namespace change can no longer be treated as a healthy terminal.
-                verifier.wal.transition_recovery_required(transaction)?;
-                *verifier.startup_blocked = true;
-                return Err(error);
-            }
-        };
-        // This admission gate deliberately precedes PurgeAuthorized/Purgeable,
-        // PurgeIntent, every progress frame, and every unlink. Internal hardlink
-        // topology is supported for staging and undo, but partial unlinking would
-        // destroy the complete alias set and is therefore not authorized.
-        if inventory
-            .regular_hard_link_topology()
-            .contains_multi_link_group()
-        {
-            *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
-            return Err(RecoveryRebindError::PurgeUnsupportedInternalHardLinks);
-        }
-        if inventory.regular_xattr_topology().contains_xattrs() {
-            *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
-            return Err(RecoveryRebindError::PurgeUnsupportedRegularXattrs);
-        }
         let manifest = verifier.undo.expected_manifest;
+        let tree = if manifest.schema_version == 3 {
+            let verified = verifier
+                .collect_exact_streamed_v3()
+                .and_then(|inventory| verifier.verify_purge_layout().map(|()| inventory));
+            let inventory = match verified {
+                Ok(inventory) => inventory,
+                Err(error) => {
+                    verifier.wal.transition_recovery_required(transaction)?;
+                    *verifier.startup_blocked = true;
+                    return Err(error);
+                }
+            };
+            // These admission gates precede plan sealing, PurgeAuthorized, and
+            // every unlink. Unsupported trees remain committed and undoable.
+            if inventory
+                .regular_hard_link_topology()
+                .contains_multi_link_group()
+            {
+                *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
+                return Err(RecoveryRebindError::PurgeUnsupportedInternalHardLinks);
+            }
+            if inventory.regular_xattr_topology().contains_xattrs() {
+                *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
+                return Err(RecoveryRebindError::PurgeUnsupportedRegularXattrs);
+            }
+            let commitment = verifier
+                .undo
+                .sidecar_commitment
+                .ok_or(RecoveryRebindError::SidecarManifestChanged)?;
+            let plan = match stream_v3::build_purge_plan(
+                verifier.wal,
+                verifier.sidecars,
+                transaction,
+                commitment,
+                manifest,
+            ) {
+                Ok(plan) => plan,
+                Err(error @ RecoveryRebindError::PurgePlan(_)) => {
+                    *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
+                    return Err(error);
+                }
+                Err(error) => {
+                    verifier.wal.transition_recovery_required(transaction)?;
+                    *verifier.startup_blocked = true;
+                    return Err(error);
+                }
+            };
+            VerifiedPurgeTree::StreamedV3(Box::new(StreamedV3PurgeMaterial {
+                purger: inventory.into_purger(),
+                plan,
+            }))
+        } else {
+            let verified = verifier
+                .collect_exact_tree()
+                .and_then(|inventory| verifier.verify_purge_layout().map(|()| inventory));
+            let inventory = match verified {
+                Ok(inventory) => inventory,
+                Err(error) => {
+                    verifier.wal.transition_recovery_required(transaction)?;
+                    *verifier.startup_blocked = true;
+                    return Err(error);
+                }
+            };
+            if inventory
+                .regular_hard_link_topology()
+                .contains_multi_link_group()
+            {
+                *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
+                return Err(RecoveryRebindError::PurgeUnsupportedInternalHardLinks);
+            }
+            if inventory.regular_xattr_topology().contains_xattrs() {
+                *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
+                return Err(RecoveryRebindError::PurgeUnsupportedRegularXattrs);
+            }
+            VerifiedPurgeTree::Resident(Box::new(inventory))
+        };
         if verifier.wal.transaction_state(transaction) == Some(TransactionState::VerifiedCommitted)
         {
             verifier.wal.record_purgeable(ExactPurgeVerification {
@@ -1004,7 +1142,7 @@ impl VerifiedPurgeSession<'_> {
         *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
         Ok(VerifiedPurgeAuthorityMaterial {
             committed: verifier.undo,
-            inventory,
+            tree,
         })
     }
 }
@@ -1252,29 +1390,32 @@ impl VerifiedUndoRecoverySession<'_> {
 
     fn verify_exact_tree(&mut self) -> Result<(), RecoveryRebindError> {
         if self.undo.expected_manifest.schema_version == 3 {
-            let commitment = self
-                .undo
-                .sidecar_commitment
-                .ok_or(RecoveryRebindError::UndoManifestChanged)?;
-            let modes_restored = self.wal.transaction_state(self.transaction)
-                == Some(TransactionState::UndoModesRestored);
-            stream_v3::verify_rebound_v3(
-                self.wal,
-                self.sidecars,
-                stream_v3::ReboundV3Verification {
-                    transaction: self.transaction,
-                    commitment,
-                    expected_manifest: self.undo.expected_manifest,
-                    root: &self.undo.root,
-                    metadata: &self.undo.metadata,
-                    plans: &self.undo.tree_seals,
-                    modes_restored,
-                    limits: HeldTreeLimits::default(),
-                },
-            )?;
-            return Ok(());
+            return self.collect_exact_streamed_v3().map(|_| ());
         }
         self.collect_exact_tree().map(|_| ())
+    }
+
+    fn collect_exact_streamed_v3(&mut self) -> Result<StreamedV3Inventory, RecoveryRebindError> {
+        let commitment = self
+            .undo
+            .sidecar_commitment
+            .ok_or(RecoveryRebindError::UndoManifestChanged)?;
+        let modes_restored = self.wal.transaction_state(self.transaction)
+            == Some(TransactionState::UndoModesRestored);
+        stream_v3::verify_rebound_v3(
+            self.wal,
+            self.sidecars,
+            stream_v3::ReboundV3Verification {
+                transaction: self.transaction,
+                commitment,
+                expected_manifest: self.undo.expected_manifest,
+                root: &self.undo.root,
+                metadata: &self.undo.metadata,
+                plans: &self.undo.tree_seals,
+                modes_restored,
+                limits: HeldTreeLimits::default(),
+            },
+        )
     }
 
     fn collect_exact_tree(&self) -> Result<HeldTreeInventory, RecoveryRebindError> {

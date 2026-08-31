@@ -25,7 +25,17 @@ const SORT_MEMORY_BYTES: usize = 1024 * 1024;
 pub(super) const MERGE_FAN_IN: usize = 8;
 /// Eight current records, one previous path, and one outgoing segment. Vec/file
 /// bookkeeping adds a small fixed overhead outside this payload-byte ceiling.
-const MERGE_PAYLOAD_MEMORY_BYTES: usize = (MERGE_FAN_IN + 2) * MAX_SEGMENT_PAYLOAD;
+const MERGE_PAYLOAD_MEMORY_BYTES: usize = (MERGE_FAN_IN + 2) * PURGE_RECORD_MAX_BYTES;
+/// Purge records carry the manifest record plus a bounded ancestor context.
+/// Keep the published manifest ceiling unchanged while admitting that fixed
+/// private planning overhead.
+const PURGE_RECORD_MAX_BYTES: usize = 2 * MAX_SEGMENT_PAYLOAD + 64 * 1024;
+const PURGE_TOTAL_MAX_BYTES: u64 = 2 * MAX_TOTAL_PAYLOAD_BYTES + MAX_RECORDS * 64 * 1024;
+const PURGE_PLAN_MAGIC: &[u8; 4] = b"DHPP";
+const PURGE_PLAN_VERSION: u16 = 1;
+const PURGE_PLAN_HEADER_LEN: usize = 72;
+const PURGE_PLAN_DOMAIN: &[u8] = b"degu-held-tree-purge-plan-v1\0";
+const PURGE_PLAN_FRAME_DOMAIN: &[u8] = b"degu-held-tree-purge-frame-v1\0";
 static NEXT_SCRATCH_NAME: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,11 +64,12 @@ struct ScratchRun {
 enum ScratchOrder {
     ManifestPath,
     HardlinkIdentityThenPath,
+    PurgePostorder,
 }
 
 fn validate_scratch_key(order: ScratchOrder, key: &[u8]) -> Result<(), TreeSidecarError> {
     match order {
-        ScratchOrder::ManifestPath => Ok(()),
+        ScratchOrder::ManifestPath | ScratchOrder::PurgePostorder => Ok(()),
         ScratchOrder::HardlinkIdentityThenPath
             if key == [0] || (key.first() == Some(&1) && key.len() >= 25) =>
         {
@@ -73,6 +84,13 @@ fn validate_scratch_key(order: ScratchOrder, key: &[u8]) -> Result<(), TreeSidec
 fn compare_scratch_keys(order: ScratchOrder, left: &[u8], right: &[u8]) -> std::cmp::Ordering {
     match order {
         ScratchOrder::ManifestPath => compare_manifest_paths(left, right),
+        ScratchOrder::PurgePostorder => {
+            let left_depth = Path::new(OsStr::from_bytes(left)).components().count();
+            let right_depth = Path::new(OsStr::from_bytes(right)).components().count();
+            right_depth.cmp(&left_depth).then_with(|| {
+                Path::new(OsStr::from_bytes(right)).cmp(Path::new(OsStr::from_bytes(left)))
+            })
+        }
         ScratchOrder::HardlinkIdentityThenPath => match (left.first(), right.first()) {
             (Some(0), Some(0)) => std::cmp::Ordering::Equal,
             (Some(0), _) => std::cmp::Ordering::Less,
@@ -107,6 +125,10 @@ pub(crate) struct TreeStructureScratch(TreeManifestScratch);
 /// cannot enter manifest fingerprint or publication APIs.
 #[derive(Debug)]
 pub(crate) struct TreeHardlinkScratch(TreeManifestScratch);
+
+/// Unpublished purge records sorted in the exact historical postorder.
+#[derive(Debug)]
+pub(crate) struct TreePurgeScratch(TreeManifestScratch);
 
 pub(crate) struct TreeStructureScratchCursor {
     scratch: TreeManifestScratch,
@@ -161,6 +183,13 @@ fn flatten_scratch_merge(error: ScratchMergeError<TreeSidecarError>) -> TreeSide
 impl TreeStructureScratch {
     pub(super) fn run_names_for_test(&self) -> Vec<OsString> {
         self.0.runs.iter().map(|run| run.name.clone()).collect()
+    }
+}
+
+#[cfg(test)]
+impl TreePurgeScratch {
+    pub(super) fn max_level_for_test(&self) -> u8 {
+        self.0.runs.iter().map(|run| run.level).max().unwrap_or(0)
     }
 }
 
@@ -286,6 +315,50 @@ impl TreeSidecarStore {
             produce,
         )
         .map(|(scratch, output)| (TreeHardlinkScratch(scratch), output))
+    }
+
+    /// Builds private purge runs in deepest-first historical postorder.
+    pub(crate) fn build_sorted_purge_scratch_with_output<T, E, P>(
+        &self,
+        wal: &mut SealWal<RecoverySession>,
+        transaction: TransactionId,
+        produce: P,
+    ) -> Result<(TreePurgeScratch, T), TreeManifestScratchBuildError<E>>
+    where
+        P: FnOnce(&mut dyn FnMut(&[u8]) -> Result<(), TreeSidecarError>) -> Result<T, E>,
+    {
+        self.build_sorted_manifest_scratch_with_budget_and_output(
+            wal,
+            transaction,
+            SORT_MEMORY_BYTES,
+            ScratchOrder::PurgePostorder,
+            produce,
+        )
+        .map(|(scratch, output)| (TreePurgeScratch(scratch), output))
+    }
+
+    #[cfg(test)]
+    pub(super) fn build_sorted_purge_scratch_with_budget<P>(
+        &self,
+        wal: &mut SealWal<RecoverySession>,
+        transaction: TransactionId,
+        memory_bytes: usize,
+        produce: P,
+    ) -> Result<TreePurgeScratch, TreeSidecarError>
+    where
+        P: FnOnce(
+            &mut dyn FnMut(&[u8]) -> Result<(), TreeSidecarError>,
+        ) -> Result<(), TreeSidecarError>,
+    {
+        self.build_sorted_manifest_scratch_with_budget_and_output(
+            wal,
+            transaction,
+            memory_bytes,
+            ScratchOrder::PurgePostorder,
+            produce,
+        )
+        .map(|(scratch, ())| TreePurgeScratch(scratch))
+        .map_err(flatten_scratch_build)
     }
 
     #[cfg(test)]
@@ -722,6 +795,49 @@ impl TreeSidecarStore {
         Ok(commitment)
     }
 
+    /// Authenticates all named purge runs and seals them into an anonymous,
+    /// descriptor-only sequential purge plan. Named runs are removed and the
+    /// containing directory synced before the plan is returned.
+    pub(crate) fn seal_sorted_purge_scratch(
+        &self,
+        wal: &mut SealWal<RecoverySession>,
+        transaction: TransactionId,
+        scratch: TreePurgeScratch,
+    ) -> Result<TreePurgePlan, TreeSidecarError> {
+        let mut scratch = scratch.0;
+        let validation = (|| {
+            self.require_scratch_binding(transaction, &scratch, ScratchOrder::PurgePostorder)?;
+            self.require_matching_wal(wal)?;
+            self.revalidate_store_binding()?;
+            self.collapse_runs(&mut scratch)?;
+            let mut writer = PurgePlanWriter::create(self, transaction)?;
+            let expected = scratch.record_count;
+            let emitted = self
+                .merge_runs(&scratch.runs, ScratchOrder::PurgePostorder, |record| {
+                    writer.push(record)
+                })
+                .map_err(flatten_scratch_merge)?;
+            if emitted != expected {
+                return Err(TreeSidecarError::InvalidScratch(
+                    "purge scratch record count changed",
+                ));
+            }
+            let plan = writer.finish(expected)?;
+            self.remove_runs(&scratch.runs)?;
+            rustix::fs::fsync(&self.directory)
+                .map_err(|error| io_error(&self.path, error.into()))?;
+            self.require_matching_wal(wal)?;
+            self.revalidate_store_binding()?;
+            Ok(plan)
+        })();
+        let cleanup = self.cleanup_unpublished(wal).map(|_| ());
+        match (validation, cleanup) {
+            (Err(primary), _) => Err(primary),
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Ok(plan), Ok(())) => Ok(plan),
+        }
+    }
+
     fn require_scratch_binding(
         &self,
         transaction: TransactionId,
@@ -818,7 +934,7 @@ impl TreeSidecarStore {
     ) -> Result<u64, ScratchMergeError<E>> {
         debug_assert_eq!(
             MERGE_PAYLOAD_MEMORY_BYTES,
-            (MERGE_FAN_IN + 2) * MAX_SEGMENT_PAYLOAD
+            (MERGE_FAN_IN + 2) * PURGE_RECORD_MAX_BYTES
         );
         if runs.is_empty() || runs.len() > MERGE_FAN_IN {
             return Err(TreeSidecarError::InvalidScratch("invalid scratch merge fan-in").into());
@@ -905,9 +1021,14 @@ impl RunBuilder<'_> {
         }
         let key = record_path(record)?;
         validate_scratch_key(self.order, key)?;
-        if record.len() > MAX_SEGMENT_PAYLOAD {
+        let max_record = if self.order == ScratchOrder::PurgePostorder {
+            PURGE_RECORD_MAX_BYTES
+        } else {
+            MAX_SEGMENT_PAYLOAD
+        };
+        if record.len() > max_record {
             return Err(TreeSidecarError::InvalidScratch(
-                "one scratch record exceeds 1 MiB",
+                "one scratch record exceeds the manifest limit plus ancestor overhead",
             ));
         }
         let record_bytes = u64::try_from(record.len()).map_err(|_| {
@@ -916,9 +1037,14 @@ impl RunBuilder<'_> {
         self.payload_bytes = self.payload_bytes.checked_add(record_bytes).ok_or(
             TreeSidecarError::InvalidScratch("scratch aggregate payload length overflow"),
         )?;
-        if self.payload_bytes > MAX_TOTAL_PAYLOAD_BYTES {
+        let max_payload_bytes = if self.order == ScratchOrder::PurgePostorder {
+            PURGE_TOTAL_MAX_BYTES
+        } else {
+            MAX_TOTAL_PAYLOAD_BYTES
+        };
+        if self.payload_bytes > max_payload_bytes {
             return Err(TreeSidecarError::InvalidScratch(
-                "scratch aggregate payload exceeds the sidecar limit",
+                "scratch aggregate payload exceeds its order-specific limit",
             ));
         }
         let charge = record
@@ -1222,6 +1348,354 @@ impl TreeStructureScratchCursor {
     }
 }
 
+fn purge_plan_digest(transaction: TransactionId) -> Sha256 {
+    let mut digest = Sha256::new();
+    digest.update(PURGE_PLAN_DOMAIN);
+    digest.update(transaction.0);
+    digest
+}
+
+fn purge_plan_frame_tag(
+    key: &[u8; 32],
+    transaction: TransactionId,
+    ordinal: u64,
+    length: [u8; 4],
+    record: &[u8],
+) -> [u8; 32] {
+    // HMAC-SHA256 with a fixed 32-byte random key retained only by the
+    // one-shot authority. A pathname racer cannot forge, remove, duplicate, or
+    // reorder a record that will pass the pre-unlink frame check.
+    let mut inner_pad = [0x36_u8; 64];
+    let mut outer_pad = [0x5c_u8; 64];
+    for (pad, byte) in inner_pad.iter_mut().zip(key) {
+        *pad ^= byte;
+    }
+    for (pad, byte) in outer_pad.iter_mut().zip(key) {
+        *pad ^= byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(PURGE_PLAN_FRAME_DOMAIN);
+    inner.update(transaction.0);
+    inner.update(ordinal.to_be_bytes());
+    inner.update(length);
+    inner.update(record);
+    let inner: [u8; 32] = inner.finalize().into();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner);
+    outer.finalize().into()
+}
+
+/// A sealed purge plan owns only an unlinked file descriptor. It has no
+/// pathname authority and can be consumed exactly once.
+#[derive(Debug)]
+pub(crate) struct TreePurgePlan {
+    file: File,
+    path: PathBuf,
+    transaction: TransactionId,
+    frame_key: [u8; 32],
+    expected_records: u64,
+    expected_payload_bytes: u64,
+    expected_digest: [u8; 32],
+    remaining: u64,
+    payload_bytes: u64,
+    digest: Sha256,
+    previous_path: Option<Vec<u8>>,
+    checked_eof: bool,
+}
+
+impl TreePurgePlan {
+    pub(crate) fn next(&mut self) -> Result<Option<Vec<u8>>, TreeSidecarError> {
+        if self.remaining == 0 {
+            if !self.checked_eof {
+                let mut extra = [0_u8; 1];
+                if self
+                    .file
+                    .read(&mut extra)
+                    .map_err(|error| io_error(&self.path, error))?
+                    != 0
+                {
+                    return Err(TreeSidecarError::InvalidScratch(
+                        "purge plan contains trailing bytes",
+                    ));
+                }
+                self.digest.update(self.expected_records.to_be_bytes());
+                self.digest
+                    .update(self.expected_payload_bytes.to_be_bytes());
+                let actual: [u8; 32] = self.digest.clone().finalize().into();
+                if self.payload_bytes != self.expected_payload_bytes
+                    || actual != self.expected_digest
+                {
+                    return Err(TreeSidecarError::InvalidScratch(
+                        "purge plan integrity check failed",
+                    ));
+                }
+                self.checked_eof = true;
+            }
+            return Ok(None);
+        }
+        let mut length_bytes = [0_u8; 4];
+        self.file
+            .read_exact(&mut length_bytes)
+            .map_err(|error| io_error(&self.path, error))?;
+        let length = u32::from_be_bytes(length_bytes) as usize;
+        if length == 0 || length > PURGE_RECORD_MAX_BYTES {
+            return Err(TreeSidecarError::InvalidScratch(
+                "invalid purge plan record length",
+            ));
+        }
+        let mut frame_tag = [0_u8; 32];
+        self.file
+            .read_exact(&mut frame_tag)
+            .map_err(|error| io_error(&self.path, error))?;
+        let mut record = vec![0_u8; length];
+        self.file
+            .read_exact(&mut record)
+            .map_err(|error| io_error(&self.path, error))?;
+        let ordinal = self.expected_records - self.remaining;
+        if purge_plan_frame_tag(
+            &self.frame_key,
+            self.transaction,
+            ordinal,
+            length_bytes,
+            &record,
+        ) != frame_tag
+        {
+            return Err(TreeSidecarError::InvalidScratch(
+                "purge plan frame authentication failed",
+            ));
+        }
+        let path = record_path(&record)?;
+        if let Some(previous) = self.previous_path.as_deref()
+            && compare_scratch_keys(ScratchOrder::PurgePostorder, previous, path)
+                != std::cmp::Ordering::Less
+        {
+            return Err(TreeSidecarError::InvalidScratch(
+                "purge plan is not in strict postorder",
+            ));
+        }
+        self.previous_path = Some(path.to_vec());
+        self.digest.update(length_bytes);
+        self.digest.update(frame_tag);
+        self.digest.update(&record);
+        self.payload_bytes = self
+            .payload_bytes
+            .checked_add(4 + 32 + length as u64)
+            .ok_or(TreeSidecarError::InvalidScratch(
+                "purge plan payload length overflow",
+            ))?;
+        self.remaining -= 1;
+        Ok(Some(record))
+    }
+
+    /// Fully authenticates count, order, every keyed frame, aggregate digest,
+    /// and EOF before PurgeIntent. The anonymous FD is then rewound; keyed
+    /// frames are checked again immediately before each destructive use.
+    pub(crate) fn authenticate(&mut self) -> Result<(), TreeSidecarError> {
+        while self.next()?.is_some() {}
+        self.rewind()
+    }
+
+    fn rewind(&mut self) -> Result<(), TreeSidecarError> {
+        if !self.checked_eof {
+            return Err(TreeSidecarError::InvalidScratch(
+                "purge plan rewind precedes authentication",
+            ));
+        }
+        self.file
+            .seek(SeekFrom::Start(PURGE_PLAN_HEADER_LEN as u64))
+            .map_err(|error| io_error(&self.path, error))?;
+        self.remaining = self.expected_records;
+        self.payload_bytes = 0;
+        self.digest = purge_plan_digest(self.transaction);
+        self.previous_path = None;
+        self.checked_eof = false;
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<(), TreeSidecarError> {
+        while self.next()?.is_some() {}
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn corrupt_frame_for_test(&mut self, target: u64) {
+        self.file
+            .seek(SeekFrom::Start(PURGE_PLAN_HEADER_LEN as u64))
+            .unwrap();
+        for ordinal in 0..self.expected_records {
+            let mut length = [0_u8; 4];
+            self.file.read_exact(&mut length).unwrap();
+            let length = u32::from_be_bytes(length) as i64;
+            if ordinal == target {
+                self.file.seek(SeekFrom::Current(32)).unwrap();
+                let offset = self.file.stream_position().unwrap();
+                let mut byte = [0_u8; 1];
+                self.file.read_exact(&mut byte).unwrap();
+                byte[0] ^= 0x80;
+                self.file.seek(SeekFrom::Start(offset)).unwrap();
+                self.file.write_all(&byte).unwrap();
+                self.file.flush().unwrap();
+                self.file
+                    .seek(SeekFrom::Start(PURGE_PLAN_HEADER_LEN as u64))
+                    .unwrap();
+                return;
+            }
+            self.file.seek(SeekFrom::Current(32 + length)).unwrap();
+        }
+        panic!("purge plan test frame {target} is absent");
+    }
+}
+
+struct PurgePlanWriter {
+    transaction: TransactionId,
+    path: PathBuf,
+    file: File,
+    frame_key: [u8; 32],
+    digest: Sha256,
+    payload_bytes: u64,
+    records: u64,
+}
+
+impl PurgePlanWriter {
+    #[allow(clippy::disallowed_methods)] // unlinks only the just-created private ephemeral plan name
+    fn create(
+        store: &TreeSidecarStore,
+        transaction: TransactionId,
+    ) -> Result<Self, TreeSidecarError> {
+        // Reuse the canonical unpublished scratch namespace so a crash in the
+        // narrow create-before-unlink window is collected by ordinary replay.
+        let name = scratch_name(transaction);
+        let path = store.path.join(&name);
+        let fd = rustix::fs::openat(&store.directory, &name, OPEN_NEW, FILE_MODE)
+            .map_err(|error| io_error(&path, error.into()))?;
+        rustix::fs::fchmod(&fd, FILE_MODE).map_err(|error| io_error(&path, error.into()))?;
+        validate_file(
+            &store.directory,
+            &name,
+            &fd,
+            store.backend,
+            store.device,
+            &path,
+        )?;
+        let mut file = File::from(fd);
+        file.write_all(&[0_u8; PURGE_PLAN_HEADER_LEN])
+            .map_err(|error| io_error(&path, error))?;
+        // Unlink before any plan data is written: only this descriptor survives.
+        rustix::fs::unlinkat(&store.directory, &name, AtFlags::empty())
+            .map_err(|error| io_error(&path, error.into()))?;
+        let mut frame_key = [0_u8; 32];
+        getrandom::fill(&mut frame_key)
+            .map_err(|error| io_error(&path, io::Error::other(error)))?;
+        Ok(Self {
+            transaction,
+            path,
+            file,
+            frame_key,
+            digest: purge_plan_digest(transaction),
+            payload_bytes: 0,
+            records: 0,
+        })
+    }
+
+    fn push(&mut self, record: &[u8]) -> Result<(), TreeSidecarError> {
+        let path = record_path(record)?;
+        validate_scratch_key(ScratchOrder::PurgePostorder, path)?;
+        if record.is_empty() || record.len() > PURGE_RECORD_MAX_BYTES {
+            return Err(TreeSidecarError::InvalidScratch(
+                "invalid purge plan record",
+            ));
+        }
+        let len = u32::try_from(record.len())
+            .map_err(|_| TreeSidecarError::InvalidScratch("purge plan record length overflow"))?;
+        let length_bytes = len.to_be_bytes();
+        let frame_tag = purge_plan_frame_tag(
+            &self.frame_key,
+            self.transaction,
+            self.records,
+            length_bytes,
+            record,
+        );
+        self.file
+            .write_all(&length_bytes)
+            .and_then(|_| self.file.write_all(&frame_tag))
+            .and_then(|_| self.file.write_all(record))
+            .map_err(|error| io_error(&self.path, error))?;
+        self.digest.update(length_bytes);
+        self.digest.update(frame_tag);
+        self.digest.update(record);
+        self.payload_bytes = self
+            .payload_bytes
+            .checked_add(4 + 32 + record.len() as u64)
+            .ok_or(TreeSidecarError::InvalidScratch(
+                "purge plan payload length overflow",
+            ))?;
+        self.records = self
+            .records
+            .checked_add(1)
+            .ok_or(TreeSidecarError::InvalidScratch(
+                "purge plan record count overflow",
+            ))?;
+        Ok(())
+    }
+
+    fn finish(mut self, expected: u64) -> Result<TreePurgePlan, TreeSidecarError> {
+        if self.records != expected || expected == 0 {
+            return Err(TreeSidecarError::InvalidScratch(
+                "purge plan record count changed",
+            ));
+        }
+        self.digest.update(self.records.to_be_bytes());
+        self.digest.update(self.payload_bytes.to_be_bytes());
+        let digest: [u8; 32] = self.digest.finalize().into();
+        let mut header = [0_u8; PURGE_PLAN_HEADER_LEN];
+        header[0..4].copy_from_slice(PURGE_PLAN_MAGIC);
+        header[4..6].copy_from_slice(&PURGE_PLAN_VERSION.to_be_bytes());
+        header[6..8].copy_from_slice(&(PURGE_PLAN_HEADER_LEN as u16).to_be_bytes());
+        header[8..24].copy_from_slice(&self.transaction.0);
+        header[24..32].copy_from_slice(&self.records.to_be_bytes());
+        header[32..40].copy_from_slice(&self.payload_bytes.to_be_bytes());
+        header[40..72].copy_from_slice(&digest);
+        self.file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| self.file.write_all(&header))
+            .and_then(|_| self.file.sync_all())
+            .map_err(|error| io_error(&self.path, error))?;
+        self.file
+            .seek(SeekFrom::Start(PURGE_PLAN_HEADER_LEN as u64))
+            .map_err(|error| io_error(&self.path, error))?;
+        let mut check = [0_u8; PURGE_PLAN_HEADER_LEN];
+        // Header is validated from the retained FD, not from a pathname.
+        self.file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| self.file.read_exact(&mut check))
+            .map_err(|error| io_error(&self.path, error))?;
+        if &check[0..4] != PURGE_PLAN_MAGIC {
+            return Err(TreeSidecarError::InvalidScratch(
+                "purge plan header validation failed",
+            ));
+        }
+        self.file
+            .seek(SeekFrom::Start(PURGE_PLAN_HEADER_LEN as u64))
+            .map_err(|error| io_error(&self.path, error))?;
+        let reader_digest = purge_plan_digest(self.transaction);
+        Ok(TreePurgePlan {
+            file: self.file,
+            path: self.path,
+            transaction: self.transaction,
+            frame_key: self.frame_key,
+            expected_records: self.records,
+            expected_payload_bytes: self.payload_bytes,
+            expected_digest: digest,
+            remaining: self.records,
+            payload_bytes: 0,
+            digest: reader_digest,
+            previous_path: None,
+            checked_eof: false,
+        })
+    }
+}
+
 struct ScratchRunReader {
     path: PathBuf,
     file: File,
@@ -1334,7 +1808,12 @@ impl ScratchRunReader {
             .read_exact(&mut length_bytes)
             .map_err(|error| io_error(&self.path, error))?;
         let length = u32::from_be_bytes(length_bytes) as usize;
-        if length == 0 || length > MAX_SEGMENT_PAYLOAD {
+        let max_record = if self.order == ScratchOrder::PurgePostorder {
+            PURGE_RECORD_MAX_BYTES
+        } else {
+            MAX_SEGMENT_PAYLOAD
+        };
+        if length == 0 || length > max_record {
             return Err(TreeSidecarError::InvalidScratch(
                 "invalid scratch record length",
             ));

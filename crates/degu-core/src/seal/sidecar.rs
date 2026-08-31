@@ -6,12 +6,15 @@
 
 use crate::authority::TransactionState;
 use crate::backend::certify_held_fd_backend;
+use crate::backend::held::{
+    ManifestV3CodecError, ManifestV3Decoder, ManifestV3Record, ManifestV3VisitError,
+};
 use crate::backend::require_held_fd_acl_absent;
 use crate::backend::roles::WalStoreBackend;
 use crate::seal::store::{
     StoreError, WAL_FILE_NAME, validate_entry_binding, validate_store_binding, validate_wal,
 };
-use crate::seal::wal::{RecoverySession, SealWal, TransactionId};
+use crate::seal::wal::{DurableTreeManifest, RecoverySession, SealWal, TransactionId};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
 use sha2::{Digest, Sha256};
@@ -23,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod scratch;
+pub(crate) use scratch::{TreeManifestScratchBuildError, TreeStructureScratchCursor};
 
 const MAGIC: &[u8; 4] = b"DHTS";
 const VERSION: u16 = 1;
@@ -54,6 +58,24 @@ const ROOT_DOMAIN: &[u8] = b"degu-held-tree-sidecar-root-v1\0";
 const TEMP_PREFIX: &[u8] = b".tree-sidecar-v1-";
 const TEMP_SUFFIX: &[u8] = b".tmp";
 static NEXT_TEMP_NAME: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_MANIFEST_PREFLIGHT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn fire_after_manifest_preflight() {
+    AFTER_MANIFEST_PREFLIGHT.with(|slot| {
+        if let Some(callback) = slot.borrow_mut().take() {
+            callback();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn fire_after_manifest_preflight() {}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TreeSidecarError {
@@ -88,6 +110,37 @@ pub(crate) enum TreeSidecarFoldError<E> {
 impl<E> From<TreeSidecarError> for TreeSidecarFoldError<E> {
     fn from(error: TreeSidecarError) -> Self {
         Self::Sidecar(error)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum TreeManifestFoldError<E> {
+    Sidecar(TreeSidecarError),
+    Codec(ManifestV3CodecError),
+    FingerprintMismatch,
+    Fold(E),
+}
+
+/// Ephemeral, non-serializable proof minted only after the exact sidecar and v3
+/// manifest pass complete authentication. Private fields make it unforgeable by
+/// sibling modules; it grants no mutation authority by itself.
+#[derive(Debug)]
+pub(crate) struct AuthenticatedTreeManifest {
+    manifest: DurableTreeManifest,
+}
+
+impl AuthenticatedTreeManifest {
+    fn new(manifest: DurableTreeManifest) -> Self {
+        Self { manifest }
+    }
+
+    pub(crate) fn manifest(&self) -> DurableTreeManifest {
+        self.manifest
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(manifest: DurableTreeManifest) -> Self {
+        Self { manifest }
     }
 }
 
@@ -410,7 +463,6 @@ impl TreeSidecarStore {
 
     /// Reopens the exact final name, revalidates its private-file contract, and
     /// streams the full codec without allocating more than one segment.
-    #[cfg(test)]
     pub(crate) fn verify(&self, expected: TreeSidecarCommitment) -> Result<(), TreeSidecarError> {
         let actual = self.inspect_unbound(expected.transaction)?;
         if actual != expected {
@@ -452,6 +504,92 @@ impl TreeSidecarStore {
         let result = fold_file(&file, expected, &path, initial, fold)?;
         self.revalidate_store_binding()?;
         Ok(result)
+    }
+
+    /// Reads one already-published exact sidecar and folds typed v3 records.
+    /// Each callback sees only a payload whose segment digest matched the
+    /// independently supplied container commitment. The accumulator and an
+    /// unforgeable completion proof are returned only after container root/EOF,
+    /// global v3 ordering/count/parent checks, and the expected fingerprint all
+    /// validate.
+    pub(crate) fn read_manifest_v3_fold<A, E, F>(
+        &self,
+        commitment: TreeSidecarCommitment,
+        expected_manifest: DurableTreeManifest,
+        mut accumulator: A,
+        mut fold: F,
+    ) -> Result<(A, AuthenticatedTreeManifest), TreeManifestFoldError<E>>
+    where
+        F: FnMut(&mut A, ManifestV3Record<'_>) -> Result<(), E>,
+    {
+        // Complete authentication precedes both expected-manifest checks and
+        // any callback that may combine these authority-neutral bytes with a
+        // separate held-tree read capability. Container integrity must win when
+        // the sidecar and the caller's expected count are both invalid.
+        self.verify(commitment)
+            .map_err(TreeManifestFoldError::Sidecar)?;
+        if commitment.record_count() != expected_manifest.entry_count {
+            return Err(TreeManifestFoldError::Codec(
+                ManifestV3CodecError::EntryCountMismatch,
+            ));
+        }
+        fire_after_manifest_preflight();
+
+        // The exact file remains mutable by the same UID, so the callback pass
+        // must not trust its self-reported segment digests before the independent
+        // root commitment is checked at EOF. Capture codec/fold errors, stop
+        // applying observations, but continue draining the generic container.
+        // Container integrity therefore always wins over attacker-controlled
+        // early callback errors, and no partial accumulator is returned.
+        let mut decoder = Some(
+            ManifestV3Decoder::new(commitment.record_count())
+                .map_err(TreeManifestFoldError::Codec)?,
+        );
+        let mut codec_error = None;
+        let mut fold_error = None;
+        self.read_fold(commitment, (), |(), record_count, payload| {
+            if codec_error.is_some() {
+                return Ok::<(), std::convert::Infallible>(());
+            }
+            let result = decoder
+                .as_mut()
+                .expect("decoder is present until its first codec error")
+                .push_segment_with(record_count, payload, |record| {
+                    if fold_error.is_none()
+                        && let Err(error) = fold(&mut accumulator, record)
+                    {
+                        fold_error = Some(error);
+                    }
+                    Ok::<(), std::convert::Infallible>(())
+                });
+            match result {
+                Ok(()) => {}
+                Err(ManifestV3VisitError::Codec(error)) => {
+                    codec_error = Some(error);
+                    decoder = None;
+                }
+                Err(ManifestV3VisitError::Visit(never)) => match never {},
+            }
+            Ok(())
+        })
+        .map_err(|error| match error {
+            TreeSidecarFoldError::Sidecar(error) => TreeManifestFoldError::Sidecar(error),
+            TreeSidecarFoldError::Fold(never) => match never {},
+        })?;
+        if let Some(error) = codec_error {
+            return Err(TreeManifestFoldError::Codec(error));
+        }
+        let actual = decoder
+            .expect("decoder remains present after a valid codec")
+            .finish()
+            .map_err(TreeManifestFoldError::Codec)?;
+        if actual != expected_manifest {
+            return Err(TreeManifestFoldError::FingerprintMismatch);
+        }
+        if let Some(error) = fold_error {
+            return Err(TreeManifestFoldError::Fold(error));
+        }
+        Ok((accumulator, AuthenticatedTreeManifest::new(actual)))
     }
 
     /// Returns a self-consistent commitment for orphan classification only. The
@@ -1610,6 +1748,21 @@ mod tests {
         record
     }
 
+    fn structure_directory_record(path: &[u8], inode: u64) -> Vec<u8> {
+        let mut record = Vec::new();
+        record.extend_from_slice(&(path.len() as u64).to_be_bytes());
+        record.extend_from_slice(path);
+        record.extend_from_slice(b"DHS1");
+        record.push(0);
+        record.extend_from_slice(&1_u64.to_be_bytes());
+        record.extend_from_slice(&inode.to_be_bytes());
+        record.extend_from_slice(&inode.to_be_bytes());
+        record.extend_from_slice(&1000_u32.to_be_bytes());
+        record.extend_from_slice(&1000_u32.to_be_bytes());
+        record.extend_from_slice(&0o700_u32.to_be_bytes());
+        record
+    }
+
     fn v3_symlink_record(path: &[u8], inode: u64, target: &[u8]) -> Vec<u8> {
         let mut record = Vec::new();
         record.extend_from_slice(&(path.len() as u64).to_be_bytes());
@@ -1630,9 +1783,10 @@ mod tests {
     fn sorted_v3_manifest(records: &[Vec<u8>]) -> (Vec<Vec<u8>>, DurableTreeManifest) {
         let mut sorted = records.to_vec();
         sorted.sort_unstable_by(|left, right| {
-            scratch::record_path(left)
-                .unwrap()
-                .cmp(scratch::record_path(right).unwrap())
+            crate::backend::held::compare_manifest_paths(
+                scratch::record_path(left).unwrap(),
+                scratch::record_path(right).unwrap(),
+            )
         });
         let mut digest = Sha256::new();
         digest.update(b"degu-held-tree-manifest-v3-content-xattr\0");
@@ -1648,6 +1802,376 @@ mod tests {
                 sha256: digest.finalize().into(),
             },
         )
+    }
+
+    #[test]
+    fn published_v3_fold_returns_typed_records_and_unforgeable_completion_proof() {
+        use crate::backend::held::ManifestV3RecordKind;
+
+        let (_temp, _root, store, mut wal) = fixture();
+        let transaction = tx(33);
+        let records = vec![v3_directory_record(b"", 1), v3_regular_record(b"a", 2)];
+        let (sorted, expected) = sorted_v3_manifest(&records);
+        let payload = sorted.concat();
+        let commitment = store
+            .publish(
+                &mut wal,
+                transaction,
+                [TreeSidecarSegment {
+                    record_count: records.len() as u64,
+                    payload: &payload,
+                }],
+            )
+            .unwrap();
+
+        let (visited, authenticated) = store
+            .read_manifest_v3_fold(commitment, expected, Vec::new(), |visited, record| {
+                visited.push((record.path.to_vec(), record.kind));
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(
+            visited,
+            vec![
+                (b"".to_vec(), ManifestV3RecordKind::Directory),
+                (b"a".to_vec(), ManifestV3RecordKind::Regular),
+            ]
+        );
+        assert_eq!(authenticated.manifest(), expected);
+    }
+
+    #[test]
+    fn published_v3_fold_authenticates_the_complete_sidecar_before_any_callback() {
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(34);
+        let root_record = v3_directory_record(b"", 1);
+        let file_record = v3_regular_record(b"a", 2);
+        let records = vec![root_record.clone(), file_record.clone()];
+        let (_, expected) = sorted_v3_manifest(&records);
+        let commitment = store
+            .publish(
+                &mut wal,
+                transaction,
+                [
+                    TreeSidecarSegment {
+                        record_count: 1,
+                        payload: &root_record,
+                    },
+                    TreeSidecarSegment {
+                        record_count: 1,
+                        payload: &file_record,
+                    },
+                ],
+            )
+            .unwrap();
+        let path = root.join(final_name(transaction));
+        let second_payload_offset = HEADER_LEN as u64
+            + SEGMENT_HEADER_LEN as u64
+            + root_record.len() as u64
+            + SEGMENT_HEADER_LEN as u64;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.seek(SeekFrom::Start(second_payload_offset)).unwrap();
+        file.write_all(b"X").unwrap();
+        file.flush().unwrap();
+
+        let visits = std::cell::Cell::new(0_u64);
+        let result = store.read_manifest_v3_fold(commitment, expected, (), |(), _| {
+            visits.set(visits.get() + 1);
+            Ok::<(), std::convert::Infallible>(())
+        });
+        assert!(matches!(result, Err(TreeManifestFoldError::Sidecar(_))));
+        assert_eq!(visits.get(), 0);
+    }
+
+    #[test]
+    fn published_v3_fold_container_integrity_precedes_expected_count_mismatch() {
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(36);
+        let root_record = v3_directory_record(b"", 1);
+        let (_, mut expected) = sorted_v3_manifest(std::slice::from_ref(&root_record));
+        let commitment = store
+            .publish(
+                &mut wal,
+                transaction,
+                [TreeSidecarSegment {
+                    record_count: 1,
+                    payload: &root_record,
+                }],
+            )
+            .unwrap();
+        expected.entry_count = 2;
+
+        let path = root.join(final_name(transaction));
+        let payload_offset = HEADER_LEN as u64 + SEGMENT_HEADER_LEN as u64;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.seek(SeekFrom::Start(payload_offset)).unwrap();
+        file.write_all(b"X").unwrap();
+        file.flush().unwrap();
+
+        let visits = std::cell::Cell::new(0_u64);
+        let result = store.read_manifest_v3_fold(commitment, expected, (), |(), _| {
+            visits.set(visits.get() + 1);
+            Ok::<(), std::convert::Infallible>(())
+        });
+        assert!(matches!(result, Err(TreeManifestFoldError::Sidecar(_))));
+        assert_eq!(visits.get(), 0);
+    }
+
+    #[test]
+    fn published_v3_fold_defers_callback_error_until_second_pass_root_authentication() {
+        #[derive(Debug, Eq, PartialEq)]
+        struct Stop;
+
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(35);
+        let root_record = v3_directory_record(b"", 1);
+        let records = vec![root_record.clone()];
+        let (_, expected) = sorted_v3_manifest(&records);
+        let commitment = store
+            .publish(
+                &mut wal,
+                transaction,
+                [TreeSidecarSegment {
+                    record_count: 1,
+                    payload: &root_record,
+                }],
+            )
+            .unwrap();
+        let path = root.join(final_name(transaction));
+        AFTER_MANIFEST_PREFLIGHT.with(|slot| {
+            assert!(
+                slot.borrow_mut()
+                    .replace(Box::new(move || {
+                        let mut file = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(path)
+                            .unwrap();
+                        let payload_offset = HEADER_LEN as u64 + SEGMENT_HEADER_LEN as u64;
+                        let device_byte = payload_offset + 8 + 1;
+                        file.seek(SeekFrom::Start(device_byte)).unwrap();
+                        file.write_all(&[9]).unwrap();
+                        let mut payload = root_record;
+                        payload[9] = 9;
+                        let digest = segment_digest(transaction, 0, 1, &payload);
+                        file.seek(SeekFrom::Start(HEADER_LEN as u64 + 24)).unwrap();
+                        file.write_all(&digest).unwrap();
+                        file.flush().unwrap();
+                    }))
+                    .is_none()
+            );
+        });
+
+        let result = store.read_manifest_v3_fold(commitment, expected, (), |(), _| Err(Stop));
+        assert!(matches!(result, Err(TreeManifestFoldError::Sidecar(_))));
+    }
+
+    #[test]
+    fn structure_scratch_cursor_sorts_authenticates_and_cleans_private_runs() {
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(37);
+        let records = vec![
+            structure_directory_record(b"", 1),
+            structure_directory_record(b"!", 2),
+            structure_directory_record(b"!!", 4),
+            structure_directory_record(b"!!!", 6),
+            structure_directory_record(b"!!!/leaf", 7),
+            structure_directory_record(b"!!/leaf", 5),
+            structure_directory_record(b"!/leaf", 3),
+        ];
+        let (scratch, output) = store
+            .build_sorted_structure_scratch_with_output(&mut wal, transaction, |emit| {
+                for record in &records {
+                    emit(record)?;
+                }
+                Ok::<_, TreeSidecarError>(91_u64)
+            })
+            .unwrap();
+        assert_eq!(output, 91);
+        let run_names = scratch.run_names_for_test();
+        let mut cursor = store
+            .open_sorted_structure_scratch_cursor(&mut wal, transaction, scratch)
+            .unwrap();
+        let mut paths = Vec::new();
+        while let Some(evidence) = cursor.next().unwrap() {
+            paths.push(evidence.path().as_os_str().as_bytes().to_vec());
+        }
+        assert_eq!(
+            paths,
+            [
+                b"".to_vec(),
+                b"!".to_vec(),
+                b"!/leaf".to_vec(),
+                b"!!".to_vec(),
+                b"!!/leaf".to_vec(),
+                b"!!!".to_vec(),
+                b"!!!/leaf".to_vec(),
+            ]
+        );
+        store
+            .finish_sorted_structure_scratch_cursor(&mut wal, cursor)
+            .unwrap();
+        assert!(run_names.iter().all(|name| !root.join(name).exists()));
+        assert_eq!(store.cleanup_unpublished(&mut wal).unwrap(), 0);
+    }
+
+    fn private_hardlink_record(identity: [u8; 24], path: &[u8], marker: u8) -> Vec<u8> {
+        let key_len = 25 + path.len();
+        let mut record = Vec::with_capacity(8 + key_len + 1);
+        record.extend_from_slice(&(key_len as u64).to_be_bytes());
+        record.push(1);
+        record.extend_from_slice(&identity);
+        record.extend_from_slice(path);
+        record.push(marker);
+        record
+    }
+
+    #[test]
+    fn hardlink_scratch_globally_groups_identity_then_component_path_and_cleans_runs() {
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(39);
+        let mut first = [0_u8; 24];
+        first[23] = 1;
+        let mut second = [0_u8; 24];
+        second[23] = 2;
+        let records = [
+            private_hardlink_record(second, b"z", 6),
+            private_hardlink_record(first, b"!!", 3),
+            private_hardlink_record(first, b"!/leaf", 2),
+            private_hardlink_record(second, b"a", 5),
+            private_hardlink_record(first, b"!", 1),
+            private_hardlink_record(first, b"!!/leaf", 4),
+        ];
+        let scratch = store
+            .build_sorted_hardlink_scratch_with_budget(&mut wal, transaction, 96, |emit| {
+                emit(crate::backend::held::hardlink_scratch_sentinel_record())?;
+                for record in &records {
+                    emit(record)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let run_names = scratch.run_names_for_test();
+        assert!(run_names.len() > 1);
+        let ordered = store
+            .fold_sorted_hardlink_scratch(
+                &mut wal,
+                transaction,
+                scratch,
+                Vec::new(),
+                |ordered, record| {
+                    let key = scratch::record_path(record).unwrap();
+                    ordered.push((key[1..25].to_vec(), key[25..].to_vec()));
+                    Ok::<(), std::convert::Infallible>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            ordered,
+            [
+                (first.to_vec(), b"!".to_vec()),
+                (first.to_vec(), b"!/leaf".to_vec()),
+                (first.to_vec(), b"!!".to_vec()),
+                (first.to_vec(), b"!!/leaf".to_vec()),
+                (second.to_vec(), b"a".to_vec()),
+                (second.to_vec(), b"z".to_vec()),
+            ]
+        );
+        assert!(run_names.iter().all(|name| !root.join(name).exists()));
+        assert_eq!(store.cleanup_unpublished(&mut wal).unwrap(), 0);
+    }
+
+    #[test]
+    fn hardlink_scratch_integrity_precedes_fold_error_and_cleans_residue() {
+        #[derive(Debug, Eq, PartialEq)]
+        struct Stop;
+
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(40);
+        let mut identity = [0_u8; 24];
+        identity[23] = 1;
+        let record = private_hardlink_record(identity, b"file", 1);
+        let (scratch, ()) = store
+            .build_sorted_hardlink_scratch_with_output(&mut wal, transaction, |emit| {
+                emit(crate::backend::held::hardlink_scratch_sentinel_record())?;
+                emit(&record)?;
+                Ok::<_, TreeSidecarError>(())
+            })
+            .unwrap();
+        let run = root.join(&scratch.run_names_for_test()[0]);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&run)
+            .unwrap();
+        let last = file.seek(SeekFrom::End(-1)).unwrap();
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 1;
+        file.seek(SeekFrom::Start(last)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.flush().unwrap();
+
+        let result =
+            store.fold_sorted_hardlink_scratch(&mut wal, transaction, scratch, (), |(), _| {
+                Err(Stop)
+            });
+        assert!(matches!(
+            result,
+            Err(TreeSidecarFoldError::Sidecar(
+                TreeSidecarError::InvalidScratch("scratch run integrity check failed")
+            ))
+        ));
+        assert!(!run.exists());
+        assert_eq!(store.cleanup_unpublished(&mut wal).unwrap(), 0);
+    }
+
+    #[test]
+    fn structure_scratch_integrity_error_withholds_success_and_cleans_residue() {
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(38);
+        let record = structure_directory_record(b"", 1);
+        let (scratch, ()) = store
+            .build_sorted_structure_scratch_with_output(&mut wal, transaction, |emit| {
+                emit(&record)?;
+                Ok::<_, TreeSidecarError>(())
+            })
+            .unwrap();
+        let run = root.join(&scratch.run_names_for_test()[0]);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&run)
+            .unwrap();
+        let last = file.seek(SeekFrom::End(-1)).unwrap();
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 1;
+        file.seek(SeekFrom::Start(last)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.flush().unwrap();
+
+        let mut cursor = store
+            .open_sorted_structure_scratch_cursor(&mut wal, transaction, scratch)
+            .unwrap();
+        assert!(cursor.next().unwrap().is_some());
+        assert!(cursor.next().unwrap().is_none());
+        assert!(matches!(
+            store.finish_sorted_structure_scratch_cursor(&mut wal, cursor),
+            Err(TreeSidecarError::InvalidScratch(
+                "scratch run integrity check failed"
+            ))
+        ));
+        assert!(!run.exists());
+        assert_eq!(store.cleanup_unpublished(&mut wal).unwrap(), 0);
     }
 
     #[test]
@@ -1708,6 +2232,12 @@ mod tests {
             })
             .unwrap();
         assert_eq!(producer_output, 73);
+        assert_eq!(
+            store
+                .fingerprint_sorted_manifest_scratch(&mut wal, transaction, &mut scratch)
+                .unwrap(),
+            expected
+        );
 
         let visited = store
             .read_sorted_manifest_scratch(
@@ -1731,6 +2261,70 @@ mod tests {
             ]
         );
         assert_eq!(store.cleanup_unpublished(&mut wal).unwrap(), 1);
+    }
+
+    #[test]
+    fn sorted_scratch_preserves_historical_component_path_order() {
+        let (_temp, _root, store, mut wal) = fixture();
+        let transaction = tx(39);
+        // Deliberately feed raw-byte order, which differs from the historical
+        // `Path`/component order used by resident v3 fingerprints.
+        let records = vec![
+            v3_directory_record(b"", 1),
+            v3_directory_record(b"!", 2),
+            v3_directory_record(b"!!", 4),
+            v3_directory_record(b"!!!", 6),
+            v3_regular_record(b"!!!/leaf", 7),
+            v3_regular_record(b"!!/leaf", 5),
+            v3_regular_record(b"!/leaf", 3),
+        ];
+        let (ordered, expected) = sorted_v3_manifest(&records);
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|record| scratch::record_path(record).unwrap().to_vec())
+                .collect::<Vec<_>>(),
+            [
+                b"".to_vec(),
+                b"!".to_vec(),
+                b"!/leaf".to_vec(),
+                b"!!".to_vec(),
+                b"!!/leaf".to_vec(),
+                b"!!!".to_vec(),
+                b"!!!/leaf".to_vec(),
+            ]
+        );
+        let (mut scratch, ()) = store
+            .build_sorted_manifest_scratch_with_output(&mut wal, transaction, |emit| {
+                for record in &records {
+                    emit(record)?;
+                }
+                Ok::<_, TreeSidecarError>(())
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .fingerprint_sorted_manifest_scratch(&mut wal, transaction, &mut scratch)
+                .unwrap(),
+            expected
+        );
+        let commitment = store
+            .publish_sorted_manifest_scratch(&mut wal, transaction, expected, scratch)
+            .unwrap();
+        let (visited, authenticated) = store
+            .read_manifest_v3_fold(commitment, expected, Vec::new(), |visited, record| {
+                visited.push(record.path.to_vec());
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(
+            visited,
+            ordered
+                .iter()
+                .map(|record| scratch::record_path(record).unwrap().to_vec())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(authenticated.manifest(), expected);
     }
 
     #[test]
@@ -1939,7 +2533,7 @@ mod tests {
         assert!(matches!(
             store.publish_sorted_manifest_scratch(&mut wal, transaction, expected, scratch),
             Err(TreeSidecarError::InvalidScratch(
-                "scratch paths are not in strict raw-byte order"
+                "scratch paths are not in strict component order"
             ))
         ));
         assert!(!root.join(final_name(transaction)).exists());

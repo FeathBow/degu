@@ -19,13 +19,14 @@ use crate::seal::executor::{
     LocalModeExecutionError, LocalModeMutationRequest, LocalModeMutationResult, LocalModeTransform,
     RecoveryLocator, execute_staging_local_mode_mutation,
 };
+use crate::seal::sidecar::AuthenticatedTreeManifest;
 use crate::seal::wal::{
     DurableTreeManifest, DurableWrite, RECOVERY_MAX_ACTIVE_PERMISSIONS, SealWal,
     StrongObjectIdentity, TransactionId,
 };
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
@@ -384,13 +385,19 @@ struct ManifestEntry {
 /// so a metadata-only rewalk can close the interval after a full content proof
 /// without reading the regular payload again.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct StructureEvidence {
+pub(crate) struct StructureEvidence {
     path: PathBuf,
     identity: NodeIdentity,
     uid: u32,
     gid: u32,
     mode: u32,
     stability: StructureStability,
+}
+
+impl StructureEvidence {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -767,11 +774,11 @@ pub(crate) struct PostSealManifestExpectation {
 impl PostSealManifestExpectation {
     pub(crate) fn verify(
         self,
-        post: &HeldTreeInventory,
+        post: &StreamedV3Inventory,
     ) -> Result<HeldTreeFingerprint, HeldTreeError> {
-        if self.backend != post.backend
-            || self.mount_id != post.mount_id
-            || self.root_identity != post.root_identity
+        if self.backend != post.context.backend
+            || self.mount_id != post.context.mount_id
+            || self.root_identity != post.context.root_identity
         {
             return Err(HeldTreeError::RootBindingChanged);
         }
@@ -795,6 +802,13 @@ enum ParentAdmission {
     Projected(ProjectedParentSeal),
 }
 
+#[derive(Clone, Copy)]
+struct TraversalConfiguration {
+    parent_admission: ParentAdmission,
+    manifest_schema: u16,
+    retain_entries: bool,
+}
+
 trait V2Traversal {
     type Entry;
 
@@ -808,6 +822,7 @@ trait V2Traversal {
         schema_version: u16,
     ) -> Result<Self::Entry, HeldTreeError>;
     fn path(entry: &Self::Entry) -> &Path;
+    fn manifest_entry(entry: &Self::Entry) -> Option<&ManifestEntry>;
     fn identity(entry: &Self::Entry) -> NodeIdentity;
     fn regular_observation(entry: &Self::Entry) -> Option<RegularFileObservation>;
     fn regular_xattr_proof(entry: &Self::Entry) -> Option<RegularXattrProof>;
@@ -854,6 +869,10 @@ impl V2Traversal for ProveTraversal {
 
     fn path(entry: &Self::Entry) -> &Path {
         &entry.manifest.path
+    }
+
+    fn manifest_entry(entry: &Self::Entry) -> Option<&ManifestEntry> {
+        Some(&entry.manifest)
     }
 
     fn identity(entry: &Self::Entry) -> NodeIdentity {
@@ -923,6 +942,10 @@ impl V2Traversal for AssessTraversal {
         &entry.path
     }
 
+    fn manifest_entry(_entry: &Self::Entry) -> Option<&ManifestEntry> {
+        None
+    }
+
     fn identity(entry: &Self::Entry) -> NodeIdentity {
         entry.identity
     }
@@ -973,6 +996,95 @@ struct V2Walk<M: V2Traversal> {
     regular_xattrs: RegularXattrTopology,
 }
 
+/// Fixed-size/root-bounded live context for production v3 after the directory
+/// seal. Descendant directory evidence is reconstructed only as an active
+/// ancestor stack while an authenticated manifest is folded; it is never kept
+/// for the complete tree.
+struct ForwardV3Context {
+    parent: HeldLocalBackendEvidence,
+    root_name: OsString,
+    root_identity: NodeIdentity,
+    root: HeldDirectory,
+    backend: CertifiedLocalBackend,
+    mount_id: u64,
+    protected_names: Vec<OsString>,
+    limits: HeldTreeLimits,
+}
+
+/// Post-seal production inventory whose complete v3 manifest remains only in
+/// the authenticated sidecar. It retains only the root reopen anchor, fixed
+/// commitments, and aggregate topology; descendant evidence and inode groups
+/// are bounded/private fold state and unpublished scratch respectively.
+pub(crate) struct StreamedV3Inventory {
+    context: ForwardV3Context,
+    regular_hard_links: RegularHardLinkTopology,
+    regular_xattrs: RegularXattrTopology,
+    manifest: HeldTreeFingerprint,
+}
+
+#[derive(Debug)]
+enum TraversalSinkError<E> {
+    Tree(HeldTreeError),
+    Emit(E),
+}
+
+impl<E> From<HeldTreeError> for TraversalSinkError<E> {
+    fn from(error: HeldTreeError) -> Self {
+        Self::Tree(error)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum HeldTreeV3CollectError<E> {
+    Tree(HeldTreeError),
+    Codec(ManifestV3CodecError),
+    Emit(E),
+}
+
+/// Post-seal-only v3 traversal state. Records have been admitted, budgeted,
+/// emitted to the caller's authority-neutral sink, and root-bound without
+/// retaining a resident manifest. Regular paths have not yet received their
+/// final metadata and xattr reobservation. It carries no WAL or scratch-file
+/// authority.
+pub(crate) struct PendingV3Inventory {
+    context: ForwardV3Context,
+    entry_count: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct HardlinkScratchObservation<'a> {
+    pub(crate) path: &'a [u8],
+    observation: RegularFileObservation,
+}
+
+struct StreamedRegularGroup {
+    first_path: PathBuf,
+    observation: RegularFileObservation,
+    enumerated: u64,
+}
+
+/// Bounded fold state for identity-sorted private hardlink scratch. Only the
+/// current group and deterministic error candidates remain resident.
+pub(crate) struct HardlinkTopologyFold {
+    current: Option<StreamedRegularGroup>,
+    current_identity: Option<NodeIdentity>,
+    first_mismatch: Option<(PathBuf, PathBuf)>,
+    first_count_failure: Option<(PathBuf, bool)>,
+    topology: RegularHardLinkTopology,
+}
+
+/// Owned fold state for authenticated sorted manifest records. Directory
+/// evidence is limited to the current ancestor chain; every final regular
+/// observation is emitted immediately to authority-neutral identity scratch.
+pub(crate) struct PendingV3Finalizer {
+    context: ForwardV3Context,
+    expected_manifest: HeldTreeFingerprint,
+    observed_entries: u64,
+    active_directories: Vec<DirectoryEvidence>,
+    hardlink_record: Vec<u8>,
+    regular_xattrs: RegularXattrTopology,
+}
+
 fn validate_v2_inputs(
     root_name: &OsStr,
     protected_names: &[OsString],
@@ -1004,6 +1116,13 @@ fn collect_proven_v2(
         ParentAdmission::CurrentExclusive,
         manifest_schema,
     )?;
+    debug_assert_eq!(walked.manifest_schema, manifest_schema);
+    inventory_from_proven_walk(walked)
+}
+
+fn inventory_from_proven_walk(
+    walked: V2Walk<ProveTraversal>,
+) -> Result<HeldTreeInventory, HeldTreeError> {
     let root = walked.root;
     let directories = walked
         .directories
@@ -1019,7 +1138,7 @@ fn collect_proven_v2(
         mount_id: walked.mount_id,
         protected_names: walked.protected_names,
         limits: walked.limits,
-        manifest_schema,
+        manifest_schema: walked.manifest_schema,
         regular_hard_links: walked.regular_hard_links,
         regular_xattrs: walked.regular_xattrs,
         directory_index,
@@ -1033,22 +1152,22 @@ fn collect_proven_v2(
     })
 }
 
-fn traverse_v2<M: V2Traversal>(
+fn traverse_v2_with_sink<M: V2Traversal, E>(
     parent: HeldLocalBackendEvidence,
     root_name: &OsStr,
     protected_names: Vec<OsString>,
     limits: HeldTreeLimits,
-    parent_admission: ParentAdmission,
-    manifest_schema: u16,
-) -> Result<V2Walk<M>, HeldTreeError> {
+    configuration: TraversalConfiguration,
+    mut emit_entry: impl FnMut(&ManifestEntry) -> Result<(), E>,
+) -> Result<V2Walk<M>, TraversalSinkError<E>> {
     validate_v2_inputs(root_name, &protected_names, limits)?;
     let backend = parent.backend();
-    require_parent_admission(&parent, backend, parent_admission)?;
+    require_parent_admission(&parent, backend, configuration.parent_admission)?;
     let euid = rustix::process::geteuid().as_raw();
     let root_path = PathBuf::new();
     let inspected = with_fd(&parent, |fd| inspect_at(fd, root_name, &root_path))?;
     if inspected.identity.kind != NodeKind::Directory {
-        return Err(HeldTreeError::RootNotDirectory);
+        return Err(HeldTreeError::RootNotDirectory.into());
     }
     require_owner(&root_path, inspected.uid, euid)?;
     require_boundary(&root_path, backend, parent.mount_id(), &inspected)?;
@@ -1064,14 +1183,17 @@ fn traverse_v2<M: V2Traversal>(
     require_same_identity(&root_path, inspected.identity, opened.identity)?;
     require_owner(&root_path, opened.uid, euid)?;
     if held.backend() != backend || held.mount_id() != parent.mount_id() {
-        return Err(HeldTreeError::BackendBoundary(root_path));
+        return Err(HeldTreeError::BackendBoundary(root_path).into());
     }
     let root_identity = opened.identity;
     let parent_mount_id = held.mount_id();
     let root_entry = M::make_root(opened);
-    let mut budget = Budget::new(limits, manifest_schema);
+    let mut budget = Budget::new(limits, configuration.manifest_schema);
     budget.add_path(M::path(&root_entry), 0)?;
     budget.add_directory()?;
+    if let Some(entry) = M::manifest_entry(&root_entry) {
+        emit_entry(entry).map_err(TraversalSinkError::Emit)?;
+    }
     let root = HeldDirectory::new(held, PathBuf::new(), 0, root_identity);
     let root_evidence = root.evidence.clone();
     let mut directory_index = BTreeMap::new();
@@ -1085,25 +1207,38 @@ fn traverse_v2<M: V2Traversal>(
         mount_id: parent_mount_id,
         protected_names,
         limits,
-        manifest_schema,
+        manifest_schema: configuration.manifest_schema,
         directory_index,
         directories: vec![WalkDirectory {
             evidence: root_evidence,
         }],
-        entries: vec![root_entry],
+        entries: if configuration.retain_entries {
+            vec![root_entry]
+        } else {
+            Vec::new()
+        },
         budget,
         regular_hard_links: RegularHardLinkTopology::default(),
         regular_xattrs: RegularXattrTopology::default(),
     };
     let mut index = 0;
     while index < walked.directories.len() {
-        read_v2_children::<M>(&mut walked, index)?;
+        read_v2_children_with_sink::<M, E>(
+            &mut walked,
+            index,
+            configuration.retain_entries,
+            &mut emit_entry,
+        )?;
         index += 1;
     }
     walked
         .entries
         .sort_unstable_by(|left, right| M::path(left).cmp(M::path(right)));
-    require_parent_admission(&walked.parent, walked.backend, parent_admission)?;
+    require_parent_admission(
+        &walked.parent,
+        walked.backend,
+        configuration.parent_admission,
+    )?;
     let rebound = with_fd(&walked.parent, |fd| {
         inspect_at(fd, &walked.root_name, Path::new(""))
     })
@@ -1114,8 +1249,39 @@ fn traverse_v2<M: V2Traversal>(
         walked.backend,
         &rebound,
     ) {
-        return Err(HeldTreeError::RootBindingChanged);
+        return Err(HeldTreeError::RootBindingChanged.into());
     }
+    Ok(walked)
+}
+
+fn traverse_v2<M: V2Traversal>(
+    parent: HeldLocalBackendEvidence,
+    root_name: &OsStr,
+    protected_names: Vec<OsString>,
+    limits: HeldTreeLimits,
+    parent_admission: ParentAdmission,
+    manifest_schema: u16,
+) -> Result<V2Walk<M>, HeldTreeError> {
+    let walked = match traverse_v2_with_sink::<M, std::convert::Infallible>(
+        parent,
+        root_name,
+        protected_names,
+        limits,
+        TraversalConfiguration {
+            parent_admission,
+            manifest_schema,
+            retain_entries: true,
+        },
+        |_| Ok(()),
+    ) {
+        Ok(walked) => walked,
+        Err(TraversalSinkError::Tree(error)) => return Err(error),
+        Err(TraversalSinkError::Emit(never)) => match never {},
+    };
+    finalize_v2_walk(walked)
+}
+
+fn finalize_v2_walk<M: V2Traversal>(mut walked: V2Walk<M>) -> Result<V2Walk<M>, HeldTreeError> {
     fire_final_regular_reobservation_test_hook();
     let regular_files = final_reobserve_regular_files(&walked)?;
     // A same-UID writer can still create an alias after a path's final check.
@@ -1174,113 +1340,184 @@ fn final_reobserve_regular_files<'a, M: V2Traversal>(
     walked: &'a V2Walk<M>,
 ) -> Result<Vec<RegularFileReobservation<'a>>, HeldTreeError> {
     let mut regular_files = Vec::new();
-    let euid = rustix::process::geteuid().as_raw();
     for entry in &walked.entries {
         let Some(recorded) = M::regular_observation(entry) else {
             continue;
         };
         let path = M::path(entry);
-        let parent_path = path
-            .parent()
-            .ok_or_else(|| HeldTreeError::ContentChangedDuringHash(path.to_path_buf()))?;
-        let name = path
-            .file_name()
-            .ok_or_else(|| HeldTreeError::ContentChangedDuringHash(path.to_path_buf()))?;
-        let reopened = reopen_directory_from_root(
-            &walked.root,
-            parent_path,
-            |candidate| walked.directory_index.get(candidate),
-            walked.backend,
-            walked.mount_id,
-            || {
-                verify_root_binding_fields(
-                    &walked.parent,
-                    &walked.root_name,
-                    walked.root_identity,
-                    walked.mount_id,
-                    walked.backend,
-                )
-            },
-            false,
-        )?;
-        let parent = reopened.held();
-
-        let before = with_fd(parent, |fd| inspect_at(fd, name, path))?;
-        require_owner(path, before.uid, euid)?;
-        require_boundary(path, walked.backend, walked.mount_id, &before)?;
-        if before.regular_file_observation(recorded.sha256, recorded.xattrs) != Some(recorded) {
-            return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
-        }
-
-        let fd = with_fd(parent, |parent_fd| {
-            rustix::fs::openat(
-                parent_fd,
-                name,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-        })
-        .map_err(|error| io_error(path, error))?;
-        let fresh_backend = crate::backend::certify_held_fd_backend(&fd).map_err(|reason| {
-            HeldTreeError::Certification {
-                path: path.to_path_buf(),
-                reason,
-            }
-        })?;
-        if fresh_backend != walked.backend {
-            return Err(HeldTreeError::BackendBoundary(path.to_path_buf()));
-        }
-        let opened_xattrs = M::reobserve_regular_xattrs(
-            &fd,
-            path,
-            walked.manifest_schema,
-            recorded.xattrs,
-            walked.limits.max_xattr_bytes,
-        )?;
-        if opened_xattrs != recorded.xattrs {
-            return Err(HeldTreeError::XattrsChangedDuringProof(path.to_path_buf()));
-        }
-        let opened = inspect_raw_fd(&fd, fresh_backend, path)?;
-        require_owner(path, opened.uid, euid)?;
-        require_boundary(path, walked.backend, walked.mount_id, &opened)?;
-        if opened.regular_file_observation(recorded.sha256, recorded.xattrs) != Some(recorded) {
-            return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
-        }
-
-        let final_xattrs = M::reobserve_regular_xattrs(
-            &fd,
-            path,
-            walked.manifest_schema,
-            recorded.xattrs,
-            walked.limits.max_xattr_bytes,
-        )?;
-        if final_xattrs != recorded.xattrs {
-            return Err(HeldTreeError::XattrsChangedDuringProof(path.to_path_buf()));
-        }
-        let final_fd = inspect_raw_fd(&fd, fresh_backend, path)?;
-        require_owner(path, final_fd.uid, euid)?;
-        require_boundary(path, walked.backend, walked.mount_id, &final_fd)?;
-        let final_observation = final_fd
-            .regular_file_observation(recorded.sha256, recorded.xattrs)
-            .ok_or_else(|| HeldTreeError::ContentChangedDuringHash(path.to_path_buf()))?;
-        if final_observation != recorded {
-            return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
-        }
-
-        let rebound = with_fd(parent, |parent_fd| inspect_at(parent_fd, name, path))?;
-        require_owner(path, rebound.uid, euid)?;
-        require_boundary(path, walked.backend, walked.mount_id, &rebound)?;
-        if rebound.regular_file_observation(recorded.sha256, recorded.xattrs)
-            != Some(final_observation)
-        {
-            return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
-        }
-        regular_files.push(RegularFileReobservation {
-            path,
-            observation: final_observation,
-        });
+        let observation = final_reobserve_regular_record::<M>(walked, path, recorded)?;
+        regular_files.push(RegularFileReobservation { path, observation });
     }
     Ok(regular_files)
+}
+
+/// Reopens and revalidates one recorded regular path. This is shared by the
+/// resident legacy finalizer and the authenticated sorted-scratch finalizer;
+/// neither path reads regular payload bytes or grants mutation authority.
+struct RegularReopenContext<'a> {
+    root: &'a HeldDirectory,
+    parent: &'a HeldLocalBackendEvidence,
+    root_name: &'a OsStr,
+    root_identity: NodeIdentity,
+    backend: CertifiedLocalBackend,
+    mount_id: u64,
+    manifest_schema: u16,
+    limits: HeldTreeLimits,
+}
+
+fn final_reobserve_regular_record<M: V2Traversal>(
+    walked: &V2Walk<M>,
+    path: &Path,
+    recorded: RegularFileObservation,
+) -> Result<RegularFileObservation, HeldTreeError> {
+    let context = RegularReopenContext {
+        root: &walked.root,
+        parent: &walked.parent,
+        root_name: &walked.root_name,
+        root_identity: walked.root_identity,
+        backend: walked.backend,
+        mount_id: walked.mount_id,
+        manifest_schema: walked.manifest_schema,
+        limits: walked.limits,
+    };
+    final_reobserve_regular_record_with::<M>(
+        &context,
+        |candidate| walked.directory_index.get(candidate),
+        path,
+        recorded,
+    )
+}
+
+fn final_reobserve_regular_record_from_context(
+    context: &ForwardV3Context,
+    active_directories: &[DirectoryEvidence],
+    path: &Path,
+    recorded: RegularFileObservation,
+) -> Result<RegularFileObservation, HeldTreeError> {
+    let reopen = RegularReopenContext {
+        root: &context.root,
+        parent: &context.parent,
+        root_name: &context.root_name,
+        root_identity: context.root_identity,
+        backend: context.backend,
+        mount_id: context.mount_id,
+        manifest_schema: CONTENT_PROOF_VERSION,
+        limits: context.limits,
+    };
+    final_reobserve_regular_record_with::<ProveTraversal>(
+        &reopen,
+        |candidate| {
+            active_directories
+                .iter()
+                .find(|directory| directory.relative_path == candidate)
+        },
+        path,
+        recorded,
+    )
+}
+
+fn final_reobserve_regular_record_with<'e, M: V2Traversal>(
+    context: &RegularReopenContext<'_>,
+    directory_evidence: impl Fn(&Path) -> Option<&'e DirectoryEvidence>,
+    path: &Path,
+    recorded: RegularFileObservation,
+) -> Result<RegularFileObservation, HeldTreeError> {
+    let euid = rustix::process::geteuid().as_raw();
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| HeldTreeError::ContentChangedDuringHash(path.to_path_buf()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| HeldTreeError::ContentChangedDuringHash(path.to_path_buf()))?;
+    let reopened = reopen_directory_from_root(
+        context.root,
+        parent_path,
+        |candidate| directory_evidence(candidate),
+        context.backend,
+        context.mount_id,
+        || {
+            verify_root_binding_fields(
+                context.parent,
+                context.root_name,
+                context.root_identity,
+                context.mount_id,
+                context.backend,
+            )
+        },
+        false,
+    )?;
+    let parent = reopened.held();
+
+    let before = with_fd(parent, |fd| inspect_at(fd, name, path))?;
+    require_owner(path, before.uid, euid)?;
+    require_boundary(path, context.backend, context.mount_id, &before)?;
+    if before.regular_file_observation(recorded.sha256, recorded.xattrs) != Some(recorded) {
+        return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
+    }
+
+    let fd = with_fd(parent, |parent_fd| {
+        rustix::fs::openat(
+            parent_fd,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+    })
+    .map_err(|error| io_error(path, error))?;
+    let fresh_backend = crate::backend::certify_held_fd_backend(&fd).map_err(|reason| {
+        HeldTreeError::Certification {
+            path: path.to_path_buf(),
+            reason,
+        }
+    })?;
+    if fresh_backend != context.backend {
+        return Err(HeldTreeError::BackendBoundary(path.to_path_buf()));
+    }
+    let opened_xattrs = M::reobserve_regular_xattrs(
+        &fd,
+        path,
+        context.manifest_schema,
+        recorded.xattrs,
+        context.limits.max_xattr_bytes,
+    )?;
+    if opened_xattrs != recorded.xattrs {
+        return Err(HeldTreeError::XattrsChangedDuringProof(path.to_path_buf()));
+    }
+    let opened = inspect_raw_fd(&fd, fresh_backend, path)?;
+    require_owner(path, opened.uid, euid)?;
+    require_boundary(path, context.backend, context.mount_id, &opened)?;
+    if opened.regular_file_observation(recorded.sha256, recorded.xattrs) != Some(recorded) {
+        return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
+    }
+
+    let final_xattrs = M::reobserve_regular_xattrs(
+        &fd,
+        path,
+        context.manifest_schema,
+        recorded.xattrs,
+        context.limits.max_xattr_bytes,
+    )?;
+    if final_xattrs != recorded.xattrs {
+        return Err(HeldTreeError::XattrsChangedDuringProof(path.to_path_buf()));
+    }
+    let final_fd = inspect_raw_fd(&fd, fresh_backend, path)?;
+    require_owner(path, final_fd.uid, euid)?;
+    require_boundary(path, context.backend, context.mount_id, &final_fd)?;
+    let final_observation = final_fd
+        .regular_file_observation(recorded.sha256, recorded.xattrs)
+        .ok_or_else(|| HeldTreeError::ContentChangedDuringHash(path.to_path_buf()))?;
+    if final_observation != recorded {
+        return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
+    }
+
+    let rebound = with_fd(parent, |parent_fd| inspect_at(parent_fd, name, path))?;
+    require_owner(path, rebound.uid, euid)?;
+    require_boundary(path, context.backend, context.mount_id, &rebound)?;
+    if rebound.regular_file_observation(recorded.sha256, recorded.xattrs) != Some(final_observation)
+    {
+        return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
+    }
+    Ok(final_observation)
 }
 
 /// Classify topology only after traversal, budget enforcement, source-parent
@@ -1360,10 +1597,12 @@ fn classify_regular_file_topology(
     Ok(topology)
 }
 
-fn read_v2_children<M: V2Traversal>(
+fn read_v2_children_with_sink<M: V2Traversal, E>(
     walked: &mut V2Walk<M>,
     index: usize,
-) -> Result<(), HeldTreeError> {
+    retain_entries: bool,
+    emit_entry: &mut impl FnMut(&ManifestEntry) -> Result<(), E>,
+) -> Result<(), TraversalSinkError<E>> {
     let parent_path = walked.directories[index].evidence.relative_path.clone();
     let parent_depth = walked.directories[index].evidence.depth;
     let reopened = if index == 0 {
@@ -1423,7 +1662,7 @@ fn read_v2_children<M: V2Traversal>(
             require_same_identity(&path, inspected.identity, opened.identity)?;
             require_owner(&path, opened.uid, rustix::process::geteuid().as_raw())?;
             if held.backend() != walked.backend || held.mount_id() != walked.mount_id {
-                return Err(HeldTreeError::BackendBoundary(path));
+                return Err(HeldTreeError::BackendBoundary(path).into());
             }
             Some(held)
         } else {
@@ -1444,8 +1683,13 @@ fn read_v2_children<M: V2Traversal>(
         if child.is_some() {
             walked.budget.add_directory()?;
         }
+        if let Some(entry) = M::manifest_entry(&result) {
+            emit_entry(entry).map_err(TraversalSinkError::Emit)?;
+        }
         let directory_identity = M::identity(&result);
-        new_entries.push(result);
+        if retain_entries {
+            new_entries.push(result);
+        }
         if let Some(held) = child {
             let evidence = DirectoryEvidence {
                 relative_path: path,
@@ -1468,11 +1712,1035 @@ fn read_v2_children<M: V2Traversal>(
             .insert(path.clone(), directory.evidence.clone())
             .is_some()
         {
-            return Err(HeldTreeError::IdentityChanged(path));
+            return Err(HeldTreeError::IdentityChanged(path).into());
         }
         walked.directories.push(directory);
     }
     Ok(())
+}
+
+fn emit_forward_v3_record<E>(
+    entry: &ManifestEntry,
+    record: &mut Vec<u8>,
+    emit_record: &mut impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), HeldTreeV3CollectError<E>> {
+    let record_len = manifest_entry_v3_len(entry).map_err(HeldTreeV3CollectError::Codec)?;
+    if record_len > MANIFEST_V3_MAX_SEGMENT_PAYLOAD {
+        return Err(HeldTreeV3CollectError::Codec(
+            ManifestV3CodecError::RecordTooLarge,
+        ));
+    }
+    record.clear();
+    emit_manifest_entry_v3(entry, |bytes| record.extend_from_slice(bytes));
+    debug_assert_eq!(record.len(), record_len);
+    emit_record(record).map_err(HeldTreeV3CollectError::Emit)
+}
+
+struct ForwardV3TraversalState<'a> {
+    backend: CertifiedLocalBackend,
+    mount_id: u64,
+    protected_names: &'a [OsString],
+    budget: &'a mut Budget,
+    record: &'a mut Vec<u8>,
+}
+
+fn duplicate_held_directory(
+    held: &HeldLocalBackendEvidence,
+    path: &Path,
+) -> Result<HeldLocalBackendEvidence, HeldTreeError> {
+    let fd = with_fd(held, |fd| {
+        rustix::fs::openat(fd, c".", OPEN_DIRECTORY, Mode::empty())
+    })
+    .map_err(|error| io_error(path, error))?;
+    certify_held_fd(fd).map_err(|reason| HeldTreeError::Certification {
+        path: path.to_path_buf(),
+        reason,
+    })
+}
+
+fn certify_directory_stream(
+    stream: &Dir,
+    path: &Path,
+    backend: CertifiedLocalBackend,
+    mount_id: u64,
+) -> Result<HeldLocalBackendEvidence, HeldTreeError> {
+    let fd = stream
+        .fd()
+        .and_then(rustix::io::dup)
+        .map_err(|error| io_error(path, error))?;
+    let held = certify_held_fd(fd).map_err(|reason| HeldTreeError::Certification {
+        path: path.to_path_buf(),
+        reason,
+    })?;
+    if held.backend() != backend || held.mount_id() != mount_id {
+        return Err(HeldTreeError::BackendBoundary(path.to_path_buf()));
+    }
+    Ok(held)
+}
+
+fn traverse_forward_v3_directory<E>(
+    directory: HeldLocalBackendEvidence,
+    relative_path: &Path,
+    depth: u32,
+    state: &mut ForwardV3TraversalState<'_>,
+    emit_record: &mut impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), HeldTreeV3CollectError<E>> {
+    let mut entries = Dir::new(directory.into_authority_fd())
+        .map_err(|error| HeldTreeV3CollectError::Tree(io_error(relative_path, error)))?;
+    let mut parent =
+        certify_directory_stream(&entries, relative_path, state.backend, state.mount_id)
+            .map_err(HeldTreeV3CollectError::Tree)?;
+    while let Some(entry) = entries.next() {
+        let entry =
+            entry.map_err(|error| HeldTreeV3CollectError::Tree(io_error(relative_path, error)))?;
+        if matches!(entry.file_name().to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let name = OsStr::from_bytes(entry.file_name().to_bytes());
+        let path = relative_path.join(name);
+        require_unprotected(state.protected_names, name, &path)
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        let inspected = with_fd(&parent, |fd| inspect_at(fd, name, &path))
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        require_owner(&path, inspected.uid, rustix::process::geteuid().as_raw())
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        require_boundary(&path, state.backend, state.mount_id, &inspected)
+            .map_err(HeldTreeV3CollectError::Tree)?;
+
+        let child = if inspected.identity.kind == NodeKind::Directory {
+            let fd = with_fd(&parent, |parent_fd| {
+                rustix::fs::openat(parent_fd, name, OPEN_DIRECTORY, Mode::empty())
+            })
+            .map_err(|error| HeldTreeV3CollectError::Tree(io_error(&path, error)))?;
+            let child = certify_held_fd(fd).map_err(|reason| {
+                HeldTreeV3CollectError::Tree(HeldTreeError::Certification {
+                    path: path.clone(),
+                    reason,
+                })
+            })?;
+            let opened = inspect_held(&child, &path).map_err(HeldTreeV3CollectError::Tree)?;
+            require_same_identity(&path, inspected.identity, opened.identity)
+                .map_err(HeldTreeV3CollectError::Tree)?;
+            require_owner(&path, opened.uid, rustix::process::geteuid().as_raw())
+                .map_err(HeldTreeV3CollectError::Tree)?;
+            require_boundary(&path, state.backend, state.mount_id, &opened)
+                .map_err(HeldTreeV3CollectError::Tree)?;
+            if !inspected.stable_content_fields_equal(&opened) {
+                return Err(HeldTreeV3CollectError::Tree(
+                    HeldTreeError::IdentityChanged(path),
+                ));
+            }
+            Some(child)
+        } else {
+            None
+        };
+
+        let proved = ProveTraversal::inspect_entry(
+            &parent,
+            name,
+            &path,
+            &inspected,
+            state.budget,
+            CONTENT_PROOF_VERSION,
+        )
+        .map_err(HeldTreeV3CollectError::Tree)?;
+        if proved.regular.is_some() {
+            fire_regular_link_observation_test_hook(&path);
+        }
+        let child_depth = depth.saturating_add(1);
+        state
+            .budget
+            .add_path(&proved.manifest.path, child_depth)
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        if child.is_some() {
+            state
+                .budget
+                .add_directory()
+                .map_err(HeldTreeV3CollectError::Tree)?;
+        }
+        emit_forward_v3_record(&proved.manifest, state.record, emit_record)?;
+        if let Some(child) = child {
+            drop(entry);
+            drop(parent);
+            traverse_forward_v3_directory(
+                child,
+                &proved.manifest.path,
+                child_depth,
+                state,
+                emit_record,
+            )?;
+            parent =
+                certify_directory_stream(&entries, relative_path, state.backend, state.mount_id)
+                    .map_err(HeldTreeV3CollectError::Tree)?;
+        }
+    }
+    Ok(())
+}
+
+impl PendingV3Inventory {
+    /// Traverses production schema v3 depth-first, retaining only the certified
+    /// root and the active descriptor stack. Records may arrive in filesystem
+    /// enumeration order; unpublished scratch owns canonical sorting.
+    pub(crate) fn collect<E>(
+        parent: HeldLocalBackendEvidence,
+        root_name: &OsStr,
+        protected_names: Vec<OsString>,
+        limits: HeldTreeLimits,
+        mut emit_record: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<Self, HeldTreeV3CollectError<E>> {
+        validate_v2_inputs(root_name, &protected_names, limits)
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        let backend = parent.backend();
+        require_parent_admission(&parent, backend, ParentAdmission::CurrentExclusive)
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        let root_path = PathBuf::new();
+        let inspected = with_fd(&parent, |fd| inspect_at(fd, root_name, &root_path))
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        if inspected.identity.kind != NodeKind::Directory {
+            return Err(HeldTreeV3CollectError::Tree(
+                HeldTreeError::RootNotDirectory,
+            ));
+        }
+        require_owner(
+            &root_path,
+            inspected.uid,
+            rustix::process::geteuid().as_raw(),
+        )
+        .map_err(HeldTreeV3CollectError::Tree)?;
+        require_boundary(&root_path, backend, parent.mount_id(), &inspected)
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        let fd = with_fd(&parent, |parent_fd| {
+            rustix::fs::openat(parent_fd, root_name, OPEN_DIRECTORY, Mode::empty())
+        })
+        .map_err(|error| HeldTreeV3CollectError::Tree(io_error(&root_path, error)))?;
+        let held = certify_held_fd(fd).map_err(|reason| {
+            HeldTreeV3CollectError::Tree(HeldTreeError::Certification {
+                path: root_path.clone(),
+                reason,
+            })
+        })?;
+        let opened = inspect_held(&held, &root_path).map_err(HeldTreeV3CollectError::Tree)?;
+        require_same_identity(&root_path, inspected.identity, opened.identity)
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        require_owner(&root_path, opened.uid, rustix::process::geteuid().as_raw())
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        if held.backend() != backend || held.mount_id() != parent.mount_id() {
+            return Err(HeldTreeV3CollectError::Tree(
+                HeldTreeError::BackendBoundary(root_path),
+            ));
+        }
+        let root_identity = opened.identity;
+        let root_entry = ProveTraversal::make_root(opened);
+        let mut budget = Budget::new(limits, CONTENT_PROOF_VERSION);
+        budget
+            .add_path(&root_entry.manifest.path, 0)
+            .and_then(|()| budget.add_directory())
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        let root = HeldDirectory::new(held, PathBuf::new(), 0, root_identity);
+        let mount_id = root.held.mount_id();
+        let mut record = Vec::with_capacity(MANIFEST_V3_MAX_SEGMENT_PAYLOAD);
+        emit_forward_v3_record(&root_entry.manifest, &mut record, &mut emit_record)?;
+        {
+            let mut traversal = ForwardV3TraversalState {
+                backend,
+                mount_id,
+                protected_names: &protected_names,
+                budget: &mut budget,
+                record: &mut record,
+            };
+            let root_stream = duplicate_held_directory(&root.held, Path::new(""))
+                .map_err(HeldTreeV3CollectError::Tree)?;
+            traverse_forward_v3_directory(
+                root_stream,
+                Path::new(""),
+                0,
+                &mut traversal,
+                &mut emit_record,
+            )?;
+        }
+        require_parent_admission(&parent, backend, ParentAdmission::CurrentExclusive)
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        let rebound = with_fd(&parent, |fd| inspect_at(fd, root_name, Path::new("")))
+            .map_err(|_| HeldTreeV3CollectError::Tree(HeldTreeError::RootBindingChanged))?;
+        if !root_binding_matches(root_identity, mount_id, backend, &rebound) {
+            return Err(HeldTreeV3CollectError::Tree(
+                HeldTreeError::RootBindingChanged,
+            ));
+        }
+        Ok(Self {
+            context: ForwardV3Context {
+                parent,
+                root_name: root_name.to_os_string(),
+                root_identity,
+                root,
+                backend,
+                mount_id,
+                protected_names,
+                limits,
+            },
+            entry_count: budget.entries,
+        })
+    }
+
+    pub(crate) fn entry_count(&self) -> u64 {
+        self.entry_count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_manifest_entries_for_test(&self) -> usize {
+        0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_directory_entries_for_test(&self) -> usize {
+        0
+    }
+
+    pub(crate) fn into_finalizer(
+        self,
+        expected_manifest: DurableTreeManifest,
+    ) -> Result<PendingV3Finalizer, HeldTreeError> {
+        if self.entry_count != expected_manifest.entry_count {
+            return Err(HeldTreeError::PostChanged(PathBuf::new()));
+        }
+        fire_final_regular_reobservation_test_hook();
+        Ok(PendingV3Finalizer {
+            expected_manifest: HeldTreeFingerprint {
+                schema_version: expected_manifest.schema_version,
+                entry_count: expected_manifest.entry_count,
+                sha256: expected_manifest.sha256,
+            },
+            context: self.context,
+            observed_entries: 0,
+            active_directories: Vec::new(),
+            hardlink_record: Vec::with_capacity(MANIFEST_V3_MAX_SEGMENT_PAYLOAD),
+            regular_xattrs: RegularXattrTopology::default(),
+        })
+    }
+}
+
+fn path_is_beneath(directory: &Path, path: &Path) -> bool {
+    if directory.as_os_str().is_empty() {
+        return !path.as_os_str().is_empty();
+    }
+    path.strip_prefix(directory)
+        .is_ok_and(|suffix| suffix.components().count() > 0)
+}
+
+impl PendingV3Finalizer {
+    /// Reobserves one typed canonical record and emits every final regular-file
+    /// observation directly to identity-sorted private scratch.
+    pub(crate) fn observe<E>(
+        &mut self,
+        record: ManifestV3Record<'_>,
+        emit_hardlink: &mut dyn FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), HeldTreeV3CollectError<E>> {
+        self.observed_entries =
+            self.observed_entries
+                .checked_add(1)
+                .ok_or(HeldTreeV3CollectError::Tree(HeldTreeError::Limit {
+                    kind: HeldTreeLimit::Entries,
+                    limit: self.context.limits.max_entries,
+                }))?;
+        let path = Path::new(OsStr::from_bytes(record.path));
+        while self
+            .active_directories
+            .last()
+            .is_some_and(|directory| !path_is_beneath(&directory.relative_path, path))
+        {
+            self.active_directories.pop();
+        }
+
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        if !path.as_os_str().is_empty()
+            && self
+                .active_directories
+                .last()
+                .is_none_or(|directory| directory.relative_path != parent)
+        {
+            return Err(HeldTreeV3CollectError::Tree(HeldTreeError::PostChanged(
+                path.to_path_buf(),
+            )));
+        }
+
+        if record.kind == ManifestV3RecordKind::Directory {
+            let evidence = DirectoryEvidence {
+                relative_path: path.to_path_buf(),
+                depth: u32::try_from(path.components().count()).map_err(|_| {
+                    HeldTreeV3CollectError::Tree(HeldTreeError::Limit {
+                        kind: HeldTreeLimit::Depth,
+                        limit: u64::from(self.context.limits.max_depth),
+                    })
+                })?,
+                identity: NodeIdentity {
+                    kind: NodeKind::Directory,
+                    device: record.device,
+                    inode: record.inode,
+                    incarnation: record.incarnation,
+                },
+                owner_uid: record.uid,
+                group_gid: record.gid,
+                observed_mode: record.mode,
+            };
+            if path.as_os_str().is_empty() && evidence != self.context.root.evidence {
+                return Err(HeldTreeV3CollectError::Tree(HeldTreeError::PostChanged(
+                    PathBuf::new(),
+                )));
+            }
+            self.active_directories.push(evidence);
+            return Ok(());
+        }
+
+        let ManifestV3RecordContent::Regular {
+            size,
+            nlink,
+            mtime_sec,
+            mtime_nsec,
+            ctime_sec,
+            ctime_nsec,
+            sha256,
+            xattr_count,
+            xattr_value_bytes,
+            xattr_sha256,
+        } = record.content
+        else {
+            return Ok(());
+        };
+        let xattrs = RegularXattrProof {
+            attribute_count: xattr_count,
+            value_bytes: xattr_value_bytes,
+            sha256: xattr_sha256,
+        };
+        let recorded = RegularFileObservation {
+            identity: NodeIdentity {
+                kind: NodeKind::Regular,
+                device: record.device,
+                inode: record.inode,
+                incarnation: record.incarnation,
+            },
+            uid: record.uid,
+            gid: record.gid,
+            mode: record.mode,
+            size,
+            nlink,
+            mtime_sec,
+            mtime_nsec,
+            ctime_sec,
+            ctime_nsec,
+            sha256: Some(sha256),
+            xattrs,
+        };
+        let observation = final_reobserve_regular_record_from_context(
+            &self.context,
+            &self.active_directories,
+            path,
+            recorded,
+        )
+        .map_err(HeldTreeV3CollectError::Tree)?;
+        if !xattrs.is_empty() {
+            self.regular_xattrs.entries =
+                self.regular_xattrs.entries.checked_add(1).ok_or_else(|| {
+                    HeldTreeV3CollectError::Tree(HeldTreeError::XattrsChangedDuringProof(
+                        path.to_path_buf(),
+                    ))
+                })?;
+            self.regular_xattrs.attributes = self
+                .regular_xattrs
+                .attributes
+                .checked_add(xattrs.attribute_count)
+                .ok_or_else(|| {
+                    HeldTreeV3CollectError::Tree(HeldTreeError::XattrsChangedDuringProof(
+                        path.to_path_buf(),
+                    ))
+                })?;
+            self.regular_xattrs.value_bytes = self
+                .regular_xattrs
+                .value_bytes
+                .checked_add(xattrs.value_bytes)
+                .ok_or_else(|| {
+                    HeldTreeV3CollectError::Tree(HeldTreeError::XattrsChangedDuringProof(
+                        path.to_path_buf(),
+                    ))
+                })?;
+        }
+        encode_hardlink_scratch_record(path, observation, &mut self.hardlink_record)
+            .map_err(HeldTreeV3CollectError::Codec)?;
+        emit_hardlink(&self.hardlink_record).map_err(HeldTreeV3CollectError::Emit)
+    }
+
+    pub(crate) fn finish(
+        self,
+        authenticated: AuthenticatedTreeManifest,
+        regular_hard_links: RegularHardLinkTopology,
+    ) -> Result<StreamedV3Inventory, HeldTreeError> {
+        let authenticated = authenticated.manifest();
+        if authenticated.schema_version != self.expected_manifest.schema_version
+            || authenticated.entry_count != self.expected_manifest.entry_count
+            || authenticated.sha256 != self.expected_manifest.sha256
+            || self.observed_entries != self.expected_manifest.entry_count
+        {
+            return Err(HeldTreeError::PostChanged(PathBuf::new()));
+        }
+        Ok(StreamedV3Inventory {
+            context: self.context,
+            regular_hard_links,
+            regular_xattrs: self.regular_xattrs,
+            manifest: self.expected_manifest,
+        })
+    }
+}
+
+impl HardlinkTopologyFold {
+    pub(crate) fn new() -> Self {
+        Self {
+            current: None,
+            current_identity: None,
+            first_mismatch: None,
+            first_count_failure: None,
+            topology: RegularHardLinkTopology::default(),
+        }
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        record: HardlinkScratchObservation<'_>,
+    ) -> Result<(), HeldTreeError> {
+        let identity = record.observation.identity;
+        if self.current_identity != Some(identity) {
+            self.finish_current()?;
+            self.current_identity = Some(identity);
+            self.current = Some(StreamedRegularGroup {
+                first_path: Path::new(OsStr::from_bytes(record.path)).to_path_buf(),
+                observation: record.observation,
+                enumerated: 1,
+            });
+            return Ok(());
+        }
+        let group = self.current.as_mut().expect("identity has a current group");
+        if group.observation != record.observation {
+            let detection = Path::new(OsStr::from_bytes(record.path)).to_path_buf();
+            if self
+                .first_mismatch
+                .as_ref()
+                .is_none_or(|(current, _)| detection < *current)
+            {
+                self.first_mismatch = Some((detection, group.first_path.clone()));
+            }
+        }
+        group.enumerated = group
+            .enumerated
+            .checked_add(1)
+            .ok_or_else(|| HeldTreeError::ContentChangedDuringHash(group.first_path.clone()))?;
+        Ok(())
+    }
+
+    fn finish_current(&mut self) -> Result<(), HeldTreeError> {
+        let Some(group) = self.current.take() else {
+            return Ok(());
+        };
+        match group.enumerated.cmp(&group.observation.nlink) {
+            std::cmp::Ordering::Equal if group.enumerated == 1 => {}
+            std::cmp::Ordering::Equal => {
+                self.topology.multi_link_groups = self
+                    .topology
+                    .multi_link_groups
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        HeldTreeError::ContentChangedDuringHash(group.first_path.clone())
+                    })?;
+                self.topology.linked_entries = self
+                    .topology
+                    .linked_entries
+                    .checked_add(group.enumerated)
+                    .ok_or_else(|| {
+                        HeldTreeError::ContentChangedDuringHash(group.first_path.clone())
+                    })?;
+            }
+            ordering => {
+                let external = ordering == std::cmp::Ordering::Less;
+                if self
+                    .first_count_failure
+                    .as_ref()
+                    .is_none_or(|(path, _)| group.first_path < *path)
+                {
+                    self.first_count_failure = Some((group.first_path, external));
+                }
+            }
+        }
+        self.current_identity = None;
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<RegularHardLinkTopology, HeldTreeError> {
+        self.finish_current()?;
+        if let Some((_, path)) = self.first_mismatch {
+            return Err(HeldTreeError::ContentChangedDuringHash(path));
+        }
+        if let Some((path, true)) = self.first_count_failure {
+            return Err(HeldTreeError::ExternalOrUnenumeratedHardLink(path));
+        }
+        if let Some((path, false)) = self.first_count_failure {
+            return Err(HeldTreeError::ContentChangedDuringHash(path));
+        }
+        Ok(self.topology)
+    }
+}
+
+fn traverse_forward_structure_directory<E>(
+    directory: HeldLocalBackendEvidence,
+    relative_path: &Path,
+    depth: u32,
+    context: &ForwardV3Context,
+    budget: &mut Budget,
+    encoded: &mut Vec<u8>,
+    emit_record: &mut impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), HeldTreeV3CollectError<E>> {
+    let mut entries = Dir::new(directory.into_authority_fd())
+        .map_err(|error| HeldTreeV3CollectError::Tree(io_error(relative_path, error)))?;
+    let mut parent =
+        certify_directory_stream(&entries, relative_path, context.backend, context.mount_id)
+            .map_err(HeldTreeV3CollectError::Tree)?;
+    while let Some(entry) = entries.next() {
+        let entry =
+            entry.map_err(|error| HeldTreeV3CollectError::Tree(io_error(relative_path, error)))?;
+        if matches!(entry.file_name().to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let name = OsStr::from_bytes(entry.file_name().to_bytes());
+        let path = relative_path.join(name);
+        require_unprotected(&context.protected_names, name, &path)
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        let inspected = with_fd(&parent, |fd| inspect_at(fd, name, &path))
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        require_owner(&path, inspected.uid, rustix::process::geteuid().as_raw())
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        require_boundary(&path, context.backend, context.mount_id, &inspected)
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        let child = if inspected.identity.kind == NodeKind::Directory {
+            let fd = with_fd(&parent, |parent_fd| {
+                rustix::fs::openat(parent_fd, name, OPEN_DIRECTORY, Mode::empty())
+            })
+            .map_err(|error| HeldTreeV3CollectError::Tree(io_error(&path, error)))?;
+            let child = certify_held_fd(fd).map_err(|reason| {
+                HeldTreeV3CollectError::Tree(HeldTreeError::Certification {
+                    path: path.clone(),
+                    reason,
+                })
+            })?;
+            let opened = inspect_held(&child, &path).map_err(HeldTreeV3CollectError::Tree)?;
+            require_same_identity(&path, inspected.identity, opened.identity)
+                .map_err(HeldTreeV3CollectError::Tree)?;
+            require_owner(&path, opened.uid, rustix::process::geteuid().as_raw())
+                .map_err(HeldTreeV3CollectError::Tree)?;
+            require_boundary(&path, context.backend, context.mount_id, &opened)
+                .map_err(HeldTreeV3CollectError::Tree)?;
+            if !inspected.stable_content_fields_equal(&opened) {
+                return Err(HeldTreeV3CollectError::Tree(
+                    HeldTreeError::IdentityChanged(path),
+                ));
+            }
+            Some(child)
+        } else {
+            None
+        };
+        let value = if inspected.identity.kind == NodeKind::Symlink {
+            let content = inspect_symlink_content(&parent, name, &path, &inspected, budget)
+                .map_err(HeldTreeV3CollectError::Tree)?;
+            inspected
+                .clone()
+                .into_manifest(path.clone(), content)
+                .structure_evidence()
+        } else {
+            inspected
+                .structure_evidence(path.clone(), CONTENT_PROOF_VERSION)
+                .map_err(HeldTreeV3CollectError::Tree)?
+        };
+        let child_depth = depth.saturating_add(1);
+        budget
+            .add_path(&value.path, child_depth)
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        if child.is_some() {
+            budget
+                .add_directory()
+                .map_err(HeldTreeV3CollectError::Tree)?;
+        }
+        emit_structure_record(&value, encoded, emit_record)?;
+        if let Some(child) = child {
+            drop(entry);
+            drop(parent);
+            traverse_forward_structure_directory(
+                child,
+                &value.path,
+                child_depth,
+                context,
+                budget,
+                encoded,
+                emit_record,
+            )?;
+            parent = certify_directory_stream(
+                &entries,
+                relative_path,
+                context.backend,
+                context.mount_id,
+            )
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        }
+    }
+    Ok(())
+}
+
+impl StreamedV3Inventory {
+    pub(crate) fn fingerprint(&self) -> HeldTreeFingerprint {
+        self.manifest
+    }
+
+    pub(crate) fn regular_hard_link_topology(&self) -> RegularHardLinkTopology {
+        self.regular_hard_links
+    }
+
+    pub(crate) fn regular_xattr_topology(&self) -> RegularXattrTopology {
+        self.regular_xattrs
+    }
+
+    /// Reobserves the current tree depth-first and emits private structure
+    /// records while retaining only the active descriptor chain.
+    pub(crate) fn stream_structure_records<E>(
+        &self,
+        mut emit_record: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), HeldTreeV3CollectError<E>> {
+        self.verify_root_binding()
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        let mut budget = Budget::new(self.context.limits, CONTENT_PROOF_VERSION);
+        let mut encoded = Vec::with_capacity(MANIFEST_V3_MAX_SEGMENT_PAYLOAD);
+        let root = inspect_held(&self.context.root.held, Path::new(""))
+            .map_err(HeldTreeV3CollectError::Tree)?
+            .structure_evidence(PathBuf::new(), CONTENT_PROOF_VERSION)
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        budget
+            .add_path(&root.path, 0)
+            .and_then(|()| budget.add_directory())
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        emit_structure_record(&root, &mut encoded, &mut emit_record)?;
+        let root_stream = duplicate_held_directory(&self.context.root.held, Path::new(""))
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        traverse_forward_structure_directory(
+            root_stream,
+            Path::new(""),
+            0,
+            &self.context,
+            &mut budget,
+            &mut encoded,
+            &mut emit_record,
+        )?;
+        self.verify_root_binding()
+            .map_err(HeldTreeV3CollectError::Tree)
+    }
+
+    pub(crate) fn finish_streamed_structure_rewalk(&self) -> Result<(), HeldTreeError> {
+        self.verify_root_binding()
+    }
+
+    fn verify_root_binding(&self) -> Result<(), HeldTreeError> {
+        require_exclusive_parent(&self.context.parent, self.context.backend)?;
+        verify_root_binding_fields(
+            &self.context.parent,
+            &self.context.root_name,
+            self.context.root_identity,
+            self.context.mount_id,
+            self.context.backend,
+        )
+    }
+}
+
+const STRUCTURE_SCRATCH_RECORD_MAGIC: &[u8; 4] = b"DHS1";
+
+pub(crate) fn hardlink_scratch_sentinel_record() -> &'static [u8] {
+    &[0, 0, 0, 0, 0, 0, 0, 1, 0]
+}
+
+fn encode_hardlink_scratch_record(
+    path: &Path,
+    observation: RegularFileObservation,
+    encoded: &mut Vec<u8>,
+) -> Result<(), ManifestV3CodecError> {
+    let path = path.as_os_str().as_bytes();
+    let key_len = 25_usize
+        .checked_add(path.len())
+        .ok_or(ManifestV3CodecError::LengthOverflow)?;
+    let record_len = 8_usize
+        .checked_add(key_len)
+        .and_then(|length| length.checked_add(132))
+        .ok_or(ManifestV3CodecError::LengthOverflow)?;
+    if record_len > MANIFEST_V3_MAX_SEGMENT_PAYLOAD {
+        return Err(ManifestV3CodecError::RecordTooLarge);
+    }
+    let sha256 = observation
+        .sha256
+        .ok_or(ManifestV3CodecError::KindContentMismatch)?;
+    encoded.clear();
+    encoded.reserve(record_len);
+    encoded.extend_from_slice(&(key_len as u64).to_be_bytes());
+    encoded.push(1);
+    encoded.extend_from_slice(&observation.identity.device.to_be_bytes());
+    encoded.extend_from_slice(&observation.identity.inode.to_be_bytes());
+    encoded.extend_from_slice(&observation.identity.incarnation.to_be_bytes());
+    encoded.extend_from_slice(path);
+    encoded.extend_from_slice(&observation.uid.to_be_bytes());
+    encoded.extend_from_slice(&observation.gid.to_be_bytes());
+    encoded.extend_from_slice(&observation.mode.to_be_bytes());
+    encoded.extend_from_slice(&observation.size.to_be_bytes());
+    encoded.extend_from_slice(&observation.nlink.to_be_bytes());
+    encoded.extend_from_slice(&observation.mtime_sec.to_be_bytes());
+    encoded.extend_from_slice(&observation.mtime_nsec.to_be_bytes());
+    encoded.extend_from_slice(&observation.ctime_sec.to_be_bytes());
+    encoded.extend_from_slice(&observation.ctime_nsec.to_be_bytes());
+    encoded.extend_from_slice(&sha256);
+    encoded.extend_from_slice(&observation.xattrs.attribute_count.to_be_bytes());
+    encoded.extend_from_slice(&observation.xattrs.value_bytes.to_be_bytes());
+    encoded.extend_from_slice(&observation.xattrs.sha256);
+    debug_assert_eq!(encoded.len(), record_len);
+    Ok(())
+}
+
+pub(crate) fn decode_hardlink_scratch_record(
+    mut record: &[u8],
+) -> Result<Option<HardlinkScratchObservation<'_>>, ManifestV3CodecError> {
+    let key_len = usize::try_from(take_u64(&mut record)?)
+        .map_err(|_| ManifestV3CodecError::LengthOverflow)?;
+    let key = take(&mut record, key_len)?;
+    if key == [0] {
+        if record.is_empty() {
+            return Ok(None);
+        }
+        return Err(ManifestV3CodecError::TrailingBytes);
+    }
+    if key.len() < 25 || key[0] != 1 {
+        return Err(ManifestV3CodecError::InvalidPath);
+    }
+    let path = &key[25..];
+    if path.is_empty() {
+        return Err(ManifestV3CodecError::InvalidPath);
+    }
+    validate_manifest_path(path, HeldTreeLimits::default().max_depth)?;
+    let identity = NodeIdentity {
+        kind: NodeKind::Regular,
+        device: u64::from_be_bytes(key[1..9].try_into().unwrap()),
+        inode: u64::from_be_bytes(key[9..17].try_into().unwrap()),
+        incarnation: u64::from_be_bytes(key[17..25].try_into().unwrap()),
+    };
+    let fields = take(&mut record, 132)?;
+    if !record.is_empty() {
+        return Err(ManifestV3CodecError::TrailingBytes);
+    }
+    let mode = u32::from_be_bytes(fields[8..12].try_into().unwrap());
+    if mode & !0o7777 != 0 {
+        return Err(ManifestV3CodecError::InvalidMode);
+    }
+    let mtime_nsec = u32::from_be_bytes(fields[36..40].try_into().unwrap());
+    let ctime_nsec = u32::from_be_bytes(fields[48..52].try_into().unwrap());
+    if mtime_nsec >= 1_000_000_000 || ctime_nsec >= 1_000_000_000 {
+        return Err(ManifestV3CodecError::InvalidNanoseconds);
+    }
+    Ok(Some(HardlinkScratchObservation {
+        path,
+        observation: RegularFileObservation {
+            identity,
+            uid: u32::from_be_bytes(fields[0..4].try_into().unwrap()),
+            gid: u32::from_be_bytes(fields[4..8].try_into().unwrap()),
+            mode,
+            size: u64::from_be_bytes(fields[12..20].try_into().unwrap()),
+            nlink: u64::from_be_bytes(fields[20..28].try_into().unwrap()),
+            mtime_sec: i64::from_be_bytes(fields[28..36].try_into().unwrap()),
+            mtime_nsec,
+            ctime_sec: i64::from_be_bytes(fields[40..48].try_into().unwrap()),
+            ctime_nsec,
+            sha256: Some(fields[52..84].try_into().unwrap()),
+            xattrs: RegularXattrProof {
+                attribute_count: u64::from_be_bytes(fields[84..92].try_into().unwrap()),
+                value_bytes: u64::from_be_bytes(fields[92..100].try_into().unwrap()),
+                sha256: fields[100..132].try_into().unwrap(),
+            },
+        },
+    }))
+}
+
+fn emit_structure_record<E>(
+    evidence: &StructureEvidence,
+    encoded: &mut Vec<u8>,
+    emit_record: &mut impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), HeldTreeV3CollectError<E>> {
+    let path = evidence.path.as_os_str().as_bytes();
+    let path_len = u64::try_from(path.len())
+        .map_err(|_| HeldTreeV3CollectError::Codec(ManifestV3CodecError::LengthOverflow))?;
+    encoded.clear();
+    encoded.extend_from_slice(&path_len.to_be_bytes());
+    encoded.extend_from_slice(path);
+    encoded.extend_from_slice(STRUCTURE_SCRATCH_RECORD_MAGIC);
+    encoded.push(match evidence.identity.kind {
+        NodeKind::Directory => 0,
+        NodeKind::Regular => 1,
+        NodeKind::Symlink => 2,
+        NodeKind::Other => 3,
+    });
+    encoded.extend_from_slice(&evidence.identity.device.to_be_bytes());
+    encoded.extend_from_slice(&evidence.identity.inode.to_be_bytes());
+    encoded.extend_from_slice(&evidence.identity.incarnation.to_be_bytes());
+    encoded.extend_from_slice(&evidence.uid.to_be_bytes());
+    encoded.extend_from_slice(&evidence.gid.to_be_bytes());
+    encoded.extend_from_slice(&evidence.mode.to_be_bytes());
+    match &evidence.stability {
+        StructureStability::Directory => {}
+        StructureStability::Regular {
+            size,
+            nlink,
+            mtime_sec,
+            mtime_nsec,
+            ctime_sec,
+            ctime_nsec,
+        } => {
+            encoded.extend_from_slice(&size.to_be_bytes());
+            encoded.extend_from_slice(&nlink.to_be_bytes());
+            encoded.extend_from_slice(&mtime_sec.to_be_bytes());
+            encoded.extend_from_slice(&mtime_nsec.to_be_bytes());
+            encoded.extend_from_slice(&ctime_sec.to_be_bytes());
+            encoded.extend_from_slice(&ctime_nsec.to_be_bytes());
+        }
+        StructureStability::Symlink { target } => {
+            let target_len = u64::try_from(target.len())
+                .map_err(|_| HeldTreeV3CollectError::Codec(ManifestV3CodecError::LengthOverflow))?;
+            encoded.extend_from_slice(&target_len.to_be_bytes());
+            encoded.extend_from_slice(target);
+        }
+        StructureStability::Legacy => {
+            return Err(HeldTreeV3CollectError::Codec(
+                ManifestV3CodecError::KindContentMismatch,
+            ));
+        }
+    }
+    if encoded.len() > MANIFEST_V3_MAX_SEGMENT_PAYLOAD {
+        return Err(HeldTreeV3CollectError::Codec(
+            ManifestV3CodecError::RecordTooLarge,
+        ));
+    }
+    emit_record(encoded).map_err(HeldTreeV3CollectError::Emit)
+}
+
+pub(crate) fn decode_structure_record(
+    record: &[u8],
+) -> Result<StructureEvidence, ManifestV3CodecError> {
+    if record.len() > MANIFEST_V3_MAX_SEGMENT_PAYLOAD {
+        return Err(ManifestV3CodecError::RecordTooLarge);
+    }
+    let mut input = record;
+    let path_len =
+        usize::try_from(take_u64(&mut input)?).map_err(|_| ManifestV3CodecError::LengthOverflow)?;
+    let path = take(&mut input, path_len)?;
+    validate_manifest_path(path, HeldTreeLimits::default().max_depth)?;
+    if take(&mut input, STRUCTURE_SCRATCH_RECORD_MAGIC.len())? != STRUCTURE_SCRATCH_RECORD_MAGIC {
+        return Err(ManifestV3CodecError::InvalidTag);
+    }
+    let kind = match take(&mut input, 1)?[0] {
+        0 => NodeKind::Directory,
+        1 => NodeKind::Regular,
+        2 => NodeKind::Symlink,
+        _ => return Err(ManifestV3CodecError::InvalidTag),
+    };
+    let identity = NodeIdentity {
+        kind,
+        device: take_u64(&mut input)?,
+        inode: take_u64(&mut input)?,
+        incarnation: take_u64(&mut input)?,
+    };
+    let uid = u32::from_be_bytes(take(&mut input, 4)?.try_into().unwrap());
+    let gid = u32::from_be_bytes(take(&mut input, 4)?.try_into().unwrap());
+    let mode = u32::from_be_bytes(take(&mut input, 4)?.try_into().unwrap());
+    if mode > 0o7777 {
+        return Err(ManifestV3CodecError::InvalidMode);
+    }
+    let stability = match kind {
+        NodeKind::Directory => StructureStability::Directory,
+        NodeKind::Regular => {
+            let size = take_u64(&mut input)?;
+            let nlink = take_u64(&mut input)?;
+            let mtime_sec = i64::from_be_bytes(take(&mut input, 8)?.try_into().unwrap());
+            let mtime_nsec = u32::from_be_bytes(take(&mut input, 4)?.try_into().unwrap());
+            let ctime_sec = i64::from_be_bytes(take(&mut input, 8)?.try_into().unwrap());
+            let ctime_nsec = u32::from_be_bytes(take(&mut input, 4)?.try_into().unwrap());
+            if mtime_nsec >= 1_000_000_000 || ctime_nsec >= 1_000_000_000 {
+                return Err(ManifestV3CodecError::InvalidNanoseconds);
+            }
+            StructureStability::Regular {
+                size,
+                nlink,
+                mtime_sec,
+                mtime_nsec,
+                ctime_sec,
+                ctime_nsec,
+            }
+        }
+        NodeKind::Symlink => {
+            let target_len = usize::try_from(take_u64(&mut input)?)
+                .map_err(|_| ManifestV3CodecError::LengthOverflow)?;
+            StructureStability::Symlink {
+                target: take(&mut input, target_len)?.to_vec(),
+            }
+        }
+        NodeKind::Other => return Err(ManifestV3CodecError::InvalidTag),
+    };
+    if !input.is_empty() {
+        return Err(ManifestV3CodecError::TrailingBytes);
+    }
+    Ok(StructureEvidence {
+        path: PathBuf::from(OsStr::from_bytes(path)),
+        identity,
+        uid,
+        gid,
+        mode,
+        stability,
+    })
+}
+
+pub(crate) fn structure_evidence_from_v3_record(record: ManifestV3Record<'_>) -> StructureEvidence {
+    let kind = match record.kind {
+        ManifestV3RecordKind::Directory => NodeKind::Directory,
+        ManifestV3RecordKind::Regular => NodeKind::Regular,
+        ManifestV3RecordKind::Symlink => NodeKind::Symlink,
+    };
+    let stability = match record.content {
+        ManifestV3RecordContent::Directory => StructureStability::Directory,
+        ManifestV3RecordContent::Regular {
+            size,
+            nlink,
+            mtime_sec,
+            mtime_nsec,
+            ctime_sec,
+            ctime_nsec,
+            ..
+        } => StructureStability::Regular {
+            size,
+            nlink,
+            mtime_sec,
+            mtime_nsec,
+            ctime_sec,
+            ctime_nsec,
+        },
+        ManifestV3RecordContent::Symlink { target } => StructureStability::Symlink {
+            target: target.to_vec(),
+        },
+    };
+    StructureEvidence {
+        path: PathBuf::from(OsStr::from_bytes(record.path)),
+        identity: NodeIdentity {
+            kind,
+            device: record.device,
+            inode: record.inode,
+            incarnation: record.incarnation,
+        },
+        uid: record.uid,
+        gid: record.gid,
+        mode: record.mode,
+        stability,
+    }
 }
 
 impl HeldTreeInventory {
@@ -3924,9 +5192,9 @@ pub(crate) struct ManifestV3Record<'a> {
 }
 
 /// Incremental decoder for the exact v3 fingerprint record stream. It retains
-/// only canonical directory paths (bounded by the existing directory limit),
-/// the previous path, counters, and the digest state; decoded entries grant no
-/// filesystem or recovery authority.
+/// one previous path plus offsets for its active directory ancestor chain,
+/// rather than every decoded directory path.
+/// Counters and digest state grant no filesystem or recovery authority.
 pub(crate) struct ManifestV3Decoder {
     expected_entries: u64,
     decoded_entries: u64,
@@ -3934,7 +5202,8 @@ pub(crate) struct ManifestV3Decoder {
     path_bytes: u64,
     manifest_bytes: u64,
     xattr_bytes: u64,
-    directories: BTreeSet<Vec<u8>>,
+    decoded_directories: u64,
+    directory_ancestor_ends: Vec<usize>,
     previous_path: Option<Vec<u8>>,
     digest: Sha256,
 }
@@ -3964,7 +5233,8 @@ impl ManifestV3Decoder {
             path_bytes: 0,
             manifest_bytes: 0,
             xattr_bytes: 0,
-            directories: BTreeSet::new(),
+            decoded_directories: 0,
+            directory_ancestor_ends: Vec::new(),
             previous_path: None,
             digest,
         })
@@ -4033,6 +5303,25 @@ impl ManifestV3Decoder {
         })
     }
 
+    /// Path/component ordering keeps a directory subtree contiguous. Ancestor
+    /// offsets refer to `previous_path`; pop completed subtrees until the direct
+    /// parent is the stack top. The surviving prefix bytes are identical in the
+    /// current path, so a directory record can append its end offset before the
+    /// previous-path buffer is replaced.
+    fn retain_directory_parent(&mut self, parent: &[u8]) -> bool {
+        let previous = self
+            .previous_path
+            .as_deref()
+            .expect("non-root records always have one previous path");
+        while let Some(end) = self.directory_ancestor_ends.last().copied() {
+            if previous.get(..end) == Some(parent) {
+                return true;
+            }
+            self.directory_ancestor_ends.pop();
+        }
+        false
+    }
+
     fn decode_record<'a>(
         &mut self,
         input: &mut &'a [u8],
@@ -4054,15 +5343,13 @@ impl ManifestV3Decoder {
             if path.is_empty() {
                 return Err(ManifestV3CodecError::InvalidRoot);
             }
-            if self
-                .previous_path
-                .as_deref()
-                .is_some_and(|previous| previous >= path)
-            {
+            if self.previous_path.as_deref().is_some_and(|previous| {
+                compare_manifest_paths(previous, path) != std::cmp::Ordering::Less
+            }) {
                 return Err(ManifestV3CodecError::InvalidOrder);
             }
             let parent = path_parent_bytes(path).ok_or(ManifestV3CodecError::InvalidPath)?;
-            if !self.directories.contains(parent) {
+            if !self.retain_directory_parent(parent) {
                 return Err(ManifestV3CodecError::MissingParent);
             }
         }
@@ -4155,17 +5442,32 @@ impl ManifestV3Decoder {
             return Err(ManifestV3CodecError::Limit(HeldTreeLimit::ManifestBytes));
         }
         if kind == ManifestV3RecordKind::Directory {
-            if self.directories.len() as u64 >= self.limits.max_directories {
+            if self.decoded_directories >= self.limits.max_directories {
                 return Err(ManifestV3CodecError::Limit(HeldTreeLimit::Directories));
             }
-            self.directories.insert(path.to_vec());
+            self.decoded_directories = self
+                .decoded_directories
+                .checked_add(1)
+                .ok_or(ManifestV3CodecError::LengthOverflow)?;
+            debug_assert!(
+                self.directory_ancestor_ends
+                    .last()
+                    .is_none_or(|end| *end < path.len() || path.is_empty())
+            );
+            self.directory_ancestor_ends.push(path.len());
         }
         if self.decoded_entries == 0 && kind != ManifestV3RecordKind::Directory {
             return Err(ManifestV3CodecError::InvalidRoot);
         }
         let consumed = encoded_record.len() - input.len();
         self.digest.update(&encoded_record[..consumed]);
-        self.previous_path = Some(path.to_vec());
+        match &mut self.previous_path {
+            Some(previous) => {
+                previous.clear();
+                previous.extend_from_slice(path);
+            }
+            None => self.previous_path = Some(path.to_vec()),
+        }
         self.decoded_entries += 1;
         Ok(ManifestV3Record {
             path,
@@ -4192,6 +5494,13 @@ fn take<'a>(input: &mut &'a [u8], length: usize) -> Result<&'a [u8], ManifestV3C
 
 fn take_u64(input: &mut &[u8]) -> Result<u64, ManifestV3CodecError> {
     Ok(u64::from_be_bytes(take(input, 8)?.try_into().unwrap()))
+}
+
+/// Historical schema-v3 ordering is Rust `Path`/component ordering over raw
+/// Unix component bytes. Encoding uses raw bytes, but comparing the entire
+/// encoded path slice would change durable fingerprints for prefix siblings.
+pub(crate) fn compare_manifest_paths(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    Path::new(OsStr::from_bytes(left)).cmp(Path::new(OsStr::from_bytes(right)))
 }
 
 fn validate_manifest_path(path: &[u8], max_depth: u32) -> Result<(), ManifestV3CodecError> {

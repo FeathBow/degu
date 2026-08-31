@@ -199,6 +199,44 @@ fn set_group(path: &Path, gid: u32) -> std::io::Result<()> {
 }
 
 #[test]
+fn component_order_prefix_paths_stage_and_restart_verify() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    for name in ["!", "!!", "!!!"] {
+        std::fs::create_dir(fixture.source_root.join(name)).unwrap();
+        std::fs::write(fixture.source_root.join(name).join("leaf"), name.as_bytes()).unwrap();
+    }
+    let transaction = TransactionId([0xdc; 16]);
+    let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty());
+    let staged = engine
+        .stage_prepared_root(transaction, fixture.prepare())
+        .unwrap();
+    assert_eq!(staged.wal_state(), Some(TransactionState::StagedUnverified));
+    drop(staged);
+    drop(engine);
+
+    let (mut recovered, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let candidate = report
+        .into_candidates()
+        .into_iter()
+        .find(|candidate| candidate.transaction() == transaction)
+        .unwrap();
+    let capability = recovered
+        .prepare_startup_recovery(candidate, fixture.anchors())
+        .unwrap();
+    let StartupRecoveryCapability::PendingVerification(pending) = capability else {
+        panic!("component-order prefix paths did not resume exact verification")
+    };
+    let StagedVerificationOutcome::StagedSealed(verified) = pending.verify_or_quarantine().unwrap()
+    else {
+        panic!("component-order prefix paths did not verify after restart")
+    };
+    assert_eq!(verified.wal_state(), Some(TransactionState::StagedSealed));
+}
+
+#[test]
 fn internal_pair_cross_directory_and_three_aliases_fingerprint_and_restart_verify() {
     for (case, aliases) in [(0_u8, 2_u64), (1, 2), (2, 3)] {
         let Some(fixture) = Fixture::new() else {
@@ -276,6 +314,16 @@ fn exact_held_tree_reaches_only_staged_unverified() {
     assert_eq!(mode(&fixture.source_parent), 0o750);
     assert_eq!(mode(&fixture.destination_root), 0o750);
     assert_eq!(mode(&fixture.destination_root.join("child")), 0o750);
+    assert!(
+        std::fs::read_dir(fixture.base.join("wal-store"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tree-scratch-v1-")),
+        "successful forward staging must clean both structure scratch passes"
+    );
     drop(staged);
     assert_eq!(
         engine.state(transaction),
@@ -471,6 +519,79 @@ fn consumed_pre_seal_expectation_rejects_same_size_content_drift_before_post_pro
     let replay = lease.replay_and_repair().unwrap();
     assert!(replay.transactions[&transaction].tree_manifest.is_none());
     assert!(replay.transactions[&transaction].tree_sidecar.is_none());
+}
+
+#[test]
+fn streamed_structure_scratch_reports_the_first_canonical_added_path() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let extra = fixture.source_root.join("extra");
+    AFTER_STRUCTURE_SIDECAR_PREFLIGHT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::fs::write(extra, b"late").unwrap();
+        }));
+    });
+    let transaction = TransactionId([0xda; 16]);
+    let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty());
+
+    let error = match engine.stage_prepared_root(transaction, fixture.prepare()) {
+        Ok(_) => panic!("late added path must not reach rename"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        StagingRenameError::HeldTree(HeldTreeError::PostAdded(path))
+            if path == Path::new("extra")
+    ));
+    assert_eq!(
+        engine.state(transaction),
+        Some(TransactionState::TreeSealIntent)
+    );
+    assert!(fixture.source_root.is_dir());
+    assert!(!fixture.destination_root.exists());
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn sidecar_integrity_wins_over_concurrent_structure_traversal_failure() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let store = fixture.base.join("wal-store");
+    let child = fixture.source_root.join("child");
+    AFTER_STRUCTURE_SIDECAR_PREFLIGHT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let sidecar = std::fs::read_dir(store)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension() == Some(OsStr::new("sidecar")))
+                .expect("published sidecar must exist before structure traversal");
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(sidecar)
+                .unwrap();
+            file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+            std::fs::remove_file(child.join("data")).unwrap();
+            std::fs::remove_dir(&child).unwrap();
+        }));
+    });
+    let transaction = TransactionId([0xdb; 16]);
+    let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty());
+
+    let error = match engine.stage_prepared_root(transaction, fixture.prepare()) {
+        Ok(_) => panic!("corrupt sidecar and failed traversal must not reach rename"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StagingRenameError::Sidecar(_)));
+    assert_eq!(
+        engine.state(transaction),
+        Some(TransactionState::TreeSealIntent)
+    );
+    assert!(fixture.source_root.is_dir());
+    assert!(!fixture.destination_root.exists());
 }
 
 #[test]

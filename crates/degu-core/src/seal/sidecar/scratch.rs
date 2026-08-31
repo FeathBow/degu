@@ -9,7 +9,10 @@
 use super::*;
 #[cfg(test)]
 use crate::backend::held::ManifestV3Record;
-use crate::backend::held::{ManifestV3Decoder, ManifestV3VisitError};
+use crate::backend::held::{
+    ManifestV3Decoder, ManifestV3VisitError, StructureEvidence, compare_manifest_paths,
+    decode_structure_record,
+};
 use crate::seal::wal::DurableTreeManifest;
 
 const SCRATCH_MAGIC: &[u8; 4] = b"DHSR";
@@ -47,6 +50,41 @@ struct ScratchRun {
     pin: File,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScratchOrder {
+    ManifestPath,
+    HardlinkIdentityThenPath,
+}
+
+fn validate_scratch_key(order: ScratchOrder, key: &[u8]) -> Result<(), TreeSidecarError> {
+    match order {
+        ScratchOrder::ManifestPath => Ok(()),
+        ScratchOrder::HardlinkIdentityThenPath
+            if key == [0] || (key.first() == Some(&1) && key.len() >= 25) =>
+        {
+            Ok(())
+        }
+        ScratchOrder::HardlinkIdentityThenPath => Err(TreeSidecarError::InvalidScratch(
+            "hardlink scratch key is invalid",
+        )),
+    }
+}
+
+fn compare_scratch_keys(order: ScratchOrder, left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    match order {
+        ScratchOrder::ManifestPath => compare_manifest_paths(left, right),
+        ScratchOrder::HardlinkIdentityThenPath => match (left.first(), right.first()) {
+            (Some(0), Some(0)) => std::cmp::Ordering::Equal,
+            (Some(0), _) => std::cmp::Ordering::Less,
+            (_, Some(0)) => std::cmp::Ordering::Greater,
+            (Some(1), Some(1)) => left[1..25]
+                .cmp(&right[1..25])
+                .then_with(|| compare_manifest_paths(&left[25..], &right[25..])),
+            _ => left.cmp(right),
+        },
+    }
+}
+
 /// A set of sorted unpublished runs. It contains no filesystem or recovery
 /// authority; every operation re-enters through its originating store and WAL
 /// lease and revalidates the exact private files by descriptor.
@@ -55,7 +93,28 @@ pub(crate) struct TreeManifestScratch {
     transaction: TransactionId,
     binding: ScratchBinding,
     record_count: u64,
+    order: ScratchOrder,
     runs: Vec<ScratchRun>,
+}
+
+/// Sorted unpublished private structure observations. This wrapper prevents
+/// structure-only records from reaching manifest fingerprint/publication APIs.
+#[derive(Debug)]
+pub(crate) struct TreeStructureScratch(TreeManifestScratch);
+
+/// Sorted final regular-file observations keyed by strong inode identity and
+/// canonical manifest path. It is unpublished, never WAL-referenceable, and
+/// cannot enter manifest fingerprint or publication APIs.
+#[derive(Debug)]
+pub(crate) struct TreeHardlinkScratch(TreeManifestScratch);
+
+pub(crate) struct TreeStructureScratchCursor {
+    scratch: TreeManifestScratch,
+    readers: Vec<ScratchRunReader>,
+    emitted: u64,
+    previous_path: Vec<u8>,
+    has_previous: bool,
+    semantic_error: Option<TreeSidecarError>,
 }
 
 #[derive(Debug)]
@@ -70,6 +129,7 @@ impl<E> From<TreeSidecarError> for TreeManifestScratchBuildError<E> {
     }
 }
 
+#[cfg(test)]
 fn flatten_scratch_build(
     error: TreeManifestScratchBuildError<TreeSidecarError>,
 ) -> TreeSidecarError {
@@ -98,6 +158,20 @@ fn flatten_scratch_merge(error: ScratchMergeError<TreeSidecarError>) -> TreeSide
 }
 
 #[cfg(test)]
+impl TreeStructureScratch {
+    pub(super) fn run_names_for_test(&self) -> Vec<OsString> {
+        self.0.runs.iter().map(|run| run.name.clone()).collect()
+    }
+}
+
+#[cfg(test)]
+impl TreeHardlinkScratch {
+    pub(super) fn run_names_for_test(&self) -> Vec<OsString> {
+        self.0.runs.iter().map(|run| run.name.clone()).collect()
+    }
+}
+
+#[cfg(test)]
 impl TreeManifestScratch {
     pub(super) fn max_level_for_test(&self) -> u8 {
         self.runs.iter().map(|run| run.level).max().unwrap_or(0)
@@ -118,6 +192,7 @@ struct RunBuilder<'a> {
     store: &'a TreeSidecarStore,
     transaction: TransactionId,
     memory_bytes: usize,
+    order: ScratchOrder,
     arena: Vec<u8>,
     records: Vec<RecordIndex>,
     runs: Vec<ScratchRun>,
@@ -130,6 +205,7 @@ impl TreeSidecarStore {
     /// producer may present records in any order. No run is synced or published,
     /// and neither the result nor any partially written file can become WAL
     /// evidence.
+    #[cfg(test)]
     pub(crate) fn build_sorted_manifest_scratch<P>(
         &self,
         wal: &mut SealWal<RecoverySession>,
@@ -163,8 +239,77 @@ impl TreeSidecarStore {
             wal,
             transaction,
             SORT_MEMORY_BYTES,
+            ScratchOrder::ManifestPath,
             produce,
         )
+    }
+
+    /// Builds fixed-memory sorted runs for fresh structure observations.
+    /// Records use a private path-prefixed codec and can never be fingerprinted,
+    /// published, or referenced by the WAL through this wrapper.
+    pub(crate) fn build_sorted_structure_scratch_with_output<T, E, P>(
+        &self,
+        wal: &mut SealWal<RecoverySession>,
+        transaction: TransactionId,
+        produce: P,
+    ) -> Result<(TreeStructureScratch, T), TreeManifestScratchBuildError<E>>
+    where
+        P: FnOnce(&mut dyn FnMut(&[u8]) -> Result<(), TreeSidecarError>) -> Result<T, E>,
+    {
+        self.build_sorted_manifest_scratch_with_budget_and_output(
+            wal,
+            transaction,
+            SORT_MEMORY_BYTES,
+            ScratchOrder::ManifestPath,
+            produce,
+        )
+        .map(|(scratch, output)| (TreeStructureScratch(scratch), output))
+    }
+
+    /// Builds fixed-memory sorted runs for final regular-file observations.
+    /// The private ordering groups equal strong inode identities and then uses
+    /// historical component ordering for the original manifest path.
+    pub(crate) fn build_sorted_hardlink_scratch_with_output<T, E, P>(
+        &self,
+        wal: &mut SealWal<RecoverySession>,
+        transaction: TransactionId,
+        produce: P,
+    ) -> Result<(TreeHardlinkScratch, T), TreeManifestScratchBuildError<E>>
+    where
+        P: FnOnce(&mut dyn FnMut(&[u8]) -> Result<(), TreeSidecarError>) -> Result<T, E>,
+    {
+        self.build_sorted_manifest_scratch_with_budget_and_output(
+            wal,
+            transaction,
+            SORT_MEMORY_BYTES,
+            ScratchOrder::HardlinkIdentityThenPath,
+            produce,
+        )
+        .map(|(scratch, output)| (TreeHardlinkScratch(scratch), output))
+    }
+
+    #[cfg(test)]
+    pub(super) fn build_sorted_hardlink_scratch_with_budget<P>(
+        &self,
+        wal: &mut SealWal<RecoverySession>,
+        transaction: TransactionId,
+        memory_bytes: usize,
+        produce: P,
+    ) -> Result<TreeHardlinkScratch, TreeSidecarError>
+    where
+        P: FnOnce(
+            &mut dyn FnMut(&[u8]) -> Result<(), TreeSidecarError>,
+        ) -> Result<(), TreeSidecarError>,
+    {
+        self.build_sorted_manifest_scratch_with_budget_and_output(
+            wal,
+            transaction,
+            memory_bytes,
+            ScratchOrder::HardlinkIdentityThenPath,
+            produce,
+        )
+        .map(|(scratch, ())| TreeHardlinkScratch(scratch))
+        .map_err(flatten_scratch_build)
     }
 
     #[cfg(test)]
@@ -184,6 +329,7 @@ impl TreeSidecarStore {
             wal,
             transaction,
             memory_bytes,
+            ScratchOrder::ManifestPath,
             produce,
         )
         .map(|(scratch, ())| scratch)
@@ -195,6 +341,7 @@ impl TreeSidecarStore {
         wal: &mut SealWal<RecoverySession>,
         transaction: TransactionId,
         memory_bytes: usize,
+        order: ScratchOrder,
         produce: P,
     ) -> Result<(TreeManifestScratch, T), TreeManifestScratchBuildError<E>>
     where
@@ -211,6 +358,7 @@ impl TreeSidecarStore {
             store: self,
             transaction,
             memory_bytes,
+            order,
             arena: Vec::with_capacity(memory_bytes),
             records: Vec::new(),
             runs: Vec::new(),
@@ -225,6 +373,218 @@ impl TreeSidecarStore {
         self.require_matching_wal(wal)?;
         self.revalidate_store_binding()?;
         Ok((scratch, output))
+    }
+
+    /// Opens a pull cursor over globally sorted fresh structure records. Run
+    /// identity and headers validate before return; complete run digests, codec
+    /// EOF, and cleanup are enforced by `finish_sorted_structure_scratch_cursor`.
+    pub(crate) fn open_sorted_structure_scratch_cursor(
+        &self,
+        wal: &mut SealWal<RecoverySession>,
+        transaction: TransactionId,
+        scratch: TreeStructureScratch,
+    ) -> Result<TreeStructureScratchCursor, TreeSidecarError> {
+        let mut scratch = scratch.0;
+        self.require_scratch_binding(transaction, &scratch, ScratchOrder::ManifestPath)?;
+        self.require_matching_wal(wal)?;
+        self.revalidate_store_binding()?;
+        self.collapse_runs(&mut scratch)?;
+        let readers = scratch
+            .runs
+            .iter()
+            .map(|run| ScratchRunReader::open(self, run, ScratchOrder::ManifestPath))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(TreeStructureScratchCursor {
+            scratch,
+            readers,
+            emitted: 0,
+            previous_path: Vec::new(),
+            has_previous: false,
+            semantic_error: None,
+        })
+    }
+
+    /// Drains and authenticates the complete structure scratch, then removes its
+    /// private runs and syncs the store. Scratch integrity/codec errors are
+    /// returned before any held-tree comparison error retained by the caller.
+    pub(crate) fn finish_sorted_structure_scratch_cursor(
+        &self,
+        wal: &mut SealWal<RecoverySession>,
+        mut cursor: TreeStructureScratchCursor,
+    ) -> Result<(), TreeSidecarError> {
+        let validation = (|| {
+            while !cursor.at_eof() {
+                let _ = cursor.consume_next()?;
+            }
+            let mut integrity_error = None;
+            for reader in cursor.readers {
+                if let Err(error) = reader.finish()
+                    && integrity_error.is_none()
+                {
+                    integrity_error = Some(error);
+                }
+            }
+            if let Some(error) = integrity_error {
+                return Err(error);
+            }
+            if let Some(error) = cursor.semantic_error {
+                return Err(error);
+            }
+            if cursor.emitted != cursor.scratch.record_count {
+                return Err(TreeSidecarError::InvalidScratch(
+                    "structure scratch record count changed",
+                ));
+            }
+            self.require_matching_wal(wal)?;
+            self.revalidate_store_binding()?;
+            self.remove_runs(&cursor.scratch.runs)?;
+            rustix::fs::fsync(&self.directory)
+                .map_err(|error| io_error(&self.path, error.into()))?;
+            self.require_matching_wal(wal)?;
+            self.revalidate_store_binding()
+        })();
+        // Normal execution must not accumulate unpublished runs. The leased
+        // store-wide cleanup can safely remove corrupt/partial scratch whose
+        // exact run handle was lost; published final sidecars are out of scope.
+        let cleanup = self.cleanup_unpublished(wal).map(|_| ());
+        match (validation, cleanup) {
+            (Err(primary), _) => Err(primary),
+            (Ok(()), Err(cleanup)) => Err(cleanup),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    /// Authenticates and folds final regular-file observations in strong-inode
+    /// groups. The sentinel, private key codec, run digests, strict global
+    /// ordering, aggregate count, cleanup, and store/WAL binding all validate
+    /// before a caller fold error can be returned.
+    pub(crate) fn fold_sorted_hardlink_scratch<A, E, F>(
+        &self,
+        wal: &mut SealWal<RecoverySession>,
+        transaction: TransactionId,
+        scratch: TreeHardlinkScratch,
+        mut accumulator: A,
+        mut fold: F,
+    ) -> Result<A, TreeSidecarFoldError<E>>
+    where
+        F: FnMut(&mut A, &[u8]) -> Result<(), E>,
+    {
+        let mut scratch = scratch.0;
+        let validation = (|| {
+            self.require_scratch_binding(
+                transaction,
+                &scratch,
+                ScratchOrder::HardlinkIdentityThenPath,
+            )?;
+            self.require_matching_wal(wal)?;
+            self.revalidate_store_binding()?;
+            self.collapse_runs(&mut scratch)?;
+            let mut saw_sentinel = false;
+            let mut semantic_error = None;
+            let mut fold_error = None;
+            let merged = self.merge_runs(&scratch.runs, scratch.order, |record| {
+                let key = record_path(record).expect("merged scratch records were validated");
+                if key == [0] {
+                    if saw_sentinel || record.len() != 9 {
+                        semantic_error.get_or_insert(TreeSidecarError::InvalidScratch(
+                            "hardlink scratch sentinel is invalid",
+                        ));
+                    }
+                    saw_sentinel = true;
+                } else if semantic_error.is_none()
+                    && fold_error.is_none()
+                    && let Err(error) = fold(&mut accumulator, record)
+                {
+                    fold_error = Some(error);
+                }
+                Ok::<(), std::convert::Infallible>(())
+            });
+            let emitted = match merged {
+                Ok(emitted) => emitted,
+                Err(ScratchMergeError::Scratch(error)) => return Err(error.into()),
+                Err(ScratchMergeError::Emit(never)) => match never {},
+            };
+            if emitted != scratch.record_count {
+                return Err(TreeSidecarError::InvalidScratch(
+                    "hardlink scratch record count changed",
+                )
+                .into());
+            }
+            if !saw_sentinel {
+                return Err(TreeSidecarError::InvalidScratch(
+                    "hardlink scratch sentinel is missing",
+                )
+                .into());
+            }
+            if let Some(error) = semantic_error {
+                return Err(error.into());
+            }
+            self.require_matching_wal(wal)?;
+            self.revalidate_store_binding()?;
+            self.remove_runs(&scratch.runs)?;
+            rustix::fs::fsync(&self.directory)
+                .map_err(|error| io_error(&self.path, error.into()))?;
+            self.require_matching_wal(wal)?;
+            self.revalidate_store_binding()?;
+            if let Some(error) = fold_error {
+                return Err(TreeSidecarFoldError::Fold(error));
+            }
+            Ok(accumulator)
+        })();
+        let cleanup = self.cleanup_unpublished(wal).map(|_| ());
+        match (validation, cleanup) {
+            (Err(TreeSidecarFoldError::Sidecar(primary)), _) => {
+                Err(TreeSidecarFoldError::Sidecar(primary))
+            }
+            (Err(TreeSidecarFoldError::Fold(_)), Err(cleanup)) | (Ok(_), Err(cleanup)) => {
+                Err(TreeSidecarFoldError::Sidecar(cleanup))
+            }
+            (Err(TreeSidecarFoldError::Fold(error)), Ok(())) => {
+                Err(TreeSidecarFoldError::Fold(error))
+            }
+            (Ok(accumulator), Ok(())) => Ok(accumulator),
+        }
+    }
+
+    /// Validates and globally decodes every sorted unpublished record, returning
+    /// only its fixed-size v3 fingerprint. The result is authority-neutral: the
+    /// runs remain unpublished, are revalidated again during publication, and
+    /// cannot become recovery evidence without the later exact WAL reference.
+    pub(crate) fn fingerprint_sorted_manifest_scratch(
+        &self,
+        wal: &mut SealWal<RecoverySession>,
+        transaction: TransactionId,
+        scratch: &mut TreeManifestScratch,
+    ) -> Result<DurableTreeManifest, TreeSidecarError> {
+        self.require_scratch_binding(transaction, scratch, ScratchOrder::ManifestPath)?;
+        self.require_matching_wal(wal)?;
+        self.revalidate_store_binding()?;
+        self.collapse_runs(scratch)?;
+        let mut decoder = ManifestV3Decoder::new(scratch.record_count).map_err(|_| {
+            TreeSidecarError::InvalidScratch("sorted scratch manifest has an invalid count")
+        })?;
+        let merged = self.merge_runs(&scratch.runs, scratch.order, |record| {
+            decoder.push_segment(1, record).map_err(|_| {
+                TreeSidecarError::InvalidScratch("sorted scratch v3 record validation failed")
+            })
+        });
+        match merged {
+            Ok(count) if count == scratch.record_count => {}
+            Ok(_) => {
+                return Err(TreeSidecarError::InvalidScratch(
+                    "sorted scratch record count changed",
+                ));
+            }
+            Err(ScratchMergeError::Scratch(error) | ScratchMergeError::Emit(error)) => {
+                return Err(error);
+            }
+        }
+        let manifest = decoder.finish().map_err(|_| {
+            TreeSidecarError::InvalidScratch("sorted scratch v3 manifest validation failed")
+        })?;
+        self.require_matching_wal(wal)?;
+        self.revalidate_store_binding()?;
+        Ok(manifest)
     }
 
     /// Authenticates and globally decodes every sorted scratch record, folding
@@ -246,7 +606,7 @@ impl TreeSidecarStore {
     where
         F: FnMut(A, ManifestV3Record<'_>) -> Result<A, E>,
     {
-        self.require_scratch_binding(transaction, scratch)?;
+        self.require_scratch_binding(transaction, scratch, ScratchOrder::ManifestPath)?;
         if expected_manifest.entry_count != scratch.record_count {
             return Err(TreeSidecarError::InvalidScratch(
                 "expected manifest count does not match scratch",
@@ -260,7 +620,7 @@ impl TreeSidecarStore {
             TreeSidecarError::InvalidScratch("sorted scratch manifest has an invalid count")
         })?;
         let mut accumulator = Some(initial);
-        let merged = self.merge_runs(&scratch.runs, |record| {
+        let merged = self.merge_runs(&scratch.runs, scratch.order, |record| {
             match decoder.push_segment_with(1, record, |typed| {
                 let current = accumulator
                     .take()
@@ -310,7 +670,7 @@ impl TreeSidecarStore {
         expected_manifest: DurableTreeManifest,
         mut scratch: TreeManifestScratch,
     ) -> Result<TreeSidecarCommitment, TreeSidecarError> {
-        self.require_scratch_binding(transaction, &scratch)?;
+        self.require_scratch_binding(transaction, &scratch, ScratchOrder::ManifestPath)?;
         if expected_manifest.entry_count != scratch.record_count {
             return Err(TreeSidecarError::InvalidScratch(
                 "expected manifest count does not match scratch",
@@ -320,6 +680,7 @@ impl TreeSidecarStore {
         self.revalidate_store_binding()?;
         self.collapse_runs(&mut scratch)?;
         let expected_records = scratch.record_count;
+        let order = scratch.order;
         // The runs move out for the duration of the merge; each one carries its
         // own held descriptor, so they are borrowed here rather than copied.
         let runs = std::mem::take(&mut scratch.runs);
@@ -330,7 +691,7 @@ impl TreeSidecarStore {
             {
                 let mut segment = SegmentBuilder::new(emit, &mut decoder);
                 let merged = self
-                    .merge_runs(&runs, |record| segment.push(record))
+                    .merge_runs(&runs, order, |record| segment.push(record))
                     .map_err(flatten_scratch_merge)?;
                 if merged != expected_records {
                     return Err(TreeSidecarError::InvalidScratch(
@@ -365,8 +726,10 @@ impl TreeSidecarStore {
         &self,
         transaction: TransactionId,
         scratch: &TreeManifestScratch,
+        expected_order: ScratchOrder,
     ) -> Result<(), TreeSidecarError> {
         if scratch.transaction != transaction
+            || scratch.order != expected_order
             || scratch.binding
                 != (ScratchBinding {
                     device: self.device,
@@ -411,7 +774,8 @@ impl TreeSidecarStore {
                     .ok_or(TreeSidecarError::InvalidScratch(
                         "scratch merge level overflow",
                     ))?;
-                let output = self.create_merged_run(scratch.transaction, &group, level)?;
+                let output =
+                    self.create_merged_run(scratch.transaction, &group, level, scratch.order)?;
                 self.remove_runs(&group)?;
                 next.push(output);
             }
@@ -437,10 +801,11 @@ impl TreeSidecarStore {
         transaction: TransactionId,
         runs: &[ScratchRun],
         level: u8,
+        order: ScratchOrder,
     ) -> Result<ScratchRun, TreeSidecarError> {
         let mut writer = ScratchRunWriter::create(self, transaction)?;
         let count = self
-            .merge_runs(runs, |record| writer.push(record))
+            .merge_runs(runs, order, |record| writer.push(record))
             .map_err(flatten_scratch_merge)?;
         writer.finish(count, level)
     }
@@ -448,6 +813,7 @@ impl TreeSidecarStore {
     fn merge_runs<E>(
         &self,
         runs: &[ScratchRun],
+        order: ScratchOrder,
         mut emit: impl FnMut(&[u8]) -> Result<(), E>,
     ) -> Result<u64, ScratchMergeError<E>> {
         debug_assert_eq!(
@@ -459,7 +825,7 @@ impl TreeSidecarStore {
         }
         let mut readers = runs
             .iter()
-            .map(|run| ScratchRunReader::open(self, run))
+            .map(|run| ScratchRunReader::open(self, run, order))
             .collect::<Result<Vec<_>, _>>()?;
         let mut emitted = 0_u64;
         let mut previous_path = Vec::new();
@@ -470,12 +836,13 @@ impl TreeSidecarStore {
                 .enumerate()
                 .filter(|(_, reader)| reader.current.is_some())
                 .min_by(|(_, left), (_, right)| {
-                    record_path(left.current.as_deref().unwrap())
-                        .expect("opened scratch records were validated")
-                        .cmp(
-                            record_path(right.current.as_deref().unwrap())
-                                .expect("opened scratch records were validated"),
-                        )
+                    compare_scratch_keys(
+                        order,
+                        record_path(left.current.as_deref().unwrap())
+                            .expect("opened scratch records were validated"),
+                        record_path(right.current.as_deref().unwrap())
+                            .expect("opened scratch records were validated"),
+                    )
                 })
                 .map(|(index, _)| index);
             let Some(selected) = selected else {
@@ -486,9 +853,11 @@ impl TreeSidecarStore {
                 .as_deref()
                 .expect("selected scratch reader has a record");
             let path = record_path(record)?;
-            if has_previous && previous_path.as_slice() >= path {
+            if has_previous
+                && compare_scratch_keys(order, &previous_path, path) != std::cmp::Ordering::Less
+            {
                 return Err(TreeSidecarError::InvalidScratch(
-                    "scratch paths are not in strict raw-byte order",
+                    "scratch paths are not in strict component order",
                 )
                 .into());
             }
@@ -534,7 +903,8 @@ impl RunBuilder<'_> {
                 "scratch record count exceeds the sidecar limit",
             ));
         }
-        record_path(record)?;
+        let key = record_path(record)?;
+        validate_scratch_key(self.order, key)?;
         if record.len() > MAX_SEGMENT_PAYLOAD {
             return Err(TreeSidecarError::InvalidScratch(
                 "one scratch record exceeds 1 MiB",
@@ -596,9 +966,11 @@ impl RunBuilder<'_> {
         self.records.sort_unstable_by(|left, right| {
             let left = &self.arena[left.offset..left.offset + left.length];
             let right = &self.arena[right.offset..right.offset + right.length];
-            record_path(left)
-                .expect("buffered scratch records were validated")
-                .cmp(record_path(right).expect("buffered scratch records were validated"))
+            compare_scratch_keys(
+                self.order,
+                record_path(left).expect("buffered scratch records were validated"),
+                record_path(right).expect("buffered scratch records were validated"),
+            )
         });
         let mut writer = ScratchRunWriter::create(self.store, self.transaction)?;
         for index in &self.records {
@@ -635,9 +1007,9 @@ impl RunBuilder<'_> {
                 .ok_or(TreeSidecarError::InvalidScratch(
                     "scratch merge level overflow",
                 ))?;
-            let output = self
-                .store
-                .create_merged_run(self.transaction, &group, next_level)?;
+            let output =
+                self.store
+                    .create_merged_run(self.transaction, &group, next_level, self.order)?;
             self.store.remove_runs(&group)?;
             retained.push(output);
             self.runs = retained;
@@ -659,6 +1031,7 @@ impl RunBuilder<'_> {
                 wal_inode: self.store.wal_inode,
             },
             record_count: self.record_count,
+            order: self.order,
             runs: self.runs,
         })
     }
@@ -782,9 +1155,77 @@ impl<'a> ScratchRunWriter<'a> {
     }
 }
 
+impl TreeStructureScratchCursor {
+    pub(crate) fn next(&mut self) -> Result<Option<StructureEvidence>, TreeSidecarError> {
+        self.consume_next()
+    }
+
+    fn at_eof(&self) -> bool {
+        self.readers.iter().all(|reader| reader.current.is_none())
+    }
+
+    fn consume_next(&mut self) -> Result<Option<StructureEvidence>, TreeSidecarError> {
+        let selected = self
+            .readers
+            .iter()
+            .enumerate()
+            .filter(|(_, reader)| reader.current.is_some())
+            .min_by(|(_, left), (_, right)| {
+                compare_manifest_paths(
+                    record_path(left.current.as_deref().unwrap())
+                        .expect("opened scratch records were path-validated"),
+                    record_path(right.current.as_deref().unwrap())
+                        .expect("opened scratch records were path-validated"),
+                )
+            })
+            .map(|(index, _)| index);
+        let Some(selected) = selected else {
+            return Ok(None);
+        };
+        let record = self.readers[selected]
+            .current
+            .as_deref()
+            .expect("selected structure scratch reader has a record");
+        let path = record_path(record)?;
+        if self.has_previous
+            && compare_manifest_paths(&self.previous_path, path) != std::cmp::Ordering::Less
+            && self.semantic_error.is_none()
+        {
+            self.semantic_error = Some(TreeSidecarError::InvalidScratch(
+                "structure scratch paths are not in strict component order",
+            ));
+        }
+        self.previous_path.clear();
+        self.previous_path.extend_from_slice(path);
+        self.has_previous = true;
+        let evidence = if self.semantic_error.is_none() {
+            match decode_structure_record(record) {
+                Ok(evidence) => Some(evidence),
+                Err(_) => {
+                    self.semantic_error = Some(TreeSidecarError::InvalidScratch(
+                        "structure scratch record validation failed",
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.readers[selected].advance()?;
+        self.emitted = self
+            .emitted
+            .checked_add(1)
+            .ok_or(TreeSidecarError::InvalidScratch(
+                "structure scratch record count overflow",
+            ))?;
+        Ok(evidence)
+    }
+}
+
 struct ScratchRunReader {
     path: PathBuf,
     file: File,
+    order: ScratchOrder,
     expected_digest: [u8; 32],
     expected_payload_bytes: u64,
     expected_records: u64,
@@ -795,7 +1236,11 @@ struct ScratchRunReader {
 }
 
 impl ScratchRunReader {
-    fn open(store: &TreeSidecarStore, run: &ScratchRun) -> Result<Self, TreeSidecarError> {
+    fn open(
+        store: &TreeSidecarStore,
+        run: &ScratchRun,
+        order: ScratchOrder,
+    ) -> Result<Self, TreeSidecarError> {
         let path = store.path.join(&run.name);
         // The run is read through the descriptor taken when it was written, so
         // the name is never resolved a second time. `validate_file` re-binds
@@ -857,6 +1302,7 @@ impl ScratchRunReader {
         let mut reader = Self {
             path,
             file,
+            order,
             expected_digest,
             expected_payload_bytes: payload_bytes,
             expected_records: records,
@@ -870,7 +1316,7 @@ impl ScratchRunReader {
     }
 
     fn advance(&mut self) -> Result<(), TreeSidecarError> {
-        if self.current.take().is_none() {
+        if self.current.is_none() {
             return Err(TreeSidecarError::InvalidScratch(
                 "scratch reader advanced past EOF",
             ));
@@ -898,7 +1344,8 @@ impl ScratchRunReader {
         self.file
             .read_exact(&mut record)
             .map_err(|error| io_error(&self.path, error))?;
-        record_path(&record)?;
+        let key = record_path(&record)?;
+        validate_scratch_key(self.order, key)?;
         self.digest.update(length_bytes);
         self.digest.update(&record);
         self.payload_bytes = self

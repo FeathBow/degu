@@ -7,8 +7,10 @@
 
 use crate::authority::TransactionState;
 use crate::backend::held::{
-    HeldTreeError, HeldTreeInventory, HeldTreeLimits, HeldTreeSealError, ManifestV3CodecError,
-    ManifestV3Decoder, ManifestV3StreamError,
+    HardlinkTopologyFold, HeldTreeError, HeldTreeInventory, HeldTreeLimits, HeldTreeSealError,
+    HeldTreeV3CollectError, ManifestV3CodecError, PendingV3Inventory, StreamedV3Inventory,
+    StructureEvidence, decode_hardlink_scratch_record, hardlink_scratch_sentinel_record,
+    structure_evidence_from_v3_record,
 };
 use crate::backend::{
     CertificationError, HeldLocalBackendEvidence, LocalModeRevalidationFailure, certify_held_fd,
@@ -17,7 +19,10 @@ use crate::seal::executor::{
     LocalModeExecutionError, LocalModeMutationRequest, LocalModeMutationResult, LocalModeTransform,
     RecoveryLocator, execute_staging_local_mode_mutation,
 };
-use crate::seal::sidecar::{TreeSidecarError, TreeSidecarFoldError, TreeSidecarStore};
+use crate::seal::sidecar::{
+    TreeManifestFoldError, TreeManifestScratchBuildError, TreeSidecarCommitment, TreeSidecarError,
+    TreeSidecarFoldError, TreeSidecarStore, TreeStructureScratchCursor,
+};
 use crate::seal::wal::{
     AppendError, DurableSourceParentStrategy, DurableTreeManifest, RecoverySession, SealWal,
     StagingLocator, StagingTransactionMetadata, StrongObjectIdentity, TransactionId,
@@ -43,6 +48,8 @@ std::thread_local! {
     static AFTER_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     static AFTER_PRE_SEAL_INVENTORY_DROPPED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static AFTER_STRUCTURE_SIDECAR_PREFLIGHT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     static FAIL_PARENT_SYNC: std::cell::Cell<Option<&'static str>> =
         const { std::cell::Cell::new(None) };
@@ -323,6 +330,12 @@ impl FreshlyConfirmedSourceResident {
     }
 }
 
+#[derive(Debug)]
+enum PostSealProducerError {
+    Binding(PreparedRootError),
+    Collect(HeldTreeV3CollectError<TreeSidecarError>),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StagingRenameError {
     #[error("startup recovery or another active transaction blocks new staging")]
@@ -376,7 +389,7 @@ pub(crate) struct StagedUnverifiedTree<'a> {
     _staged_root: OwnedFd,
     _source_parent_seal: HeldLocalBackendEvidence,
     _destination_parent_evidence: HeldLocalBackendEvidence,
-    _sealed_tree: HeldTreeInventory,
+    _sealed_tree: StreamedV3Inventory,
 }
 
 impl StagedUnverifiedTree<'_> {
@@ -478,46 +491,173 @@ pub(crate) fn execute_prepared_rename<'a>(
             hook();
         }
     });
-    let post_seal = collect_source_tree(&binding)?;
+    let produced =
+        sidecars.build_sorted_manifest_scratch_with_output(wal, transaction, |emit_record| {
+            let parent = certify_duplicate(&binding.source_parent)
+                .map_err(PostSealProducerError::Binding)?;
+            PendingV3Inventory::collect(
+                parent,
+                binding.metadata.source_basename(),
+                crate::backend::held_tree_protected_names(),
+                HeldTreeLimits::default(),
+                emit_record,
+            )
+            .map_err(PostSealProducerError::Collect)
+        });
+    let (mut scratch, pending) = match produced {
+        Ok(produced) => produced,
+        Err(TreeManifestScratchBuildError::Sidecar(error)) => {
+            let _ = sidecars.cleanup_unpublished(wal);
+            return Err(StagingRenameError::Sidecar(error));
+        }
+        Err(TreeManifestScratchBuildError::Produce(PostSealProducerError::Binding(error))) => {
+            let _ = sidecars.cleanup_unpublished(wal);
+            return Err(StagingRenameError::Binding(error));
+        }
+        Err(TreeManifestScratchBuildError::Produce(PostSealProducerError::Collect(error))) => {
+            let _ = sidecars.cleanup_unpublished(wal);
+            return Err(match error {
+                HeldTreeV3CollectError::Tree(error) => StagingRenameError::HeldTree(error),
+                HeldTreeV3CollectError::Codec(error) => StagingRenameError::ManifestCodec(error),
+                HeldTreeV3CollectError::Emit(error) => StagingRenameError::Sidecar(error),
+            });
+        }
+    };
+    let pending_manifest =
+        match sidecars.fingerprint_sorted_manifest_scratch(wal, transaction, &mut scratch) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let _ = sidecars.cleanup_unpublished(wal);
+                return Err(StagingRenameError::Sidecar(error));
+            }
+        };
+    let finalizer = match pending.into_finalizer(pending_manifest) {
+        Ok(finalizer) => finalizer,
+        Err(error) => {
+            let _ = sidecars.cleanup_unpublished(wal);
+            return Err(StagingRenameError::HeldTree(error));
+        }
+    };
+    // The exact scratch is completely merged, decoded, fingerprint-matched,
+    // synced, and published before any record drives held-tree reobservation.
+    // Failure below leaves only a self-authenticating unreferenced final orphan;
+    // it still cannot authorize recovery because the WAL reference is written last.
+    let commitment =
+        match sidecars.publish_sorted_manifest_scratch(wal, transaction, pending_manifest, scratch)
+        {
+            Ok(commitment) => commitment,
+            Err(error) => {
+                let _ = sidecars.cleanup_unpublished(wal);
+                return Err(StagingRenameError::Sidecar(error));
+            }
+        };
+    let hardlink_build =
+        sidecars.build_sorted_hardlink_scratch_with_output(wal, transaction, |emit_hardlink| {
+            emit_hardlink(hardlink_scratch_sentinel_record()).map_err(|error| {
+                TreeManifestFoldError::Fold(HeldTreeV3CollectError::Emit(error))
+            })?;
+            sidecars.read_manifest_v3_fold(
+                commitment,
+                pending_manifest,
+                finalizer,
+                |finalizer, record| finalizer.observe(record, emit_hardlink),
+            )
+        });
+    let (hardlink_scratch, (finalizer, authenticated_manifest)) = match hardlink_build {
+        Ok(result) => result,
+        Err(error) => {
+            let primary = match error {
+                TreeManifestScratchBuildError::Sidecar(error) => StagingRenameError::Sidecar(error),
+                TreeManifestScratchBuildError::Produce(TreeManifestFoldError::Sidecar(error)) => {
+                    StagingRenameError::Sidecar(error)
+                }
+                TreeManifestScratchBuildError::Produce(TreeManifestFoldError::Codec(error)) => {
+                    StagingRenameError::ManifestCodec(error)
+                }
+                TreeManifestScratchBuildError::Produce(
+                    TreeManifestFoldError::FingerprintMismatch,
+                ) => StagingRenameError::ManifestMismatch,
+                TreeManifestScratchBuildError::Produce(TreeManifestFoldError::Fold(
+                    HeldTreeV3CollectError::Tree(error),
+                )) => StagingRenameError::HeldTree(error),
+                TreeManifestScratchBuildError::Produce(TreeManifestFoldError::Fold(
+                    HeldTreeV3CollectError::Codec(error),
+                )) => StagingRenameError::ManifestCodec(error),
+                TreeManifestScratchBuildError::Produce(TreeManifestFoldError::Fold(
+                    HeldTreeV3CollectError::Emit(error),
+                )) => StagingRenameError::Sidecar(error),
+            };
+            let authenticated =
+                authenticate_streamed_v3_manifest(sidecars, commitment, pending_manifest);
+            let _ = sidecars.cleanup_unpublished(wal);
+            authenticated?;
+            return Err(primary);
+        }
+    };
+    let hardlink_fold = sidecars.fold_sorted_hardlink_scratch(
+        wal,
+        transaction,
+        hardlink_scratch,
+        HardlinkTopologyFold::new(),
+        |groups, record| {
+            let record = decode_hardlink_scratch_record(record)
+                .map_err(HeldTreeV3CollectError::<std::convert::Infallible>::Codec)?
+                .ok_or(HeldTreeV3CollectError::Codec(
+                    ManifestV3CodecError::InvalidTag,
+                ))?;
+            groups.observe(record).map_err(HeldTreeV3CollectError::Tree)
+        },
+    );
+    let hardlink_fold = match hardlink_fold {
+        Ok(fold) => fold,
+        Err(error) => {
+            let primary = match error {
+                TreeSidecarFoldError::Sidecar(error) => StagingRenameError::Sidecar(error),
+                TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Tree(error)) => {
+                    StagingRenameError::HeldTree(error)
+                }
+                TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Codec(_)) => {
+                    StagingRenameError::Sidecar(TreeSidecarError::InvalidScratch(
+                        "hardlink scratch record validation failed",
+                    ))
+                }
+                TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Emit(never)) => match never {},
+            };
+            authenticate_streamed_v3_manifest(sidecars, commitment, pending_manifest)?;
+            return Err(primary);
+        }
+    };
+    let hardlinks = match hardlink_fold.finish() {
+        Ok(topology) => topology,
+        Err(error) => {
+            authenticate_streamed_v3_manifest(sidecars, commitment, pending_manifest)?;
+            return Err(StagingRenameError::HeldTree(error));
+        }
+    };
+    let post_seal = match finalizer.finish(authenticated_manifest, hardlinks) {
+        Ok(post_seal) => post_seal,
+        Err(error) => {
+            authenticate_streamed_v3_manifest(sidecars, commitment, pending_manifest)?;
+            return Err(StagingRenameError::HeldTree(error));
+        }
+    };
     let fingerprint = post_seal_expectation.verify(&post_seal)?;
-    post_seal.rewalk_structure()?;
     let manifest = DurableTreeManifest {
         schema_version: fingerprint.schema_version,
         entry_count: fingerprint.entry_count,
         sha256: fingerprint.sha256,
     };
-    // Publication is complete and the store directory is durable before the
-    // commitment can enter the WAL. A failure after publication can leave a
-    // self-authenticating final orphan plus cleanup-eligible unpublished scratch;
-    // neither authorizes recovery.
-    let scratch = sidecars.build_sorted_manifest_scratch(wal, transaction, |emit_record| {
-        post_seal
-            .stream_manifest_v3_records(emit_record)
-            .map_err(|error| match error {
-                ManifestV3StreamError::Codec(_) => TreeSidecarError::InvalidScratch(
-                    "the collected v3 manifest could not be spooled",
-                ),
-                ManifestV3StreamError::Emit(error) => error,
-            })
-    })?;
-    let commitment =
-        sidecars.publish_sorted_manifest_scratch(wal, transaction, manifest, scratch)?;
-    // Reopen and decode the published bytes before creating their durable WAL
-    // reference. This proves both the generic container commitment and the
-    // concrete v3 manifest/count/fingerprint binding.
-    let decoder = ManifestV3Decoder::new(commitment.record_count())?;
-    let decoder = sidecars
-        .read_fold(commitment, decoder, |mut decoder, record_count, payload| {
-            decoder.push_segment(record_count, payload)?;
-            Ok(decoder)
-        })
-        .map_err(|error| match error {
-            TreeSidecarFoldError::Sidecar(error) => StagingRenameError::Sidecar(error),
-            TreeSidecarFoldError::Fold(error) => StagingRenameError::ManifestCodec(error),
-        })?;
-    if decoder.finish()? != manifest {
+    if manifest != pending_manifest {
         return Err(StagingRenameError::ManifestMismatch);
     }
+    rewalk_streamed_v3_structure(
+        wal,
+        sidecars,
+        transaction,
+        commitment,
+        pending_manifest,
+        &post_seal,
+    )?;
     #[cfg(test)]
     if FAIL_WAL_STEP.with(|failure| failure.get() == Some("manifest-reference")) {
         wal.poison_for_test();
@@ -525,7 +665,14 @@ pub(crate) fn execute_prepared_rename<'a>(
     wal.complete_tree_manifest_with_sidecar(transaction, manifest, commitment)?;
     wal.transition_staging_foundation(transaction, TransactionState::TreeSealed)?;
 
-    post_seal.rewalk_structure()?;
+    rewalk_streamed_v3_structure(
+        wal,
+        sidecars,
+        transaction,
+        commitment,
+        pending_manifest,
+        &post_seal,
+    )?;
     binding.verify_before_rename()?;
     wal.record_rename_intent(transaction)?;
     #[cfg(test)]
@@ -608,6 +755,188 @@ pub(crate) fn execute_prepared_rename<'a>(
         _destination_parent_evidence: binding.destination_parent_held,
         _sealed_tree: post_seal,
     })
+}
+
+fn authenticate_streamed_v3_manifest(
+    sidecars: &TreeSidecarStore,
+    commitment: TreeSidecarCommitment,
+    manifest: DurableTreeManifest,
+) -> Result<(), StagingRenameError> {
+    sidecars
+        .read_manifest_v3_fold(commitment, manifest, (), |(), _| {
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .map(|_| ())
+        .map_err(|error| match error {
+            TreeManifestFoldError::Sidecar(error) => StagingRenameError::Sidecar(error),
+            TreeManifestFoldError::Codec(error) => StagingRenameError::ManifestCodec(error),
+            TreeManifestFoldError::FingerprintMismatch => StagingRenameError::ManifestMismatch,
+            TreeManifestFoldError::Fold(never) => match never {},
+        })
+}
+
+struct StreamedStructureComparison {
+    actual: Option<StructureEvidence>,
+    scratch_error: Option<TreeSidecarError>,
+    first_tree_error: Option<HeldTreeError>,
+}
+
+impl StreamedStructureComparison {
+    fn observe(
+        &mut self,
+        cursor: &mut TreeStructureScratchCursor,
+        expected: crate::backend::held::ManifestV3Record<'_>,
+    ) {
+        let expected = structure_evidence_from_v3_record(expected);
+        loop {
+            if self.actual.is_none() && self.scratch_error.is_none() {
+                match cursor.next() {
+                    Ok(actual) => self.actual = actual,
+                    Err(error) => self.scratch_error = Some(error),
+                }
+            }
+            if self.scratch_error.is_some() {
+                return;
+            }
+            let Some(actual) = self.actual.as_ref() else {
+                self.record_tree_error(HeldTreeError::PostRemoved(expected.path().to_path_buf()));
+                return;
+            };
+            match expected.path().cmp(actual.path()) {
+                std::cmp::Ordering::Less => {
+                    self.record_tree_error(HeldTreeError::PostRemoved(
+                        expected.path().to_path_buf(),
+                    ));
+                    return;
+                }
+                std::cmp::Ordering::Greater => {
+                    let path = actual.path().to_path_buf();
+                    self.actual = None;
+                    self.record_tree_error(HeldTreeError::PostAdded(path));
+                }
+                std::cmp::Ordering::Equal => {
+                    if expected != *actual {
+                        self.record_tree_error(HeldTreeError::PostChanged(
+                            expected.path().to_path_buf(),
+                        ));
+                    }
+                    self.actual = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn record_tree_error(&mut self, error: HeldTreeError) {
+        if self.first_tree_error.is_none() {
+            self.first_tree_error = Some(error);
+        }
+    }
+}
+
+fn rewalk_streamed_v3_structure(
+    wal: &mut SealWal<RecoverySession>,
+    sidecars: &TreeSidecarStore,
+    transaction: TransactionId,
+    commitment: TreeSidecarCommitment,
+    manifest: DurableTreeManifest,
+    tree: &StreamedV3Inventory,
+) -> Result<(), StagingRenameError> {
+    // A corrupt published baseline must win over a traversal/scratch producer
+    // error. Recheck it again on every early exit before the authenticated fold.
+    sidecars.verify(commitment)?;
+    #[cfg(test)]
+    AFTER_STRUCTURE_SIDECAR_PREFLIGHT.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    let produced =
+        sidecars.build_sorted_structure_scratch_with_output(wal, transaction, |emit_record| {
+            tree.stream_structure_records(emit_record)
+        });
+    let (scratch, ()) = match produced {
+        Ok(produced) => produced,
+        Err(error) => {
+            let authenticated = authenticate_streamed_v3_manifest(sidecars, commitment, manifest);
+            let primary = match error {
+                TreeManifestScratchBuildError::Sidecar(error) => StagingRenameError::Sidecar(error),
+                TreeManifestScratchBuildError::Produce(HeldTreeV3CollectError::Tree(error)) => {
+                    StagingRenameError::HeldTree(error)
+                }
+                TreeManifestScratchBuildError::Produce(HeldTreeV3CollectError::Codec(error)) => {
+                    StagingRenameError::ManifestCodec(error)
+                }
+                TreeManifestScratchBuildError::Produce(HeldTreeV3CollectError::Emit(error)) => {
+                    StagingRenameError::Sidecar(error)
+                }
+            };
+            let _ = sidecars.cleanup_unpublished(wal);
+            authenticated?;
+            return Err(primary);
+        }
+    };
+    let cursor = match sidecars.open_sorted_structure_scratch_cursor(wal, transaction, scratch) {
+        Ok(cursor) => cursor,
+        Err(error) => {
+            let authenticated = authenticate_streamed_v3_manifest(sidecars, commitment, manifest);
+            let _ = sidecars.cleanup_unpublished(wal);
+            authenticated?;
+            return Err(StagingRenameError::Sidecar(error));
+        }
+    };
+    let mut cursor = cursor;
+    let comparison = StreamedStructureComparison {
+        actual: None,
+        scratch_error: None,
+        first_tree_error: None,
+    };
+    let mut comparison = comparison;
+    let sidecar_result =
+        sidecars.read_manifest_v3_fold(commitment, manifest, (), |(), expected| {
+            comparison.observe(&mut cursor, expected);
+            Ok::<(), std::convert::Infallible>(())
+        });
+    if let Err(error) = sidecar_result {
+        let primary = match error {
+            TreeManifestFoldError::Sidecar(error) => StagingRenameError::Sidecar(error),
+            TreeManifestFoldError::Codec(error) => StagingRenameError::ManifestCodec(error),
+            TreeManifestFoldError::FingerprintMismatch => StagingRenameError::ManifestMismatch,
+            TreeManifestFoldError::Fold(never) => match never {},
+        };
+        let _ = sidecars.finish_sorted_structure_scratch_cursor(wal, cursor);
+        return Err(primary);
+    }
+
+    while comparison.actual.is_some()
+        || (comparison.scratch_error.is_none()
+            && cursor
+                .next()
+                .map(|actual| {
+                    comparison.actual = actual;
+                    comparison.actual.is_some()
+                })
+                .unwrap_or_else(|error| {
+                    comparison.scratch_error = Some(error);
+                    false
+                }))
+    {
+        if let Some(actual) = comparison.actual.take() {
+            comparison.record_tree_error(HeldTreeError::PostAdded(actual.path().to_path_buf()));
+        }
+    }
+
+    if let Err(error) = sidecars.finish_sorted_structure_scratch_cursor(wal, cursor) {
+        return Err(StagingRenameError::Sidecar(error));
+    }
+    if let Some(error) = comparison.scratch_error {
+        return Err(StagingRenameError::Sidecar(error));
+    }
+    if let Some(error) = comparison.first_tree_error {
+        return Err(StagingRenameError::HeldTree(error));
+    }
+    tree.finish_streamed_structure_rewalk()?;
+    Ok(())
 }
 
 fn collect_source_tree(

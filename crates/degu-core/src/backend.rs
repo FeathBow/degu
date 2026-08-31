@@ -758,6 +758,13 @@ impl HeldLocalBackendEvidence {
         operation(self.fd.as_fd())
     }
 
+    /// Child held-tree traversal may transfer an already-certified duplicate
+    /// into a read-only directory stream. The consuming seam prevents the same
+    /// descriptor from existing simultaneously as mutation evidence and a DIR.
+    fn into_authority_fd(self) -> OwnedFd {
+        self.fd
+    }
+
     pub(crate) fn prepare_minimal_seal(
         &mut self,
         acquire_owner_write_search: bool,

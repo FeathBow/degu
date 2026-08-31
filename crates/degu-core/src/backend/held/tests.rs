@@ -1491,10 +1491,37 @@ fn v3_directory_mode_projection_hashes_in_place_without_changing_codec_bytes() {
         }
     }
 
+    let expected = fingerprint_manifest_v3(&projected);
     assert_eq!(
         inventory.fingerprint_with_directory_modes(&modes).unwrap(),
-        fingerprint_manifest_v3(&projected)
+        expected
     );
+
+    let mut streamed_digest = Sha256::new();
+    streamed_digest.update(MANIFEST_DOMAIN_V3);
+    streamed_digest.update((inventory.manifest.len() as u64).to_be_bytes());
+    let mut decoder = ManifestV3Decoder::new(inventory.manifest.len() as u64).unwrap();
+    for entry in &inventory.manifest {
+        let mut encoded = Vec::new();
+        emit_manifest_entry_v3(entry, |bytes| encoded.extend_from_slice(bytes));
+        decoder
+            .push_segment_with(1, &encoded, |record| {
+                let mode = modes.get(&entry.path).copied().unwrap_or(record.mode);
+                update_manifest_v3_digest_with_mode(&mut streamed_digest, record, mode)
+            })
+            .unwrap();
+    }
+    decoder.finish().unwrap();
+    assert_eq!(
+        HeldTreeFingerprint {
+            schema_version: CONTENT_PROOF_VERSION,
+            entry_count: inventory.manifest.len() as u64,
+            sha256: streamed_digest.finalize().into(),
+        },
+        expected,
+        "streamed pre-seal mode substitution must remain byte-identical to the v3 codec"
+    );
+
     let mut missing = modes.clone();
     missing.remove(Path::new("a"));
     assert!(matches!(
@@ -2320,6 +2347,84 @@ fn rewalk_rejects_acl_planted_after_collect() {
             ..
         })
     ));
+}
+
+#[test]
+fn pre_seal_v3_stream_moves_the_historical_bfs_permission_plan_out_of_resident_state() {
+    let (temp, root) = setup_tree();
+    for path in ["z", "z/left", "a", "a/right", "z/left/deep"] {
+        std::fs::create_dir_all(root.join(path)).unwrap();
+    }
+    for index in 0_u32..256 {
+        std::fs::write(
+            root.join(format!("payload-{index:04}")),
+            index.to_be_bytes(),
+        )
+        .unwrap();
+    }
+
+    let baseline = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    let expected_directories = baseline.directories.clone();
+    let mut expected_records = Vec::new();
+    baseline
+        .stream_manifest_v3_records(|record| {
+            expected_records.push(record.to_vec());
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap();
+
+    let mut streamed_records = Vec::new();
+    let collected = PendingV3Inventory::collect_pre_seal(
+        certify_held_fd(open_directory(temp.path())).unwrap(),
+        OsStr::new("root"),
+        vec![],
+        HeldTreeLimits::default(),
+        |record| {
+            streamed_records.push(record.to_vec());
+            Ok::<(), std::convert::Infallible>(())
+        },
+    )
+    .unwrap();
+    streamed_records.sort_by(|left, right| {
+        let left_len = u64::from_be_bytes(left[..8].try_into().unwrap()) as usize;
+        let right_len = u64::from_be_bytes(right[..8].try_into().unwrap()) as usize;
+        compare_manifest_paths(&left[8..8 + left_len], &right[8..8 + right_len])
+    });
+
+    assert_eq!(collected.resident_manifest_entries_for_test(), 0);
+    assert_eq!(
+        collected.resident_directory_entries_for_test(),
+        expected_directories.len()
+    );
+    let mut encoded_plan = Vec::new();
+    let pending = collected
+        .emit_directory_plan(|record| {
+            encoded_plan.push(record.to_vec());
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap();
+    let decoded_plan = encoded_plan
+        .iter()
+        .map(|record| decode_pre_seal_directory_plan_record(record).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(pending.resident_manifest_entries_for_test(), 0);
+    assert_eq!(pending.resident_directory_entries_for_test(), 0);
+    assert_eq!(pending.entry_count(), baseline.entry_count());
+    assert_eq!(pending.directory_count(), expected_directories.len() as u64);
+    assert_eq!(
+        decoded_plan
+            .iter()
+            .map(|record| record.evidence.clone())
+            .collect::<Vec<_>>(),
+        expected_directories
+    );
+    assert!(
+        decoded_plan
+            .iter()
+            .enumerate()
+            .all(|(ordinal, record)| record.ordinal == ordinal as u64)
+    );
+    assert_eq!(streamed_records, expected_records);
 }
 
 #[test]

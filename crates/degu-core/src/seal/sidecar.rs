@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod scratch;
+#[cfg(test)]
+pub(crate) use scratch::TreeDirectoryPlan;
 pub(crate) use scratch::{
     TreeManifestScratchBuildError, TreePurgePlan, TreeStructureScratchCursor,
 };
@@ -2248,7 +2250,7 @@ mod tests {
                 expected,
                 &mut scratch,
                 Vec::new(),
-                |mut visited, record| {
+                |mut visited, record, _wal| {
                     visited.push((record.path.to_vec(), record.kind));
                     Ok::<_, std::convert::Infallible>(visited)
                 },
@@ -2263,6 +2265,229 @@ mod tests {
             ]
         );
         assert_eq!(store.cleanup_unpublished(&mut wal).unwrap(), 1);
+    }
+
+    #[test]
+    fn directory_plan_is_anonymous_authenticated_and_exactly_reverse_bfs() {
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(44);
+        let records = vec![
+            b"root\xff".to_vec(),
+            b"child-a\x80".to_vec(),
+            b"child-b\xfe".to_vec(),
+        ];
+        let (mut plan, output) = store
+            .build_directory_plan_with_output(&mut wal, transaction, records.len() as u64, |emit| {
+                for record in &records {
+                    emit(record)?;
+                }
+                Ok::<_, TreeSidecarError>(91_u64)
+            })
+            .unwrap();
+        assert_eq!(output, 91);
+        assert_eq!(plan.link_count_for_test(), 0);
+        assert!(
+            std::fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .all(|name| !name.to_string_lossy().starts_with(".tree-scratch-v1-")),
+            "directory plan must be descriptor-only before it is returned"
+        );
+        plan.authenticate().unwrap();
+        let mut forward = Vec::new();
+        plan.for_each_forward(|record| {
+            forward.push(record.to_vec());
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap();
+        assert_eq!(forward, records);
+        let mut reverse = Vec::new();
+        while let Some(record) = plan.next_reverse().unwrap() {
+            reverse.push(record);
+        }
+        assert_eq!(reverse, records.into_iter().rev().collect::<Vec<_>>());
+        plan.finish().unwrap();
+    }
+
+    #[test]
+    fn directory_plan_producer_failure_leaves_no_named_residue() {
+        #[derive(Debug, Eq, PartialEq)]
+        struct Stop;
+
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(46);
+        let result = store.build_directory_plan_with_output(&mut wal, transaction, 2, |emit| {
+            emit(b"root").map_err(|_| Stop)?;
+            Err::<(), _>(Stop)
+        });
+        assert!(matches!(
+            result,
+            Err(TreeManifestScratchBuildError::Produce(Stop))
+        ));
+        assert!(
+            std::fs::read_dir(root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .all(|name| !name.to_string_lossy().starts_with(".tree-scratch-v1-"))
+        );
+    }
+
+    #[test]
+    fn directory_plan_frame_tamper_after_preflight_fails_before_use() {
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(45);
+        let mut plan = store
+            .build_directory_plan_with_output(&mut wal, transaction, 2, |emit| {
+                emit(b"root")?;
+                emit(b"child")?;
+                Ok::<(), TreeSidecarError>(())
+            })
+            .unwrap()
+            .0;
+        plan.authenticate().unwrap();
+        plan.corrupt_frame_for_test(1);
+        assert!(matches!(
+            plan.next_reverse(),
+            Err(TreeSidecarError::InvalidScratch(
+                "directory plan frame authentication failed"
+            ))
+        ));
+        assert!(
+            std::fs::read_dir(root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .all(|name| !name.to_string_lossy().starts_with(".tree-scratch-v1-"))
+        );
+    }
+
+    #[test]
+    fn pre_seal_hardlink_fold_preserves_then_discards_only_manifest_scratch() {
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(42);
+        let records = vec![
+            v3_regular_record(b"z", 3),
+            v3_directory_record(b"", 1),
+            v3_regular_record(b"a", 2),
+        ];
+        let (_, expected) = sorted_v3_manifest(&records);
+        let mut manifest_scratch = store
+            .build_sorted_manifest_scratch(&mut wal, transaction, |emit| {
+                for record in &records {
+                    emit(record)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let (hardlink_scratch, visited) = store
+            .build_sorted_hardlink_scratch_from_manifest(
+                &mut wal,
+                transaction,
+                &mut manifest_scratch,
+                expected,
+                Vec::new(),
+                |visited, record, _emit| {
+                    visited.push(record.path.to_vec());
+                    Ok::<(), std::convert::Infallible>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(visited, [b"".to_vec(), b"a".to_vec(), b"z".to_vec()]);
+        assert_eq!(
+            std::fs::read_dir(&root)
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".tree-scratch-v1-")
+                })
+                .count(),
+            2
+        );
+
+        store
+            .fold_sorted_hardlink_scratch_preserving_manifest(
+                &mut wal,
+                transaction,
+                hardlink_scratch,
+                0_u64,
+                |_count, _record| -> Result<(), std::convert::Infallible> {
+                    unreachable!("sentinel-only hardlink scratch has no fold record")
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .fingerprint_sorted_manifest_scratch(&mut wal, transaction, &mut manifest_scratch)
+                .unwrap(),
+            expected
+        );
+        store
+            .discard_sorted_manifest_scratch(&mut wal, transaction, expected, manifest_scratch)
+            .unwrap();
+        assert_eq!(store.cleanup_unpublished(&mut wal).unwrap(), 0);
+    }
+
+    #[test]
+    fn corrupt_pre_seal_hardlink_scratch_preserves_manifest_until_explicit_cleanup() {
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(43);
+        let records = vec![v3_directory_record(b"", 1), v3_regular_record(b"a", 2)];
+        let (_, expected) = sorted_v3_manifest(&records);
+        let mut manifest_scratch = store
+            .build_sorted_manifest_scratch(&mut wal, transaction, |emit| {
+                for record in &records {
+                    emit(record)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let (hardlink_scratch, ()) = store
+            .build_sorted_hardlink_scratch_from_manifest(
+                &mut wal,
+                transaction,
+                &mut manifest_scratch,
+                expected,
+                (),
+                |(), _record, _emit| Ok::<(), std::convert::Infallible>(()),
+            )
+            .unwrap();
+        let hardlink_run = root.join(&hardlink_scratch.run_names_for_test()[0]);
+        let length = std::fs::metadata(&hardlink_run).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&hardlink_run)
+            .unwrap()
+            .set_len(length - 1)
+            .unwrap();
+
+        let error = store
+            .fold_sorted_hardlink_scratch_preserving_manifest(
+                &mut wal,
+                transaction,
+                hardlink_scratch,
+                (),
+                |(), _record| Ok::<(), std::convert::Infallible>(()),
+            )
+            .unwrap_err();
+        assert!(matches!(error, TreeSidecarFoldError::Sidecar(_)));
+        assert_eq!(
+            store
+                .fingerprint_sorted_manifest_scratch(&mut wal, transaction, &mut manifest_scratch)
+                .unwrap(),
+            expected,
+            "hardlink corruption must not consume the separately authenticated manifest"
+        );
+        assert!(store.cleanup_unpublished(&mut wal).unwrap() >= 2);
+        assert!(
+            std::fs::read_dir(root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .all(|name| !name.to_string_lossy().starts_with(".tree-scratch-v1-"))
+        );
+        assert_eq!(wal.tree_sidecar_commitment(transaction), None);
     }
 
     #[test]
@@ -2414,7 +2639,7 @@ mod tests {
             expected,
             &mut scratch,
             (),
-            |(), _| {
+            |(), _, _wal| {
                 visits.set(visits.get() + 1);
                 Err(Stop)
             },
@@ -2459,7 +2684,7 @@ mod tests {
             expected,
             &mut scratch,
             Vec::<Vec<u8>>::new(),
-            |mut paths, record| {
+            |mut paths, record, _wal| {
                 visits.set(visits.get() + 1);
                 paths.push(record.path.to_vec());
                 Ok::<_, std::convert::Infallible>(paths)

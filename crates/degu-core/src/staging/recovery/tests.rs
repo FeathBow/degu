@@ -1,5 +1,7 @@
 use super::*;
 use crate::authority::PersistentRecoveryEvidence;
+use crate::backend::held::ManifestV3StreamError;
+use crate::seal::sidecar::TreeSidecarError;
 use crate::seal::store::SealWalStore;
 use crate::seal::wal::{
     ApplicationStatus, DurableSourceParentStrategy, DurableTreeManifest, ObjectIncarnation,
@@ -603,7 +605,7 @@ fn uncertain_inverse_intents_resolve_before_and_after_fchmod_in_every_restore_ph
             wal.complete_tree_manifest(
                 transaction,
                 DurableTreeManifest {
-                    schema_version: 2,
+                    schema_version: 3,
                     entry_count: 1,
                     sha256: [case_index as u8; 32],
                 },
@@ -850,7 +852,7 @@ fn exact_staging_snapshot_restores_all_applied_permissions_and_reaches_restored(
     wal.complete_tree_manifest(
         transaction,
         DurableTreeManifest {
-            schema_version: 2,
+            schema_version: 3,
             entry_count: 1,
             sha256: [0xa3; 32],
         },
@@ -965,7 +967,7 @@ fn quarantined_active_seals_restore_in_place_and_unblock_without_unquarantining(
     wal.complete_tree_manifest(
         transaction,
         DurableTreeManifest {
-            schema_version: 2,
+            schema_version: 3,
             entry_count: 1,
             sha256: [0xd4; 32],
         },
@@ -1056,8 +1058,8 @@ fn unknown_rename_is_durably_blocked_without_any_namespace_lookup() {
     wal.complete_tree_manifest(
         transaction,
         DurableTreeManifest {
-            schema_version: 2,
-            entry_count: 0,
+            schema_version: 3,
+            entry_count: 1,
             sha256: [0xc3; 32],
         },
     )
@@ -1102,6 +1104,7 @@ fn staged_pending(
     let transaction = TransactionId([0xa3; 16]);
     let store_path = fixture.base.as_path().join("verifier-wal");
     let store = SealWalStore::open_or_create(&store_path).unwrap();
+    let sidecars = store.tree_sidecar_store().unwrap();
     let mut wal = store.try_lease().unwrap().into_new_wal().unwrap();
     wal.begin_staging(transaction, fixture.metadata.clone())
         .unwrap();
@@ -1196,12 +1199,12 @@ fn staged_pending(
             .map(OsString::from)
             .collect(),
         HeldTreeLimits::default(),
-        2,
+        3,
     )
     .unwrap();
-    let fingerprint = inventory.fingerprint_for_schema(2).unwrap();
+    let fingerprint = inventory.fingerprint_for_schema(3).unwrap();
     let manifest = DurableTreeManifest {
-        schema_version: 2,
+        schema_version: 3,
         entry_count: fingerprint.entry_count,
         sha256: if manifest_matches {
             fingerprint.sha256
@@ -1209,7 +1212,20 @@ fn staged_pending(
             [0x55; 32]
         },
     };
-    wal.complete_tree_manifest(transaction, manifest).unwrap();
+    let commitment = sidecars
+        .publish_stream(&mut wal, transaction, |emit| {
+            inventory
+                .stream_manifest_v3_segments(|record_count, payload| emit(record_count, payload))
+                .map_err(|error| match error {
+                    ManifestV3StreamError::Codec(_) => {
+                        TreeSidecarError::InvalidSegment("test manifest segmentation failed")
+                    }
+                    ManifestV3StreamError::Emit(error) => error,
+                })
+        })
+        .unwrap();
+    wal.complete_tree_manifest_with_sidecar(transaction, manifest, commitment)
+        .unwrap();
     wal.transition_staging_for_test(transaction, TransactionState::TreeSealed)
         .unwrap();
     wal.record_rename_intent(transaction).unwrap();

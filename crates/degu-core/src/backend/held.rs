@@ -20,11 +20,12 @@ use crate::seal::executor::{
     RecoveryLocator, execute_staging_local_mode_mutation,
 };
 use crate::seal::wal::{
-    DurableWrite, RECOVERY_MAX_ACTIVE_PERMISSIONS, SealWal, StrongObjectIdentity, TransactionId,
+    DurableTreeManifest, DurableWrite, RECOVERY_MAX_ACTIVE_PERMISSIONS, SealWal,
+    StrongObjectIdentity, TransactionId,
 };
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsStr, OsString};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
@@ -1566,6 +1567,20 @@ impl HeldTreeInventory {
     pub(crate) fn fingerprint(&self) -> HeldTreeFingerprint {
         debug_assert_eq!(self.manifest_schema, CONTENT_PROOF_VERSION);
         fingerprint_manifest_v3(&self.manifest)
+    }
+
+    /// Streams the same per-entry bytes used by `fingerprint`, retaining one
+    /// reusable segment buffer and never splitting a manifest record.
+    pub(crate) fn stream_manifest_v3_segments<E>(
+        &self,
+        emit_segment: impl FnMut(u64, &[u8]) -> Result<(), E>,
+    ) -> Result<(), ManifestV3StreamError<E>> {
+        debug_assert_eq!(self.manifest_schema, CONTENT_PROOF_VERSION);
+        stream_manifest_v3_segments(
+            &self.manifest,
+            MANIFEST_V3_MAX_SEGMENT_PAYLOAD,
+            emit_segment,
+        )
     }
 
     pub(crate) fn fingerprint_for_schema(
@@ -3737,6 +3752,366 @@ fn require_one_component(name: &OsStr) -> Result<(), HeldTreeError> {
     }
 }
 
+const MANIFEST_V3_MAX_SEGMENT_PAYLOAD: usize = 1024 * 1024;
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub(crate) enum ManifestV3CodecError {
+    #[error("one v3 manifest record exceeds the 1 MiB segment payload limit")]
+    RecordTooLarge,
+    #[error("v3 manifest aggregate or record length overflow")]
+    LengthOverflow,
+    #[error("v3 manifest segment record count does not match its payload")]
+    RecordCountMismatch,
+    #[error("v3 manifest segment contains trailing bytes")]
+    TrailingBytes,
+    #[error("v3 manifest contains an invalid kind or content tag")]
+    InvalidTag,
+    #[error("v3 manifest kind and content proof do not match")]
+    KindContentMismatch,
+    #[error("v3 manifest contains invalid timestamp nanoseconds")]
+    InvalidNanoseconds,
+    #[error("v3 manifest contains an invalid mode")]
+    InvalidMode,
+    #[error("v3 manifest path is not a canonical confined root-relative path")]
+    InvalidPath,
+    #[error("v3 manifest paths are not in strict canonical order")]
+    InvalidOrder,
+    #[error("v3 manifest does not begin with its directory root")]
+    InvalidRoot,
+    #[error("v3 manifest entry has no committed directory parent")]
+    MissingParent,
+    #[error("v3 manifest exceeds its existing held-tree {0:?} limit")]
+    Limit(HeldTreeLimit),
+    #[error("v3 manifest total record count does not match the declared count")]
+    EntryCountMismatch,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ManifestV3StreamError<E> {
+    Codec(ManifestV3CodecError),
+    Emit(E),
+}
+
+/// Incremental decoder for the exact v3 fingerprint record stream. It retains
+/// only canonical directory paths (bounded by the existing directory limit),
+/// the previous path, counters, and the digest state; decoded entries grant no
+/// filesystem or recovery authority.
+pub(crate) struct ManifestV3Decoder {
+    expected_entries: u64,
+    decoded_entries: u64,
+    limits: HeldTreeLimits,
+    path_bytes: u64,
+    manifest_bytes: u64,
+    xattr_bytes: u64,
+    directories: BTreeSet<Vec<u8>>,
+    previous_path: Option<Vec<u8>>,
+    digest: Sha256,
+}
+
+impl ManifestV3Decoder {
+    pub(crate) fn new(expected_entries: u64) -> Result<Self, ManifestV3CodecError> {
+        Self::with_limits(expected_entries, HeldTreeLimits::default())
+    }
+
+    fn with_limits(
+        expected_entries: u64,
+        limits: HeldTreeLimits,
+    ) -> Result<Self, ManifestV3CodecError> {
+        if expected_entries == 0 {
+            return Err(ManifestV3CodecError::InvalidRoot);
+        }
+        if expected_entries > limits.max_entries {
+            return Err(ManifestV3CodecError::Limit(HeldTreeLimit::Entries));
+        }
+        let mut digest = Sha256::new();
+        digest.update(MANIFEST_DOMAIN_V3);
+        digest.update(expected_entries.to_be_bytes());
+        Ok(Self {
+            expected_entries,
+            decoded_entries: 0,
+            limits,
+            path_bytes: 0,
+            manifest_bytes: 0,
+            xattr_bytes: 0,
+            directories: BTreeSet::new(),
+            previous_path: None,
+            digest,
+        })
+    }
+
+    /// Consumes exactly `record_count` complete records and rejects any bytes
+    /// left in this segment. Records therefore cannot straddle segments.
+    pub(crate) fn push_segment(
+        &mut self,
+        record_count: u64,
+        payload: &[u8],
+    ) -> Result<(), ManifestV3CodecError> {
+        if record_count == 0 {
+            return Err(ManifestV3CodecError::RecordCountMismatch);
+        }
+        if payload.len() > MANIFEST_V3_MAX_SEGMENT_PAYLOAD {
+            return Err(ManifestV3CodecError::RecordTooLarge);
+        }
+        let mut input = payload;
+        for _ in 0..record_count {
+            self.decode_record(&mut input)?;
+        }
+        if !input.is_empty() {
+            return Err(ManifestV3CodecError::TrailingBytes);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<DurableTreeManifest, ManifestV3CodecError> {
+        if self.decoded_entries != self.expected_entries {
+            return Err(ManifestV3CodecError::EntryCountMismatch);
+        }
+        Ok(DurableTreeManifest {
+            schema_version: CONTENT_PROOF_VERSION,
+            entry_count: self.decoded_entries,
+            sha256: self.digest.finalize().into(),
+        })
+    }
+
+    fn decode_record(&mut self, input: &mut &[u8]) -> Result<(), ManifestV3CodecError> {
+        let record = *input;
+        if self.decoded_entries >= self.expected_entries {
+            return Err(ManifestV3CodecError::EntryCountMismatch);
+        }
+        let path_len = take_u64(input)?;
+        let path_len =
+            usize::try_from(path_len).map_err(|_| ManifestV3CodecError::LengthOverflow)?;
+        let path = take(input, path_len)?.to_vec();
+        validate_manifest_path(&path, self.limits.max_depth)?;
+        if self.decoded_entries == 0 {
+            if !path.is_empty() {
+                return Err(ManifestV3CodecError::InvalidRoot);
+            }
+        } else {
+            if path.is_empty() {
+                return Err(ManifestV3CodecError::InvalidRoot);
+            }
+            if self
+                .previous_path
+                .as_deref()
+                .is_some_and(|previous| previous >= path.as_slice())
+            {
+                return Err(ManifestV3CodecError::InvalidOrder);
+            }
+            let parent = path_parent_bytes(&path).ok_or(ManifestV3CodecError::InvalidPath)?;
+            if !self.directories.contains(parent) {
+                return Err(ManifestV3CodecError::MissingParent);
+            }
+        }
+
+        let kind = *take(input, 1)?.first().unwrap();
+        if kind > 3 {
+            return Err(ManifestV3CodecError::InvalidTag);
+        }
+        let fixed_identity_and_metadata = take(input, 24 + 4 + 4 + 4)?;
+        let mode = u32::from_be_bytes(fixed_identity_and_metadata[32..36].try_into().unwrap());
+        if mode & !0o7777 != 0 {
+            return Err(ManifestV3CodecError::InvalidMode);
+        }
+        let content = *take(input, 1)?.first().unwrap();
+        match content {
+            0 if kind == 0 => {}
+            1 if kind == 1 => {
+                let fields = take(input, 8 + 8 + 8 + 4 + 8 + 4 + 32 + 8 + 8 + 32)?;
+                let mtime_nsec = u32::from_be_bytes(fields[24..28].try_into().unwrap());
+                let ctime_nsec = u32::from_be_bytes(fields[36..40].try_into().unwrap());
+                if mtime_nsec >= 1_000_000_000 || ctime_nsec >= 1_000_000_000 {
+                    return Err(ManifestV3CodecError::InvalidNanoseconds);
+                }
+                let xattr_value_bytes = u64::from_be_bytes(fields[80..88].try_into().unwrap());
+                self.xattr_bytes = self
+                    .xattr_bytes
+                    .checked_add(xattr_value_bytes)
+                    .ok_or(ManifestV3CodecError::LengthOverflow)?;
+                if self.xattr_bytes > self.limits.max_xattr_bytes {
+                    return Err(ManifestV3CodecError::Limit(HeldTreeLimit::ContentBytes));
+                }
+            }
+            2 if kind == 2 => {
+                let target_len = take_u64(input)?;
+                let target_len = usize::try_from(target_len)
+                    .map_err(|_| ManifestV3CodecError::LengthOverflow)?;
+                take(input, target_len)?;
+            }
+            0..=2 => return Err(ManifestV3CodecError::KindContentMismatch),
+            _ => return Err(ManifestV3CodecError::InvalidTag),
+        }
+        // Other nodes and legacy content cannot occur in a valid v3 inventory.
+        if kind == 3 {
+            return Err(ManifestV3CodecError::KindContentMismatch);
+        }
+
+        let path_len_u64 =
+            u64::try_from(path.len()).map_err(|_| ManifestV3CodecError::LengthOverflow)?;
+        self.path_bytes = self
+            .path_bytes
+            .checked_add(path_len_u64)
+            .ok_or(ManifestV3CodecError::LengthOverflow)?;
+        if self.path_bytes > self.limits.max_path_bytes {
+            return Err(ManifestV3CodecError::Limit(HeldTreeLimit::PathBytes));
+        }
+        self.manifest_bytes = self
+            .manifest_bytes
+            .checked_add(std::mem::size_of::<ManifestEntry>() as u64)
+            .and_then(|value| value.checked_add(path_len_u64))
+            .ok_or(ManifestV3CodecError::LengthOverflow)?;
+        if self.manifest_bytes > self.limits.max_manifest_bytes {
+            return Err(ManifestV3CodecError::Limit(HeldTreeLimit::ManifestBytes));
+        }
+        if kind == 0 {
+            if self.directories.len() as u64 >= self.limits.max_directories {
+                return Err(ManifestV3CodecError::Limit(HeldTreeLimit::Directories));
+            }
+            self.directories.insert(path.clone());
+        }
+        if self.decoded_entries == 0 && kind != 0 {
+            return Err(ManifestV3CodecError::InvalidRoot);
+        }
+        let consumed = record.len() - input.len();
+        self.digest.update(&record[..consumed]);
+        self.previous_path = Some(path);
+        self.decoded_entries += 1;
+        Ok(())
+    }
+}
+
+fn take<'a>(input: &mut &'a [u8], length: usize) -> Result<&'a [u8], ManifestV3CodecError> {
+    if input.len() < length {
+        return Err(ManifestV3CodecError::RecordCountMismatch);
+    }
+    let (value, rest) = input.split_at(length);
+    *input = rest;
+    Ok(value)
+}
+
+fn take_u64(input: &mut &[u8]) -> Result<u64, ManifestV3CodecError> {
+    Ok(u64::from_be_bytes(take(input, 8)?.try_into().unwrap()))
+}
+
+fn validate_manifest_path(path: &[u8], max_depth: u32) -> Result<(), ManifestV3CodecError> {
+    if path.contains(&0) {
+        return Err(ManifestV3CodecError::InvalidPath);
+    }
+    if path.is_empty() {
+        return Ok(());
+    }
+    let mut depth = 0_u32;
+    for component in path.split(|byte| *byte == b'/') {
+        if component.is_empty() || matches!(component, b"." | b"..") {
+            return Err(ManifestV3CodecError::InvalidPath);
+        }
+        depth = depth
+            .checked_add(1)
+            .ok_or(ManifestV3CodecError::LengthOverflow)?;
+    }
+    if depth > max_depth {
+        return Err(ManifestV3CodecError::Limit(HeldTreeLimit::Depth));
+    }
+    Ok(())
+}
+
+fn path_parent_bytes(path: &[u8]) -> Option<&[u8]> {
+    path.iter()
+        .rposition(|byte| *byte == b'/')
+        .map_or(Some(&[][..]), |position| Some(&path[..position]))
+}
+
+fn emit_manifest_entry_v3(entry: &ManifestEntry, mut emit: impl FnMut(&[u8])) {
+    let path = entry.path.as_os_str().as_bytes();
+    emit(&(path.len() as u64).to_be_bytes());
+    emit(path);
+    emit(&[match entry.identity.kind {
+        NodeKind::Directory => 0,
+        NodeKind::Regular => 1,
+        NodeKind::Symlink => 2,
+        NodeKind::Other => 3,
+    }]);
+    emit(&entry.identity.device.to_be_bytes());
+    emit(&entry.identity.inode.to_be_bytes());
+    emit(&entry.identity.incarnation.to_be_bytes());
+    emit(&entry.uid.to_be_bytes());
+    emit(&entry.gid.to_be_bytes());
+    emit(&entry.mode.to_be_bytes());
+    match &entry.content {
+        ContentProof::Legacy => emit(&[0xff]),
+        ContentProof::Directory => emit(&[0]),
+        ContentProof::Regular {
+            size,
+            nlink,
+            mtime_sec,
+            mtime_nsec,
+            ctime_sec,
+            ctime_nsec,
+            sha256,
+            xattrs,
+        } => {
+            emit(&[1]);
+            emit(&size.to_be_bytes());
+            emit(&nlink.to_be_bytes());
+            emit(&mtime_sec.to_be_bytes());
+            emit(&mtime_nsec.to_be_bytes());
+            emit(&ctime_sec.to_be_bytes());
+            emit(&ctime_nsec.to_be_bytes());
+            emit(sha256);
+            emit(&xattrs.attribute_count.to_be_bytes());
+            emit(&xattrs.value_bytes.to_be_bytes());
+            emit(&xattrs.sha256);
+        }
+        ContentProof::Symlink { target } => {
+            emit(&[2]);
+            emit(&(target.len() as u64).to_be_bytes());
+            emit(target);
+        }
+    }
+}
+
+fn manifest_entry_v3_len(entry: &ManifestEntry) -> Result<usize, ManifestV3CodecError> {
+    let mut length = Some(0_usize);
+    emit_manifest_entry_v3(entry, |bytes| {
+        length = length.and_then(|current| current.checked_add(bytes.len()));
+    });
+    length.ok_or(ManifestV3CodecError::LengthOverflow)
+}
+
+/// Emits complete canonical v3 records in segments no larger than 1 MiB. The
+/// single reusable `Vec` is flushed before a record that would cross the bound.
+fn stream_manifest_v3_segments<E>(
+    manifest: &[ManifestEntry],
+    max_payload: usize,
+    mut emit_segment: impl FnMut(u64, &[u8]) -> Result<(), E>,
+) -> Result<(), ManifestV3StreamError<E>> {
+    let max_payload = max_payload.min(MANIFEST_V3_MAX_SEGMENT_PAYLOAD);
+    let mut payload = Vec::with_capacity(max_payload);
+    let mut records = 0_u64;
+    for entry in manifest {
+        let record_len = manifest_entry_v3_len(entry).map_err(ManifestV3StreamError::Codec)?;
+        if record_len > max_payload {
+            return Err(ManifestV3StreamError::Codec(
+                ManifestV3CodecError::RecordTooLarge,
+            ));
+        }
+        if records != 0 && payload.len() + record_len > max_payload {
+            emit_segment(records, &payload).map_err(ManifestV3StreamError::Emit)?;
+            payload.clear();
+            records = 0;
+        }
+        emit_manifest_entry_v3(entry, |bytes| payload.extend_from_slice(bytes));
+        debug_assert!(payload.len() <= max_payload);
+        records = records.checked_add(1).ok_or(ManifestV3StreamError::Codec(
+            ManifestV3CodecError::LengthOverflow,
+        ))?;
+    }
+    if records != 0 {
+        emit_segment(records, &payload).map_err(ManifestV3StreamError::Emit)?;
+    }
+    Ok(())
+}
+
 fn fingerprint_manifest_v1(manifest: &[ManifestEntry]) -> HeldTreeFingerprint {
     fingerprint_manifest(manifest, 1)
 }
@@ -3746,15 +4121,27 @@ fn fingerprint_manifest_v2(manifest: &[ManifestEntry]) -> HeldTreeFingerprint {
 }
 
 fn fingerprint_manifest_v3(manifest: &[ManifestEntry]) -> HeldTreeFingerprint {
-    fingerprint_manifest(manifest, CONTENT_PROOF_VERSION)
+    let mut digest = Sha256::new();
+    digest.update(MANIFEST_DOMAIN_V3);
+    digest.update((manifest.len() as u64).to_be_bytes());
+    for entry in manifest {
+        emit_manifest_entry_v3(entry, |bytes| digest.update(bytes));
+    }
+    HeldTreeFingerprint {
+        schema_version: CONTENT_PROOF_VERSION,
+        entry_count: manifest.len() as u64,
+        sha256: digest.finalize().into(),
+    }
 }
 
 fn fingerprint_manifest(manifest: &[ManifestEntry], schema_version: u16) -> HeldTreeFingerprint {
+    if schema_version == CONTENT_PROOF_VERSION {
+        return fingerprint_manifest_v3(manifest);
+    }
     let mut digest = Sha256::new();
     digest.update(match schema_version {
         1 => MANIFEST_DOMAIN_V1,
         LEGACY_CONTENT_PROOF_VERSION => MANIFEST_DOMAIN_V2,
-        CONTENT_PROOF_VERSION => MANIFEST_DOMAIN_V3,
         _ => {
             debug_assert!(false, "unsupported held-tree fingerprint schema");
             b"degu-held-tree-manifest-unsupported\0"
@@ -3792,7 +4179,7 @@ fn fingerprint_manifest(manifest: &[ManifestEntry], schema_version: u16) -> Held
                     ctime_sec,
                     ctime_nsec,
                     sha256,
-                    xattrs,
+                    ..
                 } => {
                     digest.update([1]);
                     digest.update(size.to_be_bytes());
@@ -3802,11 +4189,6 @@ fn fingerprint_manifest(manifest: &[ManifestEntry], schema_version: u16) -> Held
                     digest.update(ctime_sec.to_be_bytes());
                     digest.update(ctime_nsec.to_be_bytes());
                     digest.update(sha256);
-                    if schema_version == CONTENT_PROOF_VERSION {
-                        digest.update(xattrs.attribute_count.to_be_bytes());
-                        digest.update(xattrs.value_bytes.to_be_bytes());
-                        digest.update(xattrs.sha256);
-                    }
                 }
                 ContentProof::Symlink { target } => {
                     digest.update([2]);

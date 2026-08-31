@@ -1517,6 +1517,15 @@ fn fingerprint_codec_is_domain_separated_raw_and_field_complete() {
 
     let v3 = fingerprint_manifest_v3(std::slice::from_ref(&base));
     assert_eq!(v3.schema_version, CONTENT_PROOF_VERSION);
+    assert_eq!(
+        v3.sha256,
+        [
+            0xc9, 0x4b, 0xa1, 0xf3, 0x7f, 0x70, 0x07, 0x79, 0x07, 0xb0, 0x19, 0x9d, 0xab, 0x07,
+            0x0d, 0x0e, 0x9d, 0x25, 0x79, 0xbf, 0x84, 0x37, 0x32, 0x99, 0x7a, 0xda, 0x62, 0xeb,
+            0xf9, 0x41, 0xe9, 0x3f,
+        ],
+        "the pre-segmentation v3 fingerprint bytes are frozen",
+    );
     assert_ne!(v3.sha256, v2.sha256);
     let mut with_xattr = base.clone();
     if let ContentProof::Regular { xattrs, .. } = &mut with_xattr.content {
@@ -2187,4 +2196,186 @@ fn rewalk_rejects_acl_planted_after_collect() {
             ..
         })
     ));
+}
+
+fn codec_manifest_fixture() -> Vec<ManifestEntry> {
+    vec![
+        ManifestEntry {
+            path: PathBuf::new(),
+            identity: NodeIdentity {
+                kind: NodeKind::Directory,
+                device: 1,
+                inode: 1,
+                incarnation: 1,
+            },
+            uid: 10,
+            gid: 20,
+            mode: 0o700,
+            content: ContentProof::Directory,
+        },
+        ManifestEntry {
+            path: PathBuf::from("a"),
+            identity: NodeIdentity {
+                kind: NodeKind::Directory,
+                device: 1,
+                inode: 2,
+                incarnation: 2,
+            },
+            uid: 10,
+            gid: 20,
+            mode: 0o750,
+            content: ContentProof::Directory,
+        },
+        ManifestEntry {
+            path: PathBuf::from("a/file"),
+            identity: NodeIdentity {
+                kind: NodeKind::Regular,
+                device: 1,
+                inode: 3,
+                incarnation: 3,
+            },
+            uid: 10,
+            gid: 20,
+            mode: 0o640,
+            content: ContentProof::Regular {
+                size: 4,
+                nlink: 1,
+                mtime_sec: 5,
+                mtime_nsec: 6,
+                ctime_sec: 7,
+                ctime_nsec: 8,
+                sha256: [0x31; 32],
+                xattrs: empty_regular_xattr_proof(),
+            },
+        },
+        ManifestEntry {
+            path: PathBuf::from("link"),
+            identity: NodeIdentity {
+                kind: NodeKind::Symlink,
+                device: 1,
+                inode: 4,
+                incarnation: 4,
+            },
+            uid: 10,
+            gid: 20,
+            mode: 0o777,
+            content: ContentProof::Symlink {
+                target: b"a/file".to_vec(),
+            },
+        },
+    ]
+}
+
+fn encoded_v3_record(entry: &ManifestEntry) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    emit_manifest_entry_v3(entry, |field| bytes.extend_from_slice(field));
+    bytes
+}
+
+#[test]
+fn v3_segmented_round_trip_is_the_existing_fingerprint_stream() {
+    let manifest = codec_manifest_fixture();
+    let old = fingerprint_manifest_v3(&manifest);
+    let mut segments = Vec::new();
+    stream_manifest_v3_segments(&manifest, 180, |records, payload| {
+        segments.push((records, payload.to_vec()));
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .unwrap();
+
+    assert!(segments.len() > 1);
+    assert!(segments.iter().all(|(_, payload)| payload.len() <= 180));
+    assert_eq!(segments.iter().map(|(count, _)| count).sum::<u64>(), 4);
+
+    let mut decoder = ManifestV3Decoder::new(old.entry_count).unwrap();
+    for (records, payload) in segments {
+        decoder.push_segment(records, &payload).unwrap();
+    }
+    let decoded = decoder.finish().unwrap();
+    assert_eq!(decoded.schema_version, old.schema_version);
+    assert_eq!(decoded.entry_count, old.entry_count);
+    assert_eq!(decoded.sha256, old.sha256);
+}
+
+#[test]
+fn v3_decoder_rejects_record_count_trailing_and_order_mismatches() {
+    let manifest = codec_manifest_fixture();
+    let root = encoded_v3_record(&manifest[0]);
+
+    let mut decoder = ManifestV3Decoder::new(2).unwrap();
+    assert_eq!(
+        decoder.push_segment(2, &root),
+        Err(ManifestV3CodecError::RecordCountMismatch)
+    );
+
+    let mut trailing = root.clone();
+    trailing.push(0);
+    let mut decoder = ManifestV3Decoder::new(1).unwrap();
+    assert_eq!(
+        decoder.push_segment(1, &trailing),
+        Err(ManifestV3CodecError::TrailingBytes)
+    );
+
+    let mut out_of_order = vec![manifest[0].clone(), manifest[3].clone()];
+    let mut last = manifest[3].clone();
+    last.path = PathBuf::from("a");
+    last.identity.kind = NodeKind::Directory;
+    last.content = ContentProof::Directory;
+    out_of_order.push(last);
+    let mut payload = Vec::new();
+    for entry in &out_of_order {
+        emit_manifest_entry_v3(entry, |field| payload.extend_from_slice(field));
+    }
+    let mut decoder = ManifestV3Decoder::new(3).unwrap();
+    assert_eq!(
+        decoder.push_segment(3, &payload),
+        Err(ManifestV3CodecError::InvalidOrder)
+    );
+}
+
+#[test]
+fn v3_decoder_validates_paths_tags_modes_and_timestamps() {
+    let manifest = codec_manifest_fixture();
+
+    let mut invalid_path = manifest[0].clone();
+    invalid_path.path = PathBuf::from("../escape");
+    let bytes = encoded_v3_record(&invalid_path);
+    let mut decoder = ManifestV3Decoder::new(1).unwrap();
+    assert_eq!(
+        decoder.push_segment(1, &bytes),
+        Err(ManifestV3CodecError::InvalidPath)
+    );
+
+    let mut invalid_mode = manifest[0].clone();
+    invalid_mode.mode = 0o10_000;
+    let bytes = encoded_v3_record(&invalid_mode);
+    let mut decoder = ManifestV3Decoder::new(1).unwrap();
+    assert_eq!(
+        decoder.push_segment(1, &bytes),
+        Err(ManifestV3CodecError::InvalidMode)
+    );
+
+    let mut mismatched = manifest[0].clone();
+    mismatched.content = ContentProof::Symlink {
+        target: b"x".to_vec(),
+    };
+    let bytes = encoded_v3_record(&mismatched);
+    let mut decoder = ManifestV3Decoder::new(1).unwrap();
+    assert_eq!(
+        decoder.push_segment(1, &bytes),
+        Err(ManifestV3CodecError::KindContentMismatch)
+    );
+
+    let mut invalid_nsec = manifest[2].clone();
+    if let ContentProof::Regular { mtime_nsec, .. } = &mut invalid_nsec.content {
+        *mtime_nsec = 1_000_000_000;
+    }
+    let mut bytes = encoded_v3_record(&manifest[0]);
+    bytes.extend_from_slice(&encoded_v3_record(&manifest[1]));
+    bytes.extend_from_slice(&encoded_v3_record(&invalid_nsec));
+    let mut decoder = ManifestV3Decoder::new(3).unwrap();
+    assert_eq!(
+        decoder.push_segment(3, &bytes),
+        Err(ManifestV3CodecError::InvalidNanoseconds)
+    );
 }

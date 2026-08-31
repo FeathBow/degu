@@ -599,7 +599,7 @@ impl<'a> CertifiedStagedRecovery<'a> {
             &self.root.relative_path,
             &self.tree_seal_plan,
         )?;
-        inventory.rewalk_exact()?;
+        inventory.rewalk_structure()?;
         self.root.verify_fresh_binding()?;
         for plan in &self.tree_seal_plan {
             let rebound = reopen_permission_plan(&self.destination_anchor, plan, &self.metadata)?;
@@ -1235,7 +1235,7 @@ impl VerifiedUndoRecoverySession<'_> {
             return Err(RecoveryRebindError::UndoManifestChanged);
         }
         inventory
-            .rewalk_exact()
+            .rewalk_structure()
             .map_err(|_| RecoveryRebindError::UndoManifestChanged)?;
         let normalized = inventory
             .fingerprint_with_directory_modes(&expected_modes)

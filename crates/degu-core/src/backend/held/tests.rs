@@ -1,9 +1,9 @@
 use super::*;
 use crate::backend::certify_held_fd;
-use std::fs::Permissions;
+use std::fs::{FileTimes, Permissions};
 use std::io;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 fn open_directory(path: &Path) -> rustix::fd::OwnedFd {
     rustix::fs::open(path, OPEN_DIRECTORY, Mode::empty()).unwrap()
@@ -212,7 +212,8 @@ fn production_directory_budget_fits_the_recovery_permission_envelope() {
     assert_eq!(limits.max_depth, 128);
     assert_eq!(limits.max_path_bytes, 16 * 1024 * 1024);
     assert_eq!(limits.max_manifest_bytes, 64 * 1024 * 1024);
-    assert_eq!(limits.max_content_bytes, 1024 * 1024 * 1024);
+    assert_eq!(limits.max_content_bytes, None);
+    assert_eq!(limits.max_xattr_bytes, 1024 * 1024 * 1024);
 }
 
 #[test]
@@ -311,6 +312,32 @@ fn assessment_regular_files_remain_metadata_only_while_proving_reads_content() {
     let proved = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
     assert_eq!(REGULAR_CONTENT_BYTES_READ.with(std::cell::Cell::get), 3);
     assert_eq!(proved.entry_count(), 5);
+
+    reset_regular_content_bytes_read();
+    proved.rewalk_structure().unwrap();
+    assert_eq!(regular_content_bytes_read(), 0);
+}
+
+#[test]
+fn production_assessment_has_no_fixed_payload_byte_ceiling() {
+    let (temp, root) = setup_tree();
+    let payload_bytes = 1024_u64 * 1024 * 1024 + 1;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.join("a/file"))
+        .unwrap()
+        .set_len(payload_bytes)
+        .unwrap();
+    REGULAR_CONTENT_BYTES_READ.with(|bytes| bytes.set(0));
+
+    let (assessment, _) =
+        unwrap_tree_assessment(assess(&temp, vec![], HeldTreeLimits::default()).unwrap());
+    assert_eq!(assessment.content_bytes, payload_bytes + 1);
+    assert_eq!(
+        REGULAR_CONTENT_BYTES_READ.with(std::cell::Cell::get),
+        0,
+        "metadata-only assessment must not read the sparse payload"
+    );
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -336,24 +363,35 @@ fn assessment_sizes_admitted_xattrs_without_reading_values() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn admitted_xattr_sizes_remain_in_the_aggregate_content_budget() {
+fn admitted_xattr_sizes_use_an_independent_aggregate_budget() {
     let (temp, root) = setup_tree();
     set_test_xattr(&root.join("a/file"));
-    let limits = HeldTreeLimits {
-        // The regular file and symlink already consume four bytes. The
-        // admitted one-byte xattr must be charged to the same aggregate.
-        max_content_bytes: 4,
+    let admitted = HeldTreeLimits {
+        // The regular file and symlink consume four payload bytes. The
+        // admitted one-byte xattr is accounted separately.
+        max_content_bytes: Some(4),
+        max_xattr_bytes: 1,
+        ..HeldTreeLimits::default()
+    };
+    collect(&temp, vec![], admitted).unwrap();
+    let (assessment, _) = unwrap_tree_assessment(assess(&temp, vec![], admitted).unwrap());
+    assert_eq!(assessment.content_bytes, 5);
+    assert_eq!(assessment.regular_xattrs.value_bytes, 1);
+
+    let rejected = HeldTreeLimits {
+        max_content_bytes: Some(4),
+        max_xattr_bytes: 0,
         ..HeldTreeLimits::default()
     };
     for result in [
-        collect(&temp, vec![], limits).map(|_| ()),
-        assess(&temp, vec![], limits).map(|_| ()),
+        collect(&temp, vec![], rejected).map(|_| ()),
+        assess(&temp, vec![], rejected).map(|_| ()),
     ] {
         assert!(matches!(
             result,
             Err(HeldTreeError::Limit {
                 kind: HeldTreeLimit::ContentBytes,
-                limit: 4,
+                limit: 0,
             })
         ));
     }
@@ -731,7 +769,7 @@ fn assessment_and_prove_have_entry_depth_path_manifest_and_content_limit_parity(
     assert_limit(
         &temp,
         HeldTreeLimits {
-            max_content_bytes: 3,
+            max_content_bytes: Some(3),
             ..HeldTreeLimits::default()
         },
         HeldTreeLimit::ContentBytes,
@@ -745,7 +783,7 @@ fn assessment_and_prove_have_entry_depth_path_manifest_and_content_limit_parity(
     assert_limit(
         &temp,
         HeldTreeLimits {
-            max_content_bytes: 0,
+            max_content_bytes: Some(0),
             ..HeldTreeLimits::default()
         },
         HeldTreeLimit::ContentBytes,
@@ -887,6 +925,7 @@ fn bounded_collect_records_every_directory_and_exact_rewalks() {
         order.iter().map(|entry| entry.depth).collect::<Vec<_>>(),
         [2, 1, 0]
     );
+    tree.rewalk_structure().unwrap();
     tree.rewalk_exact().unwrap();
 }
 
@@ -894,12 +933,12 @@ fn bounded_collect_records_every_directory_and_exact_rewalks() {
 fn directory_evidence_is_descriptor_free_data_and_clean_rewalk_succeeds() {
     fn assert_data_only<T: Clone + Send + Sync + Eq + std::fmt::Debug>() {}
     assert_data_only::<DirectoryEvidence>();
+    assert_data_only::<StructureEvidence>();
 
     let (temp, _) = setup_tree();
-    collect(&temp, vec![], HeldTreeLimits::default())
-        .unwrap()
-        .rewalk_exact()
-        .unwrap();
+    let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    tree.rewalk_structure().unwrap();
+    tree.rewalk_exact().unwrap();
 }
 
 #[test]
@@ -1160,12 +1199,16 @@ fn ordinary_regular_xattrs_use_v3_while_v2_rejects_and_directory_xattrs_remain_o
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn ordinary_regular_xattr_value_drift_breaks_exact_rewalk() {
+fn ordinary_regular_xattr_value_drift_breaks_structure_and_exact_rewalks() {
     let (temp, root) = setup_tree();
     let file = root.join("a/file");
     set_test_xattr(&file);
     let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
-    set_test_xattr_value(&file, b"changed");
+    set_test_xattr_value(&file, b"y");
+    assert!(matches!(
+        tree.rewalk_structure(),
+        Err(HeldTreeError::PostChanged(path)) if path == Path::new("a/file")
+    ));
     assert!(matches!(
         tree.rewalk_exact(),
         Err(HeldTreeError::PostChanged(path) | HeldTreeError::XattrsChangedDuringProof(path))
@@ -1366,14 +1409,20 @@ fn symlink_xattrs_are_no_follow_and_link_metadata_stays_fail_closed() {
     std::os::unix::fs::symlink(&target, root.join("link")).unwrap();
 
     let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    tree.rewalk_structure().unwrap();
     tree.rewalk_exact().unwrap();
-    drop(tree);
 
     match set_symlink_test_xattr(&root.join("link")) {
-        Ok(()) => assert!(matches!(
-            collect(&temp, vec![], HeldTreeLimits::default()),
-            Err(HeldTreeError::NonDirectoryExtendedMetadata(path)) if path == Path::new("link")
-        )),
+        Ok(()) => {
+            assert!(matches!(
+                tree.rewalk_structure(),
+                Err(HeldTreeError::NonDirectoryExtendedMetadata(path)) if path == Path::new("link")
+            ));
+            assert!(matches!(
+                collect(&temp, vec![], HeldTreeLimits::default()),
+                Err(HeldTreeError::NonDirectoryExtendedMetadata(path)) if path == Path::new("link")
+            ));
+        }
         Err(error) if link_self_xattr_is_unsupported(&error) => {
             eprintln!("platform refused link-self xattr fixture: {error}");
         }
@@ -1542,13 +1591,55 @@ fn content_proof_rejects_same_size_overwrite_and_symlink_target_change() {
     let (temp, root) = setup_tree();
     let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
     std::fs::write(root.join("a/file"), b"two").unwrap();
+    // The metadata-only rewalk does not hash bytes, but ctime/mtime still
+    // reject this same-size non-root overwrite.
+    assert!(tree.rewalk_structure().is_err());
     assert!(tree.rewalk_exact().is_err());
 
     let (temp, root) = setup_tree();
     let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
     std::fs::remove_file(root.join("link")).unwrap();
     std::os::unix::fs::symlink("/tmp", root.join("link")).unwrap();
+    assert!(tree.rewalk_structure().is_err());
     assert!(tree.rewalk_exact().is_err());
+}
+
+#[test]
+fn structure_rewalk_rejects_same_inode_write_after_mtime_restore() {
+    let (temp, root) = setup_tree();
+    let file = root.join("a/file");
+    let before = std::fs::metadata(&file).unwrap();
+    let original_mtime = before.modified().unwrap();
+    let original_ctime = (before.ctime(), before.ctime_nsec());
+    let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+
+    // Restore the user-settable mtime after an equal-size overwrite. The
+    // non-user-settable ctime must still make the metadata rewalk fail closed.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&file, b"two").unwrap();
+    std::fs::File::open(&file)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(original_mtime))
+        .unwrap();
+    let after = std::fs::metadata(&file).unwrap();
+    assert_eq!(after.modified().unwrap(), original_mtime);
+    assert_ne!((after.ctime(), after.ctime_nsec()), original_ctime);
+    assert!(matches!(
+        tree.rewalk_structure(),
+        Err(HeldTreeError::PostChanged(path)) if path == Path::new("a/file")
+    ));
+}
+
+#[test]
+fn structure_rewalk_rejects_external_hardlink_added_after_proof() {
+    let (temp, root) = setup_tree();
+    let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+    std::fs::hard_link(root.join("a/file"), temp.path().join("external-alias")).unwrap();
+
+    assert!(matches!(
+        tree.rewalk_structure(),
+        Err(HeldTreeError::PostChanged(path)) if path == Path::new("a/file")
+    ));
 }
 
 #[test]
@@ -1847,7 +1938,7 @@ fn content_hashing_is_aggregate_bounded() {
             &temp,
             vec![],
             HeldTreeLimits {
-                max_content_bytes: 2,
+                max_content_bytes: Some(2),
                 ..HeldTreeLimits::default()
             },
         ),
@@ -1868,6 +1959,10 @@ fn protected_policy_is_accepted_once_and_reused_by_rewalk() {
     )
     .unwrap();
     std::fs::create_dir(root.join(".secret")).unwrap();
+    assert!(matches!(
+        tree.rewalk_structure(),
+        Err(HeldTreeError::ProtectedName(path)) if path == Path::new(".secret")
+    ));
     assert!(matches!(
         tree.rewalk_exact(),
         Err(HeldTreeError::ProtectedName(path)) if path == Path::new(".secret")
@@ -1968,6 +2063,7 @@ fn rewalk_rejects_add_remove_replace_and_mode_change() {
                 std::fs::set_permissions(root.join("a/b"), Permissions::from_mode(0o700)).unwrap()
             }
         }
+        assert!(tree.rewalk_structure().is_err());
         assert!(tree.rewalk_exact().is_err());
     }
 }

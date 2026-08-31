@@ -92,6 +92,16 @@ std::thread_local! {
 }
 
 #[cfg(test)]
+pub(crate) fn reset_regular_content_bytes_read() {
+    REGULAR_CONTENT_BYTES_READ.with(|bytes| bytes.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn regular_content_bytes_read() -> u64 {
+    REGULAR_CONTENT_BYTES_READ.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
 pub(crate) struct ReopenerTestHookGuard;
 
 #[cfg(test)]
@@ -219,8 +229,13 @@ pub(crate) struct HeldTreeLimits {
     pub max_depth: u32,
     pub max_path_bytes: u64,
     pub max_manifest_bytes: u64,
-    /// Maximum aggregate regular-file bytes read through held no-follow FDs.
-    pub max_content_bytes: u64,
+    /// Maximum aggregate regular-file and symlink content bytes. `None` is
+    /// unbounded (the production default); tests and callers may inject a
+    /// finite cap.
+    pub max_content_bytes: Option<u64>,
+    /// Maximum aggregate ordinary regular-file xattr value bytes read during
+    /// one traversal/proof pass.
+    pub max_xattr_bytes: u64,
 }
 
 impl Default for HeldTreeLimits {
@@ -231,7 +246,8 @@ impl Default for HeldTreeLimits {
             max_depth: 128,
             max_path_bytes: 16 * 1024 * 1024,
             max_manifest_bytes: 64 * 1024 * 1024,
-            max_content_bytes: 1024 * 1024 * 1024,
+            max_content_bytes: None,
+            max_xattr_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -357,6 +373,76 @@ struct ManifestEntry {
     gid: u32,
     mode: u32,
     content: ContentProof,
+}
+
+/// Descriptor-free evidence for one entry's namespace and stable metadata. It
+/// deliberately excludes regular-file bytes, xattr values, and their digests;
+/// symlink targets remain exact because they are small filesystem metadata. For
+/// content-proof schemas it retains the cheap regular-file fields whose drift
+/// accompanies byte, xattr, or hardlink changes in the non-root threat model,
+/// so a metadata-only rewalk can close the interval after a full content proof
+/// without reading the regular payload again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StructureEvidence {
+    path: PathBuf,
+    identity: NodeIdentity,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    stability: StructureStability,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StructureStability {
+    Legacy,
+    Directory,
+    Regular {
+        size: u64,
+        nlink: u64,
+        mtime_sec: i64,
+        mtime_nsec: u32,
+        ctime_sec: i64,
+        ctime_nsec: u32,
+    },
+    Symlink {
+        target: Vec<u8>,
+    },
+}
+
+impl ManifestEntry {
+    fn structure_evidence(&self) -> StructureEvidence {
+        let stability = match &self.content {
+            ContentProof::Legacy => StructureStability::Legacy,
+            ContentProof::Directory => StructureStability::Directory,
+            ContentProof::Regular {
+                size,
+                nlink,
+                mtime_sec,
+                mtime_nsec,
+                ctime_sec,
+                ctime_nsec,
+                ..
+            } => StructureStability::Regular {
+                size: *size,
+                nlink: *nlink,
+                mtime_sec: *mtime_sec,
+                mtime_nsec: *mtime_nsec,
+                ctime_sec: *ctime_sec,
+                ctime_nsec: *ctime_nsec,
+            },
+            ContentProof::Symlink { target } => StructureStability::Symlink {
+                target: target.clone(),
+            },
+        };
+        StructureEvidence {
+            path: self.path.clone(),
+            identity: self.identity,
+            uid: self.uid,
+            gid: self.gid,
+            mode: self.mode,
+            stability,
+        }
+    }
 }
 
 /// Mirrors the exact pre-v2 in-memory accounting shape. This is used only for
@@ -699,7 +785,7 @@ trait V2Traversal {
         path: &Path,
         schema_version: u16,
         expected: RegularXattrProof,
-        content_limit: u64,
+        xattr_limit: u64,
     ) -> Result<RegularXattrProof, HeldTreeError>;
 }
 
@@ -759,13 +845,13 @@ impl V2Traversal for ProveTraversal {
         path: &Path,
         schema_version: u16,
         expected: RegularXattrProof,
-        content_limit: u64,
+        xattr_limit: u64,
     ) -> Result<RegularXattrProof, HeldTreeError> {
         collect_regular_xattr_proof(
             fd,
             path,
             schema_version,
-            XattrReadBudget::new(expected.value_bytes, content_limit),
+            XattrReadBudget::new(expected.value_bytes, xattr_limit),
         )
     }
 }
@@ -823,12 +909,12 @@ impl V2Traversal for AssessTraversal {
         path: &Path,
         _schema_version: u16,
         expected: RegularXattrProof,
-        content_limit: u64,
+        xattr_limit: u64,
     ) -> Result<RegularXattrProof, HeldTreeError> {
         collect_regular_xattr_assessment(
             fd,
             path,
-            XattrReadBudget::new(expected.value_bytes, content_limit),
+            XattrReadBudget::new(expected.value_bytes, xattr_limit),
         )
     }
 }
@@ -1118,7 +1204,7 @@ fn final_reobserve_regular_files<'a, M: V2Traversal>(
             path,
             walked.manifest_schema,
             recorded.xattrs,
-            walked.limits.max_content_bytes,
+            walked.limits.max_xattr_bytes,
         )?;
         if opened_xattrs != recorded.xattrs {
             return Err(HeldTreeError::XattrsChangedDuringProof(path.to_path_buf()));
@@ -1135,7 +1221,7 @@ fn final_reobserve_regular_files<'a, M: V2Traversal>(
             path,
             walked.manifest_schema,
             recorded.xattrs,
-            walked.limits.max_content_bytes,
+            walked.limits.max_xattr_bytes,
         )?;
         if final_xattrs != recorded.xattrs {
             return Err(HeldTreeError::XattrsChangedDuringProof(path.to_path_buf()));
@@ -1795,8 +1881,92 @@ impl HeldTreeInventory {
         Ok(())
     }
 
+    /// Performs a bounded second walk of namespace and stable metadata only.
+    /// This is authority-neutral evidence: it does not read regular-file bytes
+    /// or xattr values, recompute a regular-file content digest, or mint a
+    /// lifecycle token. Content-proof schemas compare size, link count, mtime,
+    /// and ctime so non-root regular-file drift after the preceding full proof
+    /// is rejected without repeating payload I/O. Symlink targets and no-follow
+    /// link metadata are re-read because target length alone is not exact proof.
+    pub(crate) fn rewalk_structure(&self) -> Result<(), HeldTreeError> {
+        self.verify_root_binding()?;
+        let baseline = self
+            .manifest
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.structure_evidence()))
+            .collect::<BTreeMap<_, _>>();
+        let mut actual = BTreeMap::new();
+        let mut budget = Budget::new(self.limits, self.manifest_schema);
+        let reopened_root = self.reopen_directory(Path::new(""))?;
+        let root = inspect_held(reopened_root.held(), Path::new(""))?;
+        let root = root.structure_evidence(PathBuf::new(), self.manifest_schema)?;
+        budget.add_path(&root.path, 0)?;
+        budget.add_directory()?;
+        actual.insert(PathBuf::new(), root);
+
+        for directory in &self.directories {
+            let reopened = self.reopen_directory(&directory.relative_path)?;
+            let held = reopened.held();
+            let fresh = with_fd(held, |fd| {
+                rustix::fs::openat(fd, c".", OPEN_DIRECTORY, Mode::empty())
+            })
+            .map_err(|error| io_error(&directory.relative_path, error))?;
+            let entries =
+                Dir::new(fresh).map_err(|error| io_error(&directory.relative_path, error))?;
+            for entry in entries {
+                let entry = entry.map_err(|error| io_error(&directory.relative_path, error))?;
+                if matches!(entry.file_name().to_bytes(), b"." | b"..") {
+                    continue;
+                }
+                let name = OsStr::from_bytes(entry.file_name().to_bytes());
+                let path = directory.relative_path.join(name);
+                require_unprotected(&self.protected_names, name, &path)?;
+                let inspected = with_fd(held, |fd| inspect_at(fd, name, &path))?;
+                require_owner(&path, inspected.uid, rustix::process::geteuid().as_raw())?;
+                require_boundary(&path, self.backend, self.mount_id, &inspected)?;
+                let value =
+                    if self.manifest_schema != 1 && inspected.identity.kind == NodeKind::Symlink {
+                        // Symlink targets are small filesystem metadata, not regular-file
+                        // payload. Re-read the target and re-run no-follow link metadata
+                        // admission so the optimized rewalk cannot move a link whose
+                        // target or link-self xattrs changed after the full proof.
+                        let content =
+                            inspect_symlink_content(held, name, &path, &inspected, &mut budget)?;
+                        inspected
+                            .clone()
+                            .into_manifest(path.clone(), content)
+                            .structure_evidence()
+                    } else {
+                        inspected.structure_evidence(path.clone(), self.manifest_schema)?
+                    };
+                budget.add_path(&value.path, directory.depth.saturating_add(1))?;
+                if value.identity.kind == NodeKind::Directory {
+                    budget.add_directory()?;
+                }
+                if !baseline.contains_key(&path) {
+                    return Err(HeldTreeError::PostAdded(path));
+                }
+                if actual.insert(path.clone(), value).is_some() {
+                    return Err(HeldTreeError::PostChanged(path));
+                }
+            }
+        }
+        for (path, expected) in baseline {
+            let Some(found) = actual.get(&path) else {
+                return Err(HeldTreeError::PostRemoved(path));
+            };
+            if found != &expected {
+                return Err(HeldTreeError::PostChanged(path));
+            }
+        }
+        self.verify_root_binding()
+    }
+
     /// Performs a complete second walk under the identical policy and limits.
-    /// It only validates; success does not mint any lifecycle token.
+    /// It only validates; success does not mint any lifecycle token. Production
+    /// uses `rewalk_structure` after a preceding full proof; this complete pass
+    /// remains as a regression oracle for tests.
+    #[cfg(test)]
     pub(crate) fn rewalk_exact(&self) -> Result<(), HeldTreeError> {
         self.verify_root_binding()?;
         let baseline = self
@@ -2063,6 +2233,47 @@ impl Inspection {
             mode: self.mode,
             content,
         }
+    }
+
+    fn structure_evidence(
+        &self,
+        path: PathBuf,
+        manifest_schema: u16,
+    ) -> Result<StructureEvidence, HeldTreeError> {
+        let stability = match manifest_schema {
+            1 => StructureStability::Legacy,
+            LEGACY_CONTENT_PROOF_VERSION | CONTENT_PROOF_VERSION => match self.identity.kind {
+                NodeKind::Directory => StructureStability::Directory,
+                NodeKind::Regular if self.content_fields_available => StructureStability::Regular {
+                    size: self.size,
+                    nlink: self.nlink,
+                    mtime_sec: self.mtime_sec,
+                    mtime_nsec: self.mtime_nsec,
+                    ctime_sec: self.ctime_sec,
+                    ctime_nsec: self.ctime_nsec,
+                },
+                NodeKind::Regular => {
+                    return Err(HeldTreeError::ContentChangedDuringHash(path));
+                }
+                NodeKind::Symlink => {
+                    // Callers must re-read the no-follow target and link-self
+                    // metadata; length alone cannot preserve exact admission.
+                    return Err(HeldTreeError::UnsupportedContentProof(path));
+                }
+                NodeKind::Other => {
+                    return Err(HeldTreeError::UnsupportedContentProof(path));
+                }
+            },
+            _ => return Err(HeldTreeError::UnsupportedContentProof(path)),
+        };
+        Ok(StructureEvidence {
+            path,
+            identity: self.identity,
+            uid: self.uid,
+            gid: self.gid,
+            mode: self.mode,
+            stability,
+        })
     }
 
     fn stable_content_fields_equal(&self, other: &Self) -> bool {
@@ -2362,7 +2573,7 @@ fn assess_regular_content(
     })
     .map_err(|error| io_error(path, error))?;
     let xattrs = collect_regular_xattr_assessment(&fd, path, budget.xattr_read_budget())?;
-    budget.add_content(xattrs.value_bytes)?;
+    budget.add_xattrs(xattrs.value_bytes)?;
     let opened = inspect_raw_fd(&fd, parent.backend(), path)?;
     if !before.stable_content_fields_equal(&opened) || opened.identity.kind != NodeKind::Regular {
         return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
@@ -2370,7 +2581,7 @@ fn assess_regular_content(
     let final_xattrs = collect_regular_xattr_assessment(
         &fd,
         path,
-        XattrReadBudget::new(xattrs.value_bytes, budget.limits.max_content_bytes),
+        XattrReadBudget::new(xattrs.value_bytes, budget.limits.max_xattr_bytes),
     )?;
     let final_inspection = inspect_raw_fd(&fd, parent.backend(), path)?;
     if xattrs != final_xattrs {
@@ -2413,7 +2624,7 @@ fn inspect_regular_content(
     .map_err(|error| io_error(path, error))?;
     let xattrs =
         collect_regular_xattr_proof(&fd, path, schema_version, budget.xattr_read_budget())?;
-    budget.add_content(xattrs.value_bytes)?;
+    budget.add_xattrs(xattrs.value_bytes)?;
     let opened = inspect_raw_fd(&fd, parent.backend(), path)?;
     if !before.stable_content_fields_equal(&opened) || opened.identity.kind != NodeKind::Regular {
         return Err(HeldTreeError::ContentChangedDuringHash(path.to_path_buf()));
@@ -2447,7 +2658,7 @@ fn inspect_regular_content(
         &file,
         path,
         schema_version,
-        XattrReadBudget::new(xattrs.value_bytes, budget.limits.max_content_bytes),
+        XattrReadBudget::new(xattrs.value_bytes, budget.limits.max_xattr_bytes),
     )?;
     let final_inspection = inspect_raw_fd(&file, parent.backend(), path)?;
     if xattrs != final_xattrs {
@@ -3619,7 +3830,15 @@ struct Budget {
     directories: u64,
     path_bytes: u64,
     manifest_bytes: u64,
+    /// Regular-file and symlink bytes plus ordinary xattr value bytes. This
+    /// preserves the existing metadata assessment/reporting definition.
     content_bytes: u64,
+    /// Regular-file and symlink bytes only. The production default is
+    /// unbounded, but tests may inject a finite cap.
+    payload_bytes: u64,
+    /// Ordinary regular-file xattr value bytes only. These remain bounded
+    /// independently because values are materialized while proof hashes them.
+    xattr_bytes: u64,
 }
 
 impl Budget {
@@ -3637,6 +3856,8 @@ impl Budget {
             path_bytes: 0,
             manifest_bytes: 0,
             content_bytes: 0,
+            payload_bytes: 0,
+            xattr_bytes: 0,
         }
     }
 
@@ -3670,24 +3891,29 @@ impl Budget {
         )
     }
 
-    fn remaining_content_bytes(&self) -> u64 {
-        self.limits
-            .max_content_bytes
-            .saturating_sub(self.content_bytes)
+    fn remaining_xattr_bytes(&self) -> u64 {
+        self.limits.max_xattr_bytes.saturating_sub(self.xattr_bytes)
     }
 
     fn xattr_read_budget(&self) -> XattrReadBudget {
-        XattrReadBudget::new(
-            self.remaining_content_bytes(),
-            self.limits.max_content_bytes,
-        )
+        XattrReadBudget::new(self.remaining_xattr_bytes(), self.limits.max_xattr_bytes)
     }
 
     fn add_content(&mut self, bytes: u64) -> Result<(), HeldTreeError> {
-        self.content_bytes = self.content_bytes.saturating_add(bytes);
+        self.content_bytes = checked_content_add(self.content_bytes, bytes)?;
+        self.payload_bytes = checked_content_add(self.payload_bytes, bytes)?;
+        if let Some(limit) = self.limits.max_content_bytes {
+            check(self.payload_bytes, limit, HeldTreeLimit::ContentBytes)?;
+        }
+        Ok(())
+    }
+
+    fn add_xattrs(&mut self, bytes: u64) -> Result<(), HeldTreeError> {
+        self.content_bytes = checked_content_add(self.content_bytes, bytes)?;
+        self.xattr_bytes = checked_content_add(self.xattr_bytes, bytes)?;
         check(
-            self.content_bytes,
-            self.limits.max_content_bytes,
+            self.xattr_bytes,
+            self.limits.max_xattr_bytes,
             HeldTreeLimit::ContentBytes,
         )
     }
@@ -3700,6 +3926,13 @@ impl Budget {
             HeldTreeLimit::Directories,
         )
     }
+}
+
+fn checked_content_add(current: u64, bytes: u64) -> Result<u64, HeldTreeError> {
+    current.checked_add(bytes).ok_or(HeldTreeError::Limit {
+        kind: HeldTreeLimit::ContentBytes,
+        limit: u64::MAX,
+    })
 }
 
 fn check(value: u64, limit: u64, kind: HeldTreeLimit) -> Result<(), HeldTreeError> {

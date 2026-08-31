@@ -5,6 +5,8 @@
 //! exact binding against backend, mount, filesystem-id, dev/inode and birth-time,
 //! and rechecks that binding immediately before any held-FD mode restoration.
 
+mod stream_v3;
+
 use crate::authority::TransactionState;
 use crate::backend::held::{HeldTreeError, HeldTreeInventory, HeldTreeLimits, HeldTreePurgeError};
 use crate::backend::{
@@ -15,6 +17,7 @@ use crate::seal::executor::{
     LocalModeExecutionError, LocalModeMutationRequest, LocalModeTransform, RecoveryLocator,
     execute_staging_local_mode_mutation,
 };
+use crate::seal::sidecar::{TreeSidecarCommitment, TreeSidecarError, TreeSidecarStore};
 use crate::seal::wal::{
     AppendError, ApplicationStatus, DurablePermission, DurableTreeManifest,
     DurableUndoRenameOutcome, PermissionResolution, RecoverySession, RecoveryWork, ResolveError,
@@ -35,6 +38,8 @@ std::thread_local! {
         const { std::cell::RefCell::new(None) };
     pub(crate) static UNDO_FAIL_STEP: std::cell::Cell<Option<&'static str>> =
         const { std::cell::Cell::new(None) };
+    pub(crate) static AFTER_UNDO_MODES_RESTORED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
     pub(crate) static BEFORE_UNDO_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     pub(crate) static PURGE_FAIL_AFTER_CLAIM: std::cell::Cell<bool> =
@@ -125,6 +130,10 @@ pub(crate) enum RecoveryRebindError {
     Resolution(#[from] ResolveError),
     #[error("held recovery mutation failed: {0}")]
     Execution(#[from] LocalModeExecutionError),
+    #[error("recovery tree sidecar failed authentication: {0}")]
+    Sidecar(#[source] TreeSidecarError),
+    #[error("published recovery tree sidecar does not match its durable manifest")]
+    SidecarManifestChanged,
     #[error("committed tree no longer exactly matches its sealed content manifest")]
     UndoManifestChanged,
     #[error("verified undo destination is occupied")]
@@ -515,12 +524,14 @@ pub(crate) enum StagedVerificationOutcome<'a> {
 /// but exposes no chmod, unlink, rename, or purge operation.
 pub(crate) struct CertifiedStagedRecovery<'a> {
     wal: &'a mut SealWal<RecoverySession>,
+    sidecars: &'a TreeSidecarStore,
     startup_blocked: &'a mut bool,
     transaction: TransactionId,
     destination_anchor: RecoveryFilesystemAnchor,
     metadata: StagingTransactionMetadata,
     root: ReboundObject,
     expected_manifest: Option<DurableTreeManifest>,
+    sidecar_commitment: Option<TreeSidecarCommitment>,
     tree_seal_plan: Vec<RecoveryPermissionPlan>,
 }
 
@@ -551,7 +562,7 @@ impl<'a> CertifiedStagedRecovery<'a> {
     }
 
     fn verify_or_quarantine_with_limits(
-        self,
+        mut self,
         limits: HeldTreeLimits,
     ) -> Result<StagedVerificationOutcome<'a>, StagedVerificationError> {
         if self.wal.transaction_state(self.transaction) != Some(TransactionState::StagedUnverified)
@@ -584,14 +595,57 @@ impl<'a> CertifiedStagedRecovery<'a> {
         ))
     }
 
-    fn verify_staged_tree(&self, limits: HeldTreeLimits) -> Result<(), StagedVerificationFailure> {
+    fn verify_staged_tree(
+        &mut self,
+        limits: HeldTreeLimits,
+    ) -> Result<(), StagedVerificationFailure> {
         let expected = self
             .expected_manifest
             .ok_or(StagedVerificationFailure::MissingManifest)?;
+        let v3_commitment = if expected.schema_version == 3 {
+            let Some(commitment) = self.sidecar_commitment else {
+                if let Err(error) = self.sidecars.cleanup_unpublished(self.wal) {
+                    return Err(RecoveryRebindError::Sidecar(error).into());
+                }
+                return Err(StagedVerificationFailure::MissingManifest);
+            };
+            if let Err(error) = self.sidecars.verify(commitment) {
+                // The authenticated published baseline retains precedence, but
+                // an earlier unpublished recovery attempt must not leak runs.
+                let _ = self.sidecars.cleanup_unpublished(self.wal);
+                return Err(RecoveryRebindError::Sidecar(error).into());
+            }
+            Some(commitment)
+        } else {
+            None
+        };
         self.root.verify_fresh_binding()?;
         for plan in &self.tree_seal_plan {
             let rebound = reopen_permission_plan(&self.destination_anchor, plan, &self.metadata)?;
             rebound.verify_fresh_sealed_directory(plan.permission.expected_mode)?;
+        }
+        if let Some(commitment) = v3_commitment {
+            return stream_v3::verify_rebound_v3(
+                self.wal,
+                self.sidecars,
+                stream_v3::ReboundV3Verification {
+                    transaction: self.transaction,
+                    commitment,
+                    expected_manifest: expected,
+                    root: &self.root,
+                    metadata: &self.metadata,
+                    plans: &self.tree_seal_plan,
+                    modes_restored: false,
+                    limits,
+                },
+            )
+            .map(|_| ())
+            .map_err(|error| match error {
+                RecoveryRebindError::UndoManifestChanged => {
+                    StagedVerificationFailure::ManifestMismatch
+                }
+                error => StagedVerificationFailure::Rebind(error),
+            });
         }
         let inventory = collect_rebound_staged_tree(&self.root, limits, expected.schema_version)?;
         require_exact_tree_seal_coverage(
@@ -815,6 +869,7 @@ struct ReboundVerifiedUndo {
     root: ReboundObject,
     tree_seals: Vec<RecoveryPermissionPlan>,
     expected_manifest: DurableTreeManifest,
+    sidecar_commitment: Option<TreeSidecarCommitment>,
 }
 
 /// One-shot continuation for committed-mode restoration and rename-back. Root
@@ -822,6 +877,7 @@ struct ReboundVerifiedUndo {
 /// from the authenticated anchor and durable data is never authority by itself.
 pub(crate) struct VerifiedUndoRecoverySession<'a> {
     wal: &'a mut SealWal<RecoverySession>,
+    sidecars: &'a TreeSidecarStore,
     startup_blocked: &'a mut bool,
     transaction: TransactionId,
     undo: ReboundVerifiedUndo,
@@ -839,6 +895,7 @@ pub(crate) struct VerifiedPurgeAuthorityMaterial {
 
 pub(crate) struct VerifiedPurgeSession<'a> {
     wal: &'a mut SealWal<RecoverySession>,
+    sidecars: &'a TreeSidecarStore,
     startup_blocked: &'a mut bool,
     transaction: TransactionId,
     committed: ReboundVerifiedUndo,
@@ -902,6 +959,7 @@ impl VerifiedPurgeSession<'_> {
         let transaction = self.transaction;
         let verifier = VerifiedUndoRecoverySession {
             wal: self.wal,
+            sidecars: self.sidecars,
             startup_blocked: self.startup_blocked,
             transaction,
             undo: self.committed,
@@ -959,7 +1017,7 @@ impl VerifiedUndoRecoverySession<'_> {
             .transaction_state(transaction)
             .ok_or(RecoveryRebindError::TransactionMismatch)?;
         if state == TransactionState::VerifiedCommitted {
-            self.verify_exact_tree()?;
+            self.verify_exact_tree_or_block_unusable_v3_baseline()?;
             self.verify_parents_and_layout(true)?;
             self.wal.record_verified_undo_intent(transaction)?;
             #[cfg(test)]
@@ -1062,6 +1120,12 @@ impl VerifiedUndoRecoverySession<'_> {
             }
             self.wal.record_undo_modes_restored(transaction)?;
             #[cfg(test)]
+            AFTER_UNDO_MODES_RESTORED.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook();
+                }
+            });
+            #[cfg(test)]
             if UNDO_FAIL_STEP.with(|step| step.get() == Some("modes")) {
                 return Err(RecoveryRebindError::Io(io::Error::other(
                     "injected crash after UndoModesRestored",
@@ -1069,7 +1133,7 @@ impl VerifiedUndoRecoverySession<'_> {
             }
         }
 
-        self.verify_exact_tree()?;
+        self.verify_exact_tree_or_block_unusable_v3_baseline()?;
         self.verify_parents_and_layout(true)?;
         self.wal.record_undo_rename_intent(transaction)?;
         #[cfg(test)]
@@ -1161,7 +1225,55 @@ impl VerifiedUndoRecoverySession<'_> {
         Ok(TransactionState::Restored)
     }
 
-    fn verify_exact_tree(&self) -> Result<(), RecoveryRebindError> {
+    fn verify_exact_tree_or_block_unusable_v3_baseline(
+        &mut self,
+    ) -> Result<(), RecoveryRebindError> {
+        match self.verify_exact_tree() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let missing_v3_sidecar = self.undo.expected_manifest.schema_version == 3
+                    && self.undo.sidecar_commitment.is_none();
+                // A missing or unauthentic published v3 baseline is not live-tree
+                // drift and cannot remain retryable at either proof boundary.
+                if missing_v3_sidecar
+                    || matches!(
+                        error,
+                        RecoveryRebindError::Sidecar(_)
+                            | RecoveryRebindError::SidecarManifestChanged
+                    )
+                {
+                    self.wal.transition_recovery_required(self.transaction)?;
+                    *self.startup_blocked = true;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn verify_exact_tree(&mut self) -> Result<(), RecoveryRebindError> {
+        if self.undo.expected_manifest.schema_version == 3 {
+            let commitment = self
+                .undo
+                .sidecar_commitment
+                .ok_or(RecoveryRebindError::UndoManifestChanged)?;
+            let modes_restored = self.wal.transaction_state(self.transaction)
+                == Some(TransactionState::UndoModesRestored);
+            stream_v3::verify_rebound_v3(
+                self.wal,
+                self.sidecars,
+                stream_v3::ReboundV3Verification {
+                    transaction: self.transaction,
+                    commitment,
+                    expected_manifest: self.undo.expected_manifest,
+                    root: &self.undo.root,
+                    metadata: &self.undo.metadata,
+                    plans: &self.undo.tree_seals,
+                    modes_restored,
+                    limits: HeldTreeLimits::default(),
+                },
+            )?;
+            return Ok(());
+        }
         self.collect_exact_tree().map(|_| ())
     }
 
@@ -1370,13 +1482,14 @@ fn compare_restore_permissions(
 /// to durable `RecoveryRequired` when that transition can be recorded.
 pub(crate) fn prepare_startup_recovery<'a>(
     wal: &'a mut SealWal<RecoverySession>,
+    sidecars: &'a TreeSidecarStore,
     startup_blocked: &'a mut bool,
     transaction: TransactionId,
     anchors: RecoveryAnchors,
 ) -> Result<StartupRecoveryCapability<'a>, RecoveryRebindError> {
     // Recompute from the exact leased WAL after every durable uncertainty
     // resolution. No caller can supply/omit a permission or choose a rename side.
-    let (metadata, tree_manifest, work) = loop {
+    let (metadata, tree_manifest, sidecar_commitment, work) = loop {
         let snapshot = wal
             .recovery_snapshot(transaction)
             .ok_or(RecoveryRebindError::TransactionMismatch)?;
@@ -1428,7 +1541,12 @@ pub(crate) fn prepare_startup_recovery<'a>(
             }
             continue;
         }
-        break (metadata, snapshot.tree_manifest, work);
+        break (
+            metadata,
+            snapshot.tree_manifest,
+            snapshot.tree_sidecar,
+            work,
+        );
     };
 
     if matches!(
@@ -1454,7 +1572,7 @@ pub(crate) fn prepare_startup_recovery<'a>(
         )));
     }
 
-    match rebind_work(&metadata, tree_manifest, work, &anchors) {
+    match rebind_work(&metadata, tree_manifest, sidecar_commitment, work, &anchors) {
         Ok(ReboundWork::Restore(restore)) => Ok(StartupRecoveryCapability::Restore(Box::new(
             RecoveryRestoreSession {
                 wal,
@@ -1477,12 +1595,14 @@ pub(crate) fn prepare_startup_recovery<'a>(
             Ok(StartupRecoveryCapability::PendingVerification(Box::new(
                 CertifiedStagedRecovery {
                     wal,
+                    sidecars,
                     startup_blocked,
                     transaction,
                     destination_anchor: staged.destination_anchor,
                     metadata: staged.metadata,
                     root: staged.root,
                     expected_manifest: staged.expected_manifest,
+                    sidecar_commitment: staged.sidecar_commitment,
                     tree_seal_plan: staged.tree_seals,
                 },
             )))
@@ -1490,6 +1610,7 @@ pub(crate) fn prepare_startup_recovery<'a>(
         Ok(ReboundWork::VerifiedUndo(undo)) => Ok(StartupRecoveryCapability::VerifiedUndo(
             Box::new(VerifiedUndoRecoverySession {
                 wal,
+                sidecars,
                 startup_blocked,
                 transaction,
                 undo: *undo,
@@ -1501,6 +1622,7 @@ pub(crate) fn prepare_startup_recovery<'a>(
 
 pub(crate) fn prepare_verified_undo<'a>(
     wal: &'a mut SealWal<RecoverySession>,
+    sidecars: &'a TreeSidecarStore,
     startup_blocked: &'a mut bool,
     transaction: TransactionId,
     anchors: RecoveryAnchors,
@@ -1519,9 +1641,16 @@ pub(crate) fn prepare_verified_undo<'a>(
         transaction,
         permissions: snapshot.permissions,
     };
-    match rebind_work(&metadata, snapshot.tree_manifest, work, &anchors) {
+    match rebind_work(
+        &metadata,
+        snapshot.tree_manifest,
+        snapshot.tree_sidecar,
+        work,
+        &anchors,
+    ) {
         Ok(ReboundWork::VerifiedUndo(undo)) => Ok(VerifiedUndoRecoverySession {
             wal,
+            sidecars,
             startup_blocked,
             transaction,
             undo: *undo,
@@ -1535,6 +1664,7 @@ pub(crate) fn prepare_verified_undo<'a>(
 
 pub(crate) fn prepare_verified_purge<'a>(
     wal: &'a mut SealWal<RecoverySession>,
+    sidecars: &'a TreeSidecarStore,
     startup_blocked: &'a mut bool,
     transaction: TransactionId,
     anchors: RecoveryAnchors,
@@ -1559,9 +1689,16 @@ pub(crate) fn prepare_verified_purge<'a>(
         transaction,
         permissions: snapshot.permissions,
     };
-    match rebind_work(&metadata, snapshot.tree_manifest, work, &anchors) {
+    match rebind_work(
+        &metadata,
+        snapshot.tree_manifest,
+        snapshot.tree_sidecar,
+        work,
+        &anchors,
+    ) {
         Ok(ReboundWork::VerifiedUndo(committed)) => Ok(VerifiedPurgeSession {
             wal,
+            sidecars,
             startup_blocked,
             transaction,
             committed: *committed,
@@ -1601,6 +1738,7 @@ struct ReboundStaged {
     metadata: StagingTransactionMetadata,
     root: ReboundObject,
     expected_manifest: Option<DurableTreeManifest>,
+    sidecar_commitment: Option<TreeSidecarCommitment>,
     tree_seals: Vec<RecoveryPermissionPlan>,
 }
 
@@ -1772,6 +1910,7 @@ fn uncertain_permission_location<'a>(
 fn rebind_work(
     metadata: &StagingTransactionMetadata,
     tree_manifest: Option<DurableTreeManifest>,
+    sidecar_commitment: Option<TreeSidecarCommitment>,
     work: RecoveryWork,
     anchors: &RecoveryAnchors,
 ) -> Result<ReboundWork, RecoveryRebindError> {
@@ -1910,6 +2049,7 @@ fn rebind_work(
                 metadata: metadata.clone(),
                 root,
                 expected_manifest: tree_manifest,
+                sidecar_commitment,
                 tree_seals,
             })))
         }
@@ -1951,6 +2091,7 @@ fn rebind_work(
                 root,
                 tree_seals,
                 expected_manifest,
+                sidecar_commitment,
             })))
         }
         RecoveryWork::RecoveryRequired { .. }

@@ -847,6 +847,7 @@ impl ReadyStagingEngine {
                 })?;
         let session = match prepare_verified_purge(
             &mut self.engine.wal,
+            &self.engine.sidecars,
             &mut self.engine.startup_blocked,
             transaction,
             anchors,
@@ -1019,6 +1020,7 @@ impl ReadyStagingEngine {
         })?;
         let undo = prepare_verified_undo(
             &mut self.engine.wal,
+            &self.engine.sidecars,
             &mut self.engine.startup_blocked,
             transaction,
             anchors,
@@ -1819,6 +1821,7 @@ impl SealedStagingEngine {
         let transaction = self.validate_recovery_candidate(&candidate)?;
         prepare_startup_recovery(
             &mut self.wal,
+            &self.sidecars,
             &mut self.startup_blocked,
             transaction,
             anchors,

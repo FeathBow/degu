@@ -508,6 +508,29 @@ fn transient_seal_group_drift_fails_before_child_intent_or_fchmod_when_permitted
 }
 
 #[test]
+fn verified_commit_hashes_each_payload_three_times() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let payload_bytes = std::fs::metadata(fixture.source_root.join("child/data"))
+        .unwrap()
+        .len();
+    crate::backend::held::reset_regular_content_bytes_read();
+    let transaction = TransactionId([0xc7; 16]);
+    let mut ready = fixture.ready_engine();
+
+    ready
+        .stage_to_verified_commit(transaction, fixture.forward_request("root", "staged"))
+        .unwrap();
+
+    assert_eq!(
+        crate::backend::held::regular_content_bytes_read(),
+        payload_bytes * 3,
+        "pre-seal, post-seal, and staged verification are the only full payload proofs"
+    );
+}
+
+#[test]
 fn forward_coordinator_reaches_verified_commit_before_returning() {
     let Some(fixture) = Fixture::new() else {
         return;

@@ -456,7 +456,7 @@ pub(crate) fn execute_prepared_rename<'a>(
 
     let post_seal = collect_source_tree(&binding)?;
     tree.verify_post_seal_snapshot(&post_seal)?;
-    post_seal.rewalk_exact()?;
+    post_seal.rewalk_structure()?;
     let fingerprint = post_seal.fingerprint();
     wal.complete_tree_manifest(
         transaction,
@@ -468,7 +468,7 @@ pub(crate) fn execute_prepared_rename<'a>(
     )?;
     wal.transition_staging_foundation(transaction, TransactionState::TreeSealed)?;
 
-    post_seal.rewalk_exact()?;
+    post_seal.rewalk_structure()?;
     binding.verify_before_rename()?;
     wal.record_rename_intent(transaction)?;
     #[cfg(test)]

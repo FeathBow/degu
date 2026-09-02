@@ -15,6 +15,10 @@ pub(crate) mod recovery;
 pub(crate) mod rename;
 
 use crate::authority::TransactionState;
+use crate::backend::held::{ManifestV3CodecError, ManifestV3Decoder};
+use crate::seal::sidecar::{
+    TreeSidecarFoldError, TreeSidecarStore, tree_sidecar_required_for_state,
+};
 use crate::seal::store::{SealWalStore, StoreError};
 use crate::seal::wal::{
     AppendError, ProductionAssociation, RECOVERY_MAX_ACTIVE_PERMISSIONS, RecoveryIdentity,
@@ -59,6 +63,8 @@ pub enum StagingEngineError {
     Wal(#[from] AppendError),
     #[error(transparent)]
     Replay(#[from] ReplayError),
+    #[error("held-tree sidecar cleanup failed: {0}")]
+    Sidecar(String),
     #[error("staging recovery metadata is incomplete or inconsistent: {0}")]
     InsufficientRecoveryIdentity(&'static str),
 }
@@ -67,6 +73,7 @@ pub enum StagingEngineError {
 /// crate-private and cannot be reached through this boundary.
 pub struct SealedStagingEngine {
     wal: SealWal<RecoverySession>,
+    sidecars: TreeSidecarStore,
     startup_blocked: bool,
     recovery_generation: u64,
     issued_purge_authorities: HashSet<TransactionId>,
@@ -1222,6 +1229,36 @@ impl StartupRecoveryError {
     }
 }
 
+/// Authenticates the complete generic container, decodes every concrete v3
+/// record, and requires the resulting canonical fingerprint to equal the WAL
+/// manifest. The decoder accumulator is returned by `read_fold` only after the
+/// final root commitment and EOF have also been authenticated.
+fn referenced_sidecar_is_valid(
+    sidecars: &TreeSidecarStore,
+    transaction: &ReplayedTransaction,
+) -> bool {
+    let Some(commitment) = transaction.tree_sidecar else {
+        return true;
+    };
+    let Some(expected_manifest) = transaction.tree_manifest else {
+        return false;
+    };
+    let Ok(decoder) = ManifestV3Decoder::new(commitment.record_count()) else {
+        return false;
+    };
+    let decoder =
+        match sidecars.read_fold(commitment, decoder, |mut decoder, record_count, payload| {
+            decoder.push_segment(record_count, payload)?;
+            Ok::<_, ManifestV3CodecError>(decoder)
+        }) {
+            Ok(decoder) => decoder,
+            Err(TreeSidecarFoldError::Sidecar(_) | TreeSidecarFoldError::Fold(_)) => return false,
+        };
+    decoder
+        .finish()
+        .is_ok_and(|actual_manifest| actual_manifest == expected_manifest)
+}
+
 fn recovery_work_requires_candidate(work: &RecoveryWork) -> bool {
     matches!(
         work,
@@ -1307,6 +1344,7 @@ impl SealedStagingEngine {
     pub(crate) fn open(
         store: &SealWalStore,
     ) -> Result<(Self, StartupRecoveryReport), StagingEngineError> {
+        let sidecars = store.tree_sidecar_store()?;
         let mut recovery = store.try_lease()?;
         let replay = recovery.replay_and_repair()?.clone();
         if replay
@@ -1318,13 +1356,44 @@ impl SealedStagingEngine {
                 "transaction has no atomic staging metadata",
             ));
         }
+        // A durable v12 reference is not usable unless its exact final sidecar
+        // still satisfies the complete container commitment. Missing,
+        // substituted, truncated, or tampered referenced sidecars are converted
+        // into a durable fail-closed transaction state before recovery work is
+        // exposed. Terminal transactions no longer consume manifest evidence.
+        let invalid_sidecars = replay
+            .transactions
+            .values()
+            .filter(|transaction| tree_sidecar_required_for_state(transaction.state))
+            .filter(|transaction| !referenced_sidecar_is_valid(&sidecars, transaction))
+            .map(|transaction| transaction.id)
+            .collect::<Vec<_>>();
+        let mut wal = recovery.resume()?;
+        // Temp names can never be WAL-referenced. Replay completion and the
+        // matching mutable lease therefore prove they are safe to remove; final
+        // sidecars remain untouched until exact reachability is classified.
+        sidecars
+            .cleanup_unpublished(&mut wal)
+            .map_err(|error| StagingEngineError::Sidecar(error.to_string()))?;
+        for transaction in invalid_sidecars {
+            if wal.transaction_state(transaction) != Some(TransactionState::RecoveryRequired) {
+                wal.transition_recovery_required(transaction)?;
+            }
+        }
+        // Final cleanup derives reachability only from the replay-resumed WAL.
+        // Corrupt finals are retained; only exact terminal references and valid
+        // unreferenced publication orphans are removed and directory-synced.
+        sidecars
+            .cleanup_unreachable(&mut wal)
+            .map_err(|error| StagingEngineError::Sidecar(error.to_string()))?;
+
         // Enumerate candidate recovery ordering without granting authority. Every
         // item is subsequently required to pass staging_recovery's fresh held-FD
         // rebind; this callback cannot itself authorize chmod or namespace work.
         let recovery_generation = NEXT_RECOVERY_GENERATION.fetch_add(1, Ordering::Relaxed);
-        let mut work = replay
-            .transactions
-            .values()
+        let snapshots = wal.recovery_snapshots();
+        let mut work = snapshots
+            .iter()
             .map(|transaction| decide_recovery(transaction, |_| RecoveryIdentity::Reestablished))
             .filter(recovery_work_requires_candidate)
             .collect::<Vec<_>>();
@@ -1336,15 +1405,14 @@ impl SealedStagingEngine {
                 generation: recovery_generation,
             })
             .collect();
-        let startup_blocked = replay
-            .transactions
-            .values()
+        let startup_blocked = snapshots
+            .iter()
             .any(quarantined_transaction_retains_active_permission_seals)
             || !work.is_empty();
-        let wal = recovery.resume()?;
         Ok((
             Self {
                 wal,
+                sidecars,
                 startup_blocked,
                 recovery_generation,
                 issued_purge_authorities: HashSet::new(),
@@ -1779,6 +1847,7 @@ impl SealedStagingEngine {
         }
         execute_prepared_rename(
             &mut self.wal,
+            &self.sidecars,
             &mut self.startup_blocked,
             transaction,
             binding,

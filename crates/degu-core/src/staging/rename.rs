@@ -6,7 +6,10 @@
 //! or delete, and its only success state is `StagedUnverified`.
 
 use crate::authority::TransactionState;
-use crate::backend::held::{HeldTreeError, HeldTreeInventory, HeldTreeLimits, HeldTreeSealError};
+use crate::backend::held::{
+    HeldTreeError, HeldTreeInventory, HeldTreeLimits, HeldTreeSealError, ManifestV3CodecError,
+    ManifestV3Decoder, ManifestV3StreamError,
+};
 use crate::backend::{
     CertificationError, HeldLocalBackendEvidence, LocalModeRevalidationFailure, certify_held_fd,
 };
@@ -14,6 +17,7 @@ use crate::seal::executor::{
     LocalModeExecutionError, LocalModeMutationRequest, LocalModeMutationResult, LocalModeTransform,
     RecoveryLocator, execute_staging_local_mode_mutation,
 };
+use crate::seal::sidecar::{TreeSidecarError, TreeSidecarFoldError, TreeSidecarStore};
 use crate::seal::wal::{
     AppendError, DurableSourceParentStrategy, DurableTreeManifest, RecoverySession, SealWal,
     StagingLocator, StagingTransactionMetadata, StrongObjectIdentity, TransactionId,
@@ -333,6 +337,12 @@ pub(crate) enum StagingRenameError {
     HeldTree(#[from] HeldTreeError),
     #[error("held-tree seal failed: {0}")]
     TreeSeal(#[from] HeldTreeSealError),
+    #[error("held-tree sidecar publication or verification failed: {0}")]
+    Sidecar(#[from] TreeSidecarError),
+    #[error("held-tree manifest sidecar codec failed: {0}")]
+    ManifestCodec(#[from] ManifestV3CodecError),
+    #[error("published held-tree sidecar does not match the exact manifest fingerprint")]
+    ManifestMismatch,
     #[error("rename was confirmed not applied and the exact outcome is durable: {0}")]
     ConfirmedNotApplied(#[source] io::Error),
     #[error("rename outcome is unknown after syscall failure: {0}")]
@@ -383,6 +393,7 @@ impl StagedUnverifiedTree<'_> {
 
 pub(crate) fn execute_prepared_rename<'a>(
     wal: &'a mut SealWal<RecoverySession>,
+    sidecars: &TreeSidecarStore,
     startup_blocked: &'a mut bool,
     transaction: TransactionId,
     mut binding: PreparedRootBinding,
@@ -458,14 +469,45 @@ pub(crate) fn execute_prepared_rename<'a>(
     tree.verify_post_seal_snapshot(&post_seal)?;
     post_seal.rewalk_structure()?;
     let fingerprint = post_seal.fingerprint();
-    wal.complete_tree_manifest(
-        transaction,
-        DurableTreeManifest {
-            schema_version: fingerprint.schema_version,
-            entry_count: fingerprint.entry_count,
-            sha256: fingerprint.sha256,
-        },
-    )?;
+    let manifest = DurableTreeManifest {
+        schema_version: fingerprint.schema_version,
+        entry_count: fingerprint.entry_count,
+        sha256: fingerprint.sha256,
+    };
+    // Publication is complete and the store directory is durable before the
+    // commitment can enter the WAL. A failure after publication leaves only a
+    // self-authenticating final orphan; it never authorizes recovery.
+    let commitment = sidecars.publish_stream(wal, transaction, |emit| {
+        post_seal
+            .stream_manifest_v3_segments(|record_count, payload| emit(record_count, payload))
+            .map_err(|error| match error {
+                ManifestV3StreamError::Codec(_) => TreeSidecarError::InvalidSegment(
+                    "the collected v3 manifest could not be segmented",
+                ),
+                ManifestV3StreamError::Emit(error) => error,
+            })
+    })?;
+    // Reopen and decode the published bytes before creating their durable WAL
+    // reference. This proves both the generic container commitment and the
+    // concrete v3 manifest/count/fingerprint binding.
+    let decoder = ManifestV3Decoder::new(commitment.record_count())?;
+    let decoder = sidecars
+        .read_fold(commitment, decoder, |mut decoder, record_count, payload| {
+            decoder.push_segment(record_count, payload)?;
+            Ok(decoder)
+        })
+        .map_err(|error| match error {
+            TreeSidecarFoldError::Sidecar(error) => StagingRenameError::Sidecar(error),
+            TreeSidecarFoldError::Fold(error) => StagingRenameError::ManifestCodec(error),
+        })?;
+    if decoder.finish()? != manifest {
+        return Err(StagingRenameError::ManifestMismatch);
+    }
+    #[cfg(test)]
+    if FAIL_WAL_STEP.with(|failure| failure.get() == Some("manifest-reference")) {
+        wal.poison_for_test();
+    }
+    wal.complete_tree_manifest_with_sidecar(transaction, manifest, commitment)?;
     wal.transition_staging_foundation(transaction, TransactionState::TreeSealed)?;
 
     post_seal.rewalk_structure()?;

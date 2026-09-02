@@ -310,11 +310,28 @@ fn exact_held_tree_reaches_only_staged_unverified() {
         recovered.permissions[2].evidence.relative_path(),
         Path::new("source-parent/root")
     );
-    assert!(recovered.tree_manifest.is_some());
+    let manifest = recovered.tree_manifest.unwrap();
+    let commitment = recovered
+        .tree_sidecar
+        .expect("v12 staging must durably bind its published sidecar");
+    assert_eq!(commitment.transaction(), transaction);
+    assert_eq!(commitment.record_count(), manifest.entry_count);
+    fixture
+        .store
+        .tree_sidecar_store()
+        .unwrap()
+        .verify(commitment)
+        .unwrap();
     drop(lease);
 
     let (mut recovered_engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
     assert_eq!(report.candidates().len(), 1);
+    fixture
+        .store
+        .tree_sidecar_store()
+        .unwrap()
+        .verify(commitment)
+        .expect("an active WAL reference must remain reachable across startup");
     let candidate = report.into_candidates().pop().unwrap();
     let capability = recovered_engine
         .prepare_startup_recovery(candidate, fixture.anchors())
@@ -329,6 +346,94 @@ fn exact_held_tree_reaches_only_staged_unverified() {
     assert_eq!(verified.transaction(), transaction);
     assert_eq!(verified.wal_state(), Some(TransactionState::StagedSealed));
     assert!(verified.startup_is_blocked());
+}
+
+#[test]
+fn unreferenced_final_sidecar_is_preserved_until_replay_then_collected() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xd7; 16]);
+    let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty());
+    FAIL_WAL_STEP.with(|failure| failure.set(Some("manifest-reference")));
+    let error = match engine.stage_prepared_root(transaction, fixture.prepare()) {
+        Ok(_) => panic!("poisoned manifest reference must not report staged success"),
+        Err(error) => error,
+    };
+    FAIL_WAL_STEP.with(|failure| failure.set(None));
+    assert!(matches!(
+        error,
+        StagingRenameError::Wal(AppendError::Poisoned)
+    ));
+    drop(engine);
+
+    let final_sidecars = std::fs::read_dir(fixture.base.join("wal-store"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension() == Some(OsStr::new("sidecar")))
+        .collect::<Vec<_>>();
+    assert_eq!(final_sidecars.len(), 1);
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    let replayed = &replay.transactions[&transaction];
+    assert_eq!(replayed.state, TransactionState::TreeSealIntent);
+    assert!(replayed.tree_manifest.is_none());
+    assert!(replayed.tree_sidecar.is_none());
+    assert!(fixture.source_root.is_dir());
+    assert!(!fixture.destination_root.exists());
+    drop(lease);
+
+    let (reopened, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert_eq!(report.candidates().len(), 1);
+    assert!(
+        std::fs::read_dir(fixture.base.join("wal-store"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .all(|path| path.extension() != Some(OsStr::new("sidecar"))),
+        "replay-proven publication orphan must be removed and directory-synced"
+    );
+    drop(reopened);
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)] // simulates out-of-protocol loss of durable evidence
+fn missing_wal_referenced_sidecar_is_durably_recovery_required_on_open() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xd8; 16]);
+    let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty());
+    let staged = engine
+        .stage_prepared_root(transaction, fixture.prepare())
+        .unwrap();
+    assert_eq!(staged.wal_state(), Some(TransactionState::StagedUnverified));
+    drop(staged);
+    drop(engine);
+
+    let store_path = fixture.base.join("wal-store");
+    let sidecar_path = std::fs::read_dir(&store_path)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension() == Some(OsStr::new("sidecar")))
+        .expect("forward staging must publish one final sidecar");
+    std::fs::remove_file(&sidecar_path).unwrap();
+
+    let (reopened, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert_eq!(report.candidates().len(), 1);
+    assert_eq!(
+        reopened.state(transaction),
+        Some(TransactionState::RecoveryRequired)
+    );
+    drop(reopened);
+
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    assert_eq!(
+        replay.transactions[&transaction].state,
+        TransactionState::RecoveryRequired
+    );
 }
 
 #[test]
@@ -1229,9 +1334,23 @@ fn verified_undo_noreplace_race_reaches_durable_undo_conflict() {
     assert_eq!(mode(&fixture.destination_root), 0o770);
     assert_eq!(mode(&fixture.destination_root.join("child")), 0o770);
     drop(ready);
+    let store_path = fixture.base.join("wal-store");
+    assert!(
+        std::fs::read_dir(&store_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .any(|path| path.extension() == Some(OsStr::new("sidecar")))
+    );
 
     let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
     assert!(report.is_empty());
+    assert!(
+        std::fs::read_dir(&store_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .all(|path| path.extension() != Some(OsStr::new("sidecar"))),
+        "an exact terminal WAL reference must be collected and directory-synced"
+    );
     assert_eq!(
         engine.state(transaction),
         Some(TransactionState::UndoConflict)
@@ -2289,6 +2408,7 @@ fn direct_executor_cannot_bypass_startup_block() {
     assert!(matches!(
         execute_prepared_rename(
             &mut wal,
+            &fixture.store.tree_sidecar_store().unwrap(),
             &mut startup_blocked,
             TransactionId([0xb1; 16]),
             binding,

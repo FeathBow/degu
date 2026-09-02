@@ -12,6 +12,7 @@ use crate::backend::roles::WalStoreBackend;
 use crate::backend::{
     HeldLocalBackendEvidence, certify_held_fd, certify_held_fd_backend, require_held_fd_acl_absent,
 };
+use crate::seal::sidecar::TreeSidecarStore;
 use crate::seal::wal::{ExclusiveFileLock, RecoveryLockError, RecoverySession};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{FileType, Mode, OFlags, RenameFlags};
@@ -24,7 +25,8 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The only entry managed by [`SealWalStore`].
+/// The mandatory fixed entry managed by [`SealWalStore`]. Durable tree
+/// sidecars use transaction-derived sibling names and can never replace it.
 pub const WAL_FILE_NAME: &str = "seal.wal";
 
 const DIRECTORY_MODE: Mode = Mode::RWXU;
@@ -69,7 +71,8 @@ pub enum StoreError {
     Lease(#[from] RecoveryLockError),
 }
 
-/// An EUID-owned, exact-mode directory containing exactly addressed WAL state.
+/// An EUID-owned, exact-mode directory containing exactly addressed WAL and
+/// optional transaction-bound sidecar state.
 ///
 /// Opening the store never relaxes an existing directory's permissions. A new
 /// store is populated under an unpublished sibling and atomically renamed to
@@ -202,6 +205,39 @@ impl SealWalStore {
 
     pub(crate) fn certified_backend(&self) -> WalStoreBackend {
         self.backend
+    }
+
+    /// Duplicates the authenticated store binding for future sidecar work. All
+    /// namespace mutation methods additionally require a matching WAL lease.
+    pub(crate) fn tree_sidecar_store(&self) -> Result<TreeSidecarStore, StoreError> {
+        self.revalidate_binding()?;
+        let parent = rustix::io::fcntl_dupfd_cloexec(&self.parent, 0)
+            .map_err(|error| io_error(&self.path, error.into()))?;
+        let directory = rustix::io::fcntl_dupfd_cloexec(&self.directory, 0)
+            .map_err(|error| io_error(&self.path, error.into()))?;
+        let wal_path = self.path.join(WAL_FILE_NAME);
+        let wal = rustix::fs::openat(&self.directory, WAL_FILE_NAME, OPEN_WAL, Mode::empty())
+            .map_err(|error| io_error(&wal_path, error.into()))?;
+        validate_wal(&wal, self.backend, self.device, &wal_path)?;
+        validate_entry_binding(&self.directory, &wal, &wal_path)?;
+        let stat = rustix::fs::fstat(&wal).map_err(|error| io_error(&wal_path, error.into()))?;
+        #[cfg(target_vendor = "apple")]
+        let wal_device = u64::try_from(stat.st_dev).map_err(|_| StoreError::UnsafeWal {
+            path: wal_path.clone(),
+            reason: "WAL device identity is invalid",
+        })?;
+        #[cfg(not(target_vendor = "apple"))]
+        let wal_device = stat.st_dev;
+        Ok(TreeSidecarStore::from_validated_store(
+            parent,
+            self.name.clone(),
+            directory,
+            self.backend,
+            self.device,
+            wal_device,
+            stat.st_ino,
+            self.path.clone(),
+        ))
     }
 
     pub(crate) fn revalidate_binding(&self) -> Result<(), StoreError> {
@@ -573,7 +609,7 @@ fn nonowner_write_and_search(mode: u32) -> bool {
     mode & 0o030 == 0o030 || mode & 0o003 == 0o003
 }
 
-fn validate_store_binding(
+pub(super) fn validate_store_binding(
     parent: &OwnedFd,
     name: &OsString,
     directory: &OwnedFd,
@@ -711,7 +747,7 @@ pub(crate) fn validate_directory(fd: &OwnedFd, path: &Path) -> Result<(), StoreE
     Ok(())
 }
 
-fn validate_entry_binding<Fd: AsFd>(
+pub(super) fn validate_entry_binding<Fd: AsFd>(
     directory: &OwnedFd,
     fd: Fd,
     path: &Path,
@@ -735,7 +771,7 @@ fn validate_entry_binding<Fd: AsFd>(
     Ok(())
 }
 
-fn validate_wal<Fd: AsFd>(
+pub(super) fn validate_wal<Fd: AsFd>(
     fd: Fd,
     expected_backend: WalStoreBackend,
     expected_device: u64,

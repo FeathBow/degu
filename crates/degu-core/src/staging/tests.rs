@@ -86,6 +86,114 @@ fn forward_identity_probe_does_not_require_directory_read_permission() {
 }
 
 #[test]
+fn startup_removes_only_canonical_unpublished_sidecar_temps() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = crate::secure_test_tempdir().unwrap();
+    let store_path = temp.path().canonicalize().unwrap().join("wal-store");
+    let store = SealWalStore::open_or_create(&store_path).unwrap();
+    let unpublished = store_path.join(format!(
+        ".tree-sidecar-v1-{}-{}-1.tmp",
+        "ab".repeat(16),
+        std::process::id()
+    ));
+    std::fs::write(&unpublished, b"partial unpublished bytes").unwrap();
+    std::fs::set_permissions(&unpublished, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let unrelated = store_path.join("unrelated");
+    std::fs::write(&unrelated, b"keep").unwrap();
+    std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let corrupt_final = store_path.join(format!("tree-{}.sidecar", "cd".repeat(16)));
+    std::fs::write(&corrupt_final, b"not a complete sidecar").unwrap();
+    std::fs::set_permissions(&corrupt_final, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let (engine, report) = SealedStagingEngine::open(&store).unwrap();
+    assert!(report.is_empty());
+    assert!(!unpublished.exists());
+    assert!(unrelated.exists());
+    assert!(
+        corrupt_final.exists(),
+        "an unreferenced but corrupt final must be retained rather than guessed away"
+    );
+    drop(engine);
+}
+
+#[test]
+fn startup_validation_durably_rejects_a_self_consistent_non_manifest_sidecar() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let store =
+        SealWalStore::open_or_create(&temp.path().canonicalize().unwrap().join("wal-store"))
+            .unwrap();
+    let sidecars = store.tree_sidecar_store().unwrap();
+    let transaction = TransactionId([0x7f; 16]);
+    let transaction_metadata = metadata();
+    let parent_identity = transaction_metadata.source_parent_identity();
+    let mut recovery = store.try_lease().unwrap();
+    recovery.replay_and_repair().unwrap();
+    let mut wal = recovery.resume().unwrap();
+    wal.begin_staging(transaction, transaction_metadata)
+        .unwrap();
+    wal.transition_staging_for_test(transaction, TransactionState::ParentSealIntent)
+        .unwrap();
+    wal.apply_staging_permission_mutation(
+        PermissionIntent {
+            transaction,
+            mutation_id: 1,
+            evidence: PersistentRecoveryEvidence::new(
+                PathBuf::from("source-parent"),
+                Some("fs".into()),
+                parent_identity.device(),
+                parent_identity.inode(),
+                Some(parent_identity.incarnation().get()),
+                0o500,
+            )
+            .unwrap(),
+            pre_mode: 0o770,
+            expected_mode: 0o500,
+            reverses_mutation_id: None,
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    wal.transition_staging_for_test(transaction, TransactionState::ParentSealed)
+        .unwrap();
+    wal.transition_staging_for_test(transaction, TransactionState::TreeSealIntent)
+        .unwrap();
+    let commitment = sidecars
+        .publish_stream(&mut wal, transaction, |emit| {
+            emit(1, b"not-a-v3-manifest-record")
+        })
+        .unwrap();
+    wal.complete_tree_manifest_with_sidecar(
+        transaction,
+        DurableTreeManifest {
+            schema_version: 3,
+            entry_count: 1,
+            sha256: [0x7f; 32],
+        },
+        commitment,
+    )
+    .unwrap();
+    wal.transition_staging_for_test(transaction, TransactionState::TreeSealed)
+        .unwrap();
+    drop(wal);
+
+    assert!(sidecars.verify(commitment).is_ok());
+    let (engine, report) = SealedStagingEngine::open(&store).unwrap();
+    assert_eq!(report.candidates().len(), 1);
+    assert_eq!(
+        engine.state(transaction),
+        Some(TransactionState::RecoveryRequired)
+    );
+    drop(engine);
+
+    let mut recovery = store.try_lease().unwrap();
+    assert_eq!(
+        recovery.replay_and_repair().unwrap().transactions[&transaction].state,
+        TransactionState::RecoveryRequired
+    );
+}
+
+#[test]
 fn bare_transaction_without_staging_provenance_is_rejected() {
     let temp = crate::secure_test_tempdir().unwrap();
     let store =
@@ -275,7 +383,7 @@ fn active_seals_in_quarantine_block_runtime_and_reopen() {
             .complete_tree_manifest(
                 transaction,
                 DurableTreeManifest {
-                    schema_version: 2,
+                    schema_version: 3,
                     entry_count: 1,
                     sha256: [0x88; 32],
                 },
@@ -342,6 +450,7 @@ fn permission_and_path_workload_limits_are_checked_before_rebind() {
         permissions: vec![permission; MAX_RECOVERY_PERMISSION_RECORDS + 1],
         staging: Some(metadata()),
         tree_manifest: None,
+        tree_sidecar: None,
         rename_outcome: None,
         undo_rename_outcome: None,
         purge_removed_entries: 0,

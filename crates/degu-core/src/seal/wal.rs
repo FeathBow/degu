@@ -8,6 +8,8 @@
 use crate::authority::{PersistentRecoveryEvidence, TransactionState};
 use crate::backend::CertifiedLocalBackend;
 use crate::backend::roles::StagingMountBackend;
+pub use crate::seal::sidecar::TreeSidecarCommitment;
+use crate::seal::sidecar::validate_tree_sidecar_commitment;
 use crate::staging::recovery::{
     ExactPurgeVerification, ExactSourceParentRestoreIntent, ExactSourceParentRestored,
     ExactStagedVerification, ExactVerifiedCommit,
@@ -21,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 const MAGIC: &[u8; 4] = b"DSWL";
-const VERSION: u16 = 11;
+const VERSION: u16 = 12;
 const LEGACY_CONTENT_PROOF_MANIFEST_VERSION: u16 = 2;
 const CONTENT_PROOF_MANIFEST_VERSION: u16 = 3;
 const HEADER_LEN: usize = 20;
@@ -438,9 +440,18 @@ pub enum SealRecord {
         transaction: TransactionId,
         metadata: StagingTransactionMetadata,
     },
+    /// Legacy manifest-only completion. This record is decoded byte-for-byte
+    /// only from WAL versions 3 through 11 and is never emitted by v12.
     TreeManifestComplete {
         transaction: TransactionId,
         manifest: DurableTreeManifest,
+    },
+    /// Atomic v12 binding of the tree manifest to its exact published sidecar.
+    /// `commitment.transaction` is implied by the single encoded transaction id.
+    TreeManifestSidecarComplete {
+        transaction: TransactionId,
+        manifest: DurableTreeManifest,
+        commitment: TreeSidecarCommitment,
     },
     RenameIntent {
         transaction: TransactionId,
@@ -484,6 +495,7 @@ impl SealRecord {
             | Self::PermissionNotApplied { transaction, .. }
             | Self::StagingBegin { transaction, .. }
             | Self::TreeManifestComplete { transaction, .. }
+            | Self::TreeManifestSidecarComplete { transaction, .. }
             | Self::RenameIntent { transaction }
             | Self::RenameOutcome { transaction, .. }
             | Self::UndoRenameOutcome { transaction, .. }
@@ -539,6 +551,7 @@ pub struct SealWal<W> {
     unresolved_mutations: HashMap<(TransactionId, u64), DurablePermission>,
     staging: HashMap<TransactionId, StagingTransactionMetadata>,
     manifests: HashMap<TransactionId, DurableTreeManifest>,
+    sidecars: HashMap<TransactionId, TreeSidecarCommitment>,
     rename_outcomes: HashMap<TransactionId, DurableRenameOutcome>,
     undo_rename_outcomes: HashMap<TransactionId, DurableUndoRenameOutcome>,
     purge_progress: HashMap<TransactionId, (u64, PathBuf)>,
@@ -548,7 +561,7 @@ pub struct SealWal<W> {
 }
 
 impl<W: DurableWrite> SealWal<W> {
-    #[allow(dead_code)] // crate-private empty-WAL constructor; no production caller
+    #[cfg(test)]
     pub(crate) fn new(mut writer: W) -> Result<Self, AppendError> {
         let committed_len = writer.prepare_append().map_err(AppendError::Io)?;
         if committed_len != 0 {
@@ -570,6 +583,7 @@ impl<W: DurableWrite> SealWal<W> {
             unresolved_mutations: HashMap::new(),
             staging: HashMap::new(),
             manifests: HashMap::new(),
+            sidecars: HashMap::new(),
             rename_outcomes: HashMap::new(),
             undo_rename_outcomes: HashMap::new(),
             purge_progress: HashMap::new(),
@@ -621,7 +635,7 @@ impl<W: DurableWrite> SealWal<W> {
 
     /// Hydrates append-side validation from a fail-closed replay. The caller
     /// must supply a writer positioned for append to the same validated WAL.
-    pub(crate) fn resume(mut writer: W, replay: &Replay) -> Result<Self, AppendError> {
+    fn resume(mut writer: W, replay: &Replay) -> Result<Self, AppendError> {
         let actual_len = writer.prepare_append().map_err(AppendError::Io)?;
         if actual_len != replay.committed_len || actual_len > MAX_WAL_LEN {
             return Err(AppendError::InvalidState(
@@ -647,6 +661,9 @@ impl<W: DurableWrite> SealWal<W> {
             }
             if let Some(manifest) = transaction.tree_manifest {
                 wal.manifests.insert(transaction.id, manifest);
+            }
+            if let Some(commitment) = transaction.tree_sidecar {
+                wal.sidecars.insert(transaction.id, commitment);
             }
             if let Some(outcome) = transaction.rename_outcome {
                 wal.rename_outcomes.insert(transaction.id, outcome);
@@ -705,7 +722,7 @@ impl<W: DurableWrite> SealWal<W> {
         }
         if metadata.production_association().is_some() && metadata.recovery_anchor().is_none() {
             return Err(AppendError::InvalidState(
-                "v11 production staging metadata requires a recovery anchor",
+                "v11+ production staging metadata requires a recovery anchor",
             ));
         }
         self.append_synced(&SealRecord::StagingBegin {
@@ -728,6 +745,13 @@ impl<W: DurableWrite> SealWal<W> {
 
     pub(crate) fn transaction_state(&self, transaction: TransactionId) -> Option<TransactionState> {
         self.states.get(&transaction).copied()
+    }
+
+    pub(crate) fn tree_sidecar_commitment(
+        &self,
+        transaction: TransactionId,
+    ) -> Option<TreeSidecarCommitment> {
+        self.sidecars.get(&transaction).copied()
     }
 
     /// Exact in-memory projection of the transaction held by this leased WAL.
@@ -761,6 +785,7 @@ impl<W: DurableWrite> SealWal<W> {
             permissions,
             staging: self.staging.get(&transaction).cloned(),
             tree_manifest: self.manifests.get(&transaction).copied(),
+            tree_sidecar: self.sidecars.get(&transaction).copied(),
             rename_outcome: self.rename_outcomes.get(&transaction).copied(),
             undo_rename_outcome: self.undo_rename_outcomes.get(&transaction).copied(),
             purge_removed_entries: self.purge_progress.get(&transaction).map_or(0, |v| v.0),
@@ -1220,10 +1245,15 @@ impl<W: DurableWrite> SealWal<W> {
         }
         if current == TransactionState::TreeSealIntent
             && next == TransactionState::TreeSealed
-            && !self.manifests.contains_key(&transaction)
+            && (!self.manifests.contains_key(&transaction)
+                || (self
+                    .staging_schema_versions
+                    .get(&transaction)
+                    .is_some_and(|version| *version >= 12)
+                    && !self.sidecars.contains_key(&transaction)))
         {
             return Err(AppendError::InvalidState(
-                "tree seal completion requires a durable manifest digest",
+                "tree seal completion requires a durable manifest and v12 sidecar binding",
             ));
         }
         if current == TransactionState::RenameIntent {
@@ -1255,27 +1285,71 @@ impl<W: DurableWrite> SealWal<W> {
         Ok(())
     }
 
-    /// Durably completes the exact tree manifest after all tree seal intents
-    /// have resolved Applied. The held-tree implementation computes the
-    /// digest; this WAL method also enforces the content-proof schema,
-    /// permission completion, ordering, and uniqueness.
-    #[allow(dead_code)] // consumed by the held-tree coordinator seam
+    /// Test-only state-machine seam. Production completion requires the opaque
+    /// commitment returned by the durable sidecar publisher.
+    #[cfg(test)]
     pub(crate) fn complete_tree_manifest(
         &mut self,
         transaction: TransactionId,
         manifest: DurableTreeManifest,
+    ) -> Result<(), AppendError> {
+        self.complete_tree_manifest_with_sidecar(
+            transaction,
+            manifest,
+            TreeSidecarCommitment {
+                transaction,
+                segment_count: 1,
+                record_count: manifest.entry_count,
+                payload_bytes: 0,
+                file_bytes: 136,
+                root_sha256: [0; 32],
+            },
+        )
+    }
+
+    /// Atomically binds the exact completed tree manifest and the opaque
+    /// commitment minted only after exact sidecar publication and directory
+    /// durability. The commitment's fields are not constructible by callers in
+    /// staging code.
+    pub(crate) fn complete_tree_manifest_with_sidecar(
+        &mut self,
+        transaction: TransactionId,
+        manifest: DurableTreeManifest,
+        commitment: TreeSidecarCommitment,
     ) -> Result<(), AppendError> {
         if self.states.get(&transaction).copied() != Some(TransactionState::TreeSealIntent) {
             return Err(AppendError::InvalidState(
                 "tree manifest is outside tree seal intent",
             ));
         }
-        if !manifest.has_content_proof() {
+        if self
+            .staging_schema_versions
+            .get(&transaction)
+            .is_none_or(|version| *version < 12)
+            || !self.staging.contains_key(&transaction)
+        {
             return Err(AppendError::InvalidState(
-                "new tree manifest lacks versioned content proof",
+                "v12 sidecar completion requires v12 staging metadata",
             ));
         }
+        if manifest.schema_version != CONTENT_PROOF_MANIFEST_VERSION {
+            return Err(AppendError::InvalidState(
+                "v12 tree manifest lacks the current content-proof schema",
+            ));
+        }
+        if commitment.transaction != transaction {
+            return Err(AppendError::InvalidState(
+                "sidecar commitment belongs to a different transaction",
+            ));
+        }
+        if commitment.record_count != manifest.entry_count {
+            return Err(AppendError::InvalidState(
+                "sidecar record count differs from the tree manifest",
+            ));
+        }
+        validate_tree_sidecar_commitment(commitment).map_err(AppendError::InvalidState)?;
         if self.manifests.contains_key(&transaction)
+            || self.sidecars.contains_key(&transaction)
             || self
                 .unresolved_mutations
                 .keys()
@@ -1287,14 +1361,16 @@ impl<W: DurableWrite> SealWal<W> {
             })
         {
             return Err(AppendError::InvalidState(
-                "tree manifest is duplicate or permission work is unresolved",
+                "tree completion is duplicate or permission work is unresolved",
             ));
         }
-        self.append_synced(&SealRecord::TreeManifestComplete {
+        self.append_synced(&SealRecord::TreeManifestSidecarComplete {
             transaction,
             manifest,
+            commitment,
         })?;
         self.manifests.insert(transaction, manifest);
+        self.sidecars.insert(transaction, commitment);
         Ok(())
     }
 
@@ -1308,9 +1384,14 @@ impl<W: DurableWrite> SealWal<W> {
         if self.states.get(&transaction).copied() != Some(TransactionState::TreeSealed)
             || !self.staging.contains_key(&transaction)
             || !self.manifests.contains_key(&transaction)
+            || (self
+                .staging_schema_versions
+                .get(&transaction)
+                .is_some_and(|version| *version >= 12)
+                && !self.sidecars.contains_key(&transaction))
         {
             return Err(AppendError::InvalidState(
-                "rename intent requires staging metadata and a complete sealed tree",
+                "rename intent requires staging metadata and a complete v12 sidecar-bound tree",
             ));
         }
         self.append_synced(&SealRecord::RenameIntent { transaction })?;
@@ -1737,6 +1818,8 @@ pub struct ReplayedTransaction {
     pub permissions: Vec<DurablePermission>,
     pub staging: Option<StagingTransactionMetadata>,
     pub tree_manifest: Option<DurableTreeManifest>,
+    /// Exact authority-neutral sidecar commitment bound atomically with the manifest.
+    pub tree_sidecar: Option<TreeSidecarCommitment>,
     pub rename_outcome: Option<DurableRenameOutcome>,
     pub undo_rename_outcome: Option<DurableUndoRenameOutcome>,
     /// Number of exact postorder removals durably acknowledged by the WAL.
@@ -1767,7 +1850,7 @@ pub enum ReplayError {
     #[error("malformed committed WAL frame at byte {offset}: {reason}")]
     Malformed { offset: u64, reason: &'static str },
     #[error(
-        "unsupported legacy WAL version {version} at byte {offset}; supported legacy versions are 1 and 3 through 10"
+        "unsupported legacy WAL version {version} at byte {offset}; supported legacy versions are 1 and 3 through 11"
     )]
     UnsupportedLegacyVersion { offset: u64, version: u16 },
     #[error("WAL header checksum mismatch at byte {offset}")]
@@ -1907,8 +1990,9 @@ impl RecoverySession {
         Ok(self.replay.as_ref().unwrap())
     }
 
-    /// Starts a writer for a newly created, empty WAL while retaining this lease.
-    #[allow(dead_code)] // crate-private empty-WAL constructor; no production caller
+    /// Test-only empty-WAL constructor. Production must replay and resume the
+    /// exact leased descriptor before a concrete `SealWal<RecoverySession>` exists.
+    #[cfg(test)]
     pub(crate) fn into_new_wal(self) -> Result<SealWal<Self>, AppendError> {
         SealWal::new(self)
     }
@@ -1945,6 +2029,15 @@ impl Write for RecoverySession {
 impl SealWal<RecoverySession> {
     pub(crate) fn duplicate_lease_guard(&self) -> RecoveryLeaseGuard {
         self.writer.duplicate_lease_guard()
+    }
+
+    /// Identity of the exact replay-completed WAL writer. Requiring a mutable
+    /// `SealWal<RecoverySession>` at sidecar mutation call sites both proves
+    /// replay/resume occurred and serializes sidecar work with WAL append.
+    pub(crate) fn exact_lease_identity(&self) -> io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = self.writer.lock.as_file().metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
     }
 }
 
@@ -2287,10 +2380,19 @@ impl IntoVersionedRecord for VersionedRecord {
     }
 }
 
+#[cfg(test)]
 impl IntoVersionedRecord for SealRecord {
     fn into_versioned(self) -> VersionedRecord {
+        // Logical record-vector tests predate v12 and model the legacy v11
+        // schema unless they explicitly use the new sidecar completion. Real
+        // bytes always carry their decoded frame version.
+        let version = if matches!(self, SealRecord::TreeManifestSidecarComplete { .. }) {
+            VERSION
+        } else {
+            11
+        };
         VersionedRecord {
-            version: VERSION,
+            version,
             record: self,
         }
     }
@@ -2304,6 +2406,7 @@ struct ParsedFrames {
 fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
     let mut records = Vec::new();
     let mut offset = 0;
+    let mut last_version = None;
     while offset < bytes.len() {
         if bytes.len() - offset < HEADER_LEN {
             break;
@@ -2322,7 +2425,7 @@ fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
             });
         }
         let version = u16::from_le_bytes([header[4], header[5]]);
-        if !matches!(version, 1 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | VERSION) {
+        if !matches!(version, 1 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | VERSION) {
             return Err(ReplayError::UnsupportedLegacyVersion {
                 offset: offset as u64,
                 version,
@@ -2352,10 +2455,12 @@ fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
                 offset: offset as u64,
             });
         }
-        records.push(VersionedRecord {
-            version,
-            record: decode_record(payload, offset as u64, version)?,
-        });
+        let record = decode_record(payload, offset as u64, version)?;
+        if last_version.is_some_and(|previous| version < previous) {
+            return Err(ReplayError::InvalidHistory("WAL frame version regressed"));
+        }
+        last_version = Some(version);
+        records.push(VersionedRecord { version, record });
         offset += frame_len;
     }
     Ok(ParsedFrames {
@@ -2372,6 +2477,7 @@ struct ReplayBuilding {
     indices: HashMap<u64, (usize, TransactionState)>,
     staging: Option<StagingTransactionMetadata>,
     tree_manifest: Option<DurableTreeManifest>,
+    tree_sidecar: Option<TreeSidecarCommitment>,
     rename_outcome: Option<DurableRenameOutcome>,
     undo_rename_outcome: Option<DurableUndoRenameOutcome>,
     purge_removed_entries: u64,
@@ -2399,6 +2505,15 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                 tx.staging = Some(metadata);
             }
             SealRecord::TreeManifestComplete { manifest, .. } => {
+                if versioned.version > 11
+                    || tx
+                        .staging_schema_version
+                        .is_some_and(|version| version >= 12)
+                {
+                    return Err(ReplayError::InvalidHistory(
+                        "legacy tree manifest completion cannot complete a v12 transaction",
+                    ));
+                }
                 if !matches!(
                     manifest.schema_version,
                     1 | LEGACY_CONTENT_PROOF_MANIFEST_VERSION | CONTENT_PROOF_MANIFEST_VERSION
@@ -2409,6 +2524,7 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                 }
                 if tx.state != Some(TransactionState::TreeSealIntent)
                     || tx.tree_manifest.is_some()
+                    || tx.tree_sidecar.is_some()
                     || tx.permissions.iter().any(|permission| {
                         permission.application == ApplicationStatus::IntentDurableApplicationUnknown
                             || (permission.phase == TransactionState::TreeSealIntent
@@ -2421,13 +2537,50 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                 }
                 tx.tree_manifest = Some(manifest);
             }
+            SealRecord::TreeManifestSidecarComplete {
+                manifest,
+                commitment,
+                ..
+            } => {
+                if versioned.version < 12
+                    || tx.staging_schema_version.is_none_or(|version| version < 12)
+                    || tx.staging.is_none()
+                    || manifest.schema_version != CONTENT_PROOF_MANIFEST_VERSION
+                    || commitment.transaction != id
+                    || commitment.record_count != manifest.entry_count
+                    || validate_tree_sidecar_commitment(commitment).is_err()
+                {
+                    return Err(ReplayError::InvalidHistory(
+                        "v12 tree completion has an invalid manifest or sidecar commitment",
+                    ));
+                }
+                if tx.state != Some(TransactionState::TreeSealIntent)
+                    || tx.tree_manifest.is_some()
+                    || tx.tree_sidecar.is_some()
+                    || tx.permissions.iter().any(|permission| {
+                        permission.application == ApplicationStatus::IntentDurableApplicationUnknown
+                            || (permission.phase == TransactionState::TreeSealIntent
+                                && permission.application != ApplicationStatus::Applied)
+                    })
+                {
+                    return Err(ReplayError::InvalidHistory(
+                        "tree completion is duplicate, unordered, or has unresolved permissions",
+                    ));
+                }
+                tx.tree_manifest = Some(manifest);
+                tx.tree_sidecar = Some(commitment);
+            }
             SealRecord::RenameIntent { .. } => {
                 if tx.state != Some(TransactionState::TreeSealed)
                     || tx.staging.is_none()
                     || tx.tree_manifest.is_none()
+                    || (tx
+                        .staging_schema_version
+                        .is_some_and(|version| version >= 12)
+                        && tx.tree_sidecar.is_none())
                 {
                     return Err(ReplayError::InvalidHistory(
-                        "rename intent lacks staging metadata or a completed tree manifest",
+                        "rename intent lacks staging metadata or a completed sidecar-bound tree",
                     ));
                 }
                 tx.state = Some(TransactionState::RenameIntent);
@@ -2589,10 +2742,14 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                     }
                     if previous == TransactionState::TreeSealIntent
                         && state == TransactionState::TreeSealed
-                        && tx.tree_manifest.is_none()
+                        && (tx.tree_manifest.is_none()
+                            || (tx
+                                .staging_schema_version
+                                .is_some_and(|version| version >= 12)
+                                && tx.tree_sidecar.is_none()))
                     {
                         return Err(ReplayError::InvalidHistory(
-                            "tree seal completed without a manifest digest",
+                            "tree seal completed without its required manifest and sidecar",
                         ));
                     }
                     if previous == TransactionState::RenameIntent {
@@ -2798,6 +2955,7 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                     permissions: tx.permissions,
                     staging: tx.staging,
                     tree_manifest: tx.tree_manifest,
+                    tree_sidecar: tx.tree_sidecar,
                     rename_outcome: tx.rename_outcome,
                     undo_rename_outcome: tx.undo_rename_outcome,
                     purge_removed_entries: tx.purge_removed_entries,
@@ -3106,6 +3264,7 @@ fn valid_transition(from: TransactionState, to: TransactionState) -> bool {
                     | S::UndoModesRestored
                     | S::UndoRenameIntent
                     | S::VerifiedCommitted
+                    | S::Purgeable
                     | S::PurgeIntent,
                 S::RecoveryRequired
             )
@@ -3118,9 +3277,14 @@ pub enum FrameError {
     FieldTooLarge,
     #[error("record payload exceeds {limit} bytes")]
     PayloadTooLarge { limit: usize },
+    #[error("legacy tree-manifest tag 6 cannot be emitted by WAL v12")]
+    LegacyTreeManifest,
 }
 
 fn encode_frame(record: &SealRecord) -> Result<Vec<u8>, FrameError> {
+    if matches!(record, SealRecord::TreeManifestComplete { .. }) {
+        return Err(FrameError::LegacyTreeManifest);
+    }
     let payload = encode_record(record)?;
     let payload_len = u32::try_from(payload.len()).map_err(|_| FrameError::PayloadTooLarge {
         limit: MAX_PAYLOAD_LEN,
@@ -3194,11 +3358,30 @@ fn encode_record(record: &SealRecord) -> Result<Vec<u8>, FrameError> {
             transaction,
             manifest,
         } => {
+            // Kept byte-for-byte for construction of legacy test/golden frames.
+            // `encode_frame` rejects this variant for the current WAL version.
             bytes.push(6);
             bytes.extend_from_slice(&transaction.0);
             bytes.extend_from_slice(&manifest.schema_version.to_le_bytes());
             bytes.extend_from_slice(&manifest.entry_count.to_le_bytes());
             bytes.extend_from_slice(&manifest.sha256);
+        }
+        SealRecord::TreeManifestSidecarComplete {
+            transaction,
+            manifest,
+            commitment,
+        } => {
+            bytes.push(13);
+            bytes.extend_from_slice(&transaction.0);
+            bytes.extend_from_slice(&manifest.schema_version.to_le_bytes());
+            bytes.extend_from_slice(&manifest.entry_count.to_le_bytes());
+            bytes.extend_from_slice(&manifest.sha256);
+            // The transaction is encoded exactly once above.
+            bytes.extend_from_slice(&commitment.segment_count.to_le_bytes());
+            bytes.extend_from_slice(&commitment.record_count.to_le_bytes());
+            bytes.extend_from_slice(&commitment.payload_bytes.to_le_bytes());
+            bytes.extend_from_slice(&commitment.file_bytes.to_le_bytes());
+            bytes.extend_from_slice(&commitment.root_sha256);
         }
         SealRecord::RenameIntent { transaction } => {
             bytes.push(7);
@@ -3368,7 +3551,7 @@ fn decode_record(payload: &[u8], offset: u64, version: u16) -> Result<SealRecord
             transaction,
             metadata: decode_staging_metadata(&mut cursor, offset, version)?,
         },
-        6 if version >= 3 => SealRecord::TreeManifestComplete {
+        6 if (3..=11).contains(&version) => SealRecord::TreeManifestComplete {
             transaction,
             manifest: DurableTreeManifest {
                 schema_version: if version >= 7 { cursor.u16()? } else { 1 },
@@ -3445,6 +3628,22 @@ fn decode_record(payload: &[u8], offset: u64, version: u16) -> Result<SealRecord
             transaction,
             removed_entries: cursor.u64()?,
             last_path: PathBuf::from(std::ffi::OsString::from_vec(cursor.bytes()?)),
+        },
+        13 if version >= 12 => SealRecord::TreeManifestSidecarComplete {
+            transaction,
+            manifest: DurableTreeManifest {
+                schema_version: cursor.u16()?,
+                entry_count: cursor.u64()?,
+                sha256: cursor.array_32()?,
+            },
+            commitment: TreeSidecarCommitment {
+                transaction,
+                segment_count: cursor.u64()?,
+                record_count: cursor.u64()?,
+                payload_bytes: cursor.u64()?,
+                file_bytes: cursor.u64()?,
+                root_sha256: cursor.array_32()?,
+            },
         },
         _ => {
             return Err(ReplayError::Malformed {
@@ -3592,7 +3791,7 @@ fn decode_staging_metadata(
     {
         return Err(ReplayError::Malformed {
             offset,
-            reason: "v11 production staging metadata lacks a recovery anchor",
+            reason: "v11+ production staging metadata lacks a recovery anchor",
         });
     }
     let valid = if version >= 4 {

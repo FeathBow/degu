@@ -9,6 +9,23 @@ fn tx(byte: u8) -> TransactionId {
     TransactionId([byte; 16])
 }
 
+fn sidecar_commitment(
+    transaction: TransactionId,
+    segment_count: u64,
+    record_count: u64,
+    payload_bytes: u64,
+) -> TreeSidecarCommitment {
+    // Sidecar v1 uses an 80-byte file header and a 56-byte header per segment.
+    TreeSidecarCommitment {
+        transaction,
+        segment_count,
+        record_count,
+        payload_bytes,
+        file_bytes: 80 + segment_count * 56 + payload_bytes,
+        root_sha256: [0x6d; 32],
+    }
+}
+
 fn evidence(path: &str) -> PersistentRecoveryEvidence {
     evidence_mode(path, 0o500)
 }
@@ -153,6 +170,307 @@ fn version_seven_staging_and_content_manifest_remain_replayable() {
     };
     assert_eq!(decoded, manifest);
     assert!(decoded.has_content_proof());
+}
+
+#[test]
+fn v12_sidecar_completion_round_trips_and_replays_atomically() {
+    let transaction = tx(0x12);
+    let manifest = DurableTreeManifest {
+        schema_version: CONTENT_PROOF_MANIFEST_VERSION,
+        entry_count: 3,
+        sha256: [0x12; 32],
+    };
+    let commitment = sidecar_commitment(transaction, 2, 3, 100);
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    wal.begin_staging(transaction, staging_metadata()).unwrap();
+    advance_to_tree_intent(&mut wal, transaction);
+    wal.complete_tree_manifest_with_sidecar(transaction, manifest, commitment)
+        .unwrap();
+    wal.transition_staging(transaction, TransactionState::TreeSealed)
+        .unwrap();
+
+    let bytes = wal.into_inner().bytes;
+    let parsed = parse_frames(&bytes).unwrap();
+    assert!(
+        parsed
+            .records
+            .iter()
+            .all(|record| record.version == VERSION)
+    );
+    assert!(matches!(
+        parsed.records.iter().find(|record| {
+            matches!(
+                record.record,
+                SealRecord::TreeManifestSidecarComplete { .. }
+            )
+        }),
+        Some(VersionedRecord {
+            record: SealRecord::TreeManifestSidecarComplete {
+                manifest: decoded_manifest,
+                commitment: decoded_commitment,
+                ..
+            },
+            ..
+        }) if *decoded_manifest == manifest && *decoded_commitment == commitment
+    ));
+    let replay = replay_records(parsed.records).unwrap();
+    let replayed = &replay.transactions[&transaction];
+    assert_eq!(replayed.tree_manifest, Some(manifest));
+    assert_eq!(replayed.tree_sidecar, Some(commitment));
+    assert_eq!(replayed.state, TransactionState::TreeSealed);
+}
+
+#[test]
+fn v12_writer_rejects_forged_or_structurally_impossible_sidecar_bindings() {
+    let transaction = tx(0x13);
+    let manifest = DurableTreeManifest {
+        schema_version: CONTENT_PROOF_MANIFEST_VERSION,
+        entry_count: 3,
+        sha256: [0x13; 32],
+    };
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    wal.begin_staging(transaction, staging_metadata()).unwrap();
+    advance_to_tree_intent(&mut wal, transaction);
+
+    let mut wrong_transaction = sidecar_commitment(tx(0x14), 1, 3, 32);
+    assert!(matches!(
+        wal.complete_tree_manifest_with_sidecar(transaction, manifest, wrong_transaction),
+        Err(AppendError::InvalidState(
+            "sidecar commitment belongs to a different transaction"
+        ))
+    ));
+    wrong_transaction.transaction = transaction;
+    wrong_transaction.record_count = 2;
+    assert!(matches!(
+        wal.complete_tree_manifest_with_sidecar(transaction, manifest, wrong_transaction),
+        Err(AppendError::InvalidState(
+            "sidecar record count differs from the tree manifest"
+        ))
+    ));
+    let oversized_manifest = DurableTreeManifest {
+        entry_count: 100_001,
+        ..manifest
+    };
+    let oversized_records = sidecar_commitment(transaction, 1, 100_001, 32);
+    assert!(matches!(
+        wal.complete_tree_manifest_with_sidecar(transaction, oversized_manifest, oversized_records),
+        Err(AppendError::InvalidState("invalid sidecar record count"))
+    ));
+    let mut impossible_length = sidecar_commitment(transaction, 1, 3, 32);
+    impossible_length.file_bytes += 1;
+    assert!(matches!(
+        wal.complete_tree_manifest_with_sidecar(transaction, manifest, impossible_length),
+        Err(AppendError::InvalidState("invalid sidecar file byte count"))
+    ));
+    assert_eq!(
+        wal.transaction_state(transaction),
+        Some(TransactionState::TreeSealIntent)
+    );
+
+    let malformed_history = [
+        frame(&SealRecord::StagingBegin {
+            transaction,
+            metadata: staging_metadata(),
+        }),
+        frame(&state(transaction, TransactionState::ParentSealIntent)),
+        frame(&state(transaction, TransactionState::ParentSealed)),
+        frame(&state(transaction, TransactionState::TreeSealIntent)),
+        checked_frame(
+            VERSION,
+            encode_record(&SealRecord::TreeManifestSidecarComplete {
+                transaction,
+                manifest,
+                commitment: impossible_length,
+            })
+            .unwrap(),
+        ),
+    ]
+    .concat();
+    let parsed = parse_frames(&malformed_history).unwrap();
+    assert!(matches!(
+        replay_records(parsed.records),
+        Err(ReplayError::InvalidHistory(
+            "v12 tree completion has an invalid manifest or sidecar commitment"
+        ))
+    ));
+}
+
+#[test]
+fn v11_manifest_history_remains_replayable_but_cross_version_tags_fail_closed() {
+    let transaction = tx(0x15);
+    let metadata = staging_metadata();
+    let manifest = DurableTreeManifest {
+        schema_version: CONTENT_PROOF_MANIFEST_VERSION,
+        entry_count: 1,
+        sha256: [0x15; 32],
+    };
+    let legacy = [
+        legacy_frame(
+            11,
+            &SealRecord::StagingBegin {
+                transaction,
+                metadata: metadata.clone(),
+            },
+        ),
+        legacy_frame(11, &state(transaction, TransactionState::ParentSealIntent)),
+        legacy_frame(11, &state(transaction, TransactionState::ParentSealed)),
+        legacy_frame(11, &state(transaction, TransactionState::TreeSealIntent)),
+        legacy_frame(
+            11,
+            &SealRecord::TreeManifestComplete {
+                transaction,
+                manifest,
+            },
+        ),
+        legacy_frame(11, &state(transaction, TransactionState::TreeSealed)),
+    ]
+    .concat();
+    let replay = replay_bytes(&legacy);
+    assert_eq!(
+        replay.transactions[&transaction].tree_manifest,
+        Some(manifest)
+    );
+    assert_eq!(replay.transactions[&transaction].tree_sidecar, None);
+    assert_eq!(
+        replay.transactions[&transaction].staging_schema_version,
+        Some(11)
+    );
+
+    let legacy_payload = encode_record(&SealRecord::TreeManifestComplete {
+        transaction,
+        manifest,
+    })
+    .unwrap();
+    assert!(matches!(
+        parse_frames(&checked_frame(12, legacy_payload)),
+        Err(ReplayError::Malformed {
+            reason: "unknown record kind",
+            ..
+        })
+    ));
+    assert!(matches!(
+        encode_frame(&SealRecord::TreeManifestComplete {
+            transaction,
+            manifest,
+        }),
+        Err(FrameError::LegacyTreeManifest)
+    ));
+
+    let sidecar_payload = encode_record(&SealRecord::TreeManifestSidecarComplete {
+        transaction,
+        manifest,
+        commitment: sidecar_commitment(transaction, 1, 1, 32),
+    })
+    .unwrap();
+    assert!(matches!(
+        parse_frames(&checked_frame(11, sidecar_payload)),
+        Err(ReplayError::Malformed {
+            reason: "unknown record kind",
+            ..
+        })
+    ));
+
+    let mixed = [
+        frame(&SealRecord::StagingBegin {
+            transaction,
+            metadata: metadata.clone(),
+        }),
+        legacy_frame(11, &state(transaction, TransactionState::ParentSealIntent)),
+        legacy_frame(11, &state(transaction, TransactionState::ParentSealed)),
+        legacy_frame(11, &state(transaction, TransactionState::TreeSealIntent)),
+        legacy_frame(
+            11,
+            &SealRecord::TreeManifestComplete {
+                transaction,
+                manifest,
+            },
+        ),
+    ]
+    .concat();
+    assert!(matches!(
+        parse_frames(&mixed),
+        Err(ReplayError::InvalidHistory("WAL frame version regressed"))
+    ));
+
+    let v11_prefix = [
+        legacy_frame(
+            11,
+            &SealRecord::StagingBegin {
+                transaction,
+                metadata,
+            },
+        ),
+        legacy_frame(11, &state(transaction, TransactionState::ParentSealIntent)),
+        legacy_frame(11, &state(transaction, TransactionState::ParentSealed)),
+        legacy_frame(11, &state(transaction, TransactionState::TreeSealIntent)),
+    ]
+    .concat();
+    let sidecar_completion = SealRecord::TreeManifestSidecarComplete {
+        transaction,
+        manifest,
+        commitment: sidecar_commitment(transaction, 1, 1, 32),
+    };
+    let invalid_mixed_history = [v11_prefix.clone(), frame(&sidecar_completion)].concat();
+    let parsed = parse_frames(&invalid_mixed_history).unwrap();
+    assert!(matches!(
+        replay_records(parsed.records),
+        Err(ReplayError::InvalidHistory(
+            "v12 tree completion has an invalid manifest or sidecar commitment"
+        ))
+    ));
+
+    let replay = replay_bytes(&v11_prefix);
+    let mut resumed = SealWal::resume(
+        FaultWriter {
+            bytes: v11_prefix.clone(),
+            ..FaultWriter::default()
+        },
+        &replay,
+    )
+    .unwrap();
+    assert!(matches!(
+        resumed.complete_tree_manifest_with_sidecar(
+            transaction,
+            manifest,
+            sidecar_commitment(transaction, 1, 1, 32),
+        ),
+        Err(AppendError::InvalidState(
+            "v12 sidecar completion requires v12 staging metadata"
+        ))
+    ));
+    assert_eq!(resumed.into_inner().bytes, v11_prefix);
+}
+
+#[test]
+fn wal_frame_versions_may_advance_but_never_regress() {
+    let first = tx(0x16);
+    let second = tx(0x17);
+    let advancing = [
+        legacy_frame(10, &state(first, TransactionState::Prepared)),
+        legacy_frame(11, &state(second, TransactionState::Prepared)),
+        frame(&state(first, TransactionState::ParentSealIntent)),
+    ]
+    .concat();
+    let parsed = parse_frames(&advancing).unwrap();
+    assert_eq!(
+        parsed
+            .records
+            .iter()
+            .map(|record| record.version)
+            .collect::<Vec<_>>(),
+        vec![10, 11, VERSION]
+    );
+    assert!(replay_records(parsed.records).is_ok());
+
+    let regressing = [
+        frame(&state(first, TransactionState::Prepared)),
+        legacy_frame(11, &state(second, TransactionState::Prepared)),
+    ]
+    .concat();
+    assert!(matches!(
+        parse_frames(&regressing),
+        Err(ReplayError::InvalidHistory("WAL frame version regressed"))
+    ));
 }
 
 #[test]
@@ -610,26 +928,19 @@ fn legacy_v3_staging_frame_replays_without_inventing_mount_authority() {
 }
 
 #[test]
-fn staging_begin_version_not_transaction_minimum_controls_mount_authority() {
+fn frame_version_regression_cannot_downgrade_staging_mount_authority() {
     let transaction = tx(0x34);
-    let metadata = staging_metadata();
     let bytes = [
         frame(&SealRecord::StagingBegin {
             transaction,
-            metadata,
+            metadata: staging_metadata(),
         }),
         legacy_frame(3, &state(transaction, TransactionState::ParentSealIntent)),
     ]
     .concat();
-    let replay = replay_checked_fixture(&bytes);
-    let current_metadata = &replay.transactions[&transaction];
-    assert_eq!(current_metadata.staging_schema_version, Some(VERSION));
-    assert!(!matches!(
-        decide_recovery(current_metadata, |_| RecoveryIdentity::Reestablished),
-        RecoveryWork::RecoveryRequired {
-            reason: RecoveryRequiredReason::LegacySchemaMissingMountIdentity { .. },
-            ..
-        }
+    assert!(matches!(
+        parse_frames(&bytes),
+        Err(ReplayError::InvalidHistory("WAL frame version regressed"))
     ));
 }
 
@@ -739,6 +1050,7 @@ fn replayed(state: TransactionState) -> ReplayedTransaction {
         }],
         staging: None,
         tree_manifest: None,
+        tree_sidecar: None,
         rename_outcome: None,
         undo_rename_outcome: None,
         purge_removed_entries: 0,
@@ -1647,7 +1959,7 @@ fn manifest_and_explicit_rename_intent_enforce_order_and_uniqueness() {
         Err(AppendError::InvalidState(_))
     ));
     let manifest = DurableTreeManifest {
-        schema_version: 2,
+        schema_version: CONTENT_PROOF_MANIFEST_VERSION,
         entry_count: 9,
         sha256: [0x5a; 32],
     };
@@ -1984,7 +2296,7 @@ fn manifest_completion_freezes_tree_permission_membership_at_runtime_and_replay(
     )
     .unwrap();
     let manifest = DurableTreeManifest {
-        schema_version: 2,
+        schema_version: CONTENT_PROOF_MANIFEST_VERSION,
         entry_count: 1,
         sha256: [0x44; 32],
     };
@@ -2172,8 +2484,8 @@ fn wal_at_rename_intent(transaction: TransactionId) -> SealWal<FaultWriter> {
     wal.complete_tree_manifest(
         transaction,
         DurableTreeManifest {
-            schema_version: 2,
-            entry_count: 0,
+            schema_version: CONTENT_PROOF_MANIFEST_VERSION,
+            entry_count: 1,
             sha256: [0xa3; 32],
         },
     )
@@ -2359,7 +2671,7 @@ fn purge_authorization_sync_failure_never_publishes_purgeable() {
         .unwrap();
     let manifest = DurableTreeManifest {
         schema_version: CONTENT_PROOF_MANIFEST_VERSION,
-        entry_count: 0,
+        entry_count: 1,
         sha256: [0xa3; 32],
     };
     let mut wal = SealWal::new(FaultWriter::default()).unwrap();
@@ -2692,7 +3004,7 @@ fn v11_replay_rejects_production_metadata_without_recovery_anchor() {
     assert!(matches!(
         parse_frames(&checked_frame(11, payload)),
         Err(ReplayError::Malformed {
-            reason: "v11 production staging metadata lacks a recovery anchor",
+            reason: "v11+ production staging metadata lacks a recovery anchor",
             ..
         })
     ));

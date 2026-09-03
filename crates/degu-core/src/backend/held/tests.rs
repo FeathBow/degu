@@ -1908,6 +1908,91 @@ fn alias_group_rejects_differing_proved_content_hashes() {
     ));
 }
 
+#[test]
+fn streamed_hardlink_fold_preserves_global_manifest_mismatch_selection() {
+    let make_observation = |inode, digest| RegularFileObservation {
+        identity: NodeIdentity {
+            kind: NodeKind::Regular,
+            device: 7,
+            inode,
+            incarnation: inode + 100,
+        },
+        uid: 17,
+        gid: 19,
+        mode: 0o600,
+        size: 3,
+        nlink: 2,
+        mtime_sec: 23,
+        mtime_nsec: 29,
+        ctime_sec: 31,
+        ctime_nsec: 37,
+        sha256: Some([digest; 32]),
+        xattrs: empty_regular_xattr_proof(),
+    };
+    let first_identity = make_observation(1, 0x41);
+    let second_identity = make_observation(2, 0x51);
+    let mut fold = HardlinkTopologyFold::new();
+    for record in [
+        HardlinkScratchObservation {
+            path: b"z-first",
+            observation: first_identity,
+        },
+        HardlinkScratchObservation {
+            path: b"z-second",
+            observation: RegularFileObservation {
+                sha256: Some([0x42; 32]),
+                ..first_identity
+            },
+        },
+        HardlinkScratchObservation {
+            path: b"a-first",
+            observation: second_identity,
+        },
+        HardlinkScratchObservation {
+            path: b"a-second",
+            observation: RegularFileObservation {
+                sha256: Some([0x52; 32]),
+                ..second_identity
+            },
+        },
+    ] {
+        fold.observe(record).unwrap();
+    }
+    assert!(matches!(
+        fold.finish(),
+        Err(HeldTreeError::ContentChangedDuringHash(path)) if path == Path::new("a-first")
+    ));
+}
+
+#[test]
+fn hardlink_scratch_codec_preserves_non_utf8_paths_without_ownership_leakage() {
+    let observation = RegularFileObservation {
+        identity: NodeIdentity {
+            kind: NodeKind::Regular,
+            device: 7,
+            inode: 11,
+            incarnation: 13,
+        },
+        uid: 17,
+        gid: 19,
+        mode: 0o600,
+        size: 3,
+        nlink: 1,
+        mtime_sec: 23,
+        mtime_nsec: 29,
+        ctime_sec: 31,
+        ctime_nsec: 37,
+        sha256: Some([0x41; 32]),
+        xattrs: empty_regular_xattr_proof(),
+    };
+    let path = Path::new(OsStr::from_bytes(&[0xfe, b'-', 0xff]));
+    let mut encoded = Vec::new();
+    encode_hardlink_scratch_record(path, observation, &mut encoded).unwrap();
+    let decoded = decode_hardlink_scratch_record(&encoded).unwrap().unwrap();
+    assert_eq!(decoded.path, path.as_os_str().as_bytes());
+    assert_eq!(decoded.observation, observation);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn internal_non_utf8_alias_path_is_preserved() {
@@ -2237,6 +2322,171 @@ fn rewalk_rejects_acl_planted_after_collect() {
     ));
 }
 
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn pending_v3_streamed_finalizer_matches_resident_inventory_oracle() {
+    let (temp, root) = setup_tree();
+    std::fs::hard_link(root.join("a/file"), root.join("a/alias")).unwrap();
+    set_test_xattr(&root.join("a/file"));
+    for name in ["!", "!!", "!!!"] {
+        std::fs::create_dir(root.join(name)).unwrap();
+        std::fs::write(root.join(name).join("leaf"), name.as_bytes()).unwrap();
+    }
+    let baseline = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+
+    let mut records = Vec::new();
+    let pending = PendingV3Inventory::collect(
+        certify_held_fd(open_directory(temp.path())).unwrap(),
+        OsStr::new("root"),
+        vec![],
+        HeldTreeLimits::default(),
+        |record| {
+            records.push(record.to_vec());
+            Ok::<(), std::convert::Infallible>(())
+        },
+    )
+    .unwrap();
+    assert_eq!(pending.resident_manifest_entries_for_test(), 0);
+    assert_eq!(pending.resident_directory_entries_for_test(), 0);
+    assert_eq!(pending.entry_count(), baseline.entry_count());
+    assert_eq!(records.len() as u64, baseline.entry_count());
+    records.sort_unstable_by(|left, right| {
+        let left_len = u64::from_be_bytes(left[..8].try_into().unwrap()) as usize;
+        let right_len = u64::from_be_bytes(right[..8].try_into().unwrap()) as usize;
+        compare_manifest_paths(&left[8..8 + left_len], &right[8..8 + right_len])
+    });
+
+    let fingerprint = baseline.fingerprint();
+    let manifest = DurableTreeManifest {
+        schema_version: fingerprint.schema_version,
+        entry_count: fingerprint.entry_count,
+        sha256: fingerprint.sha256,
+    };
+    let mut decoder = ManifestV3Decoder::new(fingerprint.entry_count).unwrap();
+    let mut finalizer = pending.into_finalizer(manifest).unwrap();
+    let mut hardlink_records = Vec::new();
+    let mut max_active_directories = 0;
+    for record in &records {
+        decoder
+            .push_segment_with(1, record, |record| {
+                finalizer.observe(record, &mut |record| {
+                    hardlink_records.push(record.to_vec());
+                    Ok::<(), std::convert::Infallible>(())
+                })
+            })
+            .unwrap();
+        max_active_directories = max_active_directories.max(finalizer.active_directories.len());
+    }
+    assert_eq!(decoder.finish().unwrap(), manifest);
+    assert!(max_active_directories <= 3);
+    hardlink_records.sort_unstable_by(|left, right| {
+        let left_len = u64::from_be_bytes(left[..8].try_into().unwrap()) as usize;
+        let right_len = u64::from_be_bytes(right[..8].try_into().unwrap()) as usize;
+        let left = &left[8..8 + left_len];
+        let right = &right[8..8 + right_len];
+        left[1..25]
+            .cmp(&right[1..25])
+            .then_with(|| compare_manifest_paths(&left[25..], &right[25..]))
+    });
+    let mut topology = HardlinkTopologyFold::new();
+    for record in &hardlink_records {
+        topology
+            .observe(decode_hardlink_scratch_record(record).unwrap().unwrap())
+            .unwrap();
+    }
+    let streamed = finalizer
+        .finish(
+            AuthenticatedTreeManifest::for_test(manifest),
+            topology.finish().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(streamed.fingerprint(), baseline.fingerprint());
+    assert_eq!(
+        streamed.regular_hard_link_topology(),
+        baseline.regular_hard_link_topology()
+    );
+    assert_eq!(
+        streamed.regular_xattr_topology(),
+        baseline.regular_xattr_topology()
+    );
+
+    let mut actual_records = Vec::new();
+    streamed
+        .stream_structure_records(|record| {
+            actual_records.push(record.to_vec());
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap();
+    actual_records.sort_unstable_by(|left, right| {
+        let left_len = u64::from_be_bytes(left[..8].try_into().unwrap()) as usize;
+        let right_len = u64::from_be_bytes(right[..8].try_into().unwrap()) as usize;
+        compare_manifest_paths(&left[8..8 + left_len], &right[8..8 + right_len])
+    });
+    let mut expected_structure = Vec::new();
+    let mut decoder = ManifestV3Decoder::new(manifest.entry_count).unwrap();
+    for record in &records {
+        decoder
+            .push_segment_with(1, record, |record| {
+                expected_structure.push(structure_evidence_from_v3_record(record));
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .unwrap();
+    }
+    decoder.finish().unwrap();
+    let actual_structure = actual_records
+        .iter()
+        .map(|record| decode_structure_record(record).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(actual_structure, expected_structure);
+
+    std::fs::remove_file(root.join("link")).unwrap();
+    std::os::unix::fs::symlink("/changed", root.join("link")).unwrap();
+    actual_records.clear();
+    streamed
+        .stream_structure_records(|record| {
+            actual_records.push(record.to_vec());
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap();
+    actual_records.sort_unstable_by(|left, right| {
+        let left_len = u64::from_be_bytes(left[..8].try_into().unwrap()) as usize;
+        let right_len = u64::from_be_bytes(right[..8].try_into().unwrap()) as usize;
+        compare_manifest_paths(&left[8..8 + left_len], &right[8..8 + right_len])
+    });
+    let changed_structure = actual_records
+        .iter()
+        .map(|record| decode_structure_record(record).unwrap())
+        .collect::<Vec<_>>();
+    let changed = expected_structure
+        .iter()
+        .zip(&changed_structure)
+        .find(|(expected, actual)| expected != actual)
+        .expect("symlink replacement must change streamed structure evidence");
+    assert_eq!(changed.0.path(), Path::new("link"));
+}
+
+#[test]
+fn pending_v3_traversal_stops_at_the_first_record_sink_error() {
+    #[derive(Debug, Eq, PartialEq)]
+    struct Stop;
+
+    let (temp, _root) = setup_tree();
+    let emitted = std::cell::Cell::new(0_u64);
+    let result = PendingV3Inventory::collect(
+        certify_held_fd(open_directory(temp.path())).unwrap(),
+        OsStr::new("root"),
+        vec![],
+        HeldTreeLimits::default(),
+        |_| {
+            let next = emitted.get() + 1;
+            emitted.set(next);
+            if next == 2 { Err(Stop) } else { Ok(()) }
+        },
+    );
+    assert!(matches!(result, Err(HeldTreeV3CollectError::Emit(Stop))));
+    assert_eq!(emitted.get(), 2);
+}
+
 fn codec_manifest_fixture() -> Vec<ManifestEntry> {
     vec![
         ManifestEntry {
@@ -2303,6 +2553,40 @@ fn codec_manifest_fixture() -> Vec<ManifestEntry> {
             },
         },
     ]
+}
+
+fn v3_directory_entry(path: &[u8], inode: u64) -> ManifestEntry {
+    ManifestEntry {
+        path: PathBuf::from(OsString::from_vec(path.to_vec())),
+        identity: NodeIdentity {
+            kind: NodeKind::Directory,
+            device: 1,
+            inode,
+            incarnation: inode,
+        },
+        uid: 10,
+        gid: 20,
+        mode: 0o700,
+        content: ContentProof::Directory,
+    }
+}
+
+fn v3_symlink_entry(path: &[u8], inode: u64) -> ManifestEntry {
+    ManifestEntry {
+        path: PathBuf::from(OsString::from_vec(path.to_vec())),
+        identity: NodeIdentity {
+            kind: NodeKind::Symlink,
+            device: 1,
+            inode,
+            incarnation: inode,
+        },
+        uid: 10,
+        gid: 20,
+        mode: 0o777,
+        content: ContentProof::Symlink {
+            target: b"target".to_vec(),
+        },
+    }
 }
 
 fn encoded_v3_record(entry: &ManifestEntry) -> Vec<u8> {
@@ -2477,6 +2761,147 @@ fn v3_typed_visitor_propagates_consumer_failure_without_visiting_later_records()
 }
 
 #[test]
+fn v3_decoder_ancestor_stack_preserves_component_ordered_parents() {
+    // Component ordering keeps each directory subtree contiguous even though
+    // the same encoded paths have a different raw-byte order.
+    let manifest = vec![
+        v3_directory_entry(b"", 1),
+        v3_directory_entry(b"!", 2),
+        v3_symlink_entry(b"!/leaf", 3),
+        v3_directory_entry(b"!!", 4),
+        v3_symlink_entry(b"!!/leaf", 5),
+        v3_directory_entry(b"!!!", 6),
+        v3_symlink_entry(b"!!!/leaf", 7),
+        v3_directory_entry(b"a", 8),
+        v3_directory_entry(b"a/x", 9),
+        v3_symlink_entry(b"a/x/y", 10),
+        v3_symlink_entry(b"a-", 11),
+        v3_symlink_entry(b"a.", 12),
+        v3_symlink_entry(b"a0", 13),
+    ];
+    assert!(manifest.windows(2).all(|pair| {
+        compare_manifest_paths(
+            pair[0].path.as_os_str().as_bytes(),
+            pair[1].path.as_os_str().as_bytes(),
+        ) == std::cmp::Ordering::Less
+    }));
+    let expected = fingerprint_manifest_v3(&manifest);
+    assert_eq!(
+        expected.sha256,
+        [
+            0xf2, 0xe6, 0x32, 0x7b, 0x06, 0x97, 0x8f, 0xed, 0xcc, 0xbc, 0x5e, 0xfa, 0xec, 0x36,
+            0x82, 0x16, 0xa3, 0x2b, 0x89, 0x3c, 0xa6, 0x64, 0x5c, 0xab, 0x67, 0x60, 0x36, 0x02,
+            0x4a, 0xff, 0x98, 0x8d,
+        ],
+        "historical v3 component ordering is part of the durable fingerprint"
+    );
+    let mut decoder = ManifestV3Decoder::new(manifest.len() as u64).unwrap();
+    for (index, entry) in manifest.iter().enumerate() {
+        decoder.push_segment(1, &encoded_v3_record(entry)).unwrap();
+        if index == 8 {
+            assert_eq!(decoder.directory_ancestor_ends, [0, 1, 3]);
+        }
+        assert!(decoder.directory_ancestor_ends.len() <= entry.path.as_os_str().len() + 1);
+    }
+    assert_eq!(decoder.decoded_directories, 6);
+    assert_eq!(decoder.finish().unwrap().sha256, expected.sha256);
+
+    let raw_order = [
+        v3_directory_entry(b"", 1),
+        v3_directory_entry(b"!", 2),
+        v3_directory_entry(b"!!", 4),
+        v3_directory_entry(b"!!!", 6),
+        v3_symlink_entry(b"!!!/leaf", 7),
+        v3_symlink_entry(b"!!/leaf", 5),
+    ];
+    let mut decoder = ManifestV3Decoder::new(raw_order.len() as u64).unwrap();
+    for entry in &raw_order[..5] {
+        decoder.push_segment(1, &encoded_v3_record(entry)).unwrap();
+    }
+    assert_eq!(
+        decoder.push_segment(1, &encoded_v3_record(&raw_order[5])),
+        Err(ManifestV3CodecError::InvalidOrder)
+    );
+}
+
+#[test]
+fn v3_decoder_ancestor_stack_memory_is_independent_of_sibling_directory_count() {
+    let siblings = 900_u64;
+    let root = v3_directory_entry(b"", 1);
+    let mut decoder = ManifestV3Decoder::new(siblings + 1).unwrap();
+    decoder.push_segment(1, &encoded_v3_record(&root)).unwrap();
+    for index in 0..siblings {
+        let path = format!("d{index:04}");
+        let entry = v3_directory_entry(path.as_bytes(), index + 2);
+        decoder.push_segment(1, &encoded_v3_record(&entry)).unwrap();
+        assert_eq!(decoder.directory_ancestor_ends.len(), 2);
+    }
+    assert_eq!(decoder.decoded_directories, siblings + 1);
+    assert_eq!(decoder.finish().unwrap().entry_count, siblings + 1);
+}
+
+#[test]
+fn v3_decoder_directory_limit_counts_popped_sibling_ancestors() {
+    let limits = HeldTreeLimits {
+        max_directories: 2,
+        ..HeldTreeLimits::default()
+    };
+    let manifest = [
+        v3_directory_entry(b"", 1),
+        v3_directory_entry(b"a", 2),
+        v3_directory_entry(b"b", 3),
+    ];
+    let mut decoder = ManifestV3Decoder::with_limits(3, limits).unwrap();
+    decoder
+        .push_segment(1, &encoded_v3_record(&manifest[0]))
+        .unwrap();
+    decoder
+        .push_segment(1, &encoded_v3_record(&manifest[1]))
+        .unwrap();
+    assert_eq!(decoder.directory_ancestor_ends, [0, 1]);
+    assert_eq!(
+        decoder.push_segment(1, &encoded_v3_record(&manifest[2])),
+        Err(ManifestV3CodecError::Limit(HeldTreeLimit::Directories))
+    );
+}
+
+#[test]
+fn v3_decoder_ancestor_stack_rejects_a_missing_parent_first() {
+    let root = v3_directory_entry(b"", 1);
+    let missing_child = v3_symlink_entry(b"a/x", 2);
+    let mut decoder = ManifestV3Decoder::new(2).unwrap();
+    decoder.push_segment(1, &encoded_v3_record(&root)).unwrap();
+    let mut malformed = encoded_v3_record(&missing_child);
+    let kind_offset = 8 + missing_child.path.as_os_str().as_bytes().len();
+    malformed[kind_offset] = 0xff;
+    assert_eq!(
+        decoder.push_segment(1, &malformed),
+        Err(ManifestV3CodecError::MissingParent),
+        "parent validation must retain its existing precedence over kind parsing"
+    );
+
+    let file_parent = v3_symlink_entry(b"a", 2);
+    let child = v3_symlink_entry(b"a/x", 3);
+    let mut decoder = ManifestV3Decoder::new(3).unwrap();
+    decoder.push_segment(1, &encoded_v3_record(&root)).unwrap();
+    decoder
+        .push_segment(1, &encoded_v3_record(&file_parent))
+        .unwrap();
+    assert_eq!(
+        decoder.push_segment(1, &encoded_v3_record(&child)),
+        Err(ManifestV3CodecError::MissingParent)
+    );
+
+    let non_utf8_directory = v3_directory_entry(&[0xff], 2);
+    let non_utf8_child = v3_symlink_entry(&[0xff, b'/', b'x'], 3);
+    let mut decoder = ManifestV3Decoder::new(3).unwrap();
+    for entry in [&root, &non_utf8_directory, &non_utf8_child] {
+        decoder.push_segment(1, &encoded_v3_record(entry)).unwrap();
+    }
+    assert_eq!(decoder.finish().unwrap().entry_count, 3);
+}
+
+#[test]
 fn v3_decoder_rejects_record_count_trailing_and_order_mismatches() {
     let manifest = codec_manifest_fixture();
     let root = encoded_v3_record(&manifest[0]);
@@ -2571,4 +2996,168 @@ fn v3_decoder_validates_paths_tags_modes_and_timestamps() {
         decoder.push_segment(3, &bytes),
         Err(ManifestV3CodecError::InvalidNanoseconds)
     );
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn pending_v3_forward_directory_state_is_independent_of_900_siblings() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(temp.path(), Permissions::from_mode(0o700)).unwrap();
+    for index in 0..900_u32 {
+        std::fs::create_dir(root.join(format!("sibling-{index:04}"))).unwrap();
+    }
+    let mut records = Vec::new();
+    let pending = PendingV3Inventory::collect(
+        certify_held_fd(open_directory(temp.path())).unwrap(),
+        OsStr::new("root"),
+        vec![],
+        HeldTreeLimits::default(),
+        |record| {
+            records.push(record.to_vec());
+            Ok::<(), std::convert::Infallible>(())
+        },
+    )
+    .unwrap();
+    assert_eq!(pending.resident_manifest_entries_for_test(), 0);
+    assert_eq!(pending.resident_directory_entries_for_test(), 0);
+    assert_eq!(pending.entry_count(), 901);
+    records.sort_unstable_by(|left, right| {
+        let left_len = u64::from_be_bytes(left[..8].try_into().unwrap()) as usize;
+        let right_len = u64::from_be_bytes(right[..8].try_into().unwrap()) as usize;
+        compare_manifest_paths(&left[8..8 + left_len], &right[8..8 + right_len])
+    });
+    let mut decoder = ManifestV3Decoder::new(901).unwrap();
+    for record in &records {
+        decoder.push_segment(1, record).unwrap();
+    }
+    let manifest = decoder.finish().unwrap();
+    let mut finalizer = pending.into_finalizer(manifest).unwrap();
+    let mut max_active = 0;
+    let mut decoder = ManifestV3Decoder::new(901).unwrap();
+    for record in &records {
+        decoder
+            .push_segment_with(1, record, |record| {
+                finalizer.observe(record, &mut |_| Ok::<(), std::convert::Infallible>(()))
+            })
+            .unwrap();
+        max_active = max_active.max(finalizer.active_directories.len());
+    }
+    assert_eq!(decoder.finish().unwrap(), manifest);
+    assert_eq!(max_active, 2);
+    let streamed = finalizer
+        .finish(
+            AuthenticatedTreeManifest::for_test(manifest),
+            RegularHardLinkTopology::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        streamed.fingerprint(),
+        HeldTreeFingerprint {
+            schema_version: manifest.schema_version,
+            entry_count: manifest.entry_count,
+            sha256: manifest.sha256,
+        }
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_forward_v3_max_depth_fits_reduced_fd_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(temp.path(), Permissions::from_mode(0o700)).unwrap();
+    let mut directory = root.clone();
+    for depth in 1..=128_u32 {
+        directory.push(format!("d{depth:03}"));
+        std::fs::create_dir(&directory).unwrap();
+    }
+
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    limit.rlim_cur = limit.rlim_cur.min(192);
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+    let mut records = Vec::new();
+    let pending = PendingV3Inventory::collect(
+        certify_held_fd(open_directory(temp.path())).unwrap(),
+        OsStr::new("root"),
+        vec![],
+        HeldTreeLimits::default(),
+        |record| {
+            records.push(record.to_vec());
+            Ok::<(), std::convert::Infallible>(())
+        },
+    )
+    .unwrap();
+    assert_eq!(pending.entry_count(), 129);
+    records.sort_unstable_by(|left, right| {
+        let left_len = u64::from_be_bytes(left[..8].try_into().unwrap()) as usize;
+        let right_len = u64::from_be_bytes(right[..8].try_into().unwrap()) as usize;
+        compare_manifest_paths(&left[8..8 + left_len], &right[8..8 + right_len])
+    });
+    let mut decoder = ManifestV3Decoder::new(129).unwrap();
+    for record in &records {
+        decoder.push_segment(1, record).unwrap();
+    }
+    let manifest = decoder.finish().unwrap();
+    let mut finalizer = pending.into_finalizer(manifest).unwrap();
+    let mut decoder = ManifestV3Decoder::new(129).unwrap();
+    for record in &records {
+        decoder
+            .push_segment_with(1, record, |record| {
+                finalizer.observe(record, &mut |_| Ok::<(), std::convert::Infallible>(()))
+            })
+            .unwrap();
+    }
+    assert_eq!(decoder.finish().unwrap(), manifest);
+    assert_eq!(finalizer.active_directories.len(), 129);
+    let streamed = finalizer
+        .finish(
+            AuthenticatedTreeManifest::for_test(manifest),
+            RegularHardLinkTopology::default(),
+        )
+        .unwrap();
+    let mut observed = 0_u64;
+    streamed
+        .stream_structure_records(|_| {
+            observed += 1;
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap();
+    assert_eq!(observed, 129);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn forward_v3_max_depth_fits_a_192_fd_process_limit() {
+    const CHILD_MARKER_ENV: &str = "DEGU_FORWARD_V3_FD_CHILD_MARKER";
+    if let Some(marker) = std::env::var_os(CHILD_MARKER_ENV) {
+        assert_forward_v3_max_depth_fits_reduced_fd_limit();
+        std::fs::write(marker, b"observed").unwrap();
+        return;
+    }
+
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir.path().join("completed");
+    let test_name = format!(
+        "{}::forward_v3_max_depth_fits_a_192_fd_process_limit",
+        module_path!()
+            .strip_prefix("degu_core::")
+            .unwrap_or(module_path!())
+    );
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test_name, "--nocapture"])
+        .env(CHILD_MARKER_ENV, &marker)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(marker.exists());
 }

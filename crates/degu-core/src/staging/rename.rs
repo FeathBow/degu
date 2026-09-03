@@ -42,6 +42,8 @@ std::thread_local! {
         const { std::cell::RefCell::new(None) };
     static AFTER_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static AFTER_PRE_SEAL_INVENTORY_DROPPED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
     static FAIL_PARENT_SYNC: std::cell::Cell<Option<&'static str>> =
         const { std::cell::Cell::new(None) };
     static RENAME_ERROR: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
@@ -465,28 +467,41 @@ pub(crate) fn execute_prepared_rename<'a>(
         1,
     )?;
 
+    // Reduce the complete pre-seal inventory to a fixed-size expected v3
+    // commitment and drop it before collecting the second full content proof.
+    // The post-seal collection therefore cannot coexist with the pre-seal
+    // `Vec<ManifestEntry>` in this forward path.
+    let post_seal_expectation = tree.into_post_seal_expectation()?;
+    #[cfg(test)]
+    AFTER_PRE_SEAL_INVENTORY_DROPPED.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     let post_seal = collect_source_tree(&binding)?;
-    tree.verify_post_seal_snapshot(&post_seal)?;
+    let fingerprint = post_seal_expectation.verify(&post_seal)?;
     post_seal.rewalk_structure()?;
-    let fingerprint = post_seal.fingerprint();
     let manifest = DurableTreeManifest {
         schema_version: fingerprint.schema_version,
         entry_count: fingerprint.entry_count,
         sha256: fingerprint.sha256,
     };
     // Publication is complete and the store directory is durable before the
-    // commitment can enter the WAL. A failure after publication leaves only a
-    // self-authenticating final orphan; it never authorizes recovery.
-    let commitment = sidecars.publish_stream(wal, transaction, |emit| {
+    // commitment can enter the WAL. A failure after publication can leave a
+    // self-authenticating final orphan plus cleanup-eligible unpublished scratch;
+    // neither authorizes recovery.
+    let scratch = sidecars.build_sorted_manifest_scratch(wal, transaction, |emit_record| {
         post_seal
-            .stream_manifest_v3_segments(|record_count, payload| emit(record_count, payload))
+            .stream_manifest_v3_records(emit_record)
             .map_err(|error| match error {
-                ManifestV3StreamError::Codec(_) => TreeSidecarError::InvalidSegment(
-                    "the collected v3 manifest could not be segmented",
+                ManifestV3StreamError::Codec(_) => TreeSidecarError::InvalidScratch(
+                    "the collected v3 manifest could not be spooled",
                 ),
                 ManifestV3StreamError::Emit(error) => error,
             })
     })?;
+    let commitment =
+        sidecars.publish_sorted_manifest_scratch(wal, transaction, manifest, scratch)?;
     // Reopen and decode the published bytes before creating their durable WAL
     // reference. This proves both the generic container commitment and the
     // concrete v3 manifest/count/fingerprint binding.
@@ -591,7 +606,7 @@ pub(crate) fn execute_prepared_rename<'a>(
         _staged_root: binding.root_check_fd,
         _source_parent_seal: binding.source_parent_held,
         _destination_parent_evidence: binding.destination_parent_held,
-        _sealed_tree: tree,
+        _sealed_tree: post_seal,
     })
 }
 

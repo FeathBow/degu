@@ -1035,6 +1035,37 @@ pub(crate) struct StreamedV3Inventory {
     manifest: HeldTreeFingerprint,
 }
 
+/// A deletion engine for an authenticated v3 manifest whose resident state is
+/// bounded by the root anchor, the current plan record, and its ancestor chain.
+pub(crate) struct StreamedV3Purger {
+    context: ForwardV3Context,
+    expected_plan_records: u64,
+    processed_plan_records: u64,
+    removed: u64,
+    previous_path: Option<Vec<u8>>,
+    content_budget: Budget,
+    actual_record: Vec<u8>,
+}
+
+/// Builds private purge-plan records while a canonical v3 manifest is decoded.
+/// Only the active non-root directory chain and the previous path are retained.
+pub(crate) struct V3PurgePlanBuilder {
+    directories: Vec<V3PurgeDirectoryEvidence>,
+    previous_path: Option<Vec<u8>>,
+    saw_root: bool,
+    encoded: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct V3PurgeDirectoryEvidence {
+    device: u64,
+    inode: u64,
+    incarnation: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
 #[derive(Debug)]
 enum TraversalSinkError<E> {
     Tree(HeldTreeError),
@@ -2416,6 +2447,128 @@ fn traverse_forward_structure_directory<E>(
     Ok(())
 }
 
+const V3_PURGE_PLAN_MAGIC: &[u8; 4] = b"DHP3";
+const V3_PURGE_PLAN_VERSION: u16 = 1;
+const V3_PURGE_ANCESTOR_BYTES: usize = 36;
+const V3_PURGE_PLAN_MAX_OVERHEAD: usize = 64 * 1024;
+
+impl V3PurgePlanBuilder {
+    pub(crate) fn new() -> Self {
+        Self {
+            directories: Vec::new(),
+            previous_path: None,
+            saw_root: false,
+            encoded: Vec::new(),
+        }
+    }
+
+    /// Emits one path-keyed private record for every non-root manifest entry.
+    /// Root is retained by the inventory and is deliberately finalized only by
+    /// `StreamedV3Purger::finish`.
+    pub(crate) fn observe<E>(
+        &mut self,
+        record: ManifestV3Record<'_>,
+        mut emit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), ManifestV3StreamError<E>> {
+        if self.previous_path.as_deref().is_some_and(|previous| {
+            compare_manifest_paths(previous, record.path) != std::cmp::Ordering::Less
+        }) {
+            return Err(ManifestV3StreamError::Codec(
+                ManifestV3CodecError::InvalidOrder,
+            ));
+        }
+        if record.path.is_empty() {
+            if self.saw_root || record.kind != ManifestV3RecordKind::Directory {
+                return Err(ManifestV3StreamError::Codec(
+                    ManifestV3CodecError::InvalidRoot,
+                ));
+            }
+            self.saw_root = true;
+        } else {
+            if !self.saw_root {
+                return Err(ManifestV3StreamError::Codec(
+                    ManifestV3CodecError::InvalidRoot,
+                ));
+            }
+            let required = manifest_path_depth(record.path).saturating_sub(1);
+            self.directories.truncate(required);
+            if self.directories.len() != required {
+                return Err(ManifestV3StreamError::Codec(
+                    ManifestV3CodecError::MissingParent,
+                ));
+            }
+        }
+        // Root is included as the final sorted plan record. It carries no unlink
+        // action, but makes root-only trees non-empty and authenticates the exact
+        // root record before the final special-case rmdir.
+        encode_v3_purge_plan_record(record, &self.directories, &mut self.encoded)
+            .map_err(ManifestV3StreamError::Codec)?;
+        emit(&self.encoded).map_err(ManifestV3StreamError::Emit)?;
+        if record.kind == ManifestV3RecordKind::Directory && !record.path.is_empty() {
+            self.directories.push(V3PurgeDirectoryEvidence {
+                device: record.device,
+                inode: record.inode,
+                incarnation: record.incarnation,
+                uid: record.uid,
+                gid: record.gid,
+                mode: record.mode,
+            });
+        }
+        self.previous_path = Some(record.path.to_vec());
+        Ok(())
+    }
+}
+
+fn compare_v3_purge_paths(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    manifest_path_depth(right)
+        .cmp(&manifest_path_depth(left))
+        .then_with(|| compare_manifest_paths(right, left))
+}
+
+fn manifest_path_depth(path: &[u8]) -> usize {
+    if path.is_empty() {
+        0
+    } else {
+        path.iter().filter(|byte| **byte == b'/').count() + 1
+    }
+}
+
+fn encode_v3_purge_plan_record(
+    record: ManifestV3Record<'_>,
+    ancestors: &[V3PurgeDirectoryEvidence],
+    encoded: &mut Vec<u8>,
+) -> Result<(), ManifestV3CodecError> {
+    let overhead = 8usize
+        .checked_add(record.path.len())
+        .and_then(|n| n.checked_add(4 + 2 + 2 + 8))
+        .and_then(|n| n.checked_add(ancestors.len().checked_mul(V3_PURGE_ANCESTOR_BYTES)?))
+        .ok_or(ManifestV3CodecError::LengthOverflow)?;
+    if overhead >= V3_PURGE_PLAN_MAX_OVERHEAD || ancestors.len() > u16::MAX as usize {
+        return Err(ManifestV3CodecError::RecordTooLarge);
+    }
+    let total = overhead
+        .checked_add(record.encoded.len())
+        .ok_or(ManifestV3CodecError::LengthOverflow)?;
+    encoded.clear();
+    encoded.reserve(total);
+    encoded.extend_from_slice(&(record.path.len() as u64).to_be_bytes());
+    encoded.extend_from_slice(record.path);
+    encoded.extend_from_slice(V3_PURGE_PLAN_MAGIC);
+    encoded.extend_from_slice(&V3_PURGE_PLAN_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&(ancestors.len() as u16).to_be_bytes());
+    encoded.extend_from_slice(&(record.encoded.len() as u64).to_be_bytes());
+    for ancestor in ancestors {
+        encoded.extend_from_slice(&ancestor.device.to_be_bytes());
+        encoded.extend_from_slice(&ancestor.inode.to_be_bytes());
+        encoded.extend_from_slice(&ancestor.incarnation.to_be_bytes());
+        encoded.extend_from_slice(&ancestor.uid.to_be_bytes());
+        encoded.extend_from_slice(&ancestor.gid.to_be_bytes());
+        encoded.extend_from_slice(&ancestor.mode.to_be_bytes());
+    }
+    encoded.extend_from_slice(record.encoded);
+    Ok(())
+}
+
 impl StreamedV3Inventory {
     pub(crate) fn fingerprint(&self) -> HeldTreeFingerprint {
         self.manifest
@@ -2427,6 +2580,20 @@ impl StreamedV3Inventory {
 
     pub(crate) fn regular_xattr_topology(&self) -> RegularXattrTopology {
         self.regular_xattrs
+    }
+
+    pub(crate) fn into_purger(self) -> StreamedV3Purger {
+        let expected_plan_records = self.manifest.entry_count;
+        let limits = self.context.limits;
+        StreamedV3Purger {
+            context: self.context,
+            expected_plan_records,
+            processed_plan_records: 0,
+            removed: 0,
+            previous_path: None,
+            content_budget: Budget::new(limits, CONTENT_PROOF_VERSION),
+            actual_record: Vec::new(),
+        }
     }
 
     /// Reobserves the current tree depth-first and emits private structure
@@ -2476,6 +2643,222 @@ impl StreamedV3Inventory {
             self.context.mount_id,
             self.context.backend,
         )
+    }
+}
+
+struct DecodedV3PurgePlan<'a> {
+    path: PathBuf,
+    expected: ManifestEntry,
+    expected_raw: &'a [u8],
+    ancestors: Vec<V3PurgeDirectoryEvidence>,
+}
+
+impl StreamedV3Purger {
+    pub(crate) fn root_strong_identity(&self) -> StrongObjectIdentity {
+        StrongObjectIdentity::new_with_mount(
+            self.context.root_identity.device,
+            self.context.root_identity.inode,
+            crate::seal::wal::ObjectIncarnation::new(self.context.root_identity.incarnation),
+            self.context.mount_id,
+        )
+    }
+
+    /// Deletes one authenticated private plan record in the order supplied by
+    /// the caller. The expected historical order is reverse canonical manifest
+    /// order, which is exactly deepest/rightmost postorder.
+    #[allow(clippy::disallowed_methods)]
+    pub(crate) fn purge_plan_record<E>(
+        &mut self,
+        record: &[u8],
+        mut record_progress: impl FnMut(u64, &Path) -> Result<(), E>,
+    ) -> Result<(), HeldTreePurgeError<E>> {
+        if self.processed_plan_records >= self.expected_plan_records {
+            return Err(HeldTreeError::IdentityChanged(PathBuf::new()).into());
+        }
+        let plan = decode_v3_purge_plan_record(record, self.context.limits.max_depth)
+            .map_err(|_| HeldTreeError::IdentityChanged(PathBuf::new()))?;
+        let path_bytes = plan.path.as_os_str().as_bytes();
+        if self.previous_path.as_deref().is_some_and(|previous| {
+            compare_v3_purge_paths(previous, path_bytes) != std::cmp::Ordering::Less
+        }) {
+            return Err(HeldTreeError::IdentityChanged(plan.path).into());
+        }
+        require_exclusive_parent(&self.context.parent, self.context.backend)?;
+        verify_root_binding_fields(
+            &self.context.parent,
+            &self.context.root_name,
+            self.context.root_identity,
+            self.context.mount_id,
+            self.context.backend,
+        )?;
+
+        if plan.path.as_os_str().is_empty() {
+            if !plan.ancestors.is_empty()
+                || self.processed_plan_records.saturating_add(1) != self.expected_plan_records
+                || self.removed.saturating_add(1) != self.expected_plan_records
+            {
+                return Err(HeldTreeError::IdentityChanged(PathBuf::new()).into());
+            }
+            let named_root = with_fd(&self.context.parent, |fd| {
+                inspect_at(fd, &self.context.root_name, Path::new(""))
+            })?;
+            let held_root = inspect_held(&self.context.root.held, Path::new(""))?;
+            require_same_identity(
+                Path::new(""),
+                self.context.root_identity,
+                named_root.identity,
+            )?;
+            require_same_identity(
+                Path::new(""),
+                self.context.root_identity,
+                held_root.identity,
+            )?;
+            let actual = held_root.into_manifest(PathBuf::new(), ContentProof::Directory);
+            self.actual_record.clear();
+            emit_manifest_entry_v3(&actual, |bytes| self.actual_record.extend_from_slice(bytes));
+            if self.actual_record.as_slice() != plan.expected_raw || actual != plan.expected {
+                return Err(HeldTreeError::IdentityChanged(PathBuf::new()).into());
+            }
+            self.processed_plan_records += 1;
+            self.previous_path = Some(Vec::new());
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        if PURGE_FAIL_AFTER_REMOVALS.with(|limit| limit.get() == Some(self.removed)) {
+            return Err(io_error(&plan.path, rustix::io::Errno::IO).into());
+        }
+
+        let components = normal_relative_components(&plan.path)?;
+        let parent_depth = components.len().saturating_sub(1);
+        if plan.ancestors.len() != parent_depth.saturating_sub(0) {
+            return Err(HeldTreeError::IdentityChanged(plan.path).into());
+        }
+        let mut evidence = Vec::with_capacity(plan.ancestors.len() + 1);
+        evidence.push(self.context.root.evidence.clone());
+        let mut prefix = PathBuf::new();
+        for (index, ancestor) in plan.ancestors.iter().enumerate() {
+            prefix.push(components[index]);
+            evidence.push(DirectoryEvidence {
+                relative_path: prefix.clone(),
+                depth: u32::try_from(index + 1)
+                    .map_err(|_| HeldTreeError::InvalidDirectoryPath(prefix.clone()))?,
+                identity: NodeIdentity {
+                    kind: NodeKind::Directory,
+                    device: ancestor.device,
+                    inode: ancestor.inode,
+                    incarnation: ancestor.incarnation,
+                },
+                owner_uid: ancestor.uid,
+                group_gid: ancestor.gid,
+                observed_mode: ancestor.mode,
+            });
+        }
+        let parent_path = plan.path.parent().unwrap_or_else(|| Path::new(""));
+        let reopened = reopen_directory_from_root(
+            &self.context.root,
+            parent_path,
+            |wanted| evidence.iter().find(|item| item.relative_path == wanted),
+            self.context.backend,
+            self.context.mount_id,
+            || {
+                verify_root_binding_fields(
+                    &self.context.parent,
+                    &self.context.root_name,
+                    self.context.root_identity,
+                    self.context.mount_id,
+                    self.context.backend,
+                )
+            },
+            false,
+        )?;
+        let parent = reopened.held();
+        let name = plan.path.file_name().ok_or(HeldTreeError::InvalidRoot)?;
+        let before = with_fd(parent, |fd| inspect_at(fd, name, &plan.path))?;
+        require_owner(&plan.path, before.uid, rustix::process::geteuid().as_raw())?;
+        require_boundary(
+            &plan.path,
+            self.context.backend,
+            self.context.mount_id,
+            &before,
+        )?;
+        let content = inspect_content_at(
+            parent,
+            name,
+            &plan.path,
+            &before,
+            &mut self.content_budget,
+            CONTENT_PROOF_VERSION,
+        )?;
+        let actual = before.into_manifest(plan.path.clone(), content);
+        self.actual_record.clear();
+        emit_manifest_entry_v3(&actual, |bytes| self.actual_record.extend_from_slice(bytes));
+        if self.actual_record.as_slice() != plan.expected_raw || actual != plan.expected {
+            return Err(HeldTreeError::IdentityChanged(plan.path).into());
+        }
+        let flags = if actual.identity.kind == NodeKind::Directory {
+            AtFlags::REMOVEDIR
+        } else {
+            AtFlags::empty()
+        };
+        retry_interrupted(|| with_fd(parent, |fd| rustix::fs::unlinkat(fd, name, flags)))
+            .map_err(|error| io_error(&actual.path, error))?;
+        drop(reopened);
+        self.removed = self.removed.checked_add(1).ok_or(HeldTreeError::Limit {
+            kind: HeldTreeLimit::Entries,
+            limit: self.context.limits.max_entries,
+        })?;
+        self.processed_plan_records += 1;
+        self.previous_path = Some(path_bytes.to_vec());
+        record_progress(self.removed, &actual.path).map_err(HeldTreePurgeError::Journal)
+    }
+
+    /// Validates that every non-root plan record was consumed before performing
+    /// the historical final root identity checks, rmdir, progress, and parent
+    /// fsync sequence.
+    #[allow(clippy::disallowed_methods)]
+    pub(crate) fn finish<E>(
+        self,
+        mut record_progress: impl FnMut(u64, &Path) -> Result<(), E>,
+    ) -> Result<u64, HeldTreePurgeError<E>> {
+        if self.processed_plan_records != self.expected_plan_records
+            || self.removed.saturating_add(1) != self.expected_plan_records
+        {
+            return Err(HeldTreeError::IdentityChanged(PathBuf::new()).into());
+        }
+        require_exclusive_parent(&self.context.parent, self.context.backend)?;
+        let named_root = with_fd(&self.context.parent, |fd| {
+            inspect_at(fd, &self.context.root_name, Path::new(""))
+        })?;
+        let held_root = inspect_held(&self.context.root.held, Path::new(""))?;
+        require_same_identity(
+            Path::new(""),
+            self.context.root_identity,
+            named_root.identity,
+        )?;
+        require_same_identity(
+            Path::new(""),
+            self.context.root_identity,
+            held_root.identity,
+        )?;
+        retry_interrupted(|| {
+            with_fd(&self.context.parent, |fd| {
+                rustix::fs::unlinkat(fd, &self.context.root_name, AtFlags::REMOVEDIR)
+            })
+        })
+        .map_err(|error| io_error(Path::new(""), error))?;
+        let removed = self.removed.checked_add(1).ok_or(HeldTreeError::Limit {
+            kind: HeldTreeLimit::Entries,
+            limit: self.context.limits.max_entries,
+        })?;
+        record_progress(removed, Path::new("")).map_err(HeldTreePurgeError::Journal)?;
+        #[cfg(test)]
+        if PURGE_FAIL_PARENT_FSYNC.with(std::cell::Cell::get) {
+            return Err(io_error(Path::new(""), rustix::io::Errno::IO).into());
+        }
+        retry_interrupted(|| with_fd(&self.context.parent, |fd| rustix::fs::fsync(fd)))
+            .map_err(|error| io_error(Path::new(""), error))?;
+        Ok(removed)
     }
 }
 
@@ -5207,6 +5590,9 @@ pub(crate) enum ManifestV3RecordContent<'a> {
 /// or recovery authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ManifestV3Record<'a> {
+    /// Exact canonical bytes consumed for this record. This is deliberately a
+    /// borrowed view into the authenticated segment, not a re-encoding.
+    pub(crate) encoded: &'a [u8],
     pub(crate) path: &'a [u8],
     pub(crate) kind: ManifestV3RecordKind,
     pub(crate) device: u64,
@@ -5497,6 +5883,7 @@ impl ManifestV3Decoder {
         }
         self.decoded_entries += 1;
         Ok(ManifestV3Record {
+            encoded: &encoded_record[..consumed],
             path,
             kind,
             device,
@@ -5508,6 +5895,143 @@ impl ManifestV3Decoder {
             content,
         })
     }
+}
+
+fn decode_v3_purge_plan_record(
+    mut input: &[u8],
+    max_depth: u32,
+) -> Result<DecodedV3PurgePlan<'_>, ManifestV3CodecError> {
+    let key_len =
+        usize::try_from(take_u64(&mut input)?).map_err(|_| ManifestV3CodecError::LengthOverflow)?;
+    let key = take(&mut input, key_len)?;
+    validate_manifest_path(key, max_depth)?;
+    if take(&mut input, 4)? != V3_PURGE_PLAN_MAGIC {
+        return Err(ManifestV3CodecError::InvalidTag);
+    }
+    if u16::from_be_bytes(take(&mut input, 2)?.try_into().unwrap()) != V3_PURGE_PLAN_VERSION {
+        return Err(ManifestV3CodecError::InvalidTag);
+    }
+    let ancestor_count = usize::from(u16::from_be_bytes(take(&mut input, 2)?.try_into().unwrap()));
+    let expected_len =
+        usize::try_from(take_u64(&mut input)?).map_err(|_| ManifestV3CodecError::LengthOverflow)?;
+    if ancestor_count != manifest_path_depth(key).saturating_sub(1) {
+        return Err(ManifestV3CodecError::MissingParent);
+    }
+    let overhead = 8usize
+        .checked_add(key_len)
+        .and_then(|n| n.checked_add(4 + 2 + 2 + 8))
+        .and_then(|n| n.checked_add(ancestor_count.checked_mul(V3_PURGE_ANCESTOR_BYTES)?))
+        .ok_or(ManifestV3CodecError::LengthOverflow)?;
+    if overhead >= V3_PURGE_PLAN_MAX_OVERHEAD {
+        return Err(ManifestV3CodecError::RecordTooLarge);
+    }
+    let mut ancestors = Vec::with_capacity(ancestor_count);
+    for _ in 0..ancestor_count {
+        let fixed = take(&mut input, V3_PURGE_ANCESTOR_BYTES)?;
+        let mode = u32::from_be_bytes(fixed[32..36].try_into().unwrap());
+        if mode & !0o7777 != 0 {
+            return Err(ManifestV3CodecError::InvalidMode);
+        }
+        ancestors.push(V3PurgeDirectoryEvidence {
+            device: u64::from_be_bytes(fixed[0..8].try_into().unwrap()),
+            inode: u64::from_be_bytes(fixed[8..16].try_into().unwrap()),
+            incarnation: u64::from_be_bytes(fixed[16..24].try_into().unwrap()),
+            uid: u32::from_be_bytes(fixed[24..28].try_into().unwrap()),
+            gid: u32::from_be_bytes(fixed[28..32].try_into().unwrap()),
+            mode,
+        });
+    }
+    let expected_raw = take(&mut input, expected_len)?;
+    if !input.is_empty() {
+        return Err(ManifestV3CodecError::TrailingBytes);
+    }
+    let expected = decode_unordered_v3_record(expected_raw, max_depth)?;
+    if expected.path.as_os_str().as_bytes() != key {
+        return Err(ManifestV3CodecError::InvalidPath);
+    }
+    Ok(DecodedV3PurgePlan {
+        path: PathBuf::from(OsStr::from_bytes(key)),
+        expected,
+        expected_raw,
+        ancestors,
+    })
+}
+
+fn decode_unordered_v3_record(
+    encoded: &[u8],
+    max_depth: u32,
+) -> Result<ManifestEntry, ManifestV3CodecError> {
+    let mut input = encoded;
+    let path_len =
+        usize::try_from(take_u64(&mut input)?).map_err(|_| ManifestV3CodecError::LengthOverflow)?;
+    let path_bytes = take(&mut input, path_len)?;
+    validate_manifest_path(path_bytes, max_depth)?;
+    let kind = match take(&mut input, 1)?[0] {
+        0 => NodeKind::Directory,
+        1 => NodeKind::Regular,
+        2 => NodeKind::Symlink,
+        3 => return Err(ManifestV3CodecError::KindContentMismatch),
+        _ => return Err(ManifestV3CodecError::InvalidTag),
+    };
+    if path_bytes.is_empty() && kind != NodeKind::Directory {
+        return Err(ManifestV3CodecError::InvalidRoot);
+    }
+    let fixed = take(&mut input, 36)?;
+    let mode = u32::from_be_bytes(fixed[32..36].try_into().unwrap());
+    if mode & !0o7777 != 0 {
+        return Err(ManifestV3CodecError::InvalidMode);
+    }
+    let content_tag = take(&mut input, 1)?[0];
+    let content = match (kind, content_tag) {
+        (NodeKind::Directory, 0) => ContentProof::Directory,
+        (NodeKind::Regular, 1) => {
+            let fields = take(&mut input, 120)?;
+            let mtime_nsec = u32::from_be_bytes(fields[24..28].try_into().unwrap());
+            let ctime_nsec = u32::from_be_bytes(fields[36..40].try_into().unwrap());
+            if mtime_nsec >= 1_000_000_000 || ctime_nsec >= 1_000_000_000 {
+                return Err(ManifestV3CodecError::InvalidNanoseconds);
+            }
+            ContentProof::Regular {
+                size: u64::from_be_bytes(fields[0..8].try_into().unwrap()),
+                nlink: u64::from_be_bytes(fields[8..16].try_into().unwrap()),
+                mtime_sec: i64::from_be_bytes(fields[16..24].try_into().unwrap()),
+                mtime_nsec,
+                ctime_sec: i64::from_be_bytes(fields[28..36].try_into().unwrap()),
+                ctime_nsec,
+                sha256: fields[40..72].try_into().unwrap(),
+                xattrs: RegularXattrProof {
+                    attribute_count: u64::from_be_bytes(fields[72..80].try_into().unwrap()),
+                    value_bytes: u64::from_be_bytes(fields[80..88].try_into().unwrap()),
+                    sha256: fields[88..120].try_into().unwrap(),
+                },
+            }
+        }
+        (NodeKind::Symlink, 2) => {
+            let target_len = usize::try_from(take_u64(&mut input)?)
+                .map_err(|_| ManifestV3CodecError::LengthOverflow)?;
+            ContentProof::Symlink {
+                target: take(&mut input, target_len)?.to_vec(),
+            }
+        }
+        (_, 0..=2) => return Err(ManifestV3CodecError::KindContentMismatch),
+        _ => return Err(ManifestV3CodecError::InvalidTag),
+    };
+    if !input.is_empty() {
+        return Err(ManifestV3CodecError::TrailingBytes);
+    }
+    Ok(ManifestEntry {
+        path: PathBuf::from(OsStr::from_bytes(path_bytes)),
+        identity: NodeIdentity {
+            kind,
+            device: u64::from_be_bytes(fixed[0..8].try_into().unwrap()),
+            inode: u64::from_be_bytes(fixed[8..16].try_into().unwrap()),
+            incarnation: u64::from_be_bytes(fixed[16..24].try_into().unwrap()),
+        },
+        uid: u32::from_be_bytes(fixed[24..28].try_into().unwrap()),
+        gid: u32::from_be_bytes(fixed[28..32].try_into().unwrap()),
+        mode,
+        content,
+    })
 }
 
 fn take<'a>(input: &mut &'a [u8], length: usize) -> Result<&'a [u8], ManifestV3CodecError> {

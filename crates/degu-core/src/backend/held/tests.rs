@@ -2651,6 +2651,90 @@ fn v3_record_stream_is_byte_identical_to_existing_codec_and_reuses_one_bound() {
 }
 
 #[test]
+fn v3_purge_plan_keeps_exact_raw_records_and_only_active_ancestor_evidence() {
+    let manifest = codec_manifest_fixture();
+    let mut raw = Vec::new();
+    stream_manifest_v3_records(&manifest, |record| {
+        raw.push(record.to_vec());
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .unwrap();
+    let mut decoder = ManifestV3Decoder::new(manifest.len() as u64).unwrap();
+    let mut builder = V3PurgePlanBuilder::new();
+    let mut plans = Vec::new();
+    for expected_raw in &raw {
+        decoder
+            .push_segment_with(1, expected_raw, |record| {
+                assert_eq!(record.encoded, expected_raw);
+                builder.observe(record, |plan| {
+                    plans.push(plan.to_vec());
+                    Ok::<(), std::convert::Infallible>(())
+                })
+            })
+            .unwrap();
+    }
+    decoder.finish().unwrap();
+
+    assert_eq!(plans.len(), manifest.len());
+    for (plan, expected_raw) in plans.iter().zip(raw.iter()) {
+        let decoded =
+            decode_v3_purge_plan_record(plan, HeldTreeLimits::default().max_depth).unwrap();
+        assert_eq!(decoded.expected_raw, expected_raw);
+        assert_eq!(decoded.path, decoded.expected.path);
+        assert!(plan.len() - expected_raw.len() < V3_PURGE_PLAN_MAX_OVERHEAD);
+    }
+    assert_eq!(
+        decode_v3_purge_plan_record(&plans[2], HeldTreeLimits::default().max_depth)
+            .unwrap()
+            .ancestors,
+        vec![V3PurgeDirectoryEvidence {
+            device: 1,
+            inode: 2,
+            incarnation: 2,
+            uid: 10,
+            gid: 20,
+            mode: 0o750,
+        }]
+    );
+}
+
+#[test]
+fn v3_purge_plan_codec_preserves_non_utf8_paths() {
+    let manifest = vec![
+        v3_directory_entry(b"", 1),
+        v3_directory_entry(b"\xff", 2),
+        v3_symlink_entry(b"\xff/item", 3),
+    ];
+    let mut raw = Vec::new();
+    stream_manifest_v3_records(&manifest, |record| {
+        raw.push(record.to_vec());
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .unwrap();
+    let mut decoder = ManifestV3Decoder::new(3).unwrap();
+    let mut builder = V3PurgePlanBuilder::new();
+    let mut plans = Vec::new();
+    for record in &raw {
+        decoder
+            .push_segment_with(1, record, |typed| {
+                builder.observe(typed, |plan| {
+                    plans.push(plan.to_vec());
+                    Ok::<(), std::convert::Infallible>(())
+                })
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        decode_v3_purge_plan_record(&plans[2], 128)
+            .unwrap()
+            .path
+            .as_os_str()
+            .as_bytes(),
+        b"\xff/item"
+    );
+}
+
+#[test]
 fn v3_typed_visitor_exposes_every_validated_field_without_owning_record_bytes() {
     let manifest = codec_manifest_fixture();
     let mut segments = Vec::new();

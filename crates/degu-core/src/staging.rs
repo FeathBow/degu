@@ -883,8 +883,9 @@ impl ReadyStagingEngine {
             let disposition = match (&source, state) {
                 (
                     crate::staging::recovery::RecoveryRebindError::PurgeUnsupportedInternalHardLinks
-                    | crate::staging::recovery::RecoveryRebindError::PurgeUnsupportedRegularXattrs,
-                    Some(TransactionState::VerifiedCommitted),
+                    | crate::staging::recovery::RecoveryRebindError::PurgeUnsupportedRegularXattrs
+                    | crate::staging::recovery::RecoveryRebindError::PurgePlan(_),
+                    Some(TransactionState::VerifiedCommitted | TransactionState::Purgeable),
                 ) if !self.engine.startup_blocked => VerifiedPurgeFailureDisposition::NotStarted,
                 (_, Some(TransactionState::RecoveryRequired)) => {
                     VerifiedPurgeFailureDisposition::Terminal(TransactionState::RecoveryRequired)
@@ -938,10 +939,23 @@ impl ReadyStagingEngine {
                 removed_entries,
             })
             .map_err(|source| {
+                let preclaim_plan_failure = matches!(
+                    source,
+                    crate::staging::recovery::RecoveryRebindError::PurgePlan(_)
+                ) && self.engine.wal.transaction_state(transaction)
+                    == Some(TransactionState::Purgeable);
+                if preclaim_plan_failure {
+                    self.engine.issued_purge_authorities.remove(&transaction);
+                }
+                self.engine.startup_blocked = !self.engine.wal.can_begin_staging_transaction();
                 VerifiedPurgeError::new(
                     transaction,
                     "bounded purge execution",
-                    VerifiedPurgeFailureDisposition::RecoveryBlocked,
+                    if preclaim_plan_failure {
+                        VerifiedPurgeFailureDisposition::NotStarted
+                    } else {
+                        VerifiedPurgeFailureDisposition::RecoveryBlocked
+                    },
                     source,
                 )
             })

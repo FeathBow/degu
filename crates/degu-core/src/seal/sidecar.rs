@@ -26,7 +26,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod scratch;
-pub(crate) use scratch::{TreeManifestScratchBuildError, TreeStructureScratchCursor};
+pub(crate) use scratch::{
+    TreeManifestScratchBuildError, TreePurgePlan, TreeStructureScratchCursor,
+};
 
 const MAGIC: &[u8; 4] = b"DHTS";
 const VERSION: u16 = 1;
@@ -2325,6 +2327,67 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(authenticated.manifest(), expected);
+    }
+
+    #[test]
+    fn purge_scratch_hierarchical_merge_preserves_historical_postorder_and_seals_anonymous_plan() {
+        let (_temp, root, store, mut wal) = fixture();
+        let transaction = tx(40);
+        let mut records = Vec::new();
+        for index in 0..100_u8 {
+            for path in [
+                format!("d{index:02}/leaf").into_bytes(),
+                format!("d{index:02}").into_bytes(),
+            ] {
+                let mut record = Vec::new();
+                record.extend_from_slice(&(path.len() as u64).to_be_bytes());
+                record.extend_from_slice(&path);
+                record.push(index);
+                records.push(record);
+            }
+        }
+        records.push(0_u64.to_be_bytes().into_iter().chain([0]).collect());
+        let mut expected = records
+            .iter()
+            .map(|record| scratch::record_path(record).unwrap().to_vec())
+            .collect::<Vec<_>>();
+        expected.sort_unstable_by(|left, right| {
+            let left = Path::new(OsStr::from_bytes(left));
+            let right = Path::new(OsStr::from_bytes(right));
+            right
+                .components()
+                .count()
+                .cmp(&left.components().count())
+                .then_with(|| right.cmp(left))
+        });
+        let scratch = store
+            .build_sorted_purge_scratch_with_budget(&mut wal, transaction, 64, |emit| {
+                for record in records.iter().rev() {
+                    emit(record)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            scratch.max_level_for_test() >= 2,
+            "fixture must force hierarchical purge fan-in"
+        );
+        let mut plan = store
+            .seal_sorted_purge_scratch(&mut wal, transaction, scratch)
+            .unwrap();
+        plan.authenticate().unwrap();
+        let mut actual = Vec::new();
+        while let Some(record) = plan.next().unwrap() {
+            actual.push(scratch::record_path(&record).unwrap().to_vec());
+        }
+        plan.finish().unwrap();
+        assert_eq!(actual, expected);
+        assert!(
+            std::fs::read_dir(root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .all(|name| !name.to_string_lossy().starts_with(".tree-scratch-v1-"))
+        );
     }
 
     #[test]

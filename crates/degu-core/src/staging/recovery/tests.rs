@@ -123,6 +123,7 @@ fn inode_reuse_or_changed_incarnation_never_rebinds() {
     let result = rebind_work(
         &metadata,
         None,
+        None,
         RecoveryWork::RestoreBeforeRename {
             transaction: TransactionId([1; 16]),
             permissions: vec![],
@@ -178,6 +179,7 @@ fn exact_name_replacement_is_rejected_even_on_same_backend() {
     let result = rebind_work(
         &fixture.metadata,
         None,
+        None,
         RecoveryWork::RestoreBeforeRename {
             transaction: TransactionId([2; 16]),
             permissions: vec![],
@@ -194,6 +196,7 @@ fn capability_rechecks_name_immediately_before_use() {
     };
     let rebound = rebind_work(
         &fixture.metadata,
+        None,
         None,
         RecoveryWork::VerifyOrQuarantineAfterRename {
             transaction: TransactionId([3; 16]),
@@ -221,6 +224,7 @@ fn recovery_capability_rechecks_final_namespace_controller_exclusivity() {
     };
     let rebound = rebind_work(
         &fixture.metadata,
+        None,
         None,
         RecoveryWork::VerifyOrQuarantineAfterRename {
             transaction: TransactionId([0xbc; 16]),
@@ -252,6 +256,7 @@ fn recovery_rebind_rejects_writable_anchor_controller() {
     assert!(matches!(
         rebind_work(
             &fixture.metadata,
+            None,
             None,
             RecoveryWork::VerifyOrQuarantineAfterRename {
                 transaction: TransactionId([0xbd; 16]),
@@ -456,9 +461,11 @@ fn uncertain_staging_intent_resolves_before_after_and_at_fresh_resolution() {
                 }));
             });
         }
+        let sidecars = store.tree_sidecar_store().unwrap();
         let mut startup_blocked = true;
         let capability = prepare_startup_recovery(
             &mut wal,
+            &sidecars,
             &mut startup_blocked,
             transaction,
             anchors(&fixture),
@@ -733,10 +740,12 @@ fn uncertain_inverse_intents_resolve_before_and_after_fchmod_in_every_restore_ph
                 });
             }
             if physical_outcome == 2 {
+                let sidecars = store.tree_sidecar_store().unwrap();
                 let mut startup_blocked = true;
                 assert!(matches!(
                     prepare_startup_recovery(
                         &mut wal,
+                        &sidecars,
                         &mut startup_blocked,
                         transaction,
                         anchors(&fixture),
@@ -867,9 +876,11 @@ fn exact_staging_snapshot_restores_all_applied_permissions_and_reaches_restored(
     let mut lease = store.try_lease().unwrap();
     lease.replay_and_repair().unwrap();
     let mut wal = lease.resume().unwrap();
+    let sidecars = store.tree_sidecar_store().unwrap();
     let mut startup_blocked = true;
     let capability = prepare_startup_recovery(
         &mut wal,
+        &sidecars,
         &mut startup_blocked,
         transaction,
         anchors(&fixture),
@@ -982,9 +993,11 @@ fn quarantined_active_seals_restore_in_place_and_unblock_without_unquarantining(
     wal.transition_staging_for_test(transaction, TransactionState::Quarantined)
         .unwrap();
 
+    let sidecars = store.tree_sidecar_store().unwrap();
     let mut startup_blocked = true;
     let capability = prepare_startup_recovery(
         &mut wal,
+        &sidecars,
         &mut startup_blocked,
         transaction,
         anchors(&fixture),
@@ -1069,10 +1082,12 @@ fn unknown_rename_is_durably_blocked_without_any_namespace_lookup() {
     wal.record_rename_intent(transaction).unwrap();
 
     RECOVERY_NAME_LOOKUPS.set(0);
+    let sidecars = store.tree_sidecar_store().unwrap();
     let mut startup_blocked = true;
     assert!(matches!(
         prepare_startup_recovery(
             &mut wal,
+            &sidecars,
             &mut startup_blocked,
             transaction,
             anchors(&fixture),
@@ -1086,6 +1101,7 @@ fn unknown_rename_is_durably_blocked_without_any_namespace_lookup() {
     assert!(matches!(
         prepare_startup_recovery(
             &mut wal,
+            &sidecars,
             &mut startup_blocked,
             transaction,
             anchors(&fixture),
@@ -1099,7 +1115,13 @@ fn unknown_rename_is_durably_blocked_without_any_namespace_lookup() {
 fn staged_pending(
     include_tree_seal: bool,
     manifest_matches: bool,
-) -> Option<(Fixture, SealWal<RecoverySession>, bool, TransactionId)> {
+) -> Option<(
+    Fixture,
+    TreeSidecarStore,
+    SealWal<RecoverySession>,
+    bool,
+    TransactionId,
+)> {
     let fixture = fixture(true)?;
     let transaction = TransactionId([0xa3; 16]);
     let store_path = fixture.base.as_path().join("verifier-wal");
@@ -1232,17 +1254,159 @@ fn staged_pending(
     wal.record_applied_rename_for_test(transaction).unwrap();
     wal.transition_staging_for_test(transaction, TransactionState::StagedUnverified)
         .unwrap();
-    Some((fixture, wal, true, transaction))
+    Some((fixture, sidecars, wal, true, transaction))
 }
 
 #[test]
-fn pending_verification_consumes_exact_tree_and_stops_at_staged_sealed() {
-    let Some((fixture, mut wal, mut startup_blocked, transaction)) = staged_pending(true, true)
+fn v3_staged_verification_honors_injected_entry_limit() {
+    let Some((fixture, sidecars, mut wal, mut startup_blocked, transaction)) =
+        staged_pending(true, true)
     else {
         return;
     };
     let capability = prepare_startup_recovery(
         &mut wal,
+        &sidecars,
+        &mut startup_blocked,
+        transaction,
+        anchors(&fixture),
+    )
+    .unwrap();
+    let StartupRecoveryCapability::PendingVerification(pending) = capability else {
+        panic!("expected pending verification");
+    };
+    let outcome = pending
+        .verify_or_quarantine_with_limits(HeldTreeLimits {
+            max_entries: 1,
+            ..HeldTreeLimits::default()
+        })
+        .unwrap();
+    assert!(matches!(outcome, StagedVerificationOutcome::Quarantined(_)));
+    assert_eq!(
+        wal.transaction_state(transaction),
+        Some(TransactionState::Quarantined)
+    );
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)] // adversarially creates residue and corrupts published proof
+fn initial_sidecar_authentication_failure_cleans_prior_recovery_scratch() {
+    let Some((fixture, sidecars, mut wal, mut startup_blocked, transaction)) =
+        staged_pending(true, true)
+    else {
+        return;
+    };
+    let capability = prepare_startup_recovery(
+        &mut wal,
+        &sidecars,
+        &mut startup_blocked,
+        transaction,
+        anchors(&fixture),
+    )
+    .unwrap();
+    let StartupRecoveryCapability::PendingVerification(pending) = capability else {
+        panic!("expected pending verification");
+    };
+    let store = fixture.base.join("verifier-wal");
+    let scratch = store.join(format!(
+        ".tree-scratch-v1-{}-{}-999999.tmp",
+        "a3".repeat(16),
+        std::process::id()
+    ));
+    fs::write(&scratch, b"prior unpublished recovery scratch").unwrap();
+    fs::set_permissions(&scratch, fs::Permissions::from_mode(0o600)).unwrap();
+    let published = fs::read_dir(&store)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension() == Some(OsStr::new("sidecar")))
+        .expect("published sidecar must exist");
+    let file = fs::OpenOptions::new().write(true).open(published).unwrap();
+    file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+
+    let outcome = pending.verify_or_quarantine().unwrap();
+    assert!(matches!(
+        outcome,
+        StagedVerificationOutcome::Quarantined(StagedVerificationFailure::Rebind(
+            RecoveryRebindError::Sidecar(_)
+        ))
+    ));
+    assert!(
+        !scratch.exists(),
+        "initial auth failure leaked prior scratch"
+    );
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)] // adversarially corrupts private scratch and published proof
+fn published_sidecar_integrity_precedes_recovery_scratch_failure_and_cleans_runs() {
+    let Some((fixture, sidecars, mut wal, mut startup_blocked, transaction)) =
+        staged_pending(true, true)
+    else {
+        return;
+    };
+    let capability = prepare_startup_recovery(
+        &mut wal,
+        &sidecars,
+        &mut startup_blocked,
+        transaction,
+        anchors(&fixture),
+    )
+    .unwrap();
+    let StartupRecoveryCapability::PendingVerification(pending) = capability else {
+        panic!("expected pending verification");
+    };
+    let store = fixture.base.join("verifier-wal");
+    let hook_store = store.clone();
+    stream_v3::install_after_manifest_scratch_build_test_hook(move || {
+        let mut scratch = None;
+        let mut published = None;
+        for entry in fs::read_dir(&hook_store).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy();
+            if name.starts_with(".tree-scratch-v1-") {
+                scratch = Some(path);
+            } else if path.extension() == Some(OsStr::new("sidecar")) {
+                published = Some(path);
+            }
+        }
+        for path in [
+            scratch.expect("manifest scratch must exist at the test hook"),
+            published.expect("published sidecar must exist at the test hook"),
+        ] {
+            let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+        }
+    });
+    let outcome = pending.verify_or_quarantine().unwrap();
+    assert!(matches!(
+        outcome,
+        StagedVerificationOutcome::Quarantined(StagedVerificationFailure::Rebind(
+            RecoveryRebindError::Sidecar(_)
+        ))
+    ));
+    assert_eq!(
+        wal.transaction_state(transaction),
+        Some(TransactionState::Quarantined)
+    );
+    assert!(
+        fs::read_dir(store)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .all(|name| !name.to_string_lossy().starts_with(".tree-scratch-v1-")),
+        "failed recovery verification must not leak unpublished scratch runs"
+    );
+}
+
+#[test]
+fn pending_verification_consumes_exact_tree_and_stops_at_staged_sealed() {
+    let Some((fixture, sidecars, mut wal, mut startup_blocked, transaction)) =
+        staged_pending(true, true)
+    else {
+        return;
+    };
+    let capability = prepare_startup_recovery(
+        &mut wal,
+        &sidecars,
         &mut startup_blocked,
         transaction,
         anchors(&fixture),
@@ -1267,12 +1431,14 @@ fn pending_verification_consumes_exact_tree_and_stops_at_staged_sealed() {
 
 #[test]
 fn dropping_pending_before_transition_replays_staged_unverified() {
-    let Some((fixture, mut wal, mut startup_blocked, transaction)) = staged_pending(true, true)
+    let Some((fixture, sidecars, mut wal, mut startup_blocked, transaction)) =
+        staged_pending(true, true)
     else {
         return;
     };
     let capability = prepare_startup_recovery(
         &mut wal,
+        &sidecars,
         &mut startup_blocked,
         transaction,
         anchors(&fixture),
@@ -1296,12 +1462,14 @@ fn dropping_pending_before_transition_replays_staged_unverified() {
 
 #[test]
 fn durable_staged_sealed_replays_without_commit_promotion() {
-    let Some((fixture, mut wal, mut startup_blocked, transaction)) = staged_pending(true, true)
+    let Some((fixture, sidecars, mut wal, mut startup_blocked, transaction)) =
+        staged_pending(true, true)
     else {
         return;
     };
     let capability = prepare_startup_recovery(
         &mut wal,
+        &sidecars,
         &mut startup_blocked,
         transaction,
         anchors(&fixture),
@@ -1332,7 +1500,8 @@ fn durable_staged_sealed_replays_without_commit_promotion() {
 
 #[test]
 fn manifest_mismatch_is_durably_quarantined_without_mode_restore() {
-    let Some((fixture, mut wal, mut startup_blocked, transaction)) = staged_pending(true, false)
+    let Some((fixture, sidecars, mut wal, mut startup_blocked, transaction)) =
+        staged_pending(true, false)
     else {
         return;
     };
@@ -1340,6 +1509,7 @@ fn manifest_mismatch_is_durably_quarantined_without_mode_restore() {
     let mode_before = fs::metadata(&staged).unwrap().permissions().mode() & 0o7777;
     let capability = prepare_startup_recovery(
         &mut wal,
+        &sidecars,
         &mut startup_blocked,
         transaction,
         anchors(&fixture),
@@ -1365,12 +1535,14 @@ fn manifest_mismatch_is_durably_quarantined_without_mode_restore() {
 
 #[test]
 fn mode_drift_after_capability_creation_is_durably_quarantined() {
-    let Some((fixture, mut wal, mut startup_blocked, transaction)) = staged_pending(true, true)
+    let Some((fixture, sidecars, mut wal, mut startup_blocked, transaction)) =
+        staged_pending(true, true)
     else {
         return;
     };
     let capability = prepare_startup_recovery(
         &mut wal,
+        &sidecars,
         &mut startup_blocked,
         transaction,
         anchors(&fixture),
@@ -1396,7 +1568,8 @@ fn mode_drift_after_capability_creation_is_durably_quarantined() {
 
 #[test]
 fn added_entry_after_manifest_is_durably_quarantined() {
-    let Some((fixture, mut wal, mut startup_blocked, transaction)) = staged_pending(true, true)
+    let Some((fixture, sidecars, mut wal, mut startup_blocked, transaction)) =
+        staged_pending(true, true)
     else {
         return;
     };
@@ -1407,6 +1580,7 @@ fn added_entry_after_manifest_is_durably_quarantined() {
     fs::set_permissions(&staged, fs::Permissions::from_mode(0o500)).unwrap();
     let capability = prepare_startup_recovery(
         &mut wal,
+        &sidecars,
         &mut startup_blocked,
         transaction,
         anchors(&fixture),
@@ -1427,12 +1601,14 @@ fn added_entry_after_manifest_is_durably_quarantined() {
 
 #[test]
 fn missing_tree_seal_coverage_is_durably_quarantined() {
-    let Some((fixture, mut wal, mut startup_blocked, transaction)) = staged_pending(false, true)
+    let Some((fixture, sidecars, mut wal, mut startup_blocked, transaction)) =
+        staged_pending(false, true)
     else {
         return;
     };
     let capability = prepare_startup_recovery(
         &mut wal,
+        &sidecars,
         &mut startup_blocked,
         transaction,
         anchors(&fixture),

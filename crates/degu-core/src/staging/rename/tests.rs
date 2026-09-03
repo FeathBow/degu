@@ -1577,6 +1577,107 @@ fn verified_undo_mode_drift_fails_before_durable_undo_intent() {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods)] // adversarially corrupts the published proof
+fn verified_undo_corrupt_sidecar_is_durably_recovery_required_before_undo_intent() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xdb; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let sidecar = std::fs::read_dir(fixture.base.join("wal-store"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension() == Some(OsStr::new("sidecar")))
+        .expect("verified commit must retain its published sidecar");
+    let sidecar_file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(sidecar)
+        .unwrap();
+    sidecar_file
+        .set_len(sidecar_file.metadata().unwrap().len() - 1)
+        .unwrap();
+
+    let token = ready
+        .verified_undo_token(transaction, "undo-group")
+        .unwrap();
+    let error = ready
+        .undo_verified(token, verified_undo_request(&fixture))
+        .unwrap_err();
+
+    assert_eq!(
+        error.disposition(),
+        VerifiedUndoFailureDisposition::RecoveryBlocked
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::RecoveryRequired)
+    );
+    assert!(!fixture.source_root.exists());
+    assert!(fixture.destination_root.is_dir());
+    assert_eq!(mode(&fixture.destination_root), 0o750);
+    assert_eq!(mode(&fixture.destination_root.join("child")), 0o750);
+    drop(ready);
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    assert_eq!(
+        replay.transactions[&transaction].state,
+        TransactionState::RecoveryRequired
+    );
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)] // adversarially corrupts the published proof
+fn verified_undo_sidecar_corruption_after_mode_restore_is_durably_recovery_required() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xdd; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let store = fixture.base.join("wal-store");
+    crate::staging::recovery::AFTER_UNDO_MODES_RESTORED.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let sidecar = std::fs::read_dir(&store)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension() == Some(OsStr::new("sidecar")))
+                .expect("verified undo must retain its published sidecar");
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(sidecar)
+                .unwrap();
+            file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+        }));
+    });
+
+    let token = ready
+        .verified_undo_token(transaction, "undo-group")
+        .unwrap();
+    let error = ready
+        .undo_verified(token, verified_undo_request(&fixture))
+        .unwrap_err();
+
+    assert_eq!(
+        error.disposition(),
+        VerifiedUndoFailureDisposition::RecoveryBlocked
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::RecoveryRequired)
+    );
+    assert!(!fixture.source_root.exists());
+    assert!(fixture.destination_root.is_dir());
+    assert_eq!(mode(&fixture.destination_root), 0o770);
+    assert_eq!(mode(&fixture.destination_root.join("child")), 0o770);
+    drop(ready);
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    assert_eq!(
+        replay.transactions[&transaction].state,
+        TransactionState::RecoveryRequired
+    );
+}
+
+#[test]
 fn verified_undo_crash_boundaries_replay_without_path_guessing() {
     for (index, step) in [
         "intent",
@@ -2939,6 +3040,112 @@ fn staged_verification_and_verified_undo_are_bounded_across_240_tree_seals() {
         .unwrap();
     assert!(status.success(), "isolated recovery FD test failed");
     assert!(marker.exists(), "isolated recovery FD test did not execute");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_deep_restart_verification_and_undo_fit_process_fd_budget() {
+    fn add_deep_branch(fixture: &Fixture) {
+        let mut directory = fixture.source_root.clone();
+        for _ in 0..96 {
+            directory.push("d");
+            std::fs::create_dir(&directory).unwrap();
+            set_mode(&directory, 0o770);
+        }
+        std::fs::write(directory.join("deep-data"), b"depth-bounded recovery").unwrap();
+    }
+
+    let Some(restart_fixture) = Fixture::new() else {
+        return;
+    };
+    let Some(undo_fixture) = Fixture::new() else {
+        return;
+    };
+    add_deep_branch(&restart_fixture);
+    add_deep_branch(&undo_fixture);
+
+    let restart_transaction = TransactionId([0xf8; 16]);
+    let (mut restart_engine, report) = SealedStagingEngine::open(&restart_fixture.store).unwrap();
+    assert!(report.is_empty());
+    drop(
+        restart_engine
+            .stage_prepared_root(restart_transaction, restart_fixture.prepare())
+            .unwrap(),
+    );
+    drop(restart_engine);
+
+    let undo_transaction = TransactionId([0xf9; 16]);
+    let mut undo_ready = stage_production(&undo_fixture, undo_transaction);
+
+    // Reduce only after both forward publications. Restart verification and the
+    // two verified-undo proof passes must each fit one active directory chain
+    // plus fixed scratch/cursor descriptors; the old resident recovery
+    // inventory overlapped retained directory FDs with the deep traversal chain.
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    limit.rlim_cur = limit.rlim_cur.min(160);
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+    let (restart_engine, report) = SealedStagingEngine::open(&restart_fixture.store).unwrap();
+    let (restart_ready, summary) = restart_engine
+        .recover_startup(report, |_, _| Ok(restart_fixture.raw_anchors()))
+        .unwrap();
+    assert_eq!(summary.recovered.len(), 1);
+    assert_eq!(
+        restart_ready.state(restart_transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    drop(restart_ready);
+
+    let token = undo_ready
+        .verified_undo_token(undo_transaction, "undo-group")
+        .unwrap();
+    undo_ready
+        .undo_verified(token, verified_undo_request(&undo_fixture))
+        .unwrap();
+    assert_eq!(
+        undo_ready.state(undo_transaction),
+        Some(TransactionState::Restored)
+    );
+    let restored = undo_fixture
+        .source_root
+        .join(std::iter::repeat_n("d", 96).collect::<PathBuf>())
+        .join("deep-data");
+    assert_eq!(std::fs::read(restored).unwrap(), b"depth-bounded recovery");
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn deep_restart_verification_and_verified_undo_are_fd_bounded() {
+    const CHILD_MARKER_ENV: &str = "DEGU_DEEP_RECOVERY_FD_CHILD_MARKER";
+    if let Some(marker) = std::env::var_os(CHILD_MARKER_ENV) {
+        assert_deep_restart_verification_and_undo_fit_process_fd_budget();
+        std::fs::write(marker, b"observed").unwrap();
+        return;
+    }
+
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir.path().join("completed");
+    let test_name = format!(
+        "{}::deep_restart_verification_and_verified_undo_are_fd_bounded",
+        module_path!()
+            .strip_prefix("degu_core::")
+            .unwrap_or(module_path!())
+    );
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test_name, "--nocapture"])
+        .env(CHILD_MARKER_ENV, &marker)
+        .status()
+        .unwrap();
+    assert!(status.success(), "isolated deep recovery FD test failed");
+    assert!(
+        marker.exists(),
+        "isolated deep recovery FD test did not execute"
+    );
 }
 
 #[test]

@@ -398,6 +398,19 @@ impl StructureEvidence {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+
+    pub(crate) fn is_directory(&self) -> bool {
+        self.identity.kind == NodeKind::Directory
+    }
+
+    pub(crate) fn mode(&self) -> u32 {
+        self.mode
+    }
+
+    pub(crate) fn normalize_directory_mode(&mut self, mode: u32) {
+        debug_assert!(self.is_directory());
+        self.mode = mode;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2035,6 +2048,20 @@ impl PendingV3Finalizer {
         record: ManifestV3Record<'_>,
         emit_hardlink: &mut dyn FnMut(&[u8]) -> Result<(), E>,
     ) -> Result<(), HeldTreeV3CollectError<E>> {
+        self.observe_with_directory_mode(record, None, emit_hardlink)
+    }
+
+    /// Recovery may verify a tree after its durable inverse modes were already
+    /// applied. The authenticated record retains the sealed manifest mode, while
+    /// reopen evidence must use the freshly checked current mode. Forward and
+    /// pre-inverse callers pass `None` and therefore retain the byte-identical
+    /// sealed-mode behavior.
+    pub(crate) fn observe_with_directory_mode<E>(
+        &mut self,
+        record: ManifestV3Record<'_>,
+        observed_directory_mode: Option<u32>,
+        emit_hardlink: &mut dyn FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), HeldTreeV3CollectError<E>> {
         self.observed_entries =
             self.observed_entries
                 .checked_add(1)
@@ -2080,7 +2107,7 @@ impl PendingV3Finalizer {
                 },
                 owner_uid: record.uid,
                 group_gid: record.gid,
-                observed_mode: record.mode,
+                observed_mode: observed_directory_mode.unwrap_or(record.mode),
             };
             if path.as_os_str().is_empty() && evidence != self.context.root.evidence {
                 return Err(HeldTreeV3CollectError::Tree(HeldTreeError::PostChanged(

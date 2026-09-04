@@ -7,10 +7,10 @@
 
 use crate::authority::TransactionState;
 use crate::backend::held::{
-    HardlinkTopologyFold, HeldTreeError, HeldTreeInventory, HeldTreeLimits, HeldTreeSealError,
-    HeldTreeV3CollectError, ManifestV3CodecError, PendingV3Inventory, StreamedV3Inventory,
-    StructureEvidence, decode_hardlink_scratch_record, hardlink_scratch_sentinel_record,
-    structure_evidence_from_v3_record,
+    HardlinkTopologyFold, HeldTreeError, HeldTreeLimits, HeldTreeSealError, HeldTreeV3CollectError,
+    ManifestV3CodecError, PendingV3Inventory, StreamedV3Inventory, StructureEvidence,
+    decode_hardlink_scratch_record, decode_pre_seal_directory_plan_record,
+    hardlink_scratch_sentinel_record, structure_evidence_from_v3_record,
 };
 use crate::backend::{
     CertificationError, HeldLocalBackendEvidence, LocalModeRevalidationFailure, certify_held_fd,
@@ -19,6 +19,10 @@ use crate::seal::executor::{
     LocalModeExecutionError, LocalModeMutationRequest, LocalModeMutationResult, LocalModeTransform,
     RecoveryLocator, execute_staging_local_mode_mutation,
 };
+#[cfg(test)]
+use crate::seal::sidecar::TreeDirectoryPlan;
+#[cfg(test)]
+type DirectoryPlanTestCallback = Box<dyn FnOnce(&TreeDirectoryPlan)>;
 use crate::seal::sidecar::{
     TreeManifestFoldError, TreeManifestScratchBuildError, TreeSidecarCommitment, TreeSidecarError,
     TreeSidecarFoldError, TreeSidecarStore, TreeStructureScratchCursor,
@@ -46,6 +50,12 @@ std::thread_local! {
     static BEFORE_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     static AFTER_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static AFTER_PRE_SEAL_DIRECTORY_PLAN_PREFLIGHT: std::cell::RefCell<Option<DirectoryPlanTestCallback>> =
+        const { std::cell::RefCell::new(None) };
+    static AFTER_PRE_SEAL_SCRATCH_READY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static AFTER_PRE_SEAL_DIRECTORY_SEALS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     static AFTER_PRE_SEAL_INVENTORY_DROPPED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
@@ -460,31 +470,356 @@ pub(crate) fn execute_prepared_rename<'a>(
         .map_err(classify_source_parent)?;
     wal.transition_staging_foundation(transaction, TransactionState::ParentSealed)?;
 
-    let mut tree = collect_source_tree(&binding)?;
+    let produced =
+        sidecars.build_sorted_manifest_scratch_with_output(wal, transaction, |emit_record| {
+            let parent = certify_duplicate(&binding.source_parent)
+                .map_err(PostSealProducerError::Binding)?;
+            PendingV3Inventory::collect_pre_seal(
+                parent,
+                binding.metadata.source_basename(),
+                crate::backend::held_tree_protected_names(),
+                HeldTreeLimits::default(),
+                emit_record,
+            )
+            .map_err(PostSealProducerError::Collect)
+        });
+    let (mut pre_seal_scratch, collected_pre_seal) = match produced {
+        Ok(produced) => produced,
+        Err(TreeManifestScratchBuildError::Sidecar(error)) => {
+            let _ = sidecars.cleanup_unpublished(wal);
+            return Err(StagingRenameError::Sidecar(error));
+        }
+        Err(TreeManifestScratchBuildError::Produce(PostSealProducerError::Binding(error))) => {
+            let _ = sidecars.cleanup_unpublished(wal);
+            return Err(StagingRenameError::Binding(error));
+        }
+        Err(TreeManifestScratchBuildError::Produce(PostSealProducerError::Collect(error))) => {
+            let _ = sidecars.cleanup_unpublished(wal);
+            return Err(match error {
+                HeldTreeV3CollectError::Tree(error) => StagingRenameError::HeldTree(error),
+                HeldTreeV3CollectError::Codec(error) => StagingRenameError::ManifestCodec(error),
+                HeldTreeV3CollectError::Emit(error) => StagingRenameError::Sidecar(error),
+            });
+        }
+    };
+    let directory_count = collected_pre_seal.directory_count();
+    let directory_plan_build =
+        sidecars.build_directory_plan_with_output(wal, transaction, directory_count, |emit| {
+            collected_pre_seal.emit_directory_plan(emit)
+        });
+    let (mut directory_plan, pending_pre_seal) = match directory_plan_build {
+        Ok(result) => result,
+        Err(TreeManifestScratchBuildError::Sidecar(error)) => {
+            let _ = sidecars.cleanup_unpublished(wal);
+            return Err(StagingRenameError::Sidecar(error));
+        }
+        Err(TreeManifestScratchBuildError::Produce(error)) => {
+            let _ = sidecars.cleanup_unpublished(wal);
+            return Err(match error {
+                HeldTreeV3CollectError::Tree(error) => StagingRenameError::HeldTree(error),
+                HeldTreeV3CollectError::Codec(error) => StagingRenameError::ManifestCodec(error),
+                HeldTreeV3CollectError::Emit(error) => StagingRenameError::Sidecar(error),
+            });
+        }
+    };
+    if let Err(error) = directory_plan.authenticate() {
+        let _ = sidecars.cleanup_unpublished(wal);
+        return Err(StagingRenameError::Sidecar(error));
+    }
+    let pre_seal_manifest =
+        match sidecars.fingerprint_sorted_manifest_scratch(wal, transaction, &mut pre_seal_scratch)
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let _ = sidecars.cleanup_unpublished(wal);
+                return Err(StagingRenameError::Sidecar(error));
+            }
+        };
+    let pre_seal_finalizer = match pending_pre_seal.into_finalizer(pre_seal_manifest) {
+        Ok(finalizer) => finalizer,
+        Err(error) => {
+            let _ = sidecars.cleanup_unpublished(wal);
+            return Err(StagingRenameError::HeldTree(error));
+        }
+    };
+    let hardlink_build = sidecars.build_sorted_hardlink_scratch_from_manifest(
+        wal,
+        transaction,
+        &mut pre_seal_scratch,
+        pre_seal_manifest,
+        pre_seal_finalizer,
+        |finalizer, record, emit_hardlink| finalizer.observe(record, emit_hardlink),
+    );
+    let (pre_seal_hardlink_scratch, pre_seal_finalizer) = match hardlink_build {
+        Ok(result) => result,
+        Err(error) => {
+            // A complete scratch integrity pass wins over a tree/fold failure;
+            // no directory mutation has occurred yet.
+            let authenticated = sidecars.fingerprint_sorted_manifest_scratch(
+                wal,
+                transaction,
+                &mut pre_seal_scratch,
+            );
+            let primary = match error {
+                TreeSidecarFoldError::Sidecar(error) => StagingRenameError::Sidecar(error),
+                TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Tree(error)) => {
+                    StagingRenameError::HeldTree(error)
+                }
+                TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Codec(error)) => {
+                    StagingRenameError::ManifestCodec(error)
+                }
+                TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Emit(error)) => {
+                    StagingRenameError::Sidecar(error)
+                }
+            };
+            let _ = sidecars.cleanup_unpublished(wal);
+            authenticated.map_err(StagingRenameError::Sidecar)?;
+            return Err(primary);
+        }
+    };
+    let pre_seal_hardlinks = sidecars.fold_sorted_hardlink_scratch_preserving_manifest(
+        wal,
+        transaction,
+        pre_seal_hardlink_scratch,
+        HardlinkTopologyFold::new(),
+        |groups, record| {
+            let record = decode_hardlink_scratch_record(record)
+                .map_err(HeldTreeV3CollectError::<std::convert::Infallible>::Codec)?
+                .ok_or(HeldTreeV3CollectError::Codec(
+                    ManifestV3CodecError::InvalidTag,
+                ))?;
+            groups.observe(record).map_err(HeldTreeV3CollectError::Tree)
+        },
+    );
+    let pre_seal_hardlinks = match pre_seal_hardlinks {
+        Ok(fold) => match fold.finish() {
+            Ok(topology) => topology,
+            Err(error) => {
+                let authenticated = sidecars.fingerprint_sorted_manifest_scratch(
+                    wal,
+                    transaction,
+                    &mut pre_seal_scratch,
+                );
+                let _ = sidecars.cleanup_unpublished(wal);
+                authenticated.map_err(StagingRenameError::Sidecar)?;
+                return Err(StagingRenameError::HeldTree(error));
+            }
+        },
+        Err(error) => {
+            let primary = match error {
+                TreeSidecarFoldError::Sidecar(error) => StagingRenameError::Sidecar(error),
+                TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Tree(error)) => {
+                    StagingRenameError::HeldTree(error)
+                }
+                TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Codec(_)) => {
+                    StagingRenameError::Sidecar(TreeSidecarError::InvalidScratch(
+                        "hardlink scratch record validation failed",
+                    ))
+                }
+                TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Emit(never)) => match never {},
+            };
+            let authenticated = sidecars.fingerprint_sorted_manifest_scratch(
+                wal,
+                transaction,
+                &mut pre_seal_scratch,
+            );
+            let _ = sidecars.cleanup_unpublished(wal);
+            authenticated.map_err(StagingRenameError::Sidecar)?;
+            return Err(primary);
+        }
+    };
+    let mut tree = match pre_seal_finalizer.finish(pre_seal_hardlinks) {
+        Ok(tree) => tree,
+        Err(error) => {
+            let authenticated = sidecars.fingerprint_sorted_manifest_scratch(
+                wal,
+                transaction,
+                &mut pre_seal_scratch,
+            );
+            let _ = sidecars.cleanup_unpublished(wal);
+            authenticated.map_err(StagingRenameError::Sidecar)?;
+            return Err(StagingRenameError::HeldTree(error));
+        }
+    };
+    #[cfg(test)]
+    AFTER_PRE_SEAL_SCRATCH_READY.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    let mut plan_records = 0_u64;
+    let plan_validation = directory_plan.for_each_forward(|record| {
+        let record = decode_pre_seal_directory_plan_record(record)
+            .map_err(HeldTreeV3CollectError::<std::convert::Infallible>::Codec)?;
+        tree.validate_directory_plan_record(&record, plan_records)
+            .map_err(HeldTreeV3CollectError::Tree)?;
+        plan_records = plan_records
+            .checked_add(1)
+            .ok_or(HeldTreeV3CollectError::Tree(HeldTreeError::PostChanged(
+                PathBuf::new(),
+            )))?;
+        Ok(())
+    });
+    if let Err(error) = plan_validation {
+        let _ = sidecars.cleanup_unpublished(wal);
+        return Err(match error {
+            TreeSidecarFoldError::Sidecar(error) => StagingRenameError::Sidecar(error),
+            TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Tree(error)) => {
+                StagingRenameError::HeldTree(error)
+            }
+            TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Codec(error)) => {
+                StagingRenameError::ManifestCodec(error)
+            }
+            TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Emit(never)) => match never {},
+        });
+    }
+    if plan_records != tree.directory_count() || plan_records != directory_plan.record_count() {
+        let _ = sidecars.cleanup_unpublished(wal);
+        return Err(StagingRenameError::HeldTree(HeldTreeError::PostChanged(
+            PathBuf::new(),
+        )));
+    }
     if tree.root_strong_identity() != binding.metadata.root_identity() {
+        let _ = sidecars.cleanup_unpublished(wal);
         return Err(StagingRenameError::Binding(
             PreparedRootError::BackendOrMountChanged,
         ));
     }
-    wal.transition_staging_foundation(transaction, TransactionState::TreeSealIntent)?;
+    if let Err(error) =
+        wal.transition_staging_foundation(transaction, TransactionState::TreeSealIntent)
+    {
+        let _ = sidecars.cleanup_unpublished(wal);
+        return Err(StagingRenameError::Wal(error));
+    }
+    #[cfg(test)]
+    AFTER_PRE_SEAL_DIRECTORY_PLAN_PREFLIGHT.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook(&directory_plan);
+        }
+    });
     let source_root = binding
         .metadata
         .source_parent()
         .relative_path()
         .join(binding.metadata.source_basename());
-    tree.seal_directories_for_staging(
+    let mut mutation_id = 1_u64;
+    loop {
+        let encoded = match directory_plan.next_reverse() {
+            Ok(Some(record)) => record,
+            Ok(None) => break,
+            Err(error) => {
+                let _ = sidecars.cleanup_unpublished(wal);
+                return Err(StagingRenameError::Sidecar(error));
+            }
+        };
+        let target = match decode_pre_seal_directory_plan_record(&encoded) {
+            Ok(record) => record,
+            Err(error) => {
+                let _ = sidecars.cleanup_unpublished(wal);
+                return Err(StagingRenameError::ManifestCodec(error));
+            }
+        };
+        let mut chain = Vec::new();
+        let chain_result = directory_plan.for_each_forward(|encoded| {
+            let candidate = decode_pre_seal_directory_plan_record(encoded)
+                .map_err(HeldTreeV3CollectError::<std::convert::Infallible>::Codec)?;
+            tree.consider_directory_plan_ancestor(&target, candidate, &mut chain)
+                .map_err(HeldTreeV3CollectError::Tree)
+        });
+        if let Err(error) = chain_result {
+            let _ = sidecars.cleanup_unpublished(wal);
+            return Err(match error {
+                TreeSidecarFoldError::Sidecar(error) => StagingRenameError::Sidecar(error),
+                TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Tree(error)) => {
+                    StagingRenameError::HeldTree(error)
+                }
+                TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Codec(error)) => {
+                    StagingRenameError::ManifestCodec(error)
+                }
+                TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Emit(never)) => match never {},
+            });
+        }
+        if let Err(error) = tree.seal_directory_for_staging(
+            wal,
+            transaction,
+            &source_root,
+            binding.metadata.filesystem_id(),
+            mutation_id,
+            &target,
+            &chain,
+        ) {
+            let _ = sidecars.cleanup_unpublished(wal);
+            return Err(StagingRenameError::TreeSeal(error));
+        }
+        mutation_id = match mutation_id.checked_add(1) {
+            Some(next) => next,
+            None => {
+                let _ = sidecars.cleanup_unpublished(wal);
+                return Err(StagingRenameError::TreeSeal(
+                    HeldTreeSealError::MutationIdExhausted,
+                ));
+            }
+        };
+    }
+    if let Err(error) = directory_plan.finish() {
+        let _ = sidecars.cleanup_unpublished(wal);
+        return Err(StagingRenameError::Sidecar(error));
+    }
+    #[cfg(test)]
+    AFTER_PRE_SEAL_DIRECTORY_SEALS.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+
+    let mut expectation_builder = tree.post_seal_expectation_builder();
+    let expectation_fold = sidecars.read_sorted_manifest_scratch(
         wal,
         transaction,
-        &source_root,
-        binding.metadata.filesystem_id(),
-        1,
-    )?;
-
-    // Reduce the complete pre-seal inventory to a fixed-size expected v3
-    // commitment and drop it before collecting the second full content proof.
-    // The post-seal collection therefore cannot coexist with the pre-seal
-    // `Vec<ManifestEntry>` in this forward path.
-    let post_seal_expectation = tree.into_post_seal_expectation()?;
+        pre_seal_manifest,
+        &mut pre_seal_scratch,
+        (),
+        |(), record, wal_view| {
+            expectation_builder.observe(&tree, record, |path, device, inode, incarnation| {
+                wal_view.applied_tree_seal_mode(
+                    transaction,
+                    &source_root.join(path),
+                    device,
+                    inode,
+                    incarnation,
+                    record.mode,
+                )
+            })?;
+            Ok(())
+        },
+    );
+    if let Err(error) = expectation_fold {
+        let primary = match error {
+            TreeSidecarFoldError::Sidecar(error) => StagingRenameError::Sidecar(error),
+            TreeSidecarFoldError::Fold(error) => StagingRenameError::HeldTree(error),
+        };
+        let authenticated =
+            sidecars.fingerprint_sorted_manifest_scratch(wal, transaction, &mut pre_seal_scratch);
+        let _ = sidecars.cleanup_unpublished(wal);
+        authenticated.map_err(StagingRenameError::Sidecar)?;
+        return Err(primary);
+    }
+    let post_seal_expectation = match tree.finish_post_seal_expectation(expectation_builder) {
+        Ok(expectation) => expectation,
+        Err(error) => {
+            let _ = sidecars.cleanup_unpublished(wal);
+            return Err(StagingRenameError::HeldTree(error));
+        }
+    };
+    if let Err(error) = sidecars.discard_sorted_manifest_scratch(
+        wal,
+        transaction,
+        pre_seal_manifest,
+        pre_seal_scratch,
+    ) {
+        let _ = sidecars.cleanup_unpublished(wal);
+        return Err(StagingRenameError::Sidecar(error));
+    }
     #[cfg(test)]
     AFTER_PRE_SEAL_INVENTORY_DROPPED.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
@@ -937,18 +1272,6 @@ fn rewalk_streamed_v3_structure(
     }
     tree.finish_streamed_structure_rewalk()?;
     Ok(())
-}
-
-fn collect_source_tree(
-    binding: &PreparedRootBinding,
-) -> Result<HeldTreeInventory, StagingRenameError> {
-    let parent = certify_duplicate(&binding.source_parent)?;
-    Ok(HeldTreeInventory::collect(
-        parent,
-        binding.metadata.source_basename(),
-        crate::backend::held_tree_protected_names(),
-        HeldTreeLimits::default(),
-    )?)
 }
 
 fn verify_post_rename(binding: &PreparedRootBinding) -> Result<(), PreparedRootError> {

@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const MAGIC: &[u8; 4] = b"DSWL";
@@ -791,6 +791,40 @@ impl<W: DurableWrite> SealWal<W> {
             purge_removed_entries: self.purge_progress.get(&transaction).map_or(0, |v| v.0),
             purge_last_path: self.purge_progress.get(&transaction).map(|v| v.1.clone()),
         })
+    }
+
+    /// Returns the exact executor-reported applied mode for one original tree
+    /// seal. This is a projection of the already-resident leased-WAL state, not
+    /// new authority; duplicate or mismatched evidence fails closed.
+    pub(crate) fn applied_tree_seal_mode(
+        &self,
+        transaction: TransactionId,
+        relative_path: &Path,
+        device: u64,
+        inode: u64,
+        incarnation: u64,
+        pre_mode: u32,
+    ) -> Option<u32> {
+        let mut matched = None;
+        for ((owner, _), permission) in &self.permissions {
+            if *owner != transaction
+                || permission.phase != TransactionState::TreeSealIntent
+                || permission.application != ApplicationStatus::Applied
+                || permission.reverses_mutation_id.is_some()
+                || permission.evidence.relative_path() != relative_path
+                || permission.evidence.device() != device
+                || permission.evidence.inode() != inode
+                || permission.evidence.generation_or_btime() != Some(incarnation)
+                || permission.pre_mode != pre_mode
+                || permission.evidence.expected_mode() != permission.expected_mode
+            {
+                continue;
+            }
+            if matched.replace(permission.expected_mode).is_some() {
+                return None;
+            }
+        }
+        matched
     }
 
     /// Allocates the next transaction-local mutation id for startup recovery.

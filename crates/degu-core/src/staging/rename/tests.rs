@@ -200,6 +200,70 @@ fn set_group(path: &Path, gid: u32) -> std::io::Result<()> {
 }
 
 #[test]
+fn anonymous_directory_plan_preserves_reverse_bfs_wal_modes_and_restart_verification() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let grandchild = fixture.source_root.join("child/grandchild");
+    std::fs::create_dir(&grandchild).unwrap();
+    set_mode(&fixture.source_root, 0o770);
+    set_mode(&fixture.source_root.join("child"), 0o700);
+    set_mode(&grandchild, 0o777);
+
+    let transaction = TransactionId([0x72; 16]);
+    let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty());
+    drop(
+        engine
+            .stage_prepared_root(transaction, fixture.prepare())
+            .unwrap(),
+    );
+    drop(engine);
+
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    let permissions = &replay.transactions[&transaction].permissions;
+    assert_eq!(permissions.len(), 4);
+    assert_eq!(
+        permissions
+            .iter()
+            .map(|permission| (
+                permission.mutation_id,
+                permission.evidence.relative_path().to_path_buf(),
+                permission.pre_mode,
+                permission.expected_mode,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, PathBuf::from("source-parent"), 0o770, 0o750),
+            (
+                1,
+                PathBuf::from("source-parent/root/child/grandchild"),
+                0o777,
+                0o755,
+            ),
+            (2, PathBuf::from("source-parent/root/child"), 0o700, 0o700,),
+            (3, PathBuf::from("source-parent/root"), 0o770, 0o750,),
+        ]
+    );
+    drop(lease);
+
+    let (mut recovered, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let candidate = report.into_candidates().pop().unwrap();
+    let capability = recovered
+        .prepare_startup_recovery(candidate, fixture.anchors())
+        .unwrap();
+    let StartupRecoveryCapability::PendingVerification(pending) = capability else {
+        panic!("staged plan did not resume verification")
+    };
+    let StagedVerificationOutcome::StagedSealed(verified) = pending.verify_or_quarantine().unwrap()
+    else {
+        panic!("varied-mode tree failed exact restart verification")
+    };
+    assert_eq!(verified.wal_state(), Some(TransactionState::StagedSealed));
+}
+
+#[test]
 fn component_order_prefix_paths_stage_and_restart_verify() {
     let Some(fixture) = Fixture::new() else {
         return;
@@ -520,6 +584,130 @@ fn consumed_pre_seal_expectation_rejects_same_size_content_drift_before_post_pro
     let replay = lease.replay_and_repair().unwrap();
     assert!(replay.transactions[&transaction].tree_manifest.is_none());
     assert!(replay.transactions[&transaction].tree_sidecar.is_none());
+}
+
+#[test]
+fn corrupted_anonymous_directory_plan_mutates_no_tree_directory() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0x73; 16]);
+    AFTER_PRE_SEAL_DIRECTORY_PLAN_PREFLIGHT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|plan| plan.corrupt_frame_for_test(1)));
+    });
+    let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(report.is_empty());
+    let error = match engine.stage_prepared_root(transaction, fixture.prepare()) {
+        Ok(_) => panic!("corrupt directory plan must fail before tree sealing"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StagingRenameError::Sidecar(_)));
+    assert_eq!(
+        engine.state(transaction),
+        Some(TransactionState::TreeSealIntent)
+    );
+    assert_eq!(mode(&fixture.source_parent), 0o750);
+    assert_eq!(mode(&fixture.source_root), 0o770);
+    assert_eq!(mode(&fixture.source_root.join("child")), 0o770);
+    assert!(fixture.source_root.join("child/data").is_file());
+    assert!(!fixture.destination_root.exists());
+    assert!(
+        std::fs::read_dir(fixture.base.join("wal-store"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .all(|name| !name.to_string_lossy().starts_with(".tree-scratch-v1-"))
+    );
+    drop(engine);
+
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    let recovered = &replay.transactions[&transaction];
+    assert_eq!(recovered.permissions.len(), 1);
+    assert!(recovered.tree_manifest.is_none());
+    assert!(recovered.tree_sidecar.is_none());
+    drop(lease);
+
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let (ready, summary) = engine
+        .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+        .unwrap();
+    assert_eq!(summary.recovered.len(), 1);
+    assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+    assert_eq!(mode(&fixture.source_parent), 0o770);
+}
+
+#[test]
+fn pre_seal_scratch_crash_boundaries_cleanup_and_restore_exact_wal_prefix() {
+    for (index, (boundary, expected_state, expected_permissions)) in [
+        ("scratch-ready", TransactionState::ParentSealed, 1_usize),
+        (
+            "directories-sealed",
+            TransactionState::TreeSealIntent,
+            3_usize,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let transaction = TransactionId([0x74 + index as u8; 16]);
+        let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+        assert!(report.is_empty());
+        match boundary {
+            "scratch-ready" => AFTER_PRE_SEAL_SCRATCH_READY.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|| panic!("simulated pre-seal crash")));
+            }),
+            "directories-sealed" => AFTER_PRE_SEAL_DIRECTORY_SEALS.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|| panic!("simulated pre-seal crash")));
+            }),
+            _ => unreachable!(),
+        }
+
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = engine.stage_prepared_root(transaction, fixture.prepare());
+        }));
+        assert!(crashed.is_err(), "boundary={boundary}");
+        assert_eq!(engine.state(transaction), Some(expected_state));
+        assert!(
+            std::fs::read_dir(fixture.base.join("wal-store"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .any(|name| name.to_string_lossy().starts_with(".tree-scratch-v1-")),
+            "the simulated process death must strand unpublished scratch at {boundary}"
+        );
+        drop(engine);
+
+        let mut lease = fixture.store.try_lease().unwrap();
+        let replay = lease.replay_and_repair().unwrap();
+        let recovered = &replay.transactions[&transaction];
+        assert_eq!(recovered.state, expected_state);
+        assert_eq!(recovered.permissions.len(), expected_permissions);
+        assert!(recovered.tree_manifest.is_none());
+        assert!(recovered.tree_sidecar.is_none());
+        drop(lease);
+
+        let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+        assert_eq!(report.candidates().len(), 1);
+        assert!(
+            std::fs::read_dir(fixture.base.join("wal-store"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .all(|name| !name.to_string_lossy().starts_with(".tree-scratch-v1-")),
+            "startup must remove unpublished pre-seal scratch at {boundary}"
+        );
+        let (ready, summary) = engine
+            .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+            .unwrap();
+        assert_eq!(summary.recovered.len(), 1);
+        assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+        assert_eq!(mode(&fixture.source_parent), 0o770);
+        assert_eq!(mode(&fixture.source_root), 0o770);
+        assert_eq!(mode(&fixture.source_root.join("child")), 0o770);
+        assert!(fixture.source_root.join("child/data").is_file());
+        assert!(!fixture.destination_root.exists());
+    }
 }
 
 #[test]

@@ -7,13 +7,12 @@
 //! bound digest, and private-file checks make same-UID replacement fail closed.
 
 use super::*;
-#[cfg(test)]
-use crate::backend::held::ManifestV3Record;
 use crate::backend::held::{
-    ManifestV3Decoder, ManifestV3VisitError, StructureEvidence, compare_manifest_paths,
-    decode_structure_record,
+    ManifestV3Decoder, ManifestV3Record, ManifestV3VisitError, StructureEvidence,
+    compare_manifest_paths, decode_structure_record,
 };
 use crate::seal::wal::DurableTreeManifest;
+use std::os::unix::fs::FileExt;
 
 const SCRATCH_MAGIC: &[u8; 4] = b"DHSR";
 const SCRATCH_VERSION: u16 = 1;
@@ -36,6 +35,13 @@ const PURGE_PLAN_VERSION: u16 = 1;
 const PURGE_PLAN_HEADER_LEN: usize = 72;
 const PURGE_PLAN_DOMAIN: &[u8] = b"degu-held-tree-purge-plan-v1\0";
 const PURGE_PLAN_FRAME_DOMAIN: &[u8] = b"degu-held-tree-purge-frame-v1\0";
+const DIRECTORY_PLAN_MAGIC: &[u8; 4] = b"DHDP";
+const DIRECTORY_PLAN_VERSION: u16 = 1;
+const DIRECTORY_PLAN_HEADER_LEN: usize = 72;
+const DIRECTORY_PLAN_DOMAIN: &[u8] = b"degu-held-tree-directory-plan-v1\0";
+const DIRECTORY_PLAN_FRAME_DOMAIN: &[u8] = b"degu-held-tree-directory-frame-v1\0";
+const DIRECTORY_PLAN_MAX_RECORD_BYTES: usize = MAX_SEGMENT_PAYLOAD;
+const DIRECTORY_PLAN_MAX_TOTAL_BYTES: u64 = MAX_TOTAL_PAYLOAD_BYTES + MAX_RECORDS * 40;
 static NEXT_SCRATCH_NAME: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,6 +135,23 @@ pub(crate) struct TreeHardlinkScratch(TreeManifestScratch);
 /// Unpublished purge records sorted in the exact historical postorder.
 #[derive(Debug)]
 pub(crate) struct TreePurgeScratch(TreeManifestScratch);
+
+/// One-shot pre-seal directory plan. The backing file is unlinked before any
+/// record is written; only this keyed descriptor can enumerate its contents.
+#[derive(Debug)]
+pub(crate) struct TreeDirectoryPlan {
+    file: File,
+    path: PathBuf,
+    transaction: TransactionId,
+    frame_key: [u8; 32],
+    expected_records: u64,
+    expected_payload_bytes: u64,
+    expected_digest: [u8; 32],
+    file_bytes: u64,
+    authenticated: bool,
+    reverse_remaining: u64,
+    reverse_offset: u64,
+}
 
 pub(crate) struct TreeStructureScratchCursor {
     scratch: TreeManifestScratch,
@@ -315,6 +338,83 @@ impl TreeSidecarStore {
             produce,
         )
         .map(|(scratch, output)| (TreeHardlinkScratch(scratch), output))
+    }
+
+    /// Folds an authenticated sorted manifest while spooling final regular-file
+    /// observations into a second fixed-memory identity-sorted scratch. Keeping
+    /// both builders inside this lease-bound method avoids any resident hardlink
+    /// inventory and avoids publishing a pre-seal sidecar.
+    pub(crate) fn build_sorted_hardlink_scratch_from_manifest<A, E, F>(
+        &self,
+        wal: &mut SealWal<RecoverySession>,
+        transaction: TransactionId,
+        manifest_scratch: &mut TreeManifestScratch,
+        expected_manifest: DurableTreeManifest,
+        initial: A,
+        mut fold: F,
+    ) -> Result<(TreeHardlinkScratch, A), TreeSidecarFoldError<E>>
+    where
+        F: FnMut(
+            &mut A,
+            ManifestV3Record<'_>,
+            &mut dyn FnMut(&[u8]) -> Result<(), TreeSidecarError>,
+        ) -> Result<(), E>,
+    {
+        self.require_matching_wal(wal)?;
+        self.revalidate_store_binding()?;
+        let mut builder = RunBuilder {
+            store: self,
+            transaction,
+            memory_bytes: SORT_MEMORY_BYTES,
+            order: ScratchOrder::HardlinkIdentityThenPath,
+            arena: Vec::with_capacity(SORT_MEMORY_BYTES),
+            records: Vec::new(),
+            runs: Vec::new(),
+            record_count: 0,
+            payload_bytes: 0,
+        };
+        builder.push(crate::backend::held::hardlink_scratch_sentinel_record())?;
+        let output = self.read_sorted_manifest_scratch(
+            wal,
+            transaction,
+            expected_manifest,
+            manifest_scratch,
+            initial,
+            |mut accumulator, record, _wal| {
+                let mut emit = |bytes: &[u8]| builder.push(bytes);
+                fold(&mut accumulator, record, &mut emit)?;
+                Ok(accumulator)
+            },
+        )?;
+        let scratch = TreeHardlinkScratch(builder.finish()?);
+        self.require_matching_wal(wal)?;
+        self.revalidate_store_binding()?;
+        Ok((scratch, output))
+    }
+
+    /// Seals BFS directory records into an anonymous keyed plan. The producer's
+    /// resident traversal vector is consumed before this method returns.
+    pub(crate) fn build_directory_plan_with_output<T, E, P>(
+        &self,
+        wal: &mut SealWal<RecoverySession>,
+        transaction: TransactionId,
+        expected_records: u64,
+        produce: P,
+    ) -> Result<(TreeDirectoryPlan, T), TreeManifestScratchBuildError<E>>
+    where
+        P: FnOnce(&mut dyn FnMut(&[u8]) -> Result<(), TreeSidecarError>) -> Result<T, E>,
+    {
+        self.require_matching_wal(wal)?;
+        self.revalidate_store_binding()?;
+        let mut writer = DirectoryPlanWriter::create(self, transaction)?;
+        let output = {
+            let mut emit = |record: &[u8]| writer.push(record);
+            produce(&mut emit).map_err(TreeManifestScratchBuildError::Produce)?
+        };
+        let plan = writer.finish(expected_records)?;
+        self.require_matching_wal(wal)?;
+        self.revalidate_store_binding()?;
+        Ok((plan, output))
     }
 
     /// Builds private purge runs in deepest-first historical postorder.
@@ -536,8 +636,56 @@ impl TreeSidecarStore {
         wal: &mut SealWal<RecoverySession>,
         transaction: TransactionId,
         scratch: TreeHardlinkScratch,
+        accumulator: A,
+        fold: F,
+    ) -> Result<A, TreeSidecarFoldError<E>>
+    where
+        F: FnMut(&mut A, &[u8]) -> Result<(), E>,
+    {
+        self.fold_sorted_hardlink_scratch_with_cleanup(
+            wal,
+            transaction,
+            scratch,
+            accumulator,
+            fold,
+            true,
+        )
+    }
+
+    /// Pre-seal manifest scratch must survive this fold until its exact
+    /// WAL-applied directory modes have been substituted. On success only the
+    /// hardlink runs are removed; callers still perform store-wide cleanup on
+    /// every error path.
+    pub(crate) fn fold_sorted_hardlink_scratch_preserving_manifest<A, E, F>(
+        &self,
+        wal: &mut SealWal<RecoverySession>,
+        transaction: TransactionId,
+        scratch: TreeHardlinkScratch,
+        accumulator: A,
+        fold: F,
+    ) -> Result<A, TreeSidecarFoldError<E>>
+    where
+        F: FnMut(&mut A, &[u8]) -> Result<(), E>,
+    {
+        self.fold_sorted_hardlink_scratch_with_cleanup(
+            wal,
+            transaction,
+            scratch,
+            accumulator,
+            fold,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fold_sorted_hardlink_scratch_with_cleanup<A, E, F>(
+        &self,
+        wal: &mut SealWal<RecoverySession>,
+        transaction: TransactionId,
+        scratch: TreeHardlinkScratch,
         mut accumulator: A,
         mut fold: F,
+        cleanup_all_unpublished: bool,
     ) -> Result<A, TreeSidecarFoldError<E>>
     where
         F: FnMut(&mut A, &[u8]) -> Result<(), E>,
@@ -604,7 +752,11 @@ impl TreeSidecarStore {
             }
             Ok(accumulator)
         })();
-        let cleanup = self.cleanup_unpublished(wal).map(|_| ());
+        let cleanup = if cleanup_all_unpublished {
+            self.cleanup_unpublished(wal).map(|_| ())
+        } else {
+            Ok(())
+        };
         match (validation, cleanup) {
             (Err(TreeSidecarFoldError::Sidecar(primary)), _) => {
                 Err(TreeSidecarFoldError::Sidecar(primary))
@@ -660,13 +812,38 @@ impl TreeSidecarStore {
         Ok(manifest)
     }
 
+    /// Authenticates and removes one unpublished manifest scratch without ever
+    /// publishing it or making it WAL-referenceable. The containing directory is
+    /// synced before success so later post-seal collection starts from a clean
+    /// scratch namespace.
+    pub(crate) fn discard_sorted_manifest_scratch(
+        &self,
+        wal: &mut SealWal<RecoverySession>,
+        transaction: TransactionId,
+        expected_manifest: DurableTreeManifest,
+        mut scratch: TreeManifestScratch,
+    ) -> Result<(), TreeSidecarError> {
+        let actual = self.fingerprint_sorted_manifest_scratch(wal, transaction, &mut scratch)?;
+        if actual != expected_manifest {
+            return Err(TreeSidecarError::InvalidScratch(
+                "discarded scratch manifest fingerprint changed",
+            ));
+        }
+        self.require_scratch_binding(transaction, &scratch, ScratchOrder::ManifestPath)?;
+        self.require_matching_wal(wal)?;
+        self.revalidate_store_binding()?;
+        self.remove_runs(&scratch.runs)?;
+        rustix::fs::fsync(&self.directory).map_err(|error| io_error(&self.path, error.into()))?;
+        self.require_matching_wal(wal)?;
+        self.revalidate_store_binding()
+    }
+
     /// Authenticates and globally decodes every sorted scratch record, folding
     /// borrowed typed records into owned authority-neutral data. The accumulator
     /// is returned only after all run identities/digests, global v3 ordering,
     /// aggregate fingerprint, root/parent constraints, and EOF checks pass.
     /// A fold error consumes partial decoder state; callers must discard any
     /// observations made before the error and may not treat them as evidence.
-    #[cfg(test)]
     pub(crate) fn read_sorted_manifest_scratch<A, E, F>(
         &self,
         wal: &mut SealWal<RecoverySession>,
@@ -677,7 +854,7 @@ impl TreeSidecarStore {
         mut fold: F,
     ) -> Result<A, TreeSidecarFoldError<E>>
     where
-        F: FnMut(A, ManifestV3Record<'_>) -> Result<A, E>,
+        F: FnMut(A, ManifestV3Record<'_>, &SealWal<RecoverySession>) -> Result<A, E>,
     {
         self.require_scratch_binding(transaction, scratch, ScratchOrder::ManifestPath)?;
         if expected_manifest.entry_count != scratch.record_count {
@@ -698,7 +875,7 @@ impl TreeSidecarStore {
                 let current = accumulator
                     .take()
                     .expect("scratch fold accumulator is always present");
-                accumulator = Some(fold(current, typed)?);
+                accumulator = Some(fold(current, typed, wal)?);
                 Ok(())
             }) {
                 Ok(()) => Ok(()),
@@ -1348,6 +1525,421 @@ impl TreeStructureScratchCursor {
     }
 }
 
+fn directory_plan_digest(transaction: TransactionId) -> Sha256 {
+    let mut digest = Sha256::new();
+    digest.update(DIRECTORY_PLAN_DOMAIN);
+    digest.update(transaction.0);
+    digest
+}
+
+fn directory_plan_frame_tag(
+    key: &[u8; 32],
+    transaction: TransactionId,
+    ordinal: u64,
+    length: [u8; 4],
+    record: &[u8],
+) -> [u8; 32] {
+    let mut inner_pad = [0x36_u8; 64];
+    let mut outer_pad = [0x5c_u8; 64];
+    for (pad, byte) in inner_pad.iter_mut().zip(key) {
+        *pad ^= byte;
+    }
+    for (pad, byte) in outer_pad.iter_mut().zip(key) {
+        *pad ^= byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(DIRECTORY_PLAN_FRAME_DOMAIN);
+    inner.update(transaction.0);
+    inner.update(ordinal.to_be_bytes());
+    inner.update(length);
+    inner.update(record);
+    let inner: [u8; 32] = inner.finalize().into();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner);
+    outer.finalize().into()
+}
+
+fn plan_read_exact_at(
+    file: &File,
+    path: &Path,
+    offset: u64,
+    bytes: &mut [u8],
+) -> Result<(), TreeSidecarError> {
+    file.read_exact_at(bytes, offset)
+        .map_err(|error| io_error(path, error))
+}
+
+impl TreeDirectoryPlan {
+    fn validate_header(&self) -> Result<(), TreeSidecarError> {
+        let mut header = [0_u8; DIRECTORY_PLAN_HEADER_LEN];
+        plan_read_exact_at(&self.file, &self.path, 0, &mut header)?;
+        if &header[0..4] != DIRECTORY_PLAN_MAGIC
+            || u16::from_be_bytes(header[4..6].try_into().unwrap()) != DIRECTORY_PLAN_VERSION
+            || u16::from_be_bytes(header[6..8].try_into().unwrap()) as usize
+                != DIRECTORY_PLAN_HEADER_LEN
+            || header[8..24] != self.transaction.0
+            || u64::from_be_bytes(header[24..32].try_into().unwrap()) != self.expected_records
+            || u64::from_be_bytes(header[32..40].try_into().unwrap()) != self.expected_payload_bytes
+            || header[40..72] != self.expected_digest
+        {
+            return Err(TreeSidecarError::InvalidScratch(
+                "directory plan header validation failed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_forward_frame(
+        &self,
+        ordinal: u64,
+        offset: u64,
+    ) -> Result<(Vec<u8>, u64), TreeSidecarError> {
+        let mut length_bytes = [0_u8; 4];
+        plan_read_exact_at(&self.file, &self.path, offset, &mut length_bytes)?;
+        let length = u32::from_be_bytes(length_bytes) as usize;
+        if length == 0 || length > DIRECTORY_PLAN_MAX_RECORD_BYTES {
+            return Err(TreeSidecarError::InvalidScratch(
+                "invalid directory plan record length",
+            ));
+        }
+        let mut frame_tag = [0_u8; 32];
+        plan_read_exact_at(&self.file, &self.path, offset + 4, &mut frame_tag)?;
+        let mut record = vec![0_u8; length];
+        plan_read_exact_at(&self.file, &self.path, offset + 36, &mut record)?;
+        let trailing_offset =
+            offset
+                .checked_add(36 + length as u64)
+                .ok_or(TreeSidecarError::InvalidScratch(
+                    "directory plan frame offset overflow",
+                ))?;
+        let mut trailing = [0_u8; 4];
+        plan_read_exact_at(&self.file, &self.path, trailing_offset, &mut trailing)?;
+        if trailing != length_bytes
+            || directory_plan_frame_tag(
+                &self.frame_key,
+                self.transaction,
+                ordinal,
+                length_bytes,
+                &record,
+            ) != frame_tag
+        {
+            return Err(TreeSidecarError::InvalidScratch(
+                "directory plan frame authentication failed",
+            ));
+        }
+        Ok((record, trailing_offset + 4))
+    }
+
+    /// Authenticates the entire anonymous plan before TreeSealIntent. Every frame
+    /// is authenticated again when scanned or consumed in reverse.
+    pub(crate) fn authenticate(&mut self) -> Result<(), TreeSidecarError> {
+        self.authenticated = false;
+        self.validate_header()?;
+        let mut offset = DIRECTORY_PLAN_HEADER_LEN as u64;
+        let mut payload_bytes = 0_u64;
+        let mut digest = directory_plan_digest(self.transaction);
+        for ordinal in 0..self.expected_records {
+            let (record, next) = self.read_forward_frame(ordinal, offset)?;
+            let length = (record.len() as u32).to_be_bytes();
+            let tag = directory_plan_frame_tag(
+                &self.frame_key,
+                self.transaction,
+                ordinal,
+                length,
+                &record,
+            );
+            digest.update(length);
+            digest.update(tag);
+            digest.update(&record);
+            digest.update(length);
+            payload_bytes = payload_bytes.checked_add(next - offset).ok_or(
+                TreeSidecarError::InvalidScratch("directory plan payload overflow"),
+            )?;
+            offset = next;
+        }
+        digest.update(self.expected_records.to_be_bytes());
+        digest.update(self.expected_payload_bytes.to_be_bytes());
+        let actual: [u8; 32] = digest.finalize().into();
+        if offset != self.file_bytes
+            || payload_bytes != self.expected_payload_bytes
+            || actual != self.expected_digest
+        {
+            return Err(TreeSidecarError::InvalidScratch(
+                "directory plan aggregate integrity failed",
+            ));
+        }
+        self.authenticated = true;
+        self.reverse_remaining = self.expected_records;
+        self.reverse_offset = self.file_bytes;
+        Ok(())
+    }
+
+    pub(crate) fn record_count(&self) -> u64 {
+        self.expected_records
+    }
+
+    pub(crate) fn for_each_forward<E>(
+        &self,
+        mut visit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), TreeSidecarFoldError<E>> {
+        if !self.authenticated {
+            return Err(TreeSidecarError::InvalidScratch(
+                "directory plan scan precedes authentication",
+            )
+            .into());
+        }
+        let mut offset = DIRECTORY_PLAN_HEADER_LEN as u64;
+        for ordinal in 0..self.expected_records {
+            let (record, next) = self.read_forward_frame(ordinal, offset)?;
+            visit(&record).map_err(TreeSidecarFoldError::Fold)?;
+            offset = next;
+        }
+        if offset != self.file_bytes {
+            return Err(
+                TreeSidecarError::InvalidScratch("directory plan scan did not reach EOF").into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn next_reverse(&mut self) -> Result<Option<Vec<u8>>, TreeSidecarError> {
+        if !self.authenticated {
+            return Err(TreeSidecarError::InvalidScratch(
+                "directory plan reverse read precedes authentication",
+            ));
+        }
+        if self.reverse_remaining == 0 {
+            if self.reverse_offset != DIRECTORY_PLAN_HEADER_LEN as u64 {
+                return Err(TreeSidecarError::InvalidScratch(
+                    "directory plan reverse read missed the header boundary",
+                ));
+            }
+            return Ok(None);
+        }
+        if self.reverse_offset < DIRECTORY_PLAN_HEADER_LEN as u64 + 40 {
+            return Err(TreeSidecarError::InvalidScratch(
+                "directory plan reverse frame is truncated",
+            ));
+        }
+        let mut trailing = [0_u8; 4];
+        plan_read_exact_at(
+            &self.file,
+            &self.path,
+            self.reverse_offset - 4,
+            &mut trailing,
+        )?;
+        let length = u32::from_be_bytes(trailing) as u64;
+        if length == 0 || length as usize > DIRECTORY_PLAN_MAX_RECORD_BYTES {
+            return Err(TreeSidecarError::InvalidScratch(
+                "invalid reverse directory plan length",
+            ));
+        }
+        let frame_bytes = length
+            .checked_add(40)
+            .ok_or(TreeSidecarError::InvalidScratch(
+                "directory plan reverse frame length overflow",
+            ))?;
+        let start = self
+            .reverse_offset
+            .checked_sub(frame_bytes)
+            .filter(|offset| *offset >= DIRECTORY_PLAN_HEADER_LEN as u64)
+            .ok_or(TreeSidecarError::InvalidScratch(
+                "directory plan reverse frame crosses the header",
+            ))?;
+        let ordinal = self.reverse_remaining - 1;
+        let (record, next) = self.read_forward_frame(ordinal, start)?;
+        if next != self.reverse_offset {
+            return Err(TreeSidecarError::InvalidScratch(
+                "directory plan reverse frame boundary changed",
+            ));
+        }
+        self.reverse_offset = start;
+        self.reverse_remaining -= 1;
+        Ok(Some(record))
+    }
+
+    pub(crate) fn finish(mut self) -> Result<(), TreeSidecarError> {
+        while self.next_reverse()?.is_some() {}
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn link_count_for_test(&self) -> libc::nlink_t {
+        rustix::fs::fstat(&self.file).unwrap().st_nlink
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_frame_for_test(&self, target: u64) {
+        let mut offset = DIRECTORY_PLAN_HEADER_LEN as u64;
+        for ordinal in 0..self.expected_records {
+            let (record, next) = self.read_forward_frame(ordinal, offset).unwrap();
+            if ordinal == target {
+                let byte_offset = offset + 36;
+                let byte = [record[0] ^ 0x80];
+                self.file.write_all_at(&byte, byte_offset).unwrap();
+                self.file.sync_data().unwrap();
+                return;
+            }
+            offset = next;
+        }
+        panic!("directory plan test frame {target} is absent");
+    }
+}
+
+fn require_anonymous_plan_fd(file: &File, path: &Path) -> Result<(), TreeSidecarError> {
+    let stat = rustix::fs::fstat(file).map_err(|error| io_error(path, error.into()))?;
+    if stat.st_nlink != 0 {
+        return Err(TreeSidecarError::InvalidScratch(
+            "ephemeral plan descriptor remains named",
+        ));
+    }
+    Ok(())
+}
+
+struct DirectoryPlanWriter {
+    transaction: TransactionId,
+    path: PathBuf,
+    file: File,
+    frame_key: [u8; 32],
+    digest: Sha256,
+    payload_bytes: u64,
+    records: u64,
+}
+
+impl DirectoryPlanWriter {
+    #[allow(clippy::disallowed_methods)]
+    fn create(
+        store: &TreeSidecarStore,
+        transaction: TransactionId,
+    ) -> Result<Self, TreeSidecarError> {
+        let name = scratch_name(transaction);
+        let path = store.path.join(&name);
+        let fd = rustix::fs::openat(&store.directory, &name, OPEN_NEW, FILE_MODE)
+            .map_err(|error| io_error(&path, error.into()))?;
+        rustix::fs::fchmod(&fd, FILE_MODE).map_err(|error| io_error(&path, error.into()))?;
+        validate_file(
+            &store.directory,
+            &name,
+            &fd,
+            store.backend,
+            store.device,
+            &path,
+        )?;
+        let mut file = File::from(fd);
+        file.write_all(&[0_u8; DIRECTORY_PLAN_HEADER_LEN])
+            .map_err(|error| io_error(&path, error))?;
+        rustix::fs::unlinkat(&store.directory, &name, AtFlags::empty())
+            .map_err(|error| io_error(&path, error.into()))?;
+        require_anonymous_plan_fd(&file, &path)?;
+        rustix::fs::fsync(&store.directory).map_err(|error| io_error(&store.path, error.into()))?;
+        let mut frame_key = [0_u8; 32];
+        getrandom::fill(&mut frame_key)
+            .map_err(|error| io_error(&path, io::Error::other(error)))?;
+        Ok(Self {
+            transaction,
+            path,
+            file,
+            frame_key,
+            digest: directory_plan_digest(transaction),
+            payload_bytes: 0,
+            records: 0,
+        })
+    }
+
+    fn push(&mut self, record: &[u8]) -> Result<(), TreeSidecarError> {
+        if record.is_empty() || record.len() > DIRECTORY_PLAN_MAX_RECORD_BYTES {
+            return Err(TreeSidecarError::InvalidScratch(
+                "invalid directory plan record",
+            ));
+        }
+        let length = u32::try_from(record.len())
+            .map_err(|_| TreeSidecarError::InvalidScratch("directory plan length overflow"))?
+            .to_be_bytes();
+        let tag = directory_plan_frame_tag(
+            &self.frame_key,
+            self.transaction,
+            self.records,
+            length,
+            record,
+        );
+        self.file
+            .write_all(&length)
+            .and_then(|_| self.file.write_all(&tag))
+            .and_then(|_| self.file.write_all(record))
+            .and_then(|_| self.file.write_all(&length))
+            .map_err(|error| io_error(&self.path, error))?;
+        self.digest.update(length);
+        self.digest.update(tag);
+        self.digest.update(record);
+        self.digest.update(length);
+        self.payload_bytes = self
+            .payload_bytes
+            .checked_add(40 + record.len() as u64)
+            .filter(|bytes| *bytes <= DIRECTORY_PLAN_MAX_TOTAL_BYTES)
+            .ok_or(TreeSidecarError::InvalidScratch(
+                "directory plan exceeds its payload limit",
+            ))?;
+        self.records = self
+            .records
+            .checked_add(1)
+            .filter(|n| *n <= MAX_RECORDS)
+            .ok_or(TreeSidecarError::InvalidScratch(
+                "directory plan record count overflow",
+            ))?;
+        Ok(())
+    }
+
+    fn finish(mut self, expected: u64) -> Result<TreeDirectoryPlan, TreeSidecarError> {
+        if expected == 0 || self.records != expected {
+            return Err(TreeSidecarError::InvalidScratch(
+                "directory plan record count changed",
+            ));
+        }
+        self.digest.update(self.records.to_be_bytes());
+        self.digest.update(self.payload_bytes.to_be_bytes());
+        let digest: [u8; 32] = self.digest.finalize().into();
+        let mut header = [0_u8; DIRECTORY_PLAN_HEADER_LEN];
+        header[0..4].copy_from_slice(DIRECTORY_PLAN_MAGIC);
+        header[4..6].copy_from_slice(&DIRECTORY_PLAN_VERSION.to_be_bytes());
+        header[6..8].copy_from_slice(&(DIRECTORY_PLAN_HEADER_LEN as u16).to_be_bytes());
+        header[8..24].copy_from_slice(&self.transaction.0);
+        header[24..32].copy_from_slice(&self.records.to_be_bytes());
+        header[32..40].copy_from_slice(&self.payload_bytes.to_be_bytes());
+        header[40..72].copy_from_slice(&digest);
+        self.file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| self.file.write_all(&header))
+            .and_then(|_| self.file.sync_all())
+            .map_err(|error| io_error(&self.path, error))?;
+        let stat =
+            rustix::fs::fstat(&self.file).map_err(|error| io_error(&self.path, error.into()))?;
+        let file_bytes = u64::try_from(stat.st_size).map_err(|_| {
+            TreeSidecarError::InvalidScratch("directory plan file length is not representable")
+        })?;
+        let expected_bytes = DIRECTORY_PLAN_HEADER_LEN as u64 + self.payload_bytes;
+        if file_bytes != expected_bytes {
+            return Err(TreeSidecarError::InvalidScratch(
+                "directory plan file length changed",
+            ));
+        }
+        Ok(TreeDirectoryPlan {
+            file: self.file,
+            path: self.path,
+            transaction: self.transaction,
+            frame_key: self.frame_key,
+            expected_records: self.records,
+            expected_payload_bytes: self.payload_bytes,
+            expected_digest: digest,
+            file_bytes,
+            authenticated: false,
+            reverse_remaining: 0,
+            reverse_offset: 0,
+        })
+    }
+}
+
 fn purge_plan_digest(transaction: TransactionId) -> Sha256 {
     let mut digest = Sha256::new();
     digest.update(PURGE_PLAN_DOMAIN);
@@ -1584,6 +2176,7 @@ impl PurgePlanWriter {
         // Unlink before any plan data is written: only this descriptor survives.
         rustix::fs::unlinkat(&store.directory, &name, AtFlags::empty())
             .map_err(|error| io_error(&path, error.into()))?;
+        require_anonymous_plan_fd(&file, &path)?;
         let mut frame_key = [0_u8; 32];
         getrandom::fill(&mut frame_key)
             .map_err(|error| io_error(&path, io::Error::other(error)))?;

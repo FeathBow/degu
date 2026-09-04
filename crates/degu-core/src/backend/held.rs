@@ -1035,6 +1035,50 @@ pub(crate) struct StreamedV3Inventory {
     manifest: HeldTreeFingerprint,
 }
 
+/// Production schema-v3 proof collected before directory sealing. The complete
+/// manifest and directory permission plan live only in authenticated private
+/// storage; resident state is limited to the root context, fixed aggregate/count
+/// fields, and the active manifest ancestor chain.
+pub(crate) struct PreSealV3Inventory {
+    tree: StreamedV3Inventory,
+    directory_count: u64,
+}
+
+/// Traversal result that still owns the historical BFS directory evidence only
+/// until it is sealed into a private descriptor-only permission plan.
+pub(crate) struct CollectedPreSealV3Inventory {
+    pending: PendingV3Inventory,
+    directories: Vec<DirectoryEvidence>,
+}
+
+/// Pre-seal traversal state after the directory plan has left resident memory.
+pub(crate) struct PendingPreSealV3Inventory {
+    pending: PendingV3Inventory,
+    directory_count: u64,
+}
+
+/// Bounded finalizer for a pre-seal scratch manifest.
+pub(crate) struct PendingPreSealV3Finalizer {
+    pending: PendingV3Finalizer,
+    directory_count: u64,
+    observed_directories: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreSealDirectoryPlanRecord {
+    ordinal: u64,
+    evidence: DirectoryEvidence,
+}
+
+/// Allocation-bounded digest state for substituting the exact WAL-applied
+/// directory modes into an authenticated pre-seal manifest.
+pub(crate) struct PostSealExpectationBuilder {
+    digest: Sha256,
+    expected_entries: u64,
+    observed_entries: u64,
+    observed_directories: u64,
+}
+
 /// A deletion engine for an authenticated v3 manifest whose resident state is
 /// bounded by the root anchor, the current plan record, and its ancestor chain.
 pub(crate) struct StreamedV3Purger {
@@ -2026,6 +2070,62 @@ impl PendingV3Inventory {
         })
     }
 
+    /// Traverses schema v3 in the exact historical pre-seal breadth-first
+    /// order while emitting every complete record to private scratch. The
+    /// short-lived BFS evidence is immediately drained into an anonymous plan.
+    pub(crate) fn collect_pre_seal<E>(
+        parent: HeldLocalBackendEvidence,
+        root_name: &OsStr,
+        protected_names: Vec<OsString>,
+        limits: HeldTreeLimits,
+        mut emit_record: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<CollectedPreSealV3Inventory, HeldTreeV3CollectError<E>> {
+        let mut record = Vec::with_capacity(MANIFEST_V3_MAX_SEGMENT_PAYLOAD);
+        let walked = match traverse_v2_with_sink::<ProveTraversal, HeldTreeV3CollectError<E>>(
+            parent,
+            root_name,
+            protected_names,
+            limits,
+            TraversalConfiguration {
+                parent_admission: ParentAdmission::CurrentExclusive,
+                manifest_schema: CONTENT_PROOF_VERSION,
+                retain_entries: false,
+            },
+            |entry| emit_forward_v3_record(entry, &mut record, &mut emit_record),
+        ) {
+            Ok(walked) => walked,
+            Err(TraversalSinkError::Tree(error)) => {
+                return Err(HeldTreeV3CollectError::Tree(error));
+            }
+            Err(TraversalSinkError::Emit(error)) => return Err(error),
+        };
+        debug_assert!(walked.entries.is_empty());
+        // Do not overlap the historical traversal index with the short-lived
+        // vector that is immediately drained into the anonymous plan.
+        drop(walked.directory_index);
+        let directories = walked
+            .directories
+            .into_iter()
+            .map(|directory| directory.evidence)
+            .collect();
+        Ok(CollectedPreSealV3Inventory {
+            pending: PendingV3Inventory {
+                context: ForwardV3Context {
+                    parent: walked.parent,
+                    root_name: walked.root_name,
+                    root_identity: walked.root_identity,
+                    root: walked.root,
+                    backend: walked.backend,
+                    mount_id: walked.mount_id,
+                    protected_names: walked.protected_names,
+                    limits: walked.limits,
+                },
+                entry_count: walked.budget.entries,
+            },
+            directories,
+        })
+    }
+
     pub(crate) fn entry_count(&self) -> u64 {
         self.entry_count
     }
@@ -2059,6 +2159,113 @@ impl PendingV3Inventory {
             active_directories: Vec::new(),
             hardlink_record: Vec::with_capacity(MANIFEST_V3_MAX_SEGMENT_PAYLOAD),
             regular_xattrs: RegularXattrTopology::default(),
+        })
+    }
+}
+
+impl CollectedPreSealV3Inventory {
+    pub(crate) fn directory_count(&self) -> u64 {
+        self.directories.len() as u64
+    }
+
+    pub(crate) fn emit_directory_plan<E>(
+        self,
+        mut emit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<PendingPreSealV3Inventory, HeldTreeV3CollectError<E>> {
+        let directory_count = self.directories.len() as u64;
+        let mut record = Vec::new();
+        for (ordinal, evidence) in self.directories.into_iter().enumerate() {
+            encode_pre_seal_directory_plan_record(ordinal as u64, &evidence, &mut record)
+                .map_err(HeldTreeV3CollectError::Codec)?;
+            emit(&record).map_err(HeldTreeV3CollectError::Emit)?;
+        }
+        Ok(PendingPreSealV3Inventory {
+            pending: self.pending,
+            directory_count,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_manifest_entries_for_test(&self) -> usize {
+        0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_directory_entries_for_test(&self) -> usize {
+        self.directories.len()
+    }
+}
+
+impl PendingPreSealV3Inventory {
+    pub(crate) fn entry_count(&self) -> u64 {
+        self.pending.entry_count()
+    }
+
+    pub(crate) fn directory_count(&self) -> u64 {
+        self.directory_count
+    }
+
+    pub(crate) fn into_finalizer(
+        self,
+        expected_manifest: DurableTreeManifest,
+    ) -> Result<PendingPreSealV3Finalizer, HeldTreeError> {
+        Ok(PendingPreSealV3Finalizer {
+            pending: self.pending.into_finalizer(expected_manifest)?,
+            directory_count: self.directory_count,
+            observed_directories: 0,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_manifest_entries_for_test(&self) -> usize {
+        0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_directory_entries_for_test(&self) -> usize {
+        0
+    }
+}
+
+impl PendingPreSealV3Finalizer {
+    pub(crate) fn observe<E>(
+        &mut self,
+        record: ManifestV3Record<'_>,
+        emit_hardlink: &mut dyn FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), HeldTreeV3CollectError<E>> {
+        if record.kind == ManifestV3RecordKind::Directory {
+            self.observed_directories =
+                self.observed_directories
+                    .checked_add(1)
+                    .ok_or(HeldTreeV3CollectError::Tree(HeldTreeError::Limit {
+                        kind: HeldTreeLimit::Directories,
+                        limit: self.pending.context.limits.max_directories,
+                    }))?;
+        }
+        self.pending.observe(record, emit_hardlink)
+    }
+
+    /// Finishes only after the caller's complete sorted-scratch fold returned
+    /// successfully. The scratch reader has already validated its count, codec,
+    /// aggregate fingerprint, run digests, and EOF before this can be called.
+    pub(crate) fn finish(
+        self,
+        regular_hard_links: RegularHardLinkTopology,
+    ) -> Result<PreSealV3Inventory, HeldTreeError> {
+        if self.observed_directories != self.directory_count {
+            return Err(HeldTreeError::PostChanged(PathBuf::new()));
+        }
+        let expected = self.pending.expected_manifest;
+        let authenticated = DurableTreeManifest {
+            schema_version: expected.schema_version,
+            entry_count: expected.entry_count,
+            sha256: expected.sha256,
+        };
+        Ok(PreSealV3Inventory {
+            tree: self
+                .pending
+                .finish_manifest(authenticated, regular_hard_links)?,
+            directory_count: self.directory_count,
         })
     }
 }
@@ -2231,7 +2438,14 @@ impl PendingV3Finalizer {
         authenticated: AuthenticatedTreeManifest,
         regular_hard_links: RegularHardLinkTopology,
     ) -> Result<StreamedV3Inventory, HeldTreeError> {
-        let authenticated = authenticated.manifest();
+        self.finish_manifest(authenticated.manifest(), regular_hard_links)
+    }
+
+    fn finish_manifest(
+        self,
+        authenticated: DurableTreeManifest,
+        regular_hard_links: RegularHardLinkTopology,
+    ) -> Result<StreamedV3Inventory, HeldTreeError> {
         if authenticated.schema_version != self.expected_manifest.schema_version
             || authenticated.entry_count != self.expected_manifest.entry_count
             || authenticated.sha256 != self.expected_manifest.sha256
@@ -2569,6 +2783,310 @@ fn encode_v3_purge_plan_record(
     Ok(())
 }
 
+impl PreSealV3Inventory {
+    pub(crate) fn root_strong_identity(&self) -> StrongObjectIdentity {
+        StrongObjectIdentity::new_with_mount(
+            self.tree.context.root_identity.device,
+            self.tree.context.root_identity.inode,
+            crate::seal::wal::ObjectIncarnation::new(self.tree.context.root_identity.incarnation),
+            self.tree.context.mount_id,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_manifest_entries_for_test(&self) -> usize {
+        0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_directory_entries_for_test(&self) -> usize {
+        0
+    }
+
+    pub(crate) fn directory_count(&self) -> u64 {
+        self.directory_count
+    }
+
+    pub(crate) fn validate_directory_plan_record(
+        &self,
+        record: &PreSealDirectoryPlanRecord,
+        expected_ordinal: u64,
+    ) -> Result<(), HeldTreeError> {
+        let evidence = &record.evidence;
+        if record.ordinal != expected_ordinal
+            || record.ordinal >= self.directory_count
+            || evidence.depth as u64 > self.tree.context.limits.max_depth as u64
+            || evidence.owner_uid != rustix::process::geteuid().as_raw()
+        {
+            return Err(HeldTreeError::PostChanged(evidence.relative_path.clone()));
+        }
+        if record.ordinal == 0 {
+            if !evidence.relative_path.as_os_str().is_empty()
+                || evidence.depth != 0
+                || evidence.identity != self.tree.context.root_identity
+                || evidence.owner_uid != self.tree.context.root.held.owner_uid()
+                || evidence.group_gid != self.tree.context.root.held.group_gid()
+                || evidence.observed_mode != self.tree.context.root.held.mode()
+            {
+                return Err(HeldTreeError::PostChanged(PathBuf::new()));
+            }
+        } else if evidence.relative_path.as_os_str().is_empty() || evidence.depth == 0 {
+            return Err(HeldTreeError::PostChanged(evidence.relative_path.clone()));
+        }
+        Ok(())
+    }
+
+    /// Retains only the target's root-to-directory evidence while an authenticated
+    /// descriptor-only plan is scanned. The vector is bounded by max_depth, never
+    /// by the number of directories in the tree.
+    pub(crate) fn consider_directory_plan_ancestor(
+        &self,
+        target: &PreSealDirectoryPlanRecord,
+        candidate: PreSealDirectoryPlanRecord,
+        chain: &mut Vec<PreSealDirectoryPlanRecord>,
+    ) -> Result<(), HeldTreeError> {
+        let target_path = &target.evidence.relative_path;
+        let candidate_path = &candidate.evidence.relative_path;
+        let is_ancestor = candidate_path.as_os_str().is_empty()
+            || candidate_path == target_path
+            || path_is_beneath(candidate_path, target_path);
+        if !is_ancestor {
+            return Ok(());
+        }
+        if candidate.evidence.depth as usize != chain.len()
+            || candidate.evidence.depth > target.evidence.depth
+            || (candidate.evidence.depth > 0
+                && candidate_path.parent()
+                    != chain
+                        .last()
+                        .map(|record| record.evidence.relative_path.as_path()))
+        {
+            return Err(HeldTreeError::PostChanged(target_path.clone()));
+        }
+        chain.push(candidate);
+        Ok(())
+    }
+
+    fn validate_directory_plan_chain(
+        &self,
+        target: &PreSealDirectoryPlanRecord,
+        chain: &[PreSealDirectoryPlanRecord],
+    ) -> Result<(), HeldTreeError> {
+        if chain.len() != target.evidence.depth as usize + 1
+            || chain
+                .last()
+                .is_none_or(|record| record.evidence != target.evidence)
+        {
+            return Err(HeldTreeError::PostChanged(
+                target.evidence.relative_path.clone(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reopen_directory_for_transient_seal<'a>(
+        &'a self,
+        relative_path: &Path,
+        chain: &'a [PreSealDirectoryPlanRecord],
+    ) -> Result<ReopenedDirectory<'a>, HeldTreeError> {
+        reopen_directory_from_root(
+            &self.tree.context.root,
+            relative_path,
+            |candidate| {
+                chain
+                    .iter()
+                    .find(|record| record.evidence.relative_path == candidate)
+                    .map(|record| &record.evidence)
+            },
+            self.tree.context.backend,
+            self.tree.context.mount_id,
+            || {
+                verify_root_binding_fields(
+                    &self.tree.context.parent,
+                    &self.tree.context.root_name,
+                    self.tree.context.root_identity,
+                    self.tree.context.mount_id,
+                    self.tree.context.backend,
+                )
+            },
+            true,
+        )
+    }
+
+    /// Applies one authenticated reverse-BFS directory record. The caller has
+    /// already authenticated the complete anonymous plan and supplies only this
+    /// record's bounded root-to-target chain.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn seal_directory_for_staging<W: DurableWrite>(
+        &mut self,
+        wal: &mut SealWal<W>,
+        transaction: TransactionId,
+        source_root: &Path,
+        filesystem_id: &str,
+        mutation_id: u64,
+        target: &PreSealDirectoryPlanRecord,
+        chain: &[PreSealDirectoryPlanRecord],
+    ) -> Result<u32, HeldTreeSealError> {
+        self.validate_directory_plan_chain(target, chain)
+            .map_err(HeldTreeSealError::Tree)?;
+        let evidence = &target.evidence;
+        let relative_path = source_root.join(&evidence.relative_path);
+        let path = evidence.relative_path.clone();
+        let result = if evidence.depth == 0 {
+            execute_staging_local_mode_mutation(
+                wal,
+                &mut self.tree.context.root.held,
+                LocalModeMutationRequest {
+                    transaction,
+                    mutation_id,
+                    locator: RecoveryLocator::held_staging(
+                        relative_path,
+                        filesystem_id.to_owned(),
+                        evidence.identity.incarnation,
+                    ),
+                    transform: LocalModeTransform::Seal {
+                        acquire_owner_write_search: false,
+                    },
+                },
+            )
+        } else {
+            let mut reopened = self
+                .reopen_directory_for_transient_seal(&evidence.relative_path, chain)
+                .map_err(HeldTreeSealError::Tree)?;
+            let held = match &mut reopened.held {
+                ReopenedHeldDirectory::Descendant(held) => held,
+                ReopenedHeldDirectory::Root(_) => {
+                    return Err(HeldTreeSealError::Mutation {
+                        path,
+                        source: LocalModeExecutionError::InvalidRequest(
+                            "reopener returned retained root unexpectedly",
+                        ),
+                    });
+                }
+            };
+            let result = execute_staging_local_mode_mutation(
+                wal,
+                held,
+                LocalModeMutationRequest {
+                    transaction,
+                    mutation_id,
+                    locator: RecoveryLocator::held_staging(
+                        relative_path,
+                        filesystem_id.to_owned(),
+                        evidence.identity.incarnation,
+                    ),
+                    transform: LocalModeTransform::Seal {
+                        acquire_owner_write_search: false,
+                    },
+                },
+            );
+            drop(reopened);
+            result
+        }
+        .map_err(|source| HeldTreeSealError::Mutation {
+            path: evidence.relative_path.clone(),
+            source,
+        })?;
+        match result {
+            LocalModeMutationResult::Applied { applied_mode, .. } => Ok(applied_mode),
+            LocalModeMutationResult::ConfirmedNotApplied => Err(
+                HeldTreeSealError::ConfirmedNotApplied(evidence.relative_path.clone()),
+            ),
+        }
+    }
+
+    pub(crate) fn post_seal_expectation_builder(&self) -> PostSealExpectationBuilder {
+        let mut digest = Sha256::new();
+        digest.update(MANIFEST_DOMAIN_V3);
+        digest.update(self.tree.manifest.entry_count.to_be_bytes());
+        PostSealExpectationBuilder {
+            digest,
+            expected_entries: self.tree.manifest.entry_count,
+            observed_entries: 0,
+            observed_directories: 0,
+        }
+    }
+
+    pub(crate) fn finish_post_seal_expectation(
+        self,
+        builder: PostSealExpectationBuilder,
+    ) -> Result<PostSealManifestExpectation, HeldTreeError> {
+        if builder.observed_entries != builder.expected_entries
+            || builder.observed_directories != self.directory_count
+        {
+            return Err(HeldTreeError::PostChanged(PathBuf::new()));
+        }
+        Ok(PostSealManifestExpectation {
+            root_identity: self.tree.context.root_identity,
+            backend: self.tree.context.backend,
+            mount_id: self.tree.context.mount_id,
+            fingerprint: HeldTreeFingerprint {
+                schema_version: CONTENT_PROOF_VERSION,
+                entry_count: builder.expected_entries,
+                sha256: builder.digest.finalize().into(),
+            },
+        })
+    }
+}
+
+impl PostSealExpectationBuilder {
+    pub(crate) fn observe(
+        &mut self,
+        inventory: &PreSealV3Inventory,
+        record: ManifestV3Record<'_>,
+        directory_mode: impl FnOnce(&Path, u64, u64, u64) -> Option<u32>,
+    ) -> Result<(), HeldTreeError> {
+        self.observed_entries =
+            self.observed_entries
+                .checked_add(1)
+                .ok_or(HeldTreeError::Limit {
+                    kind: HeldTreeLimit::Entries,
+                    limit: inventory.tree.context.limits.max_entries,
+                })?;
+        let mode = if record.kind == ManifestV3RecordKind::Directory {
+            self.observed_directories =
+                self.observed_directories
+                    .checked_add(1)
+                    .ok_or(HeldTreeError::Limit {
+                        kind: HeldTreeLimit::Directories,
+                        limit: inventory.tree.context.limits.max_directories,
+                    })?;
+            let path = Path::new(OsStr::from_bytes(record.path));
+            directory_mode(path, record.device, record.inode, record.incarnation)
+                .ok_or_else(|| HeldTreeError::PostChanged(path.to_path_buf()))?
+        } else {
+            record.mode
+        };
+        update_manifest_v3_digest_with_mode(&mut self.digest, record, mode)
+    }
+}
+
+fn update_manifest_v3_digest_with_mode(
+    digest: &mut Sha256,
+    record: ManifestV3Record<'_>,
+    mode: u32,
+) -> Result<(), HeldTreeError> {
+    let mode_offset = 8_usize
+        .checked_add(record.path.len())
+        .and_then(|offset| offset.checked_add(1 + 8 + 8 + 8 + 4 + 4))
+        .ok_or_else(|| HeldTreeError::PostChanged(PathBuf::new()))?;
+    let suffix_offset = mode_offset
+        .checked_add(4)
+        .ok_or_else(|| HeldTreeError::PostChanged(PathBuf::new()))?;
+    let prefix = record
+        .encoded
+        .get(..mode_offset)
+        .ok_or_else(|| HeldTreeError::PostChanged(PathBuf::new()))?;
+    let suffix = record
+        .encoded
+        .get(suffix_offset..)
+        .ok_or_else(|| HeldTreeError::PostChanged(PathBuf::new()))?;
+    digest.update(prefix);
+    digest.update(mode.to_be_bytes());
+    digest.update(suffix);
+    Ok(())
+}
+
 impl StreamedV3Inventory {
     pub(crate) fn fingerprint(&self) -> HeldTreeFingerprint {
         self.manifest
@@ -2863,6 +3381,77 @@ impl StreamedV3Purger {
 }
 
 const STRUCTURE_SCRATCH_RECORD_MAGIC: &[u8; 4] = b"DHS1";
+const PRE_SEAL_DIRECTORY_PLAN_MAGIC: &[u8; 4] = b"DHDP";
+
+fn encode_pre_seal_directory_plan_record(
+    ordinal: u64,
+    evidence: &DirectoryEvidence,
+    encoded: &mut Vec<u8>,
+) -> Result<(), ManifestV3CodecError> {
+    let path = evidence.relative_path.as_os_str().as_bytes();
+    let record_len = 60_usize
+        .checked_add(path.len())
+        .ok_or(ManifestV3CodecError::LengthOverflow)?;
+    if record_len > MANIFEST_V3_MAX_SEGMENT_PAYLOAD {
+        return Err(ManifestV3CodecError::RecordTooLarge);
+    }
+    encoded.clear();
+    encoded.reserve(record_len);
+    encoded.extend_from_slice(PRE_SEAL_DIRECTORY_PLAN_MAGIC);
+    encoded.extend_from_slice(&ordinal.to_be_bytes());
+    encoded.extend_from_slice(&(path.len() as u64).to_be_bytes());
+    encoded.extend_from_slice(path);
+    encoded.extend_from_slice(&evidence.depth.to_be_bytes());
+    encoded.extend_from_slice(&evidence.identity.device.to_be_bytes());
+    encoded.extend_from_slice(&evidence.identity.inode.to_be_bytes());
+    encoded.extend_from_slice(&evidence.identity.incarnation.to_be_bytes());
+    encoded.extend_from_slice(&evidence.owner_uid.to_be_bytes());
+    encoded.extend_from_slice(&evidence.group_gid.to_be_bytes());
+    encoded.extend_from_slice(&evidence.observed_mode.to_be_bytes());
+    debug_assert_eq!(encoded.len(), record_len);
+    Ok(())
+}
+
+pub(crate) fn decode_pre_seal_directory_plan_record(
+    mut record: &[u8],
+) -> Result<PreSealDirectoryPlanRecord, ManifestV3CodecError> {
+    if record.len() > MANIFEST_V3_MAX_SEGMENT_PAYLOAD
+        || take(&mut record, PRE_SEAL_DIRECTORY_PLAN_MAGIC.len())? != PRE_SEAL_DIRECTORY_PLAN_MAGIC
+    {
+        return Err(ManifestV3CodecError::InvalidTag);
+    }
+    let ordinal = take_u64(&mut record)?;
+    let path_len = usize::try_from(take_u64(&mut record)?)
+        .map_err(|_| ManifestV3CodecError::LengthOverflow)?;
+    let path_bytes = take(&mut record, path_len)?;
+    validate_manifest_path(path_bytes, HeldTreeLimits::default().max_depth)?;
+    let depth = u32::from_be_bytes(take(&mut record, 4)?.try_into().unwrap());
+    let path = PathBuf::from(OsStr::from_bytes(path_bytes));
+    if path.components().count() != depth as usize {
+        return Err(ManifestV3CodecError::InvalidPath);
+    }
+    let evidence = DirectoryEvidence {
+        relative_path: path,
+        depth,
+        identity: NodeIdentity {
+            kind: NodeKind::Directory,
+            device: take_u64(&mut record)?,
+            inode: take_u64(&mut record)?,
+            incarnation: take_u64(&mut record)?,
+        },
+        owner_uid: u32::from_be_bytes(take(&mut record, 4)?.try_into().unwrap()),
+        group_gid: u32::from_be_bytes(take(&mut record, 4)?.try_into().unwrap()),
+        observed_mode: u32::from_be_bytes(take(&mut record, 4)?.try_into().unwrap()),
+    };
+    if evidence.observed_mode > 0o7777 || !record.is_empty() {
+        return Err(if !record.is_empty() {
+            ManifestV3CodecError::TrailingBytes
+        } else {
+            ManifestV3CodecError::InvalidMode
+        });
+    }
+    Ok(PreSealDirectoryPlanRecord { ordinal, evidence })
+}
 
 pub(crate) fn hardlink_scratch_sentinel_record() -> &'static [u8] {
     &[0, 0, 0, 0, 0, 0, 0, 1, 0]

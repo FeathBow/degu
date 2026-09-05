@@ -21,6 +21,11 @@ pub mod provision;
 pub mod safety;
 pub mod seal;
 pub mod staging;
+/// Only Linux needs to reach a host service through a separate process: the
+/// account database behind the name service switch is the sole caller today,
+/// and macOS's libc already sees Open Directory in-process.
+#[cfg(target_os = "linux")]
+mod system_tool;
 
 #[cfg(test)]
 pub(crate) fn secure_test_tempdir() -> std::io::Result<tempfile::TempDir> {

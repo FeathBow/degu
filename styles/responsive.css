@@ -1,0 +1,117 @@
+@layer responsive {
+  @media (min-width: 1400px) {
+    .page { padding-top: 14px; }
+    .hero { padding-top: 45px; padding-bottom: 37px; }
+  }
+  @media (max-width: 1080px) {
+    .page { padding-right: 28px; padding-left: 28px; }
+    .brand-note { display: none; }
+    .hero { gap: 20px; }
+    .hero h1 { font-size: 43px; }
+    .hero-description { max-width: 275px; font-size: 12px; }
+    .habitat-grid { grid-template-columns: 305px minmax(0, 1fr); gap: 18px; }
+    .layout-habitat .journey { padding-left: 0; }
+    .lesson-panel { padding: 24px 22px; }
+    .map-node { width: 128px; }
+    .room-label { display: none; }
+    .scene-keys { display: none; }
+    .footer-links { max-width: 170px; }
+  }
+  @media (max-width: 820px) {
+    .page { padding: 0 22px 100px; max-width: 650px; }
+    .nav { min-height: 76px; }
+    .nav-links { gap: 18px; font-size: 11px; }
+    .nav-install { padding: 6px 10px; }
+    .hero { display: block; text-align: left; padding: 30px 0 24px; }
+    .hero h1 { font-size: 43px; max-width: 490px; }
+    .hero-description { max-width: 460px; margin: 16px 0 0; font-size: 12px; }
+    .hero-description br { display: none; }
+    .habitat-grid { grid-template-columns: minmax(0, 1fr); gap: 18px; }
+    .habitat-grid .world-column { grid-row: 1; }
+    .world-column .room { min-height: 355px; }
+    .world-column { gap: 14px; }
+    .lesson-panel, .layout-habitat .lesson-panel { min-height: 0; padding: 25px; }
+    .lesson-panel h2 br { display: none; }
+    .lesson-eyebrow { margin-bottom: 16px; }
+    .lesson-panel h2 { font-size: 32px; }
+    .lesson-panel > p { font-size: 13px; }
+    .location-choices { display: grid; grid-template-columns: repeat(3, 1fr); padding: 4px; gap: 4px; margin-bottom: 24px; background: #eff3e5; border-radius: 8px; }
+    .location-choices button { border: 1px solid transparent; border-radius: 5px; padding: 10px 6px; font-size: 11px; background: none; }
+    .location-choices button[aria-pressed="true"] { background: #fffff9; border-color: #d9e3c8; box-shadow: 0 2px 3px #243c3008; }
+    #tutorial[data-phase="welcome"] .scene-mobile-start { display: grid; width: 100%; gap: 9px; }
+    .scene-mobile-start p { text-align: center; font-size: 10px; }
+    .scene-mobile-start .button { justify-content: center; width: 100%; }
+    #tutorial[data-phase="welcome"] .scene-bottomline { padding: 14px 18px; }
+    #tutorial[data-phase="welcome"] .scene-bottomline > p, #tutorial[data-phase="welcome"] .scene-keys { display: none; }
+    .mission-card { margin: 18px 0 12px; }
+    .lesson-actions { margin-top: 20px; }
+    .lesson-actions .button { min-height: 46px; font-size: 13px; }
+    .map-node { width: 139px; }
+    .room-label { display: block; }
+    .scene-keys { display: inline; }
+    .journey-list { gap: 24px; }
+    .journey-list li + li::before { left: -18px; width: 11px; }
+    .journey-list li { font-size: 9px; gap: 5px; }
+    .terminal-body { padding-right: 17px; padding-left: 17px; }
+    .command-line code { font-size: 10px; }
+    .terminal-caption { font-size: 9px; }
+    .terminal-bottom { display: block; font-size: 9px; padding: 8px 17px 13px; }
+    #copy-feedback { display: block; }
+    .footer { flex-wrap: wrap; gap: 16px 20px; align-items: flex-start; font-size: 10px; }
+    .footer > span { flex-basis: 100%; }
+    .footer-links { max-width: none; flex: 1; font-size: 9px; }
+  }
+  @media (max-width: 440px) {
+    .page { padding-right: 16px; padding-left: 16px; }
+    .nav-links { gap: 13px; }
+    .nav-install { display: none; }
+    .brand-name { font-size: 31px; }
+    .brand-mark { width: 36px; height: 41px; }
+    .hero h1 { font-size: 35px; letter-spacing: -1.2px; }
+    .hero-description { font-size: 12px; }
+    .hero { padding: 18px 0 16px; }
+    .hero-description { display: none; }
+    .world-column .room { min-height: 280px; }
+    .world-column { gap: 10px; }
+    .tutorial-toolbar { margin-bottom: 12px; }
+    .eyebrow { font-size: 9px; letter-spacing: 1.3px; }
+    .quota-panel { padding: 14px; }
+    .quota-heading { font-size: 11px; }
+    .quota-value { font-size: 9px; }
+    .quota-value strong { font-size: 13px; }
+    .quota-caption { font-size: 9px; }
+    .quota-caption span:last-child { white-space: nowrap; font-size: 8px; }
+    .scene-topline { padding: 0 14px; }
+    .scene-mode { font-size: 7px; }
+    .scene-title { font-size: 10px; }
+    .room-window { left: 41%; width: 69px; height: 73px; }
+    .room-frame { left: 10%; width: 42px; height: 43px; }
+    .room-plant { top: 73px; width: 46px; height: 70px; }
+    .room-label { display: none; }
+    .map-node { width: 112px; min-height: 116px; padding: 0 3px 6px; }
+    .node-art { width: 83px; height: 71px; }
+    .node-title { font-size: 10px; }
+    .node-meta { font-size: 8px; }
+    .node-status { font-size: 7px; }
+    .mascot { width: 89px; height: 96px; }
+    .mascot-bubble { display: none; }
+    .undo-nook { width: 98px; }
+    .undo-nook svg { width: 62px; height: 51px; }
+    .nook-title { font-size: 9px; }
+    .nook-meta { font-size: 7px; }
+    .scene-bottomline { padding: 10px 12px; }
+    .scene-bottomline p { font-size: 8px; }
+    .scene-keys { display: none; }
+    .journey-list { gap: 13px; }
+    .journey-list li { flex-direction: column; gap: 5px; font-size: 9px; }
+    .journey-list li + li::before { top: 10px; left: -14px; width: 15px; }
+    .lesson-panel { padding: 23px; }
+    .lesson-panel > p { font-size: 12px; }
+    .terminal-header { padding: 11px 15px; font-size: 9px; }
+    .terminal-caption { padding-left: 0; }
+    .dialog { padding: 22px; }
+    .dialog h2 { font-size: 30px; }
+    .dialog-actions { flex-direction: column-reverse; }
+    .dialog-actions .button { width: 100%; }
+  }
+}

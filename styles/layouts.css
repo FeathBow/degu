@@ -1,0 +1,8 @@
+@layer layouts {
+  .habitat-grid { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 22px; align-items: stretch; }
+  .world-column { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  .world-column .scene-card { flex: 1; display: flex; flex-direction: column; }
+  .world-column .room { flex: 1; min-height: 360px; }
+  .layout-habitat .lesson-panel { min-height: 562px; }
+  .layout-habitat .journey { padding-left: 352px; }
+}

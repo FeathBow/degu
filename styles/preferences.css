@@ -1,0 +1,55 @@
+@layer components {
+  .preferences { display: flex; align-items: center; gap: 6px; }
+  .preference-control { position: relative; display: flex; align-items: center; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
+  .preference-control select { appearance: none; height: 35px; padding: 0 22px 0 8px; width: 88px; border: none; border-radius: 7px; background: transparent; color: var(--ink); font-family: inherit; font-size: 11px; line-height: 1.4; cursor: pointer; }
+  .appearance-control select { width: 94px; padding-left: 27px; }
+  .appearance-icon, .select-chevron { position: absolute; top: 50%; transform: translateY(-50%); display: grid; place-items: center; pointer-events: none; color: var(--muted); }
+  .appearance-icon { left: 9px; }
+  .appearance-icon svg { width: 13px; height: 13px; }
+  .select-chevron { right: 7px; }
+  .select-chevron svg { width: 12px; height: 12px; }
+  .nav-links { gap: 19px; }
+  .footer-links { flex-wrap: wrap; max-width: 350px; justify-content: flex-end; gap: 5px 14px; }
+}
+
+@layer responsive {
+  :lang(zh-CN) { --serif: "Songti SC", "Noto Serif CJK SC", "STSong", Georgia, serif; }
+  :lang(zh-CN) .brand-name { font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif; }
+  :lang(zh-CN) .hero h1 { font-size: clamp(34px, 3.6vw, 48px); letter-spacing: 0; line-height: 1.4; }
+  :lang(zh-CN) .hero h1 em { font-style: normal; }
+  :lang(zh-CN) .lesson-panel h2 { font-size: 31px; letter-spacing: 0; line-height: 1.4; }
+  :lang(zh-CN) .dialog h2 { font-size: 30px; letter-spacing: 0; line-height: 1.5; }
+  :lang(zh-CN) .lesson-panel > p { line-height: 1.9; }
+  :lang(zh-CN) .eyebrow, :lang(zh-CN) .lesson-eyebrow { letter-spacing: 1px; }
+  :lang(zh-CN) .node-status { font-size: 9px; }
+  :lang(zh-CN) .mascot-bubble { font-size: 11px; line-height: 1.7; }
+  :lang(zh-CN) .lesson-revelation strong { font-size: 18px; }
+  @media (max-width: 1120px) {
+    .brand-note { display: none; }
+  }
+  @media (max-width: 820px) {
+    .nav-links > a { display: none; }
+    .preference-control select { height: 39px; font-size: 11px; }
+    .footer-links { max-width: none; justify-content: flex-start; }
+    :lang(zh-CN) .lesson-panel h2 { font-size: 29px; }
+  }
+  @media (max-width: 440px) {
+    .preferences { gap: 5px; }
+    .preference-control select { width: 82px; padding-right: 19px; padding-left: 7px; }
+    .appearance-control select { width: 91px; padding-left: 24px; }
+    .appearance-icon { left: 7px; }
+    .select-chevron { right: 5px; }
+    .nav-links { gap: 0; }
+    :lang(zh-CN) .hero h1 { font-size: 34px; }
+    :lang(zh-CN) .lesson-panel h2 { font-size: 28px; }
+    :lang(zh-CN) .node-status { font-size: 8px; }
+    :lang(zh-CN) .eyebrow { font-size: 9px; }
+  }
+  @media (max-width: 350px) {
+    .brand-name { font-size: 28px; }
+    .brand-mark { width: 29px; }
+    .brand { gap: 5px; }
+    .preference-control select { width: 77px; }
+    .appearance-control select { width: 88px; }
+  }
+}

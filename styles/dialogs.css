@@ -1,0 +1,27 @@
+@layer components {
+  .dialog { width: min(530px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); padding: 27px 30px; color: var(--ink); background: var(--surface); border: 1px solid #d2dcc2; border-radius: 17px; box-shadow: 0 24px 120px #243c303b; }
+  .dialog::backdrop { background: #263a2b65; backdrop-filter: blur(5px); }
+  .dialog-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+  .dialog h2 { font: 500 34px/1.2 var(--serif); letter-spacing: -.7px; margin-bottom: 16px; }
+  .dialog > p { color: var(--muted); font-size: 12px; line-height: 1.8; }
+  .dialog .plan-list code { font-size: 10px; }
+  .purge-warning { padding: 12px 14px; background: #eff4e2; border-radius: 8px; font-size: 11px; margin: 17px 0 22px; }
+  .dialog label { display: block; font-size: 12px; margin-bottom: 10px; }
+  .dialog label strong { font-family: var(--mono); color: var(--danger); padding: 2px 5px; background: var(--danger-pale); border-radius: 3px; }
+  .dialog input { width: 100%; padding: 12px 14px; border: 1px solid #c7d2ba; border-radius: 7px; background: white; color: var(--ink); font: 14px var(--mono); }
+  .dialog input::placeholder { color: #abb3a1; }
+  .dialog .lesson-soft { margin-top: 10px; font-size: 10px; }
+  .dialog-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; margin-top: 24px; }
+  .dialog-actions .button { font-size: 11px; }
+  .receipt-disclaimer { display: grid; gap: 6px; padding: 13px 15px; border: 1px solid #e4d5b2; background: #f9f2df; border-radius: 8px; margin-top: 20px; }
+  .receipt-disclaimer strong { font: 600 9px var(--mono); color: #8d7444; letter-spacing: .6px; }
+  .receipt-disclaimer span { font-size: 10px; color: #8e8060; }
+  .receipt-list { list-style: none; margin: 20px 0 0; padding: 0; }
+  .receipt-list > li { padding: 14px 0; border-bottom: 1px solid var(--line); }
+  .receipt-entry-heading { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 12px; }
+  .receipt-entry-heading span { font: 9px var(--mono); color: var(--muted); }
+  .receipt-list code { display: block; font: 10px/1.7 var(--mono); overflow-wrap: anywhere; padding: 8px 10px; background: #f0f3e8; border-radius: 5px; }
+  .receipt-list ul { list-style: none; padding: 5px 0 0; font: 9px/1.8 var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+  .receipt-list time { display: block; color: #8c977e; font: 8px var(--mono); margin-top: 9px; }
+  .receipt-empty { font-size: 12px; color: var(--muted); }
+}

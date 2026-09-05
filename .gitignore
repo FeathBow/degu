@@ -1,0 +1,31 @@
+# Keep this branch limited to the reviewed static site.
+/*
+!/.gitignore
+!/.nojekyll
+!/README.md
+!/LICENSE-APACHE
+!/LICENSE-MIT
+!/index.html
+!/assets/
+!/src/
+!/styles/
+
+# Exclude local configuration and generated files inside allowed directories.
+.DS_Store
+.env*
+.npmrc
+.netrc
+.pypirc
+*.local
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+*.map
+*.pyc
+*.swp
+*~
+node_modules/
+__pycache__/
+.*/

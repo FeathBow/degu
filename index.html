@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f7f7ef">
+    <meta name="description" content="Send a little job through Slurm, read its result, and make room for your next experiment. A playful, interactive HPC adventure with degu.">
+    <title>degu’s little HPC adventure</title>
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="degu’s little HPC adventure">
+    <meta property="og:description" content="Send an experiment through Slurm. Read its story. Make room for the next big idea. Play in English or 简体中文.">
+    <meta property="og:image" content="https://feathbow.github.io/degu/assets/share-card.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:image:alt" content="A curious degu carries a job ticket between Slurm and a small compute workshop.">
+    <meta name="twitter:card" content="summary_large_image">
+    <script src="./src/preferences-bootstrap.js"></script>
+    <link rel="icon" href="./assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="./styles/base.css">
+    <link rel="stylesheet" href="./styles/scene.css">
+    <link rel="stylesheet" href="./styles/panels.css">
+    <link rel="stylesheet" href="./styles/dialogs.css">
+    <link rel="stylesheet" href="./styles/layouts.css">
+    <link rel="stylesheet" href="./styles/motion.css">
+    <link rel="stylesheet" href="./styles/responsive.css">
+    <link rel="stylesheet" href="./styles/preferences.css">
+    <link rel="stylesheet" href="./styles/slurm.css">
+    <link rel="stylesheet" href="./styles/themes.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#lesson">Skip to the tutorial</a>
+    <div id="app"></div>
+    <div id="overlay-root"></div>
+    <div id="announcement" class="sr-only" role="status" aria-live="polite"></div>
+    <div id="error-banner" class="error-banner" role="alert" hidden></div>
+    <noscript><main class="no-script"><p>This interactive browser tutorial needs JavaScript. Read the <a href="https://github.com/FeathBow/degu#quick-start">degu quick start</a>.</p><p lang="zh-CN">互动教程需要 JavaScript。你也可以阅读 <a href="https://github.com/FeathBow/degu#quick-start">degu 快速入门</a>。</p></main></noscript>
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>

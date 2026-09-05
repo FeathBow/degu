@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg">
+  <symbol id="desk" viewBox="0 0 180 150">
+    <ellipse cx="90" cy="137" rx="75" ry="8" fill="#718758" opacity=".16"/>
+    <path d="M33 61h114v65H33z" fill="#bca580" stroke="#927c58" stroke-width="2"/>
+    <path d="M22 58h136v12H22z" fill="#e7d7b0" stroke="#a38e69" stroke-width="2"/>
+    <path d="M47 34h63v29H47z" fill="#729982" stroke="#527863" stroke-width="3"/>
+    <path d="M53 40h49v16H53z" fill="#dbe6c8"/>
+    <path d="m59 45 5 4-5 4m12 0h13" fill="none" stroke="#6a8b62" stroke-width="2"/>
+    <path d="M74 63v-8" stroke="#537862" stroke-width="4"/>
+    <path d="M120 48h20v14h-20z" fill="#d7a976"/><path d="M140 51c12 0 12 8 0 8" fill="none" stroke="#b2895f" stroke-width="3"/>
+    <path d="M44 80h91v29H44z" fill="#f5edd2" transform="rotate(-2 90 95)"/>
+    <text x="90" y="98" text-anchor="middle" fill="#78694c" font-family="monospace" font-size="13">LOGIN</text>
+    <path d="M39 126v10m100-10v10" stroke="#8b7958" stroke-width="7" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="scheduler" viewBox="0 0 180 170">
+    <ellipse cx="91" cy="156" rx="68" ry="8" fill="#718758" opacity=".16"/>
+    <path d="M42 26h99v112H42z" fill="#bcceb0" stroke="#7c9570" stroke-width="3"/>
+    <path d="M35 24h113v20H35z" fill="#78956c" stroke="#5c7d53" stroke-width="2"/>
+    <text x="91" y="38" text-anchor="middle" fill="#f2f3d6" font-family="monospace" font-size="11">SLURM</text>
+    <path d="M52 56h77v65H52z" fill="#ecedd7" stroke="#9aac8b"/>
+    <path d="M60 67h25v17H60zM94 67h25v17H94zM60 93h25v17H60z" fill="#e6c898" stroke="#b79c6d"/>
+    <path d="m61 68 12 8 11-8m11 0 12 8 11-8m-57 26 12 8 11-8" fill="none" stroke="#b79c6d"/>
+    <circle cx="107" cy="101" r="12" fill="#aac68c"/><path d="m101 101 4 4 7-8" fill="none" stroke="#567441" stroke-width="2"/>
+    <path d="M54 137v17m75-17v17" stroke="#7d956d" stroke-width="7" stroke-linecap="round"/>
+    <circle cx="148" cy="19" r="15" fill="#f1e7c4" stroke="#a3af84" stroke-width="2"/>
+    <path d="M148 10v10l6 4" stroke="#819268" fill="none" stroke-width="2"/>
+  </symbol>
+  <symbol id="workshop" viewBox="0 0 190 160">
+    <ellipse cx="98" cy="146" rx="76" ry="8" fill="#718758" opacity=".16"/>
+    <path d="M37 57h126v83H37z" fill="#b9c9a2" stroke="#839a70" stroke-width="2"/>
+    <path d="m26 57 25-32h95l29 32z" fill="#628575" stroke="#486d5d" stroke-width="2"/>
+    <path d="M137 15h13v24h-13z" fill="#a2b49a" stroke="#6f8e73" stroke-width="2"/>
+    <path d="M51 75h45v46H51z" fill="#e1e7ca" stroke="#849f74" stroke-width="2"/>
+    <path d="M73 75v46m-22-23h45" stroke="#9baf87" stroke-width="3"/>
+    <path d="M115 75h32v65h-32z" fill="#f1e3ba" stroke="#a69e77" stroke-width="2"/>
+    <circle cx="139" cy="110" r="2.5" fill="#9a9d6b"/>
+    <path d="M35 140h131" stroke="#8a9f73" stroke-width="5" stroke-linecap="round"/>
+    <path d="M48 41h78" stroke="#88a28e" stroke-width="2" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="ticket" viewBox="0 0 100 75">
+    <path d="M9 12h82v52H9z" fill="#ead7ab" stroke="#b3996a" stroke-width="2"/>
+    <path d="m10 13 40 28 40-28M10 63l30-28m50 28L60 35" fill="none" stroke="#baa078" stroke-width="2"/>
+    <circle cx="50" cy="40" r="11" fill="#7a985c"/>
+    <path d="m45 40 4 4 7-8" fill="none" stroke="#f5f1d8" stroke-width="2"/>
+  </symbol>
+</svg>

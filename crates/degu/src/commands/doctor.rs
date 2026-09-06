@@ -6,6 +6,7 @@ use degu_core::activation::{
     StoreActivationKind, check_current_euid_authority_readiness,
 };
 use degu_core::backend::{CertificationError, CertifiedLocalBackend};
+use degu_core::provision::AccountBaseError;
 use degu_core::seal::store::StoreError;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -362,17 +363,45 @@ fn classify_error(error: &StoreActivationError) -> FailureClassification {
             ),
             status => unreachable!("backend cannot classify as {status:?}"),
         },
+        // An account fact that no source can supply is settled, not uncertain:
+        // the anchor has no home to be derived from and retrying cannot change
+        // that. Only a lookup that failed with an errno may succeed later.
+        StoreActivationError::AccountBase(AccountBaseError::AccountMissing) => {
+            FailureClassification::new(
+                ReadinessStatus::Unsupported,
+                "no account source this build can consult has an entry for the effective UID",
+                "run degu under an account the host resolves, and confirm it with 'getent passwd'; do not initialize or fall back",
+            )
+        }
+        // The resolver failing to answer is transient; the account being
+        // absent from every source is not. They must not read alike.
+        StoreActivationError::AccountBase(AccountBaseError::ResolverUnavailable) => {
+            FailureClassification::new(
+                ReadinessStatus::Uncertain,
+                "the host's account resolver exists but could not be consulted",
+                "retry once the directory service answers; do not initialize or fall back",
+            )
+        }
+        StoreActivationError::AccountBase(AccountBaseError::HomeNotAbsolute) => {
+            FailureClassification::new(
+                ReadinessStatus::Unsupported,
+                "the account entry for the effective UID names an empty or relative home",
+                "correct the account entry's home directory; degu will not resolve it against the working directory",
+            )
+        }
         StoreActivationError::Io { .. }
         | StoreActivationError::Identity
         | StoreActivationError::Store(_)
         | StoreActivationError::RecordInspection { .. }
         | StoreActivationError::SyncUncertain(_)
         | StoreActivationError::Random(_)
-        | StoreActivationError::AccountBase(_) => FailureClassification::new(
-            ReadinessStatus::Uncertain,
-            "the authority selector could not authenticate all candidate state with certainty",
-            "retry after resolving account lookup, I/O, lock, ACL, mount, or backend inspection failures; do not initialize or fall back",
-        ),
+        | StoreActivationError::AccountBase(AccountBaseError::Lookup(_)) => {
+            FailureClassification::new(
+                ReadinessStatus::Uncertain,
+                "the authority selector could not authenticate all candidate state with certainty",
+                "retry after resolving account lookup, I/O, lock, ACL, mount, or backend inspection failures; do not initialize or fall back",
+            )
+        }
     }
 }
 

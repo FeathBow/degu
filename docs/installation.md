@@ -68,7 +68,7 @@ Cargo installs both `degu` and its short alias, `dg`, into `~/.local/bin` becaus
 
 Prebuilt installation routes become usable only after the [Releases page](https://github.com/FeathBow/degu/releases) lists a published version. Choose a published tag there; draft releases and workflow artifacts are not installation sources.
 
-Linux and macOS are supported runtime platforms. Published Linux artifacts are static musl binaries that do not require the host's glibc; macOS artifacts are native builds for Apple Silicon and Intel Macs.
+Linux and macOS are supported runtime platforms. Published Linux artifacts are static musl binaries that do not require the host's glibc; macOS artifacts are native builds for Apple Silicon and Intel Macs. Such a build reads only the local account file, so on a host whose accounts come from LDAP, SSSD, or winbind degu resolves the account home by running the host's own `getent`; [safety.md](safety.md) states the bounds on that and why it selects no path the account database does not already name.
 
 ### Installer
 

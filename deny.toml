@@ -14,6 +14,13 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "Unicode-3.0",
 ]
+# Scoped to the one crate that needs it rather than admitted globally. Zlib is
+# permissive and, unlike MIT, binds only source distributions — a published
+# binary carries no notice obligation from it. foldhash arrives as hashbrown's
+# default hasher beneath ratatui-core, where neither it nor kasuari is optional.
+[[licenses.exceptions]]
+crate = "foldhash"
+allow = ["Zlib"]
 
 [bans]
 multiple-versions = "warn"

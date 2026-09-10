@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -83,11 +84,19 @@ impl GroupBy {
     }
 }
 
+#[derive(Clone)]
 pub struct Group {
-    pub name: String,
+    // The filter matches findings against this key, so it stays raw and private.
+    name: String,
     pub count: usize,
     pub class: Option<Class>,
     pub allocated: Total,
+}
+
+impl Group {
+    pub fn label(&self) -> String {
+        crate::escape::text(&self.name)
+    }
 }
 
 fn group(findings: &[Finding], section: Section, by: GroupBy) -> Vec<Group> {
@@ -167,7 +176,11 @@ impl Browser {
         self.section
     }
 
-    pub fn coverage(&self, section: Section) -> Coverage {
+    pub fn coverage(&self) -> Coverage {
+        self.coverage_of(self.section)
+    }
+
+    pub fn coverage_of(&self, section: Section) -> Coverage {
         self.report.completeness.section(section)
     }
 
@@ -195,12 +208,16 @@ impl Browser {
         &self.groups
     }
 
-    pub fn ecosystem_groups(&self) -> Vec<Group> {
-        group(
+    // Borrowed when the current grouping already answers this.
+    pub fn ecosystem_groups(&self) -> Cow<'_, [Group]> {
+        if self.group_by == GroupBy::Ecosystem {
+            return Cow::Borrowed(&self.groups);
+        }
+        Cow::Owned(group(
             self.report.section(self.section),
             self.section,
             GroupBy::Ecosystem,
-        )
+        ))
     }
 
     pub fn active_group(&self) -> Option<&Group> {
@@ -248,7 +265,11 @@ impl Browser {
 
     fn regroup(&mut self) {
         self.group_index = None;
-        self.groups = group(self.report.section(self.section), self.section, self.group_by);
+        self.groups = group(
+            self.report.section(self.section),
+            self.section,
+            self.group_by,
+        );
         if self.group_by == GroupBy::Class {
             self.groups.sort_by_key(|group| group.class);
         }

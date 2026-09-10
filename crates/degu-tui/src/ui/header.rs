@@ -28,7 +28,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![masthead(app, usize::from(area.width)), sections(app)];
     if app.view() == View::Details {
         lines.push(overview::summary(app, usize::from(area.width)));
-        if let Some(warning) = coverage_warning(browser.coverage(browser.section())) {
+        if let Some(warning) = coverage_warning(browser.coverage()) {
             lines.push(Line::from(vec![
                 Span::styled("! ", Style::new().fg(CAUTION)),
                 Span::raw(warning),
@@ -57,7 +57,7 @@ fn sections(app: &App) -> Line<'static> {
         [Section::Cache, Section::Runtime]
             .into_iter()
             .map(|section| {
-                let suffix = if browser.coverage(section).was_requested() {
+                let suffix = if browser.coverage_of(section).was_requested() {
                     ""
                 } else {
                     " (not scanned)"

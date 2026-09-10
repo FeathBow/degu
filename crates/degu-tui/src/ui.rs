@@ -2,6 +2,7 @@
 mod allocation;
 mod app;
 mod brand;
+mod derived;
 mod details;
 mod findings;
 mod format;
@@ -24,7 +25,6 @@ const FILTER_HEIGHT: u16 = 1;
 const FOOTER_HEIGHT: u16 = 1;
 const MIN_LIST_HEIGHT: u16 = 5;
 const PREVIEW_HEIGHT: u16 = 6;
-const MIN_PREVIEW_HEIGHT: u16 = 4;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Block::default().style(theme::canvas()), frame.area());
@@ -57,8 +57,9 @@ fn browser(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         overview::COMPACT_HEIGHT
     };
-    let has_preview =
-        area.height >= overview_height + FILTER_HEIGHT + MIN_LIST_HEIGHT + MIN_PREVIEW_HEIGHT;
+    // The guard counts what the layout below reserves, gap included.
+    let has_preview = area.height
+        >= overview_height + FILTER_HEIGHT + MIN_LIST_HEIGHT + PANEL_GAP + PREVIEW_HEIGHT;
     let preview_height = if has_preview { PREVIEW_HEIGHT } else { 0 };
     let rows = Layout::vertical([
         Constraint::Length(overview_height),

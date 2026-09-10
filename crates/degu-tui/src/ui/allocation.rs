@@ -2,7 +2,6 @@ use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
 use crate::browser::Browser;
-use crate::escape;
 use crate::report::Total;
 
 use super::App;
@@ -33,7 +32,7 @@ pub fn segments(browser: &Browser) -> Vec<Segment> {
         .iter()
         .take(NAMED_SEGMENTS)
         .map(|group| Segment {
-            name: escape::text(&group.name),
+            name: group.label(),
             total: group.allocated,
         })
         .collect::<Vec<_>>();

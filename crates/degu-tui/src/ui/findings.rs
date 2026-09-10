@@ -160,7 +160,7 @@ fn symbol(class: Class) -> &'static str {
 
 fn empty_message(app: &App) -> &'static str {
     let browser = app.browser();
-    if !browser.coverage(browser.section()).was_requested() {
+    if !browser.coverage().was_requested() {
         return match browser.section() {
             Section::Runtime => {
                 "Runtime was not scanned.\nCreate a report with degu scan --runtime --json."

@@ -1,7 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use crate::escape;
+use crate::browser::Group;
 
 use super::format::{bytes_total, count};
 use super::text::{columns, elide, pad};
@@ -63,8 +63,12 @@ fn row(app: &App, position: usize, width: u16) -> [Line<'static>; ROW_HEIGHT] {
         .checked_sub(1)
         .and_then(|index| browser.groups().get(index));
     let (name, total, findings) = group.map_or(
-        ("All findings", browser.allocated(), browser.section_len()),
-        |group| (group.name.as_str(), group.allocated, group.count),
+        (
+            "All findings".to_owned(),
+            browser.allocated(),
+            browser.section_len(),
+        ),
+        |group| (group.label(), group.allocated, group.count),
     );
     let selected = browser.group_position() == position;
     let prefix = if selected { "▸ " } else { "  " };
@@ -75,27 +79,28 @@ fn row(app: &App, position: usize, width: u16) -> [Line<'static>; ROW_HEIGHT] {
     }
     let label = Line::from(format!(
         "{prefix}{}",
-        pad(
-            &escape::text(name),
-            usize::from(width).saturating_sub(ROW_PREFIX)
-        )
+        pad(&name, usize::from(width).saturating_sub(ROW_PREFIX))
     ))
     .style(style);
     [
         label,
-        Line::from(format!("  {} · {}", count(findings as u64), bytes_total(total)))
-            .fg(SECONDARY),
+        Line::from(format!(
+            "  {} · {}",
+            count(findings as u64),
+            bytes_total(total)
+        ))
+        .fg(SECONDARY),
     ]
 }
 
 pub fn filter_line(frame: &mut Frame, area: Rect, app: &App) {
     let browser = app.browser();
-    if !browser.coverage(browser.section()).was_requested() {
+    if !browser.coverage().was_requested() {
         return;
     }
     let name = browser
         .active_group()
-        .map_or("All findings", |group| group.name.as_str());
+        .map_or_else(|| "All findings".to_owned(), Group::label);
     let prefix = format!("by {} › ", browser.group_by().label());
     let suffix = format!(" · {} shown", browser.finding_count());
     let budget = usize::from(area.width).saturating_sub(columns(&prefix) + columns(&suffix));
@@ -107,7 +112,7 @@ pub fn filter_line(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(prefix, style),
-            Span::styled(elide(&escape::text(name), budget), style),
+            Span::styled(elide(&name, budget), style),
             Span::styled(suffix, style),
         ])),
         area,

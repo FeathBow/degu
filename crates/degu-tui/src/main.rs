@@ -60,15 +60,19 @@ fn print_help() {
 }
 
 fn read_report(path: &str) -> Result<ScanReport> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("could not open the report at {path}"))?;
-    let length = file
-        .metadata()
-        .with_context(|| format!("could not inspect the report at {path}"))?
-        .len();
-    if length > MAX_REPORT_BYTES {
-        bail!("{path} is {length} bytes; a scan report above {MAX_REPORT_BYTES} bytes is refused");
+    let shown = escape::text(path);
+    // Opening a FIFO blocks until a writer connects, and its length reads zero.
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("could not inspect the report at {shown}"))?;
+    if !metadata.is_file() {
+        bail!("{shown} is not a regular file; degu-tui reads a saved report");
     }
+    let length = metadata.len();
+    if length > MAX_REPORT_BYTES {
+        bail!("{shown} is {length} bytes; a scan report above {MAX_REPORT_BYTES} bytes is refused");
+    }
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("could not open the report at {shown}"))?;
     let mut json = String::new();
     // One extra byte distinguishes an exact-size report from a truncated read.
     file.take(MAX_REPORT_BYTES + 1)

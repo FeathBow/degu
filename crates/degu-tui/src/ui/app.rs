@@ -1,10 +1,11 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::browser::Browser;
+use crate::browser::{Browser, SortBy};
 use crate::escape;
-use crate::report::ScanReport;
+use crate::report::{ScanReport, Section};
 
 use super::allocation::{self, Segment};
+use super::derived::Derived;
 use super::details::Document;
 use super::format;
 
@@ -26,32 +27,42 @@ pub struct App {
     source: String,
     view: View,
     focus: Focus,
-    document: Document,
     page_size: usize,
     group_page_size: usize,
-    metric_width: usize,
-    allocation: Vec<Segment>,
+    document: Derived<Document, Option<(Section, usize)>>,
+    metric_width: Derived<usize, (Section, SortBy, usize)>,
+    allocation: Derived<Vec<Segment>, Section>,
     help_return: View,
 }
 
 impl App {
     pub fn new(report: ScanReport, source: String) -> Self {
         let browser = Browser::new(report);
-        let allocation = allocation::segments(&browser);
-        let document = document(&browser);
-        let metric_width = metric_width(&browser);
+        let document = Derived::new(document_key(&browser), || document(&browser));
+        let metric_width = Derived::new(metric_key(&browser), || metric_width(&browser));
+        let allocation = Derived::new(browser.section(), || allocation::segments(&browser));
         Self {
             browser,
             source: escape::text(&source),
             view: View::Browser,
             focus: Focus::Findings,
-            document,
             page_size: 1,
             group_page_size: 1,
+            document,
             metric_width,
             allocation,
             help_return: View::Browser,
         }
+    }
+
+    fn refresh(&mut self) {
+        let browser = &self.browser;
+        self.document
+            .refresh(document_key(browser), || document(browser));
+        self.metric_width
+            .refresh(metric_key(browser), || metric_width(browser));
+        self.allocation
+            .refresh(browser.section(), || allocation::segments(browser));
     }
 
     pub fn browser(&self) -> &Browser {
@@ -71,15 +82,15 @@ impl App {
     }
 
     pub fn document(&mut self) -> &mut Document {
-        &mut self.document
+        self.document.get_mut()
     }
 
     pub fn metric_width(&self) -> usize {
-        self.metric_width
+        *self.metric_width.get()
     }
 
     pub fn allocation(&self) -> &[Segment] {
-        &self.allocation
+        self.allocation.get()
     }
 
     pub fn resize(&mut self, findings: usize, groups: usize) {
@@ -93,23 +104,14 @@ impl App {
         if key.code == KeyCode::Char('q') || control_quit {
             return true;
         }
-        let selection = self.browser.selection();
-        let section = self.browser.section();
-        let reordered = match key.code {
+        match key.code {
             KeyCode::Esc => match self.view {
-                View::Help => {
-                    self.view = self.help_return;
-                    false
-                }
-                View::Details => {
-                    self.view = View::Browser;
-                    false
-                }
+                View::Help => self.view = self.help_return,
+                View::Details => self.view = View::Browser,
                 View::Browser => {
                     if !self.browser.clear_filter() {
                         return true;
                     }
-                    true
                 }
             },
             KeyCode::Char('?') => {
@@ -119,58 +121,37 @@ impl App {
                     self.help_return = self.view;
                     self.view = View::Help;
                 }
-                false
             }
             code => match self.view {
                 View::Browser => self.browse(code),
-                View::Details => {
-                    self.scroll(code);
-                    false
-                }
-                View::Help => false,
+                View::Details => self.scroll(code),
+                View::Help => {}
             },
-        };
-        if reordered {
-            self.metric_width = metric_width(&self.browser);
         }
-        if section != self.browser.section() {
-            self.allocation = allocation::segments(&self.browser);
-        }
-        if selection != self.browser.selection() {
-            self.document = document(&self.browser);
-        }
+        self.refresh();
         false
     }
 
-    fn browse(&mut self, code: KeyCode) -> bool {
+    fn browse(&mut self, code: KeyCode) {
         let page_size = match self.focus {
             Focus::Groups => self.group_page_size,
             Focus::Findings => self.page_size,
         };
         if let Some(delta) = movement(code, page_size) {
-            return match self.focus {
-                Focus::Groups => {
-                    self.browser.filter_by(delta);
-                    true
-                }
-                Focus::Findings => {
-                    self.browser.move_by(delta);
-                    false
-                }
-            };
+            match self.focus {
+                Focus::Groups => self.browser.filter_by(delta),
+                Focus::Findings => self.browser.move_by(delta),
+            }
+            return;
         }
         match code {
             KeyCode::Home | KeyCode::End => {
                 let last = code == KeyCode::End;
                 if self.focus == Focus::Groups {
-                    let position = if last {
-                        self.browser.groups().len()
-                    } else {
-                        0
-                    };
+                    let position = if last { self.browser.groups().len() } else { 0 };
                     self.browser
                         .filter_by(position as isize - self.browser.group_position() as isize);
-                    return true;
+                    return;
                 }
                 if last {
                     self.browser.select_last();
@@ -180,23 +161,18 @@ impl App {
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.browser.filter_by(-1);
-                return true;
             }
             KeyCode::Right | KeyCode::Char('l') => {
                 self.browser.filter_by(1);
-                return true;
             }
             KeyCode::Char('s') => {
                 self.browser.next_sort();
-                return true;
             }
             KeyCode::Char('g') => {
                 self.browser.next_grouping();
-                return true;
             }
             KeyCode::Tab => {
                 self.browser.switch_section();
-                return true;
             }
             KeyCode::Enter | KeyCode::Char('3') => {
                 if self.browser.selected_finding().is_some() {
@@ -207,17 +183,16 @@ impl App {
             KeyCode::Char('2') => self.focus = Focus::Findings,
             _ => {}
         }
-        false
     }
 
     fn scroll(&mut self, code: KeyCode) {
-        if let Some(delta) = movement(code, self.document.page_size()) {
-            self.document.move_by(delta);
+        if let Some(delta) = movement(code, self.document.get_mut().page_size()) {
+            self.document.get_mut().move_by(delta);
             return;
         }
         match code {
-            KeyCode::Home => self.document.first(),
-            KeyCode::End => self.document.last(),
+            KeyCode::Home => self.document.get_mut().first(),
+            KeyCode::End => self.document.get_mut().last(),
             KeyCode::Enter => self.view = View::Browser,
             _ => {}
         }
@@ -229,6 +204,19 @@ fn document(browser: &Browser) -> Document {
         .selected_finding()
         .map(|finding| Document::new(finding, browser.section()))
         .unwrap_or_default()
+}
+
+fn document_key(browser: &Browser) -> Option<(Section, usize)> {
+    browser.selection()
+}
+
+// Sized from every finding currently listed.
+fn metric_key(browser: &Browser) -> (Section, SortBy, usize) {
+    (
+        browser.section(),
+        browser.sort_by(),
+        browser.group_position(),
+    )
 }
 
 fn metric_width(browser: &Browser) -> usize {

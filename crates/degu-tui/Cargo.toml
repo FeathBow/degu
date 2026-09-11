@@ -1,0 +1,16 @@
+[package]
+name = "degu-tui"
+description = "Browser for degu scan reports (internal crate; no API stability guarantees)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ratatui.workspace = true
+crossterm = { workspace = true, features = ["events"] }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+unicode-width.workspace = true

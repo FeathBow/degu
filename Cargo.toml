@@ -5,6 +5,7 @@ members = [
     "crates/degu-core",
     "crates/degu-adapters",
     "crates/degu",
+    "crates/degu-tui",
 ]
 
 [workspace.package]
@@ -21,6 +22,7 @@ clap = { version = "4.6", features = ["derive", "wrap_help"] }
 clap_complete = "4.6"
 clap_mangen = "0.2"
 comfy-table = "7.2"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.29", default-features = false }
 terminal_size = "0.4"
 serde = { version = "1.0", features = ["derive"] }

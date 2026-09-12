@@ -193,6 +193,10 @@ impl MutationSession {
         purge::plan_all_trash(&self.lifecycle.ctx)
     }
 
+    pub(crate) fn plan_purge_selected(&self, selection: &[PathBuf]) -> Result<TrashPurgePlan> {
+        purge::plan_selected_trash(&self.lifecycle.ctx, selection)
+    }
+
     /// Post-confirmation classification and sealed execution. Unsupported
     /// proof topologies are retained per entry and do not prevent unrelated
     /// work. A recovery blocker still stops the batch before any later legacy

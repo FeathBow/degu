@@ -392,12 +392,15 @@ pub(crate) enum TrashCommand {
         #[command(flatten)]
         output: JsonArgs,
     },
-    /// Permanently remove all trash entries
+    /// Permanently remove trash entries; every entry unless --path selects some
     Purge {
         #[command(flatten)]
         output: JsonArgs,
         /// Proceed without prompting
         #[arg(long)]
         yes: bool,
+        /// Keep only entries staged from at or under this path; repeatable
+        #[arg(long)]
+        path: Vec<PathBuf>,
     },
 }

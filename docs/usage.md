@@ -106,6 +106,12 @@ degu trash list
 degu trash purge
 ```
 
+`--path` narrows that plan to entries staged from at or under a path, so space can be reclaimed from one origin while the rest stay restorable by `degu undo`. It is repeatable, matches the origin recorded in the operation log, and takes the same confirmation as a full purge:
+
+```sh
+degu trash purge --path ~/.cache/huggingface
+```
+
 A sealed purge interrupted after its durable WAL claim is different: startup marks it `RecoveryRequired`; it does not become a legacy claim that `trash purge` may guess or retry.
 
 For immediate permanent deletion, use `degu clean --purge`. Successfully purged entries cannot be restored. The [staging, undo, and purge policy](safety.md#staging-undo-and-purge) defines the confirmations and fixed-plan guarantees for both purge commands.

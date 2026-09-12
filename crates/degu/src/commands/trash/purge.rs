@@ -1,6 +1,6 @@
 use anyhow::Result;
 use degu_core::ecosystem::DetectCtx;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::commands::prompt::confirm_permanent_delete;
 use crate::lifecycle::{Lifecycle, TrashPurgePlan};
@@ -14,13 +14,17 @@ use crate::presentation::{display_path, escape_terminal_text, semantic};
 use crate::runtime::Ui;
 use serde::Serialize;
 
-pub(super) fn run(json: bool, yes: bool, ui: Ui) -> Result<()> {
+pub(super) fn run(json: bool, yes: bool, selection: &[PathBuf], ui: Ui) -> Result<()> {
     let ctx = DetectCtx::from_process()?;
     if json && !yes {
         anyhow::bail!("--json requires --yes");
     }
     let mut session = Lifecycle::new(&ctx).lock()?;
-    let plan = session.plan_purge_all()?;
+    let plan = if selection.is_empty() {
+        session.plan_purge_all()?
+    } else {
+        session.plan_purge_selected(selection)?
+    };
     if json {
         validate_json_plan(&plan)?;
     } else {

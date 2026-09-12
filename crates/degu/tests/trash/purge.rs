@@ -364,3 +364,121 @@ fn trash_purge_rejects_a_symlinked_claims_directory() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("purge claims path is not a real directory"));
 }
+
+#[test]
+fn purge_path_removes_only_entries_staged_from_that_origin() {
+    let (home, state, cache) = crate::pip_fixture::create();
+    // A second staged origin the scanner treats the same way pip is treated.
+    let other = crate::common::platform_cache_dir(home.path(), "go-build");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("object"), [0_u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+    let selected = std::fs::canonicalize(&cache).unwrap();
+    crate::clean_run::run(home.path(), state.path());
+    let trash_dir = private_trash_root(&state);
+    let staged = crate::trash_entries::visible(&trash_dir).len();
+    assert!(staged >= 2, "expected two staged origins, got {staged}");
+
+    let out = run(
+        &home,
+        &state,
+        &[
+            "trash",
+            "purge",
+            "--yes",
+            "--json",
+            "--path",
+            selected.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["purged"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        crate::trash_entries::visible(&trash_dir).len(),
+        staged - 1,
+        "an unselected origin must stay staged"
+    );
+}
+
+/// The recorded origin is canonical, so a selector is compared against the
+/// canonical form; on macOS a temporary directory reaches it through a symlink.
+#[test]
+fn purge_path_matches_a_parent_of_the_origin() {
+    let (home, state, cache) = crate::pip_fixture::create();
+    let parent = std::fs::canonicalize(&cache)
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    crate::clean_run::run(home.path(), state.path());
+
+    let out = run(
+        &home,
+        &state,
+        &[
+            "trash",
+            "purge",
+            "--yes",
+            "--json",
+            "--path",
+            parent.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["purged"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn purge_path_that_matches_nothing_leaves_the_entries_intact() {
+    let (home, state, _) = crate::pip_fixture::create();
+    crate::clean_run::run(home.path(), state.path());
+    let trash_dir = private_trash_root(&state);
+    let before = crate::trash_entries::visible(&trash_dir);
+
+    let out = run(
+        &home,
+        &state,
+        &[
+            "trash",
+            "purge",
+            "--yes",
+            "--json",
+            "--path",
+            home.path().join("nothing-here").to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success());
+    assert_eq!(crate::trash_entries::visible(&trash_dir), before);
+}
+
+/// Selection governs which staged entries are destroyed, not the expired-claim
+/// housekeeping every purge carries. degu runs no background timer, so that
+/// housekeeping rides on the next mutating command; skipping it for a selected
+/// purge would let claims accumulate forever for anyone who only selects.
+#[test]
+fn purge_path_still_runs_expired_claim_housekeeping() {
+    let (home, state, cache) = crate::pip_fixture::create();
+    let canonical = std::fs::canonicalize(&cache).unwrap();
+    crate::clean_run::run(home.path(), state.path());
+    let marker = aged_claim_marker(&state);
+
+    let out = run(
+        &home,
+        &state,
+        &[
+            "trash",
+            "purge",
+            "--yes",
+            "--json",
+            "--path",
+            canonical.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success());
+    assert!(
+        !marker.exists(),
+        "expired claims are collected by any purge"
+    );
+}

@@ -96,6 +96,50 @@ pub(crate) fn plan_expired_trash(ctx: &DetectCtx) -> Result<ExpiryPlan> {
     Ok(ExpiryPlan { batches })
 }
 
+/// Trash entries whose recorded original path lies at or under one of
+/// `selection`, which is how `clean --path` already reads a path selector.
+///
+/// Interrupted purge claims are deliberately absent: a selected purge removes
+/// what was asked for and nothing beside it. They stay for a full purge, which
+/// is where finishing an abandoned one belongs.
+///
+/// An entry whose original path the operation log cannot supply never matches.
+/// Selecting by origin cannot reach an entry whose origin is unknown, and
+/// guessing would purge on a resemblance.
+pub(crate) fn plan_selected_trash(
+    ctx: &DetectCtx,
+    selection: &[PathBuf],
+) -> Result<TrashPurgePlan> {
+    let records = OperationLog::new(ctx).read()?;
+    let recorded = reconciled_trash_info(&records);
+    let mut batches = Vec::new();
+
+    for root in trash_roots(ctx)? {
+        let trash = Trash::new(root.clone());
+        let entries = trash
+            .entries_matching(|entry, _| {
+                recorded
+                    .get(entry)
+                    .is_some_and(|info| is_selected(&info.original, selection))
+            })
+            .with_context(|| format!("failed to select trash in {}", root.display()))?;
+        let entries = entries
+            .into_iter()
+            .map(PlannedTrashEntry::capture)
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| format!("failed to snapshot trash in {}", root.display()))?;
+        batches.push(PurgePlanBatch {
+            trash_root: root,
+            entries,
+        });
+    }
+    Ok(TrashPurgePlan { batches })
+}
+
+fn is_selected(original: &Path, selection: &[PathBuf]) -> bool {
+    selection.iter().any(|chosen| original.starts_with(chosen))
+}
+
 pub(crate) fn execute_expiry_plan(
     ctx: &DetectCtx,
     plan: &ExpiryPlan,

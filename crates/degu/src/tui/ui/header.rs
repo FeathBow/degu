@@ -37,8 +37,6 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// The masthead carries the plan rather than a fixed label, so the size of a
-/// decision is visible from whichever row the reader is standing on.
 fn masthead(app: &App, width: usize) -> Line<'static> {
     let plan = plan_label(app);
     let gap = width
@@ -53,9 +51,6 @@ fn masthead(app: &App, width: usize) -> Line<'static> {
 }
 
 fn plan_label(app: &App) -> String {
-    // Each screen carries its own plan: the browser decides what gets staged,
-    // the staged screen decides what gets destroyed, and showing one total on
-    // the other screen would read as a single number for both.
     let (plan, verb) = if app.view() == View::Staged {
         (app.staged().chosen_plan(), "To delete permanently")
     } else {
@@ -70,17 +65,9 @@ fn plan_label(app: &App) -> String {
     }
     format!(
         "{verb}: {} · {}",
-        pluralize(plan.locations, "location"),
+        super::format::locations(plan.locations),
         super::format::bytes(plan.bytes)
     )
-}
-
-fn pluralize(count: usize, noun: &str) -> String {
-    if count == 1 {
-        format!("{count} {noun}")
-    } else {
-        format!("{count} {noun}s")
-    }
 }
 
 fn plan_tone(app: &App) -> Color {

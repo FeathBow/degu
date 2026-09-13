@@ -4,82 +4,107 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
-use crate::cli::{JsonArgs, ScanArgs, TrashCommand};
+use crate::cli::{CleanArgs, ScanArgs, ScanLimitArgs, TrashCommand};
+use crate::findings::Filters;
 use crate::runtime::Ui;
 use crate::tui::{App, Outcome};
 
+struct Review {
+    app: App,
+    filters: Filters,
+    limits: ScanLimitArgs,
+}
+
+impl Review {
+    fn collect(args: ScanArgs, ui: Ui) -> Result<Self> {
+        let limits = args.limits;
+        let (report, filters) = crate::commands::scan::collect_for_review(args, ui)?;
+        let ctx = degu_core::ecosystem::DetectCtx::from_process()?;
+        let lifecycle = crate::lifecycle::Lifecycle::new(&ctx);
+        let staged = crate::tui::Staged::new(
+            lifecycle.trash_entries()?,
+            lifecycle
+                .plan_expired()?
+                .entries()
+                .map(std::path::Path::to_path_buf)
+                .collect(),
+        );
+        Ok(Self {
+            app: App::new(report, staged, ctx.home),
+            filters,
+            limits,
+        })
+    }
+
+    fn clean_args(&self, dry_run: bool) -> Option<CleanArgs> {
+        self.app
+            .decisions()
+            .clean_args(&self.filters, self.limits, dry_run)
+    }
+}
+
 pub(crate) fn run(args: ScanArgs, ui: Ui) -> Result<()> {
-    // Refuse before taking the screen rather than inside terminal setup: with
-    // only stdout checked, a redirected stdin enters the alternate screen and
-    // then waits for a key that can never arrive.
+    // Redirected stdin cannot supply keys even when stdout is a terminal.
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         bail!(
             "degu tui requires an interactive terminal; use 'degu scan' for output that survives a pipe or a log"
         );
     }
-    let limits = args.limits;
-    let ctx = degu_core::ecosystem::DetectCtx::from_process()?;
-    let staged = crate::tui::Staged::new(crate::lifecycle::Lifecycle::new(&ctx).trash_entries()?);
-    let home = ctx.home.clone();
-    let report = crate::commands::scan::collect_for_review(args, ui)?;
-    let mut app = App::new(report, staged, home, limits);
+    let mut review = Review::collect(args, ui)?;
 
-    // Nothing executes while the alternate screen is up. Previewing returns to
-    // the interface; cleaning ends it. Either way the plan and its confirmation
-    // print to the restored terminal, so the scrollback holds what it would
-    // have held if the command had been typed.
+    // Restore the terminal before commands run so plans and prompts remain in scrollback.
     loop {
-        match browse(&mut app)? {
+        match browse(&mut review.app)? {
             Outcome::Quit => return Ok(()),
             Outcome::Preview => {
-                announce(&app.decisions().command_line(true), ui)?;
-                crate::commands::clean::run(app.clean_args(true), ui)?;
+                if let Some(args) = review.clean_args(true) {
+                    run_clean(args, ui)?;
+                } else {
+                    crate::output::stdoutln!(
+                        "Nothing chosen to clean; no clean or expiry will run."
+                    )?;
+                }
                 if !resume(ui)? {
                     return Ok(());
                 }
             }
-            Outcome::Clean => return execute(&app, ui),
+            Outcome::Clean => return execute(&review, ui),
         }
     }
 }
 
-/// Permanent removal runs first. A clean stages new entries under the same
-/// originals, and a purge selector naming one of those would then destroy the
-/// copy the reader had just made rather than the one they chose.
-fn execute(app: &App, ui: Ui) -> Result<()> {
-    let purging = app.staged().purge_paths();
-    let cleaning = !app.decisions().is_empty();
-    if !purging.is_empty() {
-        announce(&app.staged().command_line(), ui)?;
-        let purged = crate::commands::trash::run(
-            TrashCommand::Purge {
-                output: JsonArgs { json: false },
-                yes: false,
-                path: purging,
-            },
-            ui,
-        );
-        if cleaning {
-            // Refusing the destructive half refuses the whole outcome: it was
-            // decided as one, and staging more on the way out would be a
-            // surprise from a keystroke the reader just declined.
+fn execute(review: &Review, ui: Ui) -> Result<()> {
+    let app = &review.app;
+    let clean = review.clean_args(false);
+    if let Some(args) = app.staged().purge_args() {
+        announce(crate::commands::guidance::purge_command(&args), ui)?;
+        let purged = crate::commands::trash::run(TrashCommand::Purge(args), ui);
+        if clean.is_some() {
+            // Declining purge also cancels the clean chosen in the same action.
             purged.context("the clean was not run either")?;
         } else {
             purged?;
         }
     }
-    if !cleaning {
-        return Ok(());
+    match clean {
+        Some(args) => run_clean(args, ui),
+        None => Ok(()),
     }
-    announce(&app.decisions().command_line(false), ui)?;
-    crate::commands::clean::run(app.clean_args(false), ui)
 }
 
-/// Show the command these decisions amount to before running it, so a reader
-/// who wants the rule rather than the judgement next time can see how to say it
-/// on a command line.
-fn announce(command: &str, ui: Ui) -> Result<()> {
-    crate::output::stdoutln!("{}", ui.prose(command))
+fn run_clean(args: CleanArgs, ui: Ui) -> Result<()> {
+    announce(crate::commands::guidance::clean_command(&args), ui)?;
+    crate::commands::clean::run(args, ui)
+}
+
+fn announce(command: Option<String>, ui: Ui) -> Result<()> {
+    match command {
+        Some(command) => crate::output::stdoutln!("{command}"),
+        None => crate::output::stdoutln!(
+            "{}",
+            ui.prose("Equivalent command unavailable: an argument cannot be represented safely as shell text.")
+        ),
+    }
 }
 
 fn browse(app: &mut App) -> Result<Outcome> {
@@ -110,10 +135,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
     }
 }
 
-/// A preview leaves the reader at a shell prompt holding the plan they asked
-/// to read; reopening over it would take it away before they had read it. The
-/// prompt says what it is asking, because on its own "Proceed?" right under a
-/// plan reads as consent to run that plan.
+// Returning to the TUI needs separate wording from confirming the displayed plan.
 fn resume(ui: Ui) -> Result<bool> {
     crate::output::stdoutln!(
         "{}",

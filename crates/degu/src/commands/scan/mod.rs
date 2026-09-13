@@ -9,7 +9,7 @@ use crate::cli::ScanArgs;
 use crate::collection::{CollectionRequest, ScanCompleteness, collect_profiled};
 use crate::commands::scope::ScanScope;
 use crate::configuration::{deadline_from_budget, load_config, resolve_max_concurrency};
-use crate::findings::{FilteredFinding, PreparedFindingFilter};
+use crate::findings::{FilteredFinding, Filters, PreparedFindingFilter};
 use crate::runtime::Ui;
 use crate::selection::SourceSelection;
 use anyhow::Result;
@@ -28,6 +28,7 @@ pub(super) struct ScanReport {
     /// JSON schema is frozen).
     pub(super) incomplete_regions: IncompleteRegions,
     pub(super) has_effective_project_roots: bool,
+    pub(super) project_roots: Vec<std::path::PathBuf>,
     pub(super) json: bool,
     pub(super) details: bool,
     pub(super) summary: bool,
@@ -81,14 +82,22 @@ impl ScanRequest {
     }
 }
 
-/// Run the same collection `scan` runs and hand back its findings, so an
-/// interactive review shows exactly what the printed report would have shown.
-pub(crate) fn collect_for_review(args: ScanArgs, ui: Ui) -> Result<crate::tui::ScanReport> {
+pub(crate) fn collect_for_review(
+    args: ScanArgs,
+    ui: Ui,
+) -> Result<(crate::tui::ScanReport, Filters)> {
     let report = prepare(ScanRequest::new(args, ui))?;
-    Ok(crate::tui::ScanReport::new(
-        report.findings,
-        report.runtime_findings,
-        report.completeness,
+    let filters = Filters {
+        roots: report.project_roots,
+        ..report.scope.clean_scope().filters
+    };
+    Ok((
+        crate::tui::ScanReport::new(
+            report.findings,
+            report.runtime_findings,
+            report.completeness,
+        ),
+        filters,
     ))
 }
 
@@ -110,6 +119,15 @@ fn prepare(request: ScanRequest) -> Result<ScanReport> {
         request.scope.has_explicit_roots() || !config.roots.is_empty();
     let sources =
         SourceSelection::from_only(request.scope.only_ids(), runtime_enabled, &config.disable)?;
+    let project_roots = if sources.includes_project_sources() {
+        crate::collection::requested_roots(
+            &ctx,
+            crate::collection::ProjectRoots::ReadOnlyDiscovery(request.scope.roots().to_vec()),
+            &config,
+        )
+    } else {
+        Vec::new()
+    };
     let collection_request = CollectionRequest::scan(
         request.scope.roots().to_vec(),
         sources,
@@ -142,6 +160,7 @@ fn prepare(request: ScanRequest) -> Result<ScanReport> {
         completeness,
         incomplete_regions,
         has_effective_project_roots,
+        project_roots,
         json: request.run.json,
         details: request.details,
         summary: request.summary,

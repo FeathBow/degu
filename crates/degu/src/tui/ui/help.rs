@@ -27,7 +27,7 @@ q, Ctrl-C/D   Quit
 Compact status: + Ready to clean; ? Needs review; · Not managed
 Row marks: ✓ in the plan; ○ out of it; blank degu will not act on it
 Ready to clean findings start in the plan; Needs review findings start out.
-Staged entries start out of the purge; nothing is destroyed unless you choose it.
+Staged entries start unchosen. A confirmed clean also runs its expiry plan.
 Runtime findings are Not managed and never join cache totals.
 Nothing moves until you leave this screen and confirm the plan degu prints.";
 
@@ -61,8 +61,6 @@ pub fn draw(frame: &mut Frame, area: Rect) {
 }
 
 pub fn footer(frame: &mut Frame, area: Rect, app: &App) {
-    // A key the footer names must be a key that acts, and `c` does nothing
-    // when the reader has taken everything out of both plans.
     let decided = app.has_work();
     let mut keys: Vec<(&str, &str)> = match app.view() {
         View::Help => vec![("Esc", "back"), ("q", "quit")],

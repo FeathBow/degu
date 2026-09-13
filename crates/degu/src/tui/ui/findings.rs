@@ -1,7 +1,6 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
-use crate::tui::decision::Choice;
 use crate::tui::escape;
 use crate::tui::report::{Class, Finding, Section};
 
@@ -128,12 +127,10 @@ fn finding_row(item: (&Finding, usize), columns: &Columns, app: &App) -> Row<'st
         symbol(class)
     };
     let selected = position == app.browser().selected();
-    // The cursor marks where you are; the mark beside it answers one question
-    // only — whether this finding is in the plan the interface will run.
-    let mark = match app.choice(finding) {
-        Choice::Offered { taken: true } => "✓",
-        Choice::Offered { taken: false } => "○",
-        Choice::Withheld => " ",
+    let mark = match (class, app.decisions().is_chosen(finding)) {
+        (Class::NotManaged, _) => " ",
+        (_, true) => "✓",
+        (_, false) => "○",
     };
     let mut cells = vec![
         Cell::from(if selected { "▸" } else { " " }).style(Style::new().fg(ACCENT)),
@@ -176,9 +173,7 @@ fn empty_message(app: &App) -> &'static str {
     let browser = app.browser();
     if !browser.coverage().is_requested() {
         return match browser.section() {
-            Section::Runtime => {
-                "Runtime was not scanned.\nCreate a report with degu scan --runtime --json."
-            }
+            Section::Runtime => "Runtime was not scanned.\nRun degu tui --runtime to include it.",
             Section::Cache => "Cache was not scanned in this report.",
         };
     }

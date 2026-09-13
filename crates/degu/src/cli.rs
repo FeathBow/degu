@@ -394,15 +394,21 @@ pub(crate) enum TrashCommand {
         #[command(flatten)]
         output: JsonArgs,
     },
-    /// Permanently remove trash entries; every entry unless --path selects some
-    Purge {
-        #[command(flatten)]
-        output: JsonArgs,
-        /// Proceed without prompting
-        #[arg(long)]
-        yes: bool,
-        /// Keep only entries staged from at or under this path; repeatable
-        #[arg(long)]
-        path: Vec<PathBuf>,
-    },
+    /// Permanently remove trash entries; all entries unless a selector is given
+    Purge(TrashPurgeArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct TrashPurgeArgs {
+    #[command(flatten)]
+    pub(crate) output: JsonArgs,
+    /// Proceed without prompting
+    #[arg(long)]
+    pub(crate) yes: bool,
+    /// Keep only entries staged from at or under this original path; repeatable
+    #[arg(long, conflicts_with = "entry")]
+    pub(crate) path: Vec<PathBuf>,
+    /// Select the exact managed trash entry shown by trash list; repeatable
+    #[arg(long, conflicts_with = "path")]
+    pub(crate) entry: Vec<PathBuf>,
 }

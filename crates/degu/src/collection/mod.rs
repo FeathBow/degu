@@ -17,6 +17,7 @@ use std::time::Instant;
 pub(crate) use adapters::validate_clean_plan_disablement;
 use metrics::{elapsed_ms, max_rss_bytes};
 use progress::{ScanIndicator, ScanRootProgress};
+pub(crate) use roots::requested_roots;
 pub(crate) use section::{CollectionSection, ScanStatus};
 
 pub(crate) struct CollectionRequest {

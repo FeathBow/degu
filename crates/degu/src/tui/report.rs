@@ -50,7 +50,6 @@ impl Total {
     }
 }
 
-/// The findings of one scan, split the way the printed report splits them.
 pub struct ScanReport {
     pub findings: Vec<Finding>,
     pub runtime: Vec<Finding>,

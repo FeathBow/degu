@@ -139,9 +139,9 @@ fn preview_lines(source: &[Line<'static>], summary: &str, width: u16) -> Vec<Lin
 }
 
 fn preview(finding: &Finding, section: Section) -> Vec<Line<'static>> {
+    let class = Class::of(finding, section);
     let mut lines = vec![
-        Line::from(Class::of(finding, section).label())
-            .style(class_style(Class::of(finding, section))),
+        Line::from(class.label()).style(class_style(class)),
         Line::from(escape::text(&finding.path().to_string_lossy())).bold(),
     ];
     if finding.skipped() > 0 {
@@ -154,8 +154,6 @@ fn preview(finding: &Finding, section: Section) -> Vec<Line<'static>> {
             .fg(CAUTION),
         );
     }
-    // A reason is present exactly when the disposition is not Eligible; the
-    // rationale carries the explanation otherwise.
     let reason = finding
         .disposition()
         .reason
@@ -218,8 +216,6 @@ fn heading(label: &'static str) -> Line<'static> {
 
 fn sizes(finding: &Finding) -> String {
     let floor = if finding.skipped() > 0 { "≥" } else { "" };
-    // Allocated blocks are what a quota charges; the CLI reports no apparent
-    // size and neither does this.
     format!(
         "Allocated {floor}{} · Inodes {}",
         format::bytes(finding.bytes_allocated()),
@@ -239,7 +235,6 @@ fn other_measurements(finding: &Finding) -> String {
 }
 
 fn metadata(finding: &Finding) -> Vec<String> {
-    // The same rows `--details` prints, in the same order.
     [
         ("Source", finding.ecosystem()),
         ("Kind", crate::findings::table::kind_label(finding.kind())),

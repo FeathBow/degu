@@ -48,7 +48,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.view() {
         View::Browser => browser(frame, rows[1], app),
         View::Staged => {
-            app.resize_staged(staged::page_size(rows[1]));
+            app.resize_staged(staged::page_size(rows[1], app));
             staged::draw(frame, rows[1], app);
         }
         View::Details => app.document().draw(frame, rows[1], true),

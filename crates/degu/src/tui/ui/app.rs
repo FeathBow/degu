@@ -1,7 +1,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::tui::browser::{Browser, SortBy};
-use crate::tui::decision::{Choice, Decisions};
+use crate::tui::decision::Decisions;
 use crate::tui::report::{ScanReport, Section};
 use crate::tui::staged::Staged;
 
@@ -16,9 +16,6 @@ pub enum Focus {
     Findings,
 }
 
-/// Why the interface stopped. Anything that acts happens after the screen is
-/// restored, so its output lands in the scrollback exactly as the command's own
-/// output would.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Quit,
@@ -39,7 +36,6 @@ pub struct App {
     decisions: Decisions,
     staged: Staged,
     home: std::path::PathBuf,
-    limits: crate::cli::ScanLimitArgs,
     view: View,
     focus: Focus,
     page_size: usize,
@@ -52,15 +48,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(
-        report: ScanReport,
-        staged: Staged,
-        home: std::path::PathBuf,
-        limits: crate::cli::ScanLimitArgs,
-    ) -> Self {
+    pub fn new(report: ScanReport, staged: Staged, home: std::path::PathBuf) -> Self {
         let decisions = Decisions::new(report.section(Section::Cache));
         let browser = Browser::new(report);
-        let document = Derived::new(document_key(&browser), || document(&browser));
+        let document = Derived::new(browser.selection(), || document(&browser));
         let metric_width = Derived::new(metric_key(&browser), || metric_width(&browser));
         let allocation = Derived::new(browser.section(), || allocation::segments(&browser));
         Self {
@@ -68,7 +59,6 @@ impl App {
             decisions,
             staged,
             home,
-            limits,
             view: View::Browser,
             focus: Focus::Findings,
             page_size: 1,
@@ -84,7 +74,7 @@ impl App {
     fn refresh(&mut self) {
         let browser = &self.browser;
         self.document
-            .refresh(document_key(browser), || document(browser));
+            .refresh(browser.selection(), || document(browser));
         self.metric_width
             .refresh(metric_key(browser), || metric_width(browser));
         self.allocation
@@ -101,18 +91,6 @@ impl App {
 
     pub fn home(&self) -> &std::path::Path {
         &self.home
-    }
-
-    pub fn choice(&self, finding: &degu_core::finding::Finding) -> Choice {
-        Choice::of(
-            finding,
-            self.browser.section(),
-            self.decisions.is_chosen(finding),
-        )
-    }
-
-    pub fn clean_args(&self, dry_run: bool) -> crate::cli::CleanArgs {
-        self.decisions.clean_args(self.limits, dry_run)
     }
 
     pub fn browser(&self) -> &Browser {
@@ -242,8 +220,8 @@ impl App {
             KeyCode::Char('p') => return Some(Outcome::Preview),
             KeyCode::Char('c') if self.has_work() => return Some(Outcome::Clean),
             KeyCode::Char(' ') => {
-                if let Some(finding) = self.browser.selected_finding().cloned() {
-                    self.decisions.toggle(&finding, self.browser.section());
+                if let Some(finding) = self.browser.selected_finding() {
+                    self.decisions.toggle(finding, self.browser.section());
                 }
             }
             KeyCode::Char('1') => self.focus = Focus::Groups,
@@ -253,9 +231,6 @@ impl App {
         None
     }
 
-    /// The staged trash is its own screen rather than a third section of the
-    /// browser: its rows are entries already moved, not findings, and none of
-    /// the browser's grouping or sorting means anything for them.
     fn review_staged(&mut self, code: KeyCode) -> Option<Outcome> {
         if let Some(delta) = movement(code, self.staged_page_size) {
             self.staged.move_by(delta);
@@ -272,8 +247,6 @@ impl App {
         None
     }
 
-    /// Whether `c` would do anything. It runs both halves, so either one being
-    /// non-empty is enough.
     pub fn has_work(&self) -> bool {
         !self.decisions.is_empty() || !self.staged.nothing_chosen()
     }
@@ -299,11 +272,6 @@ fn document(browser: &Browser) -> Document {
         .unwrap_or_default()
 }
 
-fn document_key(browser: &Browser) -> Option<(Section, usize)> {
-    browser.selection()
-}
-
-// Sized from every finding currently listed.
 fn metric_key(browser: &Browser) -> (Section, SortBy, usize) {
     (
         browser.section(),

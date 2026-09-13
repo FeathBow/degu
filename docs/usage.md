@@ -112,6 +112,8 @@ degu trash purge
 degu trash purge --path ~/.cache/huggingface
 ```
 
+To select one particular staged copy, use `--entry` with its trash path from `degu trash list`. It is repeatable, matches the exact entry rather than its original location, and cannot be combined with `--path`. If a selected entry is no longer available, the command refuses the selected plan. Interrupted purge claims remain part of the full-purge workflow.
+
 A sealed purge interrupted after its durable WAL claim is different: startup marks it `RecoveryRequired`; it does not become a legacy claim that `trash purge` may guess or retry.
 
 For immediate permanent deletion, use `degu clean --purge`. Successfully purged entries cannot be restored. The [staging, undo, and purge policy](safety.md#staging-undo-and-purge) defines the confirmations and fixed-plan guarantees for both purge commands.
@@ -126,9 +128,9 @@ degu tui
 
 This runs the same scan, shows its findings alongside the current staging trash, and lets you decide per location. Space puts a finding in the clean plan or takes it out; **Ready to clean** findings start in it and **Needs review** findings start out, so including one is still an explicit act for one location at a time. **Not managed** findings cannot be put in from here, exactly as they cannot from the command line. `t` shows the staging trash, where space chooses entries for permanent deletion; nothing there is chosen for you. `c` runs what you decided.
 
-It executes nothing itself. What it produces is the same argument set you could have typed, handed to `degu trash purge` and `degu clean`, so there is one deletion path rather than two. Permanent deletion runs first, because a clean stages new entries under the same origins and a selector naming one of those would otherwise reach the copy you had just made. Each half prints its own plan and takes its own confirmation, including typing the word for irreversible removal, and refusing the permanent deletion cancels the clean with it. The equivalent command line is printed before each — not to be typed, but so that the next time the decision is a rule rather than a judgement, you already know how to say it.
+The interface passes its choices to `degu trash purge` and `degu clean`. Clean requests preserve the scan's filters, project roots, and limits, and explicitly name every chosen finding, including the initial Ready to clean selection. Staged choices use `--entry`, so copies from the same original location can be selected independently. Permanent deletion runs first. Each half prints its own plan and takes its own confirmation, including typing the word for irreversible removal; refusing permanent deletion cancels the clean with it. The equivalent command line is printed before each, with quoted paths and the same arguments.
 
-Because there is no background timer, a confirmed clean also permanently removes staged entries older than the [seven-day retention](safety.md#staging-undo-and-purge). The staged screen counts those apart from what you chose, so the two are never read as one number.
+Because there is no background timer, a confirmed clean also runs the [seven-day expiry plan](safety.md#staging-undo-and-purge). The staged screen uses that plan to distinguish expiry candidates from explicitly chosen entries and entries outside both plans. Unsupported purge entries remain staged; displayed plan sizes do not promise an equal reduction in quota. If every clean finding is unselected, `p` reports an empty selection and `c` runs only any explicitly chosen trash purge, without automatic expiry.
 
 `degu tui` requires an interactive terminal on both stdin and stdout, and refuses before taking the screen. Use `degu scan` for output that survives a pipe or a log.
 

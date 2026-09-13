@@ -57,7 +57,11 @@ fn ensure_project_root_allowed(
     Ok(())
 }
 
-fn requested_roots(ctx: &DetectCtx, requested: ProjectRoots, config: &Config) -> Vec<PathBuf> {
+pub(crate) fn requested_roots(
+    ctx: &DetectCtx,
+    requested: ProjectRoots,
+    config: &Config,
+) -> Vec<PathBuf> {
     match requested {
         ProjectRoots::ReadOnlyDiscovery(cli_roots) => {
             let mut roots = config

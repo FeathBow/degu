@@ -50,6 +50,11 @@ pub fn count(value: u64) -> String {
     out
 }
 
+pub fn locations(count: usize) -> String {
+    let suffix = if count == 1 { "" } else { "s" };
+    format!("{count} location{suffix}")
+}
+
 pub fn bytes_total(total: Total) -> String {
     bound(bytes(total.value), total.saturated)
 }

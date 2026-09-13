@@ -372,6 +372,7 @@ mod tests {
             completeness: ScanCompleteness { findings, runtime },
             incomplete_regions: IncompleteRegions::default(),
             has_effective_project_roots: false,
+            project_roots: Vec::new(),
             json: false,
             details: false,
             summary: false,

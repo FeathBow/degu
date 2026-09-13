@@ -1,10 +1,11 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
+use crate::tui::decision::Plan;
 use crate::tui::escape;
 use crate::tui::staged::Entry;
 
-use super::text::elide;
+use super::text::{elide, wrapped};
 use super::theme::{CAUTION, EDGE, ROSE, SECONDARY, panel};
 use super::{App, format, window_start};
 
@@ -13,59 +14,86 @@ const CURSOR_WIDTH: usize = 1;
 const MARK_WIDTH: usize = 1;
 const AGE_WIDTH: usize = 9;
 const SIZE_WIDTH: usize = 10;
-const NOTICE_HEIGHT: u16 = 4;
+const MIN_LIST_HEIGHT: u16 = 3;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
-    let rows =
-        Layout::vertical([Constraint::Length(NOTICE_HEIGHT), Constraint::Min(3)]).split(area);
-    notice(frame, rows[0], app);
-    listing(frame, rows[1], app);
+    let lines = notice_lines(app);
+    let (notice, list) = areas(area, &lines);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), notice);
+    listing(frame, list, app);
 }
 
-pub fn page_size(area: Rect) -> usize {
-    usize::from(area.height)
-        .saturating_sub(usize::from(NOTICE_HEIGHT))
-        .saturating_sub(TABLE_OVERHEAD)
+pub fn page_size(area: Rect, app: &App) -> usize {
+    let (_, list) = areas(area, &notice_lines(app));
+    usize::from(list.height).saturating_sub(TABLE_OVERHEAD)
 }
 
-/// Staging is why a clean does not free quota, and expiry is why some of it
-/// goes without being chosen. Both belong on screen before any choice is made,
-/// and the two totals stay apart so neither is read as the other.
-fn notice(frame: &mut Frame, area: Rect, app: &App) {
+fn areas(area: Rect, lines: &[Line<'_>]) -> (Rect, Rect) {
+    let height = lines
+        .iter()
+        .map(|line| wrapped(&line.to_string(), usize::from(area.width)).len())
+        .sum::<usize>();
+    let height = u16::try_from(height).unwrap_or(u16::MAX);
+    let rows = Layout::vertical([Constraint::Length(height), Constraint::Min(MIN_LIST_HEIGHT)])
+        .split(area);
+    (rows[0], rows[1])
+}
+
+fn notice_lines(app: &App) -> Vec<Line<'static>> {
     let staged = app.staged();
     let total = staged.total_plan();
     let chosen = staged.chosen_plan();
-    let expiring = staged.expiring_plan();
+    let cleaning = !app.decisions().is_empty();
+    let expiring = staged.expiring_plan(cleaning);
     let mut lines = vec![
         Line::from(format!(
-            "Staged: {} · {}. This still counts against quota until it is permanently deleted.",
-            locations(total.locations),
+            "Staged: {} · {}. Staged data still counts against quota.",
+            format::locations(total.locations),
             format::bytes(total.bytes)
         ))
         .fg(SECONDARY),
     ];
     if chosen.locations > 0 {
-        lines.push(
-            Line::from(format!(
-                "Chosen for permanent deletion: {} · {}.",
-                locations(chosen.locations),
-                format::bytes(chosen.bytes)
-            ))
-            .fg(ROSE),
-        );
+        lines.push(plan_line("Chosen for permanent deletion", chosen).fg(ROSE));
     }
     if expiring.locations > 0 {
+        lines.push(plan_line("Also in this clean's expiry plan", expiring).fg(CAUTION));
+    } else if !cleaning && staged.expiring_plan(true).locations > 0 {
+        lines.push(Line::from("No clean selected; automatic expiry will not run.").fg(SECONDARY));
+    }
+    if chosen.locations > 0 || expiring.locations > 0 || cleaning {
+        lines.push(outcome_line(app));
+    }
+    if chosen.locations > 0 || expiring.locations > 0 {
         lines.push(
-            Line::from(format!(
-                "A confirmed clean also removes {} · {} already past {} days, chosen or not.",
-                locations(expiring.locations),
-                format::bytes(expiring.bytes),
-                crate::lifecycle::TRASH_RETENTION_DAYS
-            ))
-            .fg(CAUTION),
+            Line::from(
+                "Unsupported purge entries stay staged. The CLI rechecks and confirms each plan.",
+            )
+            .fg(SECONDARY),
         );
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    lines
+}
+
+fn outcome_line(app: &App) -> Line<'static> {
+    let clean = app.decisions().plan();
+    let remaining = app.staged().remaining_plan(clean.locations > 0);
+    Line::from(format!(
+        "Outside both purge plans: {} · {}. This clean would stage {} · {}.",
+        format::locations(remaining.locations),
+        format::bytes(remaining.bytes),
+        format::locations(clean.locations),
+        format::bytes(clean.bytes)
+    ))
+    .fg(SECONDARY)
+}
+
+fn plan_line(label: &str, plan: Plan) -> Line<'static> {
+    Line::from(format!(
+        "{label}: {} · {}.",
+        format::locations(plan.locations),
+        format::bytes(plan.bytes)
+    ))
 }
 
 fn listing(frame: &mut Frame, area: Rect, app: &App) {
@@ -80,7 +108,7 @@ fn listing(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let inner = panel("").inner(area);
-    let page_size = usize::from(inner.height).saturating_sub(2);
+    let page_size = usize::from(area.height).saturating_sub(TABLE_OVERHEAD);
     let path_width = usize::from(inner.width)
         .saturating_sub(CURSOR_WIDTH + MARK_WIDTH + AGE_WIDTH + SIZE_WIDTH + TABLE_OVERHEAD)
         .max(1);
@@ -91,7 +119,7 @@ fn listing(frame: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .skip(first)
         .take(page_size)
-        .map(|(position, entry)| row(entry, position, path_width, app))
+        .map(|(position, entry)| row((entry, position), path_width, app))
         .collect::<Vec<_>>();
     let position = format!(" {}/{} ", staged.cursor() + 1, staged.entries().len());
     frame.render_widget(
@@ -109,7 +137,7 @@ fn listing(frame: &mut Frame, area: Rect, app: &App) {
             Row::new(vec![
                 Cell::from(""),
                 Cell::from(""),
-                Cell::from("STAGED FROM"),
+                Cell::from("ENTRY · STAGED FROM"),
                 Cell::from(Line::from("IDLE").right_aligned()),
                 Cell::from(Line::from("ON DISK").right_aligned()),
             ])
@@ -122,7 +150,8 @@ fn listing(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn row(entry: &Entry, position: usize, path_width: usize, app: &App) -> Row<'static> {
+fn row(item: (&Entry, usize), path_width: usize, app: &App) -> Row<'static> {
+    let (entry, position) = item;
     let staged = app.staged();
     let chosen = staged.is_chosen(entry);
     let mark = if chosen {
@@ -154,11 +183,13 @@ fn row(entry: &Entry, position: usize, path_width: usize, app: &App) -> Row<'sta
         .style(Style::new().fg(super::theme::ACCENT)),
         Cell::from(mark),
         Cell::from(elide(&escape::text(&entry.label(app.home())), path_width)),
-        Cell::from(Line::from(days(entry.age_days)).right_aligned()).style(if entry.expiring {
-            Style::new().fg(CAUTION)
-        } else {
-            Style::new().fg(SECONDARY)
-        }),
+        Cell::from(Line::from(days(entry.age_days)).right_aligned()).style(
+            if entry.expiring && !app.decisions().is_empty() {
+                Style::new().fg(CAUTION)
+            } else {
+                Style::new().fg(SECONDARY)
+            },
+        ),
         Cell::from(Line::from(size).right_aligned()),
     ])
     .style(style)
@@ -169,13 +200,5 @@ fn days(age: u64) -> String {
         0 => "today".to_owned(),
         1 => "1 day".to_owned(),
         other => format!("{other} days"),
-    }
-}
-
-fn locations(count: usize) -> String {
-    if count == 1 {
-        format!("{count} location")
-    } else {
-        format!("{count} locations")
     }
 }

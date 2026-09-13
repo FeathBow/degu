@@ -6,6 +6,7 @@ use std::path::Path;
 mod output;
 mod render;
 pub(crate) use output::print;
+pub(crate) use render::{clean_command, purge_command};
 
 pub(crate) const UNSAFE_PATH_REASON: &str =
     "Preview unavailable: this path cannot be represented safely as a shell command.";

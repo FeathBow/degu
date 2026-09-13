@@ -47,7 +47,7 @@ pub(crate) fn run(args: ScanArgs, ui: Ui) -> Result<()> {
 /// originals, and a purge selector naming one of those would then destroy the
 /// copy the reader had just made rather than the one they chose.
 fn execute(app: &App, ui: Ui) -> Result<()> {
-    let purging = app.purge_paths();
+    let purging = app.staged().purge_paths();
     let cleaning = !app.decisions().is_empty();
     if !purging.is_empty() {
         announce(&app.staged().command_line(), ui)?;

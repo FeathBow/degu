@@ -103,14 +103,6 @@ impl App {
         &self.home
     }
 
-    /// The permanent removal the current choices describe, as the arguments a
-    /// person could have typed. Empty means nothing was chosen and no purge
-    /// runs at all.
-    pub fn purge_paths(&self) -> Vec<std::path::PathBuf> {
-        self.staged.purge_paths()
-    }
-
-    /// The choice the reader faces for one finding, or has already made.
     pub fn choice(&self, finding: &degu_core::finding::Finding) -> Choice {
         Choice::of(
             finding,
@@ -119,8 +111,6 @@ impl App {
         )
     }
 
-    /// The clean the current decisions describe, ready for preview or
-    /// execution by the ordinary command implementation.
     pub fn clean_args(&self, dry_run: bool) -> crate::cli::CleanArgs {
         self.decisions.clean_args(self.limits, dry_run)
     }

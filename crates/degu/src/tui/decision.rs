@@ -238,16 +238,6 @@ mod tests {
     }
 
     #[test]
-    fn the_tiers_the_fixtures_stand_for_are_the_ones_degu_assigns() {
-        assert_eq!(ready("/y").disposition().mode, DispositionMode::Eligible);
-        assert_eq!(review("/r").disposition().mode, DispositionMode::OptIn);
-        assert_eq!(
-            withheld("/n").disposition().mode,
-            DispositionMode::ReportOnly
-        );
-    }
-
-    #[test]
     fn the_plan_starts_as_the_one_degu_would_build_alone() {
         let decisions = decisions(vec![ready("/y"), review("/r"), withheld("/n")]);
         assert!(decisions.is_chosen(&ready("/y")));

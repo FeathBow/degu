@@ -4,7 +4,7 @@
 
 mod filter;
 mod filters;
-mod table;
+pub(crate) mod table;
 
 pub(crate) use filter::*;
 pub(crate) use filters::*;

@@ -1,8 +1,8 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::browser::{Browser, SortBy};
-use crate::escape;
-use crate::report::{ScanReport, Section};
+use crate::tui::browser::{Browser, SortBy};
+use crate::tui::escape;
+use crate::tui::report::{ScanReport, Section};
 
 use super::allocation::{self, Segment};
 use super::derived::Derived;

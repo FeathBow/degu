@@ -168,6 +168,8 @@ pub(crate) enum Command {
     /// Report known cache sources and, when project roots are available, build artifacts (read-only)
     #[command(after_help = SCAN_EXAMPLES)]
     Scan(ScanArgs),
+    /// Review findings interactively and clean what you choose
+    Tui(ScanArgs),
     /// Check whether required account setup is ready (read-only)
     #[command(after_help = DOCTOR_EXAMPLES)]
     Doctor {

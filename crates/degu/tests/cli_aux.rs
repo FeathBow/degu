@@ -2,6 +2,7 @@ use assert_cmd::Command;
 
 const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[
     &["scan"],
+    &["tui"],
     &["doctor"],
     &["init"],
     &["quota"],
@@ -226,7 +227,7 @@ fn assert_completion_order(shell: &str) {
     if shell == "bash" {
         assert!(output.contains("complete -F") || output.contains("_degu"));
         assert!(output.contains(
-            "scan doctor init quota clean undo trash reclaim relocate admin ops adapters completions man help"
+            "scan tui doctor init quota clean undo trash reclaim relocate admin ops adapters completions man help"
         ));
         assert!(!output.contains("degu,usage)"));
         return;

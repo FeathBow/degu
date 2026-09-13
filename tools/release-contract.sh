@@ -8,6 +8,7 @@ degu-admin.1
 degu-admin-setup.1
 degu-quota.1
 degu-scan.1
+degu-tui.1
 degu-clean.1
 degu-undo.1
 degu-trash.1

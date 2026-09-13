@@ -1,5 +1,5 @@
-use crate::browser::SortBy;
-use crate::report::{Coverage, Finding, Total};
+use crate::tui::browser::SortBy;
+use crate::tui::report::{Coverage, Finding, Total};
 
 const UNIT_BASE: u64 = 1024;
 const DECIMAL_BASE: f64 = 10.0;
@@ -67,18 +67,20 @@ fn bound(value: String, saturated: bool) -> String {
 }
 
 pub fn coverage_label(coverage: Coverage) -> &'static str {
-    match coverage {
-        Coverage::Complete => "Complete scan",
-        Coverage::NotRequested => "Not scanned",
-        Coverage::Truncated => "truncated",
-        Coverage::Incomplete => "incomplete",
-        Coverage::Unknown => "completeness unknown",
+    if !coverage.is_requested() {
+        "Not scanned"
+    } else if coverage.is_truncated() {
+        "truncated"
+    } else if coverage.is_incomplete() {
+        "incomplete"
+    } else {
+        "Complete scan"
     }
 }
 
 pub fn coverage_warning(coverage: Coverage) -> Option<String> {
     coverage
-        .is_floor()
+        .is_lower_bound()
         .then(|| format!("{} — totals are a floor", coverage_label(coverage)))
 }
 
@@ -92,9 +94,9 @@ pub fn metric_heading(sort: SortBy) -> &'static str {
 
 pub fn metric(finding: &Finding, sort: SortBy) -> String {
     match sort {
-        SortBy::Size | SortBy::Path => bytes(finding.bytes_allocated),
-        SortBy::Inodes => count(finding.inodes),
-        SortBy::Age => age(finding.age_days),
+        SortBy::Size | SortBy::Path => bytes(finding.bytes_allocated()),
+        SortBy::Inodes => count(finding.inodes()),
+        SortBy::Age => age(finding.age_days()),
     }
 }
 

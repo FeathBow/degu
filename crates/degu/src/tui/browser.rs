@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::report::{Class, Coverage, Finding, ScanReport, Section, Total};
+use crate::tui::report::{Class, Coverage, Finding, ScanReport, Section, Total};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SortBy {
@@ -33,18 +33,18 @@ impl SortBy {
 
     fn compare(self, left: &Finding, right: &Finding) -> Ordering {
         match self {
-            Self::Size => right.bytes_allocated.cmp(&left.bytes_allocated),
-            Self::Inodes => right.inodes.cmp(&left.inodes),
+            Self::Size => right.bytes_allocated().cmp(&left.bytes_allocated()),
+            Self::Inodes => right.inodes().cmp(&left.inodes()),
             // Unknown ages follow every measured age.
-            Self::Age => match (left.age_days, right.age_days) {
+            Self::Age => match (left.age_days(), right.age_days()) {
                 (Some(left), Some(right)) => right.cmp(&left),
                 (Some(_), None) => Ordering::Less,
                 (None, Some(_)) => Ordering::Greater,
                 (None, None) => Ordering::Equal,
             },
-            Self::Path => left.path.cmp(&right.path),
+            Self::Path => left.path().cmp(right.path()),
         }
-        .then_with(|| left.path.cmp(&right.path))
+        .then_with(|| left.path().cmp(right.path()))
     }
 }
 
@@ -74,12 +74,12 @@ impl GroupBy {
 
     fn key(self, finding: &Finding, section: Section) -> (&str, Option<Class>) {
         match self {
-            Self::Ecosystem => (&finding.ecosystem, None),
+            Self::Ecosystem => (finding.ecosystem(), None),
             Self::Class => {
                 let class = Class::of(finding, section);
                 (class.label(), Some(class))
             }
-            Self::Kind => (&finding.kind, None),
+            Self::Kind => (crate::findings::table::kind_label(finding.kind()), None),
         }
     }
 }
@@ -95,7 +95,7 @@ pub struct Group {
 
 impl Group {
     pub fn label(&self) -> String {
-        crate::escape::text(&self.name)
+        crate::tui::escape::text(&self.name)
     }
 }
 
@@ -108,7 +108,8 @@ fn group(findings: &[Finding], section: Section, by: GroupBy) -> Vec<Group> {
             Some(&position) => {
                 let group = &mut groups[position];
                 group.count += 1;
-                let total = Total::of([group.allocated.value, finding.bytes_allocated].into_iter());
+                let total =
+                    Total::of([group.allocated.value, finding.bytes_allocated()].into_iter());
                 group.allocated = Total {
                     saturated: group.allocated.saturated || total.saturated,
                     ..total
@@ -121,7 +122,7 @@ fn group(findings: &[Finding], section: Section, by: GroupBy) -> Vec<Group> {
                     count: 1,
                     class,
                     allocated: Total {
-                        value: finding.bytes_allocated,
+                        value: finding.bytes_allocated(),
                         saturated: false,
                     },
                 });
@@ -181,7 +182,7 @@ impl Browser {
     }
 
     pub fn coverage_of(&self, section: Section) -> Coverage {
-        self.report.completeness.section(section)
+        self.report.coverage(section)
     }
 
     pub fn section_len(&self) -> usize {

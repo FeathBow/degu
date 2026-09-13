@@ -1,8 +1,8 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
-use crate::escape;
-use crate::report::{Class, Finding, Section};
+use crate::tui::escape;
+use crate::tui::report::{Class, Finding, Section};
 
 use super::format;
 use super::text::elide;
@@ -127,10 +127,13 @@ fn finding_row(item: (&Finding, usize), columns: &Columns, app: &App) -> Row<'st
     let selected = position == app.browser().selected();
     let mut cells = vec![
         Cell::from(if selected { "▸" } else { " " }).style(Style::new().fg(ACCENT)),
-        Cell::from(elide(&escape::text(&finding.path), columns.path)),
+        Cell::from(elide(
+            &escape::text(&finding.path().to_string_lossy()),
+            columns.path,
+        )),
     ];
     if columns.ecosystem {
-        cells.push(Cell::from(escape::text(&finding.ecosystem)));
+        cells.push(Cell::from(escape::text(finding.ecosystem())));
     }
     cells.push(Cell::from(status).style(class_style(class)));
     let metric_style = if selected {
@@ -160,7 +163,7 @@ fn symbol(class: Class) -> &'static str {
 
 fn empty_message(app: &App) -> &'static str {
     let browser = app.browser();
-    if !browser.coverage().was_requested() {
+    if !browser.coverage().is_requested() {
         return match browser.section() {
             Section::Runtime => {
                 "Runtime was not scanned.\nCreate a report with degu scan --runtime --json."

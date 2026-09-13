@@ -35,7 +35,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .split(area);
     measured(frame, columns[0], app);
-    if browser.coverage().was_requested() {
+    if browser.coverage().is_requested() {
         allocation::draw(frame, columns[2], app);
     } else {
         frame.render_widget(
@@ -51,7 +51,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
 fn measured(frame: &mut Frame, area: Rect, app: &App) {
     let browser = app.browser();
     let block = panel("measured").border_style(Style::new().fg(REVIEW));
-    if !browser.coverage().was_requested() {
+    if !browser.coverage().is_requested() {
         frame.render_widget(
             Paragraph::new("Not scanned\nNo measurements").block(block),
             area,
@@ -61,7 +61,7 @@ fn measured(frame: &mut Frame, area: Rect, app: &App) {
     let (value, unit) = format::byte_parts(browser.allocated().value);
     let bound = if browser.allocated().saturated {
         "over"
-    } else if browser.coverage().is_floor() {
+    } else if browser.coverage().is_lower_bound() {
         "≥"
     } else {
         ""
@@ -93,7 +93,7 @@ fn scope(frame: &mut Frame, area: Rect, app: &App) {
     let browser = app.browser();
     let mut lines = vec![Line::default()];
     let coverage = browser.coverage();
-    if coverage.is_floor() {
+    if coverage.is_lower_bound() {
         lines.push(Line::from(format!("! {}", coverage_label(coverage))).fg(CAUTION));
         lines.push(Line::from("totals are a floor"));
     } else {
@@ -126,17 +126,17 @@ fn compact(frame: &mut Frame, area: Rect, app: &App) {
         ]));
     }
     frame.render_widget(Paragraph::new(lines), rows[0]);
-    if browser.coverage().was_requested() {
+    if browser.coverage().is_requested() {
         allocation::selected_share(frame, rows[1], app);
     }
 }
 
 pub fn summary(app: &App, width: usize) -> Line<'static> {
     let browser = app.browser();
-    if !browser.coverage().was_requested() {
+    if !browser.coverage().is_requested() {
         return Line::from("Not scanned · no measurements in this report").fg(SECONDARY);
     }
-    let bound = if browser.coverage().is_floor() && !browser.allocated().saturated {
+    let bound = if browser.coverage().is_lower_bound() && !browser.allocated().saturated {
         "≥"
     } else {
         ""

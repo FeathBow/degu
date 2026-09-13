@@ -196,7 +196,7 @@ fn style_disposition(
     }
 }
 
-fn kind_label(kind: FindingKind) -> &'static str {
+pub(crate) fn kind_label(kind: FindingKind) -> &'static str {
     match kind {
         FindingKind::PackageCache => "package_cache",
         FindingKind::ModelCache => "model_cache",

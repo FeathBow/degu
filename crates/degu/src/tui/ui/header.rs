@@ -1,7 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use crate::report::Section;
+use crate::tui::report::Section;
 
 use super::format::coverage_warning;
 use super::overview;
@@ -57,7 +57,7 @@ fn sections(app: &App) -> Line<'static> {
         [Section::Cache, Section::Runtime]
             .into_iter()
             .map(|section| {
-                let suffix = if browser.coverage_of(section).was_requested() {
+                let suffix = if browser.coverage_of(section).is_requested() {
                     ""
                 } else {
                     " (not scanned)"

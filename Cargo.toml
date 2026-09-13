@@ -5,7 +5,6 @@ members = [
     "crates/degu-core",
     "crates/degu-adapters",
     "crates/degu",
-    "crates/degu-tui",
 ]
 
 [workspace.package]

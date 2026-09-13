@@ -81,6 +81,17 @@ impl ScanRequest {
     }
 }
 
+/// Run the same collection `scan` runs and hand back its findings, so an
+/// interactive review shows exactly what the printed report would have shown.
+pub(crate) fn collect_for_review(args: ScanArgs, ui: Ui) -> Result<crate::tui::ScanReport> {
+    let report = prepare(ScanRequest::new(args, ui))?;
+    Ok(crate::tui::ScanReport::new(
+        report.findings,
+        report.runtime_findings,
+        report.completeness,
+    ))
+}
+
 pub(crate) fn run(args: ScanArgs, ui: Ui) -> Result<()> {
     if args.details && args.summary && !args.output.json {
         anyhow::bail!("--details cannot be used with --summary unless --json is also set");

@@ -116,6 +116,22 @@ A sealed purge interrupted after its durable WAL claim is different: startup mar
 
 For immediate permanent deletion, use `degu clean --purge`. Successfully purged entries cannot be restored. The [staging, undo, and purge policy](safety.md#staging-undo-and-purge) defines the confirmations and fixed-plan guarantees for both purge commands.
 
+## Review and decide interactively
+
+The commands above express a policy. Some decisions are not a policy: on a node where the reclaimable space is model and compile caches, which model is coming back next week and which is not is a judgement about one location, and a rule cannot capture it. Writing it down means transcribing paths out of a report that has already scrolled past.
+
+```sh
+degu tui
+```
+
+This runs the same scan, shows its findings alongside the current staging trash, and lets you decide per location. Space puts a finding in the clean plan or takes it out; **Ready to clean** findings start in it and **Needs review** findings start out, so including one is still an explicit act for one location at a time. **Not managed** findings cannot be put in from here, exactly as they cannot from the command line. `t` shows the staging trash, where space chooses entries for permanent deletion; nothing there is chosen for you. `c` runs what you decided.
+
+It executes nothing itself. What it produces is the same argument set you could have typed, handed to `degu trash purge` and `degu clean`, so there is one deletion path rather than two. Permanent deletion runs first, because a clean stages new entries under the same origins and a selector naming one of those would otherwise reach the copy you had just made. Each half prints its own plan and takes its own confirmation, including typing the word for irreversible removal, and refusing the permanent deletion cancels the clean with it. The equivalent command line is printed before each — not to be typed, but so that the next time the decision is a rule rather than a judgement, you already know how to say it.
+
+Because there is no background timer, a confirmed clean also permanently removes staged entries older than the [seven-day retention](safety.md#staging-undo-and-purge). The staged screen counts those apart from what you chose, so the two are never read as one number.
+
+`degu tui` requires an interactive terminal on both stdin and stdout, and refuses before taking the screen. Use `degu scan` for output that survives a pipe or a log.
+
 ## Tool-native reclaim (advanced)
 
 Normal `clean` reports uv caches as **Not managed** because uv owns their internal cleanup rules. For exactly uv 0.12.3, degu can validate and run the tool's fixed ordinary prune while keeping both authority inputs explicit:

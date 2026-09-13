@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
-use crate::cli::ScanArgs;
+use crate::cli::{JsonArgs, ScanArgs, TrashCommand};
 use crate::runtime::Ui;
 use crate::tui::{App, Outcome};
 
@@ -18,8 +18,11 @@ pub(crate) fn run(args: ScanArgs, ui: Ui) -> Result<()> {
         );
     }
     let limits = args.limits;
+    let ctx = degu_core::ecosystem::DetectCtx::from_process()?;
+    let staged = crate::tui::Staged::new(crate::lifecycle::Lifecycle::new(&ctx).trash_entries()?);
+    let home = ctx.home.clone();
     let report = crate::commands::scan::collect_for_review(args, ui)?;
-    let mut app = App::new(report, limits);
+    let mut app = App::new(report, staged, home, limits);
 
     // Nothing executes while the alternate screen is up. Previewing returns to
     // the interface; cleaning ends it. Either way the plan and its confirmation
@@ -29,25 +32,54 @@ pub(crate) fn run(args: ScanArgs, ui: Ui) -> Result<()> {
         match browse(&mut app)? {
             Outcome::Quit => return Ok(()),
             Outcome::Preview => {
-                announce(&app, ui, true)?;
+                announce(&app.decisions().command_line(true), ui)?;
                 crate::commands::clean::run(app.clean_args(true), ui)?;
                 if !resume(ui)? {
                     return Ok(());
                 }
             }
-            Outcome::Clean => {
-                announce(&app, ui, false)?;
-                return crate::commands::clean::run(app.clean_args(false), ui);
-            }
+            Outcome::Clean => return execute(&app, ui),
         }
     }
+}
+
+/// Permanent removal runs first. A clean stages new entries under the same
+/// originals, and a purge selector naming one of those would then destroy the
+/// copy the reader had just made rather than the one they chose.
+fn execute(app: &App, ui: Ui) -> Result<()> {
+    let purging = app.purge_paths();
+    let cleaning = !app.decisions().is_empty();
+    if !purging.is_empty() {
+        announce(&app.staged().command_line(), ui)?;
+        let purged = crate::commands::trash::run(
+            TrashCommand::Purge {
+                output: JsonArgs { json: false },
+                yes: false,
+                path: purging,
+            },
+            ui,
+        );
+        if cleaning {
+            // Refusing the destructive half refuses the whole outcome: it was
+            // decided as one, and staging more on the way out would be a
+            // surprise from a keystroke the reader just declined.
+            purged.context("the clean was not run either")?;
+        } else {
+            purged?;
+        }
+    }
+    if !cleaning {
+        return Ok(());
+    }
+    announce(&app.decisions().command_line(false), ui)?;
+    crate::commands::clean::run(app.clean_args(false), ui)
 }
 
 /// Show the command these decisions amount to before running it, so a reader
 /// who wants the rule rather than the judgement next time can see how to say it
 /// on a command line.
-fn announce(app: &App, ui: Ui, dry_run: bool) -> Result<()> {
-    crate::output::stdoutln!("{}", ui.prose(&app.decisions().command_line(dry_run)))
+fn announce(command: &str, ui: Ui) -> Result<()> {
+    crate::output::stdoutln!("{}", ui.prose(command))
 }
 
 fn browse(app: &mut App) -> Result<Outcome> {

@@ -1,4 +1,5 @@
-//! Responsive, read-only views of the report's aggregated findings.
+//! Responsive views of the findings, the staging trash, and the plan the
+//! reader is building from them.
 mod allocation;
 mod app;
 mod brand;
@@ -10,6 +11,7 @@ mod groups;
 mod header;
 pub(crate) mod help;
 mod overview;
+mod staged;
 mod text;
 mod theme;
 
@@ -45,6 +47,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     header::draw(frame, rows[0], app);
     match app.view() {
         View::Browser => browser(frame, rows[1], app),
+        View::Staged => {
+            app.resize_staged(staged::page_size(rows[1]));
+            staged::draw(frame, rows[1], app);
+        }
         View::Details => app.document().draw(frame, rows[1], true),
         View::Help => help::draw(frame, rows[1]),
     }

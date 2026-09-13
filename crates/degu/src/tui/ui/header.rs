@@ -6,7 +6,7 @@ use crate::tui::report::Section;
 use super::format::coverage_warning;
 use super::overview;
 use super::text::columns;
-use super::theme::{ACCENT, CAUTION, READY, SECONDARY};
+use super::theme::{ACCENT, CAUTION, READY, ROSE, SECONDARY};
 use super::{App, View};
 
 const MASTHEAD_PREFIX: &str = "degu  / storage report";
@@ -15,10 +15,10 @@ const BROWSER_HEIGHT: u16 = 2;
 const DETAIL_HEIGHT: u16 = 4;
 
 pub fn height(app: &App) -> u16 {
-    if app.view() == View::Browser {
-        BROWSER_HEIGHT
-    } else {
+    if app.view() == View::Details {
         DETAIL_HEIGHT
+    } else {
+        BROWSER_HEIGHT
     }
 }
 
@@ -48,24 +48,28 @@ fn masthead(app: &App, width: usize) -> Line<'static> {
         Span::styled("degu", Style::new().fg(READY).bold()),
         Span::styled("  / storage report", Style::new().fg(SECONDARY)),
         Span::raw(" ".repeat(gap)),
-        Span::styled(
-            plan,
-            Style::new().fg(if app.decisions().is_empty() {
-                SECONDARY
-            } else {
-                READY
-            }),
-        ),
+        Span::styled(plan, Style::new().fg(plan_tone(app))),
     ])
 }
 
 fn plan_label(app: &App) -> String {
-    let plan = app.decisions().plan();
+    // Each screen carries its own plan: the browser decides what gets staged,
+    // the staged screen decides what gets destroyed, and showing one total on
+    // the other screen would read as a single number for both.
+    let (plan, verb) = if app.view() == View::Staged {
+        (app.staged().chosen_plan(), "To delete permanently")
+    } else {
+        (app.decisions().plan(), "In the plan")
+    };
     if plan.locations == 0 {
-        return "Nothing in the plan".to_owned();
+        return if app.view() == View::Staged {
+            "Nothing chosen for deletion".to_owned()
+        } else {
+            "Nothing in the plan".to_owned()
+        };
     }
     format!(
-        "In the plan: {} · {}",
+        "{verb}: {} · {}",
         pluralize(plan.locations, "location"),
         super::format::bytes(plan.bytes)
     )
@@ -79,7 +83,30 @@ fn pluralize(count: usize, noun: &str) -> String {
     }
 }
 
+fn plan_tone(app: &App) -> Color {
+    if app.view() == View::Staged {
+        if app.staged().nothing_chosen() {
+            SECONDARY
+        } else {
+            ROSE
+        }
+    } else if app.decisions().is_empty() {
+        SECONDARY
+    } else {
+        READY
+    }
+}
+
 fn sections(app: &App) -> Line<'static> {
+    if app.view() == View::Staged {
+        return Line::from(vec![
+            Span::styled("[staged trash]  ", Style::new().fg(ACCENT).bold()),
+            Span::styled(
+                "t or Esc returns to the findings",
+                Style::new().fg(SECONDARY),
+            ),
+        ]);
+    }
     let browser = app.browser();
     Line::from(
         [Section::Cache, Section::Runtime]

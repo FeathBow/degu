@@ -3,6 +3,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::tui::browser::{Browser, SortBy};
 use crate::tui::decision::{Choice, Decisions};
 use crate::tui::report::{ScanReport, Section};
+use crate::tui::staged::Staged;
 
 use super::allocation::{self, Segment};
 use super::derived::Derived;
@@ -28,6 +29,7 @@ pub enum Outcome {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Browser,
+    Staged,
     Details,
     Help,
 }
@@ -35,11 +37,14 @@ pub enum View {
 pub struct App {
     browser: Browser,
     decisions: Decisions,
+    staged: Staged,
+    home: std::path::PathBuf,
     limits: crate::cli::ScanLimitArgs,
     view: View,
     focus: Focus,
     page_size: usize,
     group_page_size: usize,
+    staged_page_size: usize,
     document: Derived<Document, Option<(Section, usize)>>,
     metric_width: Derived<usize, (Section, SortBy, usize)>,
     allocation: Derived<Vec<Segment>, Section>,
@@ -47,7 +52,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(report: ScanReport, limits: crate::cli::ScanLimitArgs) -> Self {
+    pub fn new(
+        report: ScanReport,
+        staged: Staged,
+        home: std::path::PathBuf,
+        limits: crate::cli::ScanLimitArgs,
+    ) -> Self {
         let decisions = Decisions::new(report.section(Section::Cache));
         let browser = Browser::new(report);
         let document = Derived::new(document_key(&browser), || document(&browser));
@@ -56,11 +66,14 @@ impl App {
         Self {
             browser,
             decisions,
+            staged,
+            home,
             limits,
             view: View::Browser,
             focus: Focus::Findings,
             page_size: 1,
             group_page_size: 1,
+            staged_page_size: 1,
             document,
             metric_width,
             allocation,
@@ -80,6 +93,21 @@ impl App {
 
     pub fn decisions(&self) -> &Decisions {
         &self.decisions
+    }
+
+    pub fn staged(&self) -> &Staged {
+        &self.staged
+    }
+
+    pub fn home(&self) -> &std::path::Path {
+        &self.home
+    }
+
+    /// The permanent removal the current choices describe, as the arguments a
+    /// person could have typed. Empty means nothing was chosen and no purge
+    /// runs at all.
+    pub fn purge_paths(&self) -> Vec<std::path::PathBuf> {
+        self.staged.purge_paths()
     }
 
     /// The choice the reader faces for one finding, or has already made.
@@ -126,6 +154,10 @@ impl App {
         self.group_page_size = groups;
     }
 
+    pub fn resize_staged(&mut self, entries: usize) {
+        self.staged_page_size = entries;
+    }
+
     pub fn handle(&mut self, key: KeyEvent) -> Option<Outcome> {
         let control_quit = key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c' | 'd'));
@@ -135,7 +167,7 @@ impl App {
         match key.code {
             KeyCode::Esc => match self.view {
                 View::Help => self.view = self.help_return,
-                View::Details => self.view = View::Browser,
+                View::Details | View::Staged => self.view = View::Browser,
                 View::Browser => {
                     if !self.browser.clear_filter() {
                         return Some(Outcome::Quit);
@@ -153,6 +185,11 @@ impl App {
             code => match self.view {
                 View::Browser => {
                     if let Some(outcome) = self.browse(code) {
+                        return Some(outcome);
+                    }
+                }
+                View::Staged => {
+                    if let Some(outcome) = self.review_staged(code) {
                         return Some(outcome);
                     }
                 }
@@ -211,8 +248,9 @@ impl App {
                     self.view = View::Details;
                 }
             }
+            KeyCode::Char('t') => self.view = View::Staged,
             KeyCode::Char('p') => return Some(Outcome::Preview),
-            KeyCode::Char('c') if !self.decisions.is_empty() => return Some(Outcome::Clean),
+            KeyCode::Char('c') if self.has_work() => return Some(Outcome::Clean),
             KeyCode::Char(' ') => {
                 if let Some(finding) = self.browser.selected_finding().cloned() {
                     self.decisions.toggle(&finding, self.browser.section());
@@ -223,6 +261,31 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    /// The staged trash is its own screen rather than a third section of the
+    /// browser: its rows are entries already moved, not findings, and none of
+    /// the browser's grouping or sorting means anything for them.
+    fn review_staged(&mut self, code: KeyCode) -> Option<Outcome> {
+        if let Some(delta) = movement(code, self.staged_page_size) {
+            self.staged.move_by(delta);
+            return None;
+        }
+        match code {
+            KeyCode::Home => self.staged.select_first(),
+            KeyCode::End => self.staged.select_last(),
+            KeyCode::Char(' ') => self.staged.toggle(),
+            KeyCode::Char('t') => self.view = View::Browser,
+            KeyCode::Char('c') if self.has_work() => return Some(Outcome::Clean),
+            _ => {}
+        }
+        None
+    }
+
+    /// Whether `c` would do anything. It runs both halves, so either one being
+    /// non-empty is enough.
+    pub fn has_work(&self) -> bool {
+        !self.decisions.is_empty() || !self.staged.nothing_chosen()
     }
 
     fn scroll(&mut self, code: KeyCode) {

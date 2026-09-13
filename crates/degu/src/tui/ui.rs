@@ -16,7 +16,7 @@ mod theme;
 use ratatui::prelude::*;
 use ratatui::widgets::Block;
 
-pub use app::{App, Focus, View};
+pub use app::{App, Focus, Outcome, View};
 
 const SIDEBAR_MIN_WIDTH: u16 = 98;
 const SIDEBAR_WIDTH: u16 = 25;

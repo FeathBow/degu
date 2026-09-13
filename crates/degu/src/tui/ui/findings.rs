@@ -1,6 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
+use crate::tui::decision::Choice;
 use crate::tui::escape;
 use crate::tui::report::{Class, Finding, Section};
 
@@ -11,6 +12,7 @@ use super::{App, Focus, window_start};
 
 const TABLE_OVERHEAD: usize = 3;
 const CURSOR_WIDTH: usize = 1;
+const MARK_WIDTH: usize = 1;
 const STATUS_WIDTH: usize = 14;
 const ECOSYSTEM_WIDTH: usize = 14;
 const FULL_STATUS_MIN_WIDTH: usize = 55;
@@ -33,7 +35,7 @@ impl Columns {
         };
         let ecosystem = inner >= ECOSYSTEM_MIN_WIDTH;
         let ecosystem_space = if ecosystem { ECOSYSTEM_WIDTH + 1 } else { 0 };
-        let fixed = CURSOR_WIDTH + status + metric + TABLE_OVERHEAD + ecosystem_space;
+        let fixed = CURSOR_WIDTH + MARK_WIDTH + status + metric + TABLE_OVERHEAD + ecosystem_space;
         Self {
             path: inner.saturating_sub(fixed).max(1),
             status,
@@ -45,6 +47,7 @@ impl Columns {
     fn widths(&self) -> Vec<Constraint> {
         let mut widths = vec![
             Constraint::Length(CURSOR_WIDTH as u16),
+            Constraint::Length(MARK_WIDTH as u16),
             Constraint::Min(self.path as u16),
         ];
         if self.ecosystem {
@@ -61,7 +64,7 @@ impl Columns {
         } else {
             ""
         };
-        let mut cells = vec![Cell::from(""), Cell::from("PATH")];
+        let mut cells = vec![Cell::from(""), Cell::from(""), Cell::from("PATH")];
         if self.ecosystem {
             cells.push(Cell::from("ECOSYSTEM"));
         }
@@ -125,8 +128,16 @@ fn finding_row(item: (&Finding, usize), columns: &Columns, app: &App) -> Row<'st
         symbol(class)
     };
     let selected = position == app.browser().selected();
+    // The cursor marks where you are; the mark beside it answers one question
+    // only — whether this finding is in the plan the interface will run.
+    let mark = match app.choice(finding) {
+        Choice::Offered { taken: true } => "✓",
+        Choice::Offered { taken: false } => "○",
+        Choice::Withheld => " ",
+    };
     let mut cells = vec![
         Cell::from(if selected { "▸" } else { " " }).style(Style::new().fg(ACCENT)),
+        Cell::from(mark).style(class_style(class)),
         Cell::from(elide(
             &escape::text(&finding.path().to_string_lossy()),
             columns.path,

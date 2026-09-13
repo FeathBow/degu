@@ -1,7 +1,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::tui::browser::{Browser, SortBy};
-use crate::tui::escape;
+use crate::tui::decision::{Choice, Decisions};
 use crate::tui::report::{ScanReport, Section};
 
 use super::allocation::{self, Segment};
@@ -15,6 +15,16 @@ pub enum Focus {
     Findings,
 }
 
+/// Why the interface stopped. Anything that acts happens after the screen is
+/// restored, so its output lands in the scrollback exactly as the command's own
+/// output would.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Quit,
+    Preview,
+    Clean,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Browser,
@@ -24,7 +34,8 @@ pub enum View {
 
 pub struct App {
     browser: Browser,
-    source: String,
+    decisions: Decisions,
+    limits: crate::cli::ScanLimitArgs,
     view: View,
     focus: Focus,
     page_size: usize,
@@ -36,14 +47,16 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(report: ScanReport, source: String) -> Self {
+    pub fn new(report: ScanReport, limits: crate::cli::ScanLimitArgs) -> Self {
+        let decisions = Decisions::new(report.section(Section::Cache));
         let browser = Browser::new(report);
         let document = Derived::new(document_key(&browser), || document(&browser));
         let metric_width = Derived::new(metric_key(&browser), || metric_width(&browser));
         let allocation = Derived::new(browser.section(), || allocation::segments(&browser));
         Self {
             browser,
-            source: escape::text(&source),
+            decisions,
+            limits,
             view: View::Browser,
             focus: Focus::Findings,
             page_size: 1,
@@ -65,12 +78,27 @@ impl App {
             .refresh(browser.section(), || allocation::segments(browser));
     }
 
-    pub fn browser(&self) -> &Browser {
-        &self.browser
+    pub fn decisions(&self) -> &Decisions {
+        &self.decisions
     }
 
-    pub fn source(&self) -> &str {
-        &self.source
+    /// The choice the reader faces for one finding, or has already made.
+    pub fn choice(&self, finding: &degu_core::finding::Finding) -> Choice {
+        Choice::of(
+            finding,
+            self.browser.section(),
+            self.decisions.is_chosen(finding),
+        )
+    }
+
+    /// The clean the current decisions describe, ready for preview or
+    /// execution by the ordinary command implementation.
+    pub fn clean_args(&self, dry_run: bool) -> crate::cli::CleanArgs {
+        self.decisions.clean_args(self.limits, dry_run)
+    }
+
+    pub fn browser(&self) -> &Browser {
+        &self.browser
     }
 
     pub fn view(&self) -> View {
@@ -98,11 +126,11 @@ impl App {
         self.group_page_size = groups;
     }
 
-    pub fn handle(&mut self, key: KeyEvent) -> bool {
+    pub fn handle(&mut self, key: KeyEvent) -> Option<Outcome> {
         let control_quit = key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c' | 'd'));
         if key.code == KeyCode::Char('q') || control_quit {
-            return true;
+            return Some(Outcome::Quit);
         }
         match key.code {
             KeyCode::Esc => match self.view {
@@ -110,7 +138,7 @@ impl App {
                 View::Details => self.view = View::Browser,
                 View::Browser => {
                     if !self.browser.clear_filter() {
-                        return true;
+                        return Some(Outcome::Quit);
                     }
                 }
             },
@@ -123,16 +151,20 @@ impl App {
                 }
             }
             code => match self.view {
-                View::Browser => self.browse(code),
+                View::Browser => {
+                    if let Some(outcome) = self.browse(code) {
+                        return Some(outcome);
+                    }
+                }
                 View::Details => self.scroll(code),
                 View::Help => {}
             },
         }
         self.refresh();
-        false
+        None
     }
 
-    fn browse(&mut self, code: KeyCode) {
+    fn browse(&mut self, code: KeyCode) -> Option<Outcome> {
         let page_size = match self.focus {
             Focus::Groups => self.group_page_size,
             Focus::Findings => self.page_size,
@@ -142,7 +174,7 @@ impl App {
                 Focus::Groups => self.browser.filter_by(delta),
                 Focus::Findings => self.browser.move_by(delta),
             }
-            return;
+            return None;
         }
         match code {
             KeyCode::Home | KeyCode::End => {
@@ -151,7 +183,7 @@ impl App {
                     let position = if last { self.browser.groups().len() } else { 0 };
                     self.browser
                         .filter_by(position as isize - self.browser.group_position() as isize);
-                    return;
+                    return None;
                 }
                 if last {
                     self.browser.select_last();
@@ -179,10 +211,18 @@ impl App {
                     self.view = View::Details;
                 }
             }
+            KeyCode::Char('p') => return Some(Outcome::Preview),
+            KeyCode::Char('c') if !self.decisions.is_empty() => return Some(Outcome::Clean),
+            KeyCode::Char(' ') => {
+                if let Some(finding) = self.browser.selected_finding().cloned() {
+                    self.decisions.toggle(&finding, self.browser.section());
+                }
+            }
             KeyCode::Char('1') => self.focus = Focus::Groups,
             KeyCode::Char('2') => self.focus = Focus::Findings,
             _ => {}
         }
+        None
     }
 
     fn scroll(&mut self, code: KeyCode) {

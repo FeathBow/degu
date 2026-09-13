@@ -101,7 +101,7 @@ fn scope(frame: &mut Frame, area: Rect, app: &App) {
     }
     lines.extend([
         Line::default(),
-        Line::from("Browsing changes no files.").fg(SECONDARY),
+        Line::from("No file moves until you confirm the plan.").fg(SECONDARY),
     ]);
     frame.render_widget(
         Paragraph::new(lines)

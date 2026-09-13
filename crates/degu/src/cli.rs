@@ -149,7 +149,7 @@ pub(crate) struct JsonArgs {
     pub(crate) json: bool,
 }
 
-#[derive(Args)]
+#[derive(Args, Clone, Copy)]
 pub(crate) struct ScanLimitArgs {
     #[arg(
         long,

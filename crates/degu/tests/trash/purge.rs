@@ -2,6 +2,7 @@ use super::support::*;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
 
 fn aged_claim_marker(state: &tempfile::TempDir) -> std::path::PathBuf {
     let claims = private_trash_root(state).join(".claims");
@@ -363,4 +364,221 @@ fn trash_purge_rejects_a_symlinked_claims_directory() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("purge claims path is not a real directory"));
+}
+
+/// Two staged origins, so a selector has something to leave behind.
+fn two_staged_origins() -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf) {
+    let (home, state, pip) = fake_pip_cache();
+    let go = crate::common::platform_cache_dir(home.path(), "go-build");
+    std::fs::create_dir_all(&go).unwrap();
+    std::fs::write(go.join("blob.bin"), vec![0u8; 4096]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+    // `--path` compares against the origin the operation log recorded, which
+    // is resolved. Take the resolved form here, while the origins still exist.
+    let pip = std::fs::canonicalize(&pip).unwrap();
+    let go = std::fs::canonicalize(&go).unwrap();
+    clean_pip_cache(&home, &state);
+    assert_eq!(
+        visible_trash_entries(&private_trash_root(&state)).len(),
+        2,
+        "both origins must stage for a selector to be meaningful"
+    );
+    (home, state, pip, go)
+}
+
+fn staged_from(state: &tempfile::TempDir, origin: &Path) -> PathBuf {
+    let name = origin.file_name().unwrap().to_string_lossy().into_owned();
+    visible_trash_entries(&private_trash_root(state))
+        .into_iter()
+        .find(|entry| entry.file_name().unwrap().to_string_lossy().contains(&name))
+        .unwrap_or_else(|| panic!("no staged entry for {}", origin.display()))
+}
+
+fn remaining_origins(state: &tempfile::TempDir) -> Vec<String> {
+    visible_trash_entries(&private_trash_root(state))
+        .into_iter()
+        .map(|entry| entry.file_name().unwrap().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn purge_path_removes_only_entries_staged_from_that_origin() {
+    let (home, state, pip, _) = two_staged_origins();
+
+    let out = run(
+        &home,
+        &state,
+        &["trash", "purge", "--yes", "--path", pip.to_str().unwrap()],
+    );
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let left = remaining_origins(&state);
+    assert_eq!(left.len(), 1, "left: {left:?}");
+    assert!(left[0].contains("go-build"), "left: {left:?}");
+}
+
+#[test]
+fn purge_path_matches_a_parent_of_the_origin() {
+    let (home, state, pip, _) = two_staged_origins();
+    let parent = pip.parent().unwrap().to_path_buf();
+
+    let out = run(
+        &home,
+        &state,
+        &[
+            "trash",
+            "purge",
+            "--yes",
+            "--path",
+            parent.to_str().unwrap(),
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        remaining_origins(&state).is_empty(),
+        "a parent selector must reach every origin beneath it"
+    );
+}
+
+#[test]
+fn purge_path_that_matches_nothing_leaves_the_entries_intact() {
+    let (home, state, _, _) = two_staged_origins();
+    let before = remaining_origins(&state);
+
+    let out = run(
+        &home,
+        &state,
+        &[
+            "trash",
+            "purge",
+            "--yes",
+            "--path",
+            home.path().join("nowhere").to_str().unwrap(),
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(remaining_origins(&state), before);
+}
+
+/// Narrowing chooses which entries are destroyed, not whether housekeeping
+/// runs. degu has no background timer, so a reader who only ever purges
+/// selectively would otherwise accumulate expired claims forever.
+#[test]
+fn purge_path_still_runs_expired_claim_housekeeping() {
+    let (home, state, pip, _) = two_staged_origins();
+    let marker = aged_claim_marker(&state);
+    assert!(marker.exists());
+
+    let out = run(
+        &home,
+        &state,
+        &["trash", "purge", "--yes", "--path", pip.to_str().unwrap()],
+    );
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!marker.exists(), "expired claim housekeeping was skipped");
+}
+
+#[test]
+fn purge_entry_removes_only_the_named_entry() {
+    let (home, state, pip, _) = two_staged_origins();
+    let entry = staged_from(&state, &pip);
+
+    let out = run(
+        &home,
+        &state,
+        &[
+            "trash",
+            "purge",
+            "--yes",
+            "--entry",
+            entry.to_str().unwrap(),
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let left = remaining_origins(&state);
+    assert_eq!(left.len(), 1, "left: {left:?}");
+    assert!(left[0].contains("go-build"), "left: {left:?}");
+}
+
+/// An exact selection is all or nothing: a name that no longer resolves to a
+/// managed entry refuses the batch rather than destroying the rest of it.
+#[test]
+fn purge_entry_refuses_the_whole_plan_when_one_name_is_gone() {
+    let (home, state, pip, _) = two_staged_origins();
+    let entry = staged_from(&state, &pip);
+    let missing = private_trash_root(&state).join("9999-never-staged");
+    let before = remaining_origins(&state);
+
+    let out = run(
+        &home,
+        &state,
+        &[
+            "trash",
+            "purge",
+            "--yes",
+            "--entry",
+            entry.to_str().unwrap(),
+            "--entry",
+            missing.to_str().unwrap(),
+        ],
+    );
+
+    assert!(!out.status.success(), "a missing entry was accepted");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no longer available"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        remaining_origins(&state),
+        before,
+        "the batch was partly executed before it was refused"
+    );
+}
+
+#[test]
+fn purge_refuses_an_origin_selector_together_with_an_exact_entry() {
+    let (home, state, pip, _) = two_staged_origins();
+    let entry = staged_from(&state, &pip);
+
+    let out = run(
+        &home,
+        &state,
+        &[
+            "trash",
+            "purge",
+            "--yes",
+            "--path",
+            pip.to_str().unwrap(),
+            "--entry",
+            entry.to_str().unwrap(),
+        ],
+    );
+
+    assert!(!out.status.success());
+    assert_eq!(remaining_origins(&state).len(), 2);
 }

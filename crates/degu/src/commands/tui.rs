@@ -16,19 +16,16 @@ struct Review {
 }
 
 impl Review {
-    fn collect(args: ScanArgs, ui: Ui) -> Result<Self> {
+    fn collect(args: TuiArgs, ui: Ui) -> Result<Self> {
         let limits = args.limits;
-        let (report, filters) = crate::commands::scan::collect_for_review(args, ui)?;
-        let ctx = degu_core::ecosystem::DetectCtx::from_process()?;
-        let lifecycle = crate::lifecycle::Lifecycle::new(&ctx);
-        let staged = crate::tui::Staged::new(
-            lifecycle.trash_entries()?,
-            lifecycle
-                .plan_expired()?
-                .entries()
-                .map(std::path::Path::to_path_buf)
-                .collect(),
-        );
+        let args = crate::cli::ScanArgs::from(args);
+        let (report, filters, ctx) = crate::commands::scan::collect_for_review(args, ui)?;
+        // One read-only pass over the trash. Each row already carries whether
+        // a confirmed clean would expire it, so asking the expiry planner as
+        // well would re-read the operation log and capture execution-grade
+        // identities that this screen then discards.
+        let staged =
+            crate::tui::Staged::new(crate::lifecycle::Lifecycle::new(&ctx).trash_entries()?);
         Ok(Self {
             app: App::new(report, staged, ctx.home),
             filters,
@@ -43,7 +40,7 @@ impl Review {
     }
 }
 
-pub(crate) fn run(args: ScanArgs, ui: Ui) -> Result<()> {
+pub(crate) fn run(args: TuiArgs, ui: Ui) -> Result<()> {
     // Redirected stdin cannot supply keys even when stdout is a terminal.
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         bail!(
@@ -80,7 +77,11 @@ fn execute(review: &Review, ui: Ui) -> Result<()> {
         announce(crate::commands::guidance::purge_command(&args), ui)?;
         let purged = crate::commands::trash::run(TrashCommand::Purge(args), ui);
         if clean.is_some() {
-            // Declining purge also cancels the clean chosen in the same action.
+            // The two halves are sequential, not atomic. Anything that stops
+            // the purge — a declined confirmation, an entry that moved since
+            // the screen was drawn, a held lock, or a failure after some
+            // entries were already destroyed — stops the clean as well, so the
+            // message says what did not happen rather than naming one cause.
             purged.context("the clean was not run either")?;
         } else {
             purged?;

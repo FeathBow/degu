@@ -100,3 +100,169 @@ impl Decisions {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use degu_core::finding::{
+        DispositionMode, FindingCandidate, FindingKind, FindingSource, Ownership, Recovery,
+        RegenCost, finalize_findings,
+    };
+
+    fn finding(path: &str, recovery: Recovery) -> Finding {
+        finalize_findings(
+            vec![FindingCandidate {
+                ecosystem: "test".to_owned(),
+                path: PathBuf::from(path),
+                kind: FindingKind::PackageCache,
+                bytes_apparent: 4096,
+                bytes_allocated: 4096,
+                age_days: Some(30),
+                bytes_hardlinked: 0,
+                inodes: 1,
+                skipped: 0,
+                truncated: false,
+                unvisited_dirs: 0,
+                shared_writable_dirs: 0,
+                parent_grants_foreign_mutation: false,
+                protected_boundaries: 0,
+                protected_credential_boundaries: 0,
+                recovery,
+                ownership: Ownership::Standalone,
+                hazard: None,
+                rationale: "fixture".to_owned(),
+            }],
+            FindingSource::WellKnownRoot,
+        )
+        .pop()
+        .expect("one finalized finding")
+    }
+
+    fn ready(path: &str) -> Finding {
+        finding(
+            path,
+            Recovery::Regenerable {
+                cost: RegenCost::Cheap,
+            },
+        )
+    }
+
+    fn review(path: &str) -> Finding {
+        finding(
+            path,
+            Recovery::Regenerable {
+                cost: RegenCost::Costly,
+            },
+        )
+    }
+
+    fn unmanaged(path: &str) -> Finding {
+        finding(path, Recovery::UserAsset)
+    }
+
+    fn filters() -> Filters {
+        Filters {
+            roots: vec![PathBuf::from("/authorized")],
+            only: vec!["test".to_owned()],
+            older_than: Some(30),
+            min_size: Some(1024),
+            top: Some(5),
+        }
+    }
+
+    #[test]
+    fn the_plan_starts_as_the_one_degu_would_build_alone() {
+        let decisions = Decisions::new(&[ready("/y"), review("/r"), unmanaged("/n")]);
+        assert!(decisions.is_chosen(&ready("/y")));
+        assert!(!decisions.is_chosen(&review("/r")));
+        assert!(!decisions.is_chosen(&unmanaged("/n")));
+    }
+
+    #[test]
+    fn a_not_managed_finding_cannot_be_put_in_the_plan() {
+        assert_eq!(
+            unmanaged("/n").disposition().mode,
+            DispositionMode::ReportOnly
+        );
+        let mut decisions = Decisions::new(&[unmanaged("/n")]);
+        decisions.toggle(&unmanaged("/n"), Section::Cache);
+        assert!(decisions.is_empty(), "a keystroke reached a withheld tier");
+    }
+
+    #[test]
+    fn a_runtime_finding_cannot_be_put_in_the_plan() {
+        let finding = review("/r");
+        let mut decisions = Decisions::new(std::slice::from_ref(&finding));
+        decisions.toggle(&finding, Section::Runtime);
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn deciding_twice_returns_to_where_it_started() {
+        let mut decisions = Decisions::new(&[ready("/y"), review("/r")]);
+        for finding in [review("/r"), ready("/y")] {
+            decisions.toggle(&finding, Section::Cache);
+            decisions.toggle(&finding, Section::Cache);
+        }
+        assert!(decisions.is_chosen(&ready("/y")));
+        assert!(!decisions.is_chosen(&review("/r")));
+    }
+
+    #[test]
+    fn dropping_everything_leaves_nothing_to_run() {
+        let mut decisions = Decisions::new(&[ready("/y")]);
+        decisions.toggle(&ready("/y"), Section::Cache);
+        assert!(decisions.is_empty());
+        assert!(
+            decisions
+                .clean_args(&filters(), ScanLimitArgs::default(), false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn choosing_a_review_finding_asks_for_review_and_keeps_the_rest() {
+        let mut decisions = Decisions::new(&[ready("/y"), review("/r"), review("/other")]);
+        decisions.toggle(&review("/r"), Section::Cache);
+
+        let args = decisions
+            .clean_args(&filters(), ScanLimitArgs::default(), false)
+            .expect("a non-empty plan produces arguments");
+        assert!(args.include_review);
+        assert_eq!(args.path, vec![PathBuf::from("/r"), PathBuf::from("/y")]);
+    }
+
+    #[test]
+    fn a_plan_of_only_ready_findings_asks_for_no_review() {
+        let decisions = Decisions::new(&[ready("/a"), ready("/b")]);
+        let args = decisions
+            .clean_args(&filters(), ScanLimitArgs::default(), false)
+            .expect("arguments");
+        assert!(!args.include_review);
+    }
+
+    /// The arguments carry the scan's own filters and nothing the reader did
+    /// not decide. `roots` in particular is a cleanup authority: it must be
+    /// the set the scope carried, never one the interface widened.
+    #[test]
+    fn the_arguments_carry_the_scope_and_no_decision_of_their_own() {
+        let filters = filters();
+        let args = Decisions::new(&[ready("/y")])
+            .clean_args(&filters, ScanLimitArgs::default(), true)
+            .expect("arguments");
+        assert_eq!(args.roots, filters.roots);
+        assert_eq!(args.only, filters.only);
+        assert_eq!(args.older_than, filters.older_than);
+        assert_eq!(args.min_size, filters.min_size);
+        assert_eq!(args.top, filters.top);
+        assert!(args.dry_run);
+        assert!(!args.purge, "the review never plans permanent removal here");
+        assert!(!args.yes, "the command's own confirmation still runs");
+        assert!(
+            args.review.is_none(),
+            "--review takes one path; these are many"
+        );
+        assert!(!args.output.json);
+        assert!(!args.details);
+    }
+}

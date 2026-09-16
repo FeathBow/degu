@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
-use crate::cli::{CleanArgs, ScanArgs, ScanLimitArgs, TrashCommand};
+use crate::cli::{CleanArgs, ScanLimitArgs, TrashCommand, TuiArgs};
 use crate::findings::Filters;
 use crate::runtime::Ui;
 use crate::tui::{App, Outcome};

@@ -149,7 +149,7 @@ pub(crate) struct JsonArgs {
     pub(crate) json: bool,
 }
 
-#[derive(Args, Clone, Copy)]
+#[derive(Args, Clone, Copy, Default)]
 pub(crate) struct ScanLimitArgs {
     #[arg(
         long,
@@ -169,7 +169,7 @@ pub(crate) enum Command {
     #[command(after_help = SCAN_EXAMPLES)]
     Scan(ScanArgs),
     /// Review findings interactively and clean what you choose
-    Tui(ScanArgs),
+    Tui(TuiArgs),
     /// Check whether required account setup is ready (read-only)
     #[command(after_help = DOCTOR_EXAMPLES)]
     Doctor {
@@ -298,6 +298,49 @@ pub(crate) struct ScanArgs {
     pub(crate) runtime: bool,
     /// Project roots whose build artifacts are added to the usual cache scan
     pub(crate) roots: Vec<PathBuf>,
+}
+
+/// The interactive review draws its own output, so `scan`'s output options
+/// have nothing to act on here. It takes only what selects and bounds the
+/// scan; accepting `--json`, `--details` or `--summary` would promise a
+/// rendering this command never produces.
+#[derive(Args)]
+pub(crate) struct TuiArgs {
+    #[command(flatten)]
+    pub(crate) limits: ScanLimitArgs,
+    /// Keep only findings using at least this much space on disk (bytes, K, M, G, T)
+    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+    pub(crate) min_size: Option<u64>,
+    /// Keep only the N largest findings; applies per section (cache findings and node-runtime findings are filtered independently)
+    #[arg(long, value_name = "N")]
+    pub(crate) top: Option<usize>,
+    /// Keep only findings untouched for at least this many days
+    #[arg(long, value_name = "DAYS")]
+    pub(crate) older_than: Option<u64>,
+    /// Show only findings from this source ID; repeatable
+    #[arg(long)]
+    pub(crate) only: Vec<String>,
+    #[arg(long, help = RUNTIME_HELP)]
+    pub(crate) runtime: bool,
+    /// Project roots whose build artifacts are added to the usual cache scan
+    pub(crate) roots: Vec<PathBuf>,
+}
+
+impl From<TuiArgs> for ScanArgs {
+    fn from(args: TuiArgs) -> Self {
+        Self {
+            output: JsonArgs { json: false },
+            limits: args.limits,
+            details: false,
+            summary: false,
+            min_size: args.min_size,
+            top: args.top,
+            older_than: args.older_than,
+            only: args.only,
+            runtime: args.runtime,
+            roots: args.roots,
+        }
+    }
 }
 
 #[derive(Args)]

@@ -128,7 +128,7 @@ degu trash purge     # or permanently delete what you reviewed
 
 Only **Ready to clean** enters the default plan. For one **Needs review** location, the scan prints a shorter `degu clean -dn --review PATH` preview; the resulting `Next` command keeps the same exact selection.
 
-When the decision is about one location rather than a rule, `degu tui` puts those five commands behind one screen: it shows the scan and the staging trash together, you choose per location what to clean and what to permanently delete, and it hands your choices to the same `clean` and `trash purge` implementations with their own plans and confirmations.
+When the decision is about one location rather than a rule, `degu tui` brings the scan, the clean, and a selective purge onto one screen: it shows the findings and the staging trash together, you choose per location what to clean and what to permanently delete, and it hands your choices to the same `clean` and `trash purge` implementations with their own plans and confirmations. Recovery stays a command of its own — `degu undo` restores the latest clean, and nothing in the review does that for you.
 
 ```sh
 degu tui

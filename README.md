@@ -151,7 +151,7 @@ degu scan .
 degu clean . --dry-run
 ```
 
-To include a project tree in every scan, add it to `roots` in the [configuration](https://github.com/FeathBow/degu/blob/main/docs/configuration.md); `clean` still requires the root as an explicit argument.
+To include a project tree in every `degu scan`, add it to `roots` in the [configuration](https://github.com/FeathBow/degu/blob/main/docs/configuration.md). Configured roots are for reading: `clean` and `tui` both require the root as an explicit argument before anything under it can enter a plan.
 
 ### Check filesystem quota
 

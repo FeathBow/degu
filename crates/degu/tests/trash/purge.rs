@@ -582,3 +582,40 @@ fn purge_refuses_an_origin_selector_together_with_an_exact_entry() {
     assert!(!out.status.success());
     assert_eq!(remaining_origins(&state).len(), 2);
 }
+
+/// The selector matches whole path components. A refactor to a string prefix
+/// would silently widen every selection to its lexical neighbours, so a name
+/// that merely starts with the selector must not match.
+#[test]
+fn purge_path_does_not_match_a_sibling_sharing_a_name_prefix() {
+    let (home, state, _, go) = two_staged_origins();
+    let prefix = go.parent().unwrap().join("go");
+    assert!(
+        go.to_string_lossy().starts_with(prefix.to_str().unwrap()),
+        "the fixture must share a lexical prefix for this to be a boundary test"
+    );
+    let before = remaining_origins(&state);
+
+    let out = run(
+        &home,
+        &state,
+        &[
+            "trash",
+            "purge",
+            "--yes",
+            "--path",
+            prefix.to_str().unwrap(),
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        remaining_origins(&state),
+        before,
+        "a lexical prefix reached a sibling it does not contain"
+    );
+}

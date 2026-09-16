@@ -106,9 +106,8 @@ pub(crate) fn collect_for_review(
         ProjectRootAuthority::CleanupAuthorized,
     ))?;
     // The roots stay the ones the scope carries, which are the roots typed on
-    // the command line. `report.project_roots` is the discovery set, and a
-    // configured root in it would become a cleanup authority the reader never
-    // granted.
+    // the command line. Anything wider here becomes a cleanup authority the
+    // reader never granted, since these filters end up in `CleanArgs`.
     let filters = report.scope.clean_scope().filters;
     Ok((
         crate::tui::ScanReport::new(

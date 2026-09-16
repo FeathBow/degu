@@ -207,3 +207,94 @@ fn the_review_keeps_the_scan_selection_options() {
         );
     }
 }
+
+/// The two halves are sequential, not atomic. A purge that does not happen —
+/// here because its confirmation was declined — must stop the clean as well,
+/// rather than staging more on the way out of a keystroke the reader declined.
+#[test]
+fn declining_the_purge_stops_the_clean_that_was_chosen_with_it() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let config = config_home_with_roots(&[]);
+
+    // One cache already staged, so the trash has something to choose; another
+    // still on disk, so the clean half has work of its own.
+    let staged_origin = platform_cache(home.path(), "go-build");
+    std::fs::create_dir_all(&staged_origin).unwrap();
+    std::fs::write(staged_origin.join("blob.bin"), vec![0u8; CACHE_BYTES]).unwrap();
+    common::make_tree_non_shared_writable(home.path()).unwrap();
+    stage_everything(home.path(), config.path(), state.path());
+    let trash = state.path().join("degu/trash");
+    let before = entry_names(&trash);
+    assert_eq!(before.len(), 1, "the fixture must stage exactly one entry");
+
+    let kept = platform_cache(home.path(), "pip");
+    std::fs::create_dir_all(&kept).unwrap();
+    std::fs::write(kept.join("wheel.whl"), vec![0u8; CACHE_BYTES]).unwrap();
+    common::make_tree_non_shared_writable(home.path()).unwrap();
+
+    let out = run_pty(PtyRun {
+        body: r#"
+spawn -noecho sh -c {stty rows 40 columns 120; exec "$DEGU_BIN" --color never tui}
+expect -ex "\033\[?1049h"
+sleep 1
+send "t"
+sleep 1
+send " "
+sleep 1
+send "c"
+expect "Type 'purge'"
+send "no\r"
+"#,
+        home: home.path(),
+        config_home: config.path(),
+        state_home: state.path(),
+        extra_env: &[],
+    });
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "a declined purge reported success");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("the clean was not run either")
+            || stdout.contains("the clean was not run either"),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        entry_names(&trash),
+        before,
+        "the trash changed after a declined purge"
+    );
+    assert!(
+        kept.exists(),
+        "the clean ran even though the purge chosen with it did not"
+    );
+}
+
+fn stage_everything(home: &Path, config_home: &Path, state: &Path) {
+    let out = common::isolated_degu()
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_STATE_HOME", state)
+        .args(["clean", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn entry_names(trash: &Path) -> Vec<String> {
+    let Ok(dir) = std::fs::read_dir(trash) else {
+        return Vec::new();
+    };
+    let mut names = dir
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with('.'))
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}

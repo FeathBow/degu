@@ -1,7 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
-use crate::tui::escape;
+use crate::presentation::escape_terminal_text;
 use crate::tui::report::{Class, Finding, Section};
 
 use super::format;
@@ -136,12 +136,12 @@ fn finding_row(item: (&Finding, usize), columns: &Columns, app: &App) -> Row<'st
         Cell::from(if selected { "▸" } else { " " }).style(Style::new().fg(ACCENT)),
         Cell::from(mark).style(class_style(class)),
         Cell::from(elide(
-            &escape::text(&finding.path().to_string_lossy()),
+            &escape_terminal_text(&finding.path().to_string_lossy()),
             columns.path,
         )),
     ];
     if columns.ecosystem {
-        cells.push(Cell::from(escape::text(finding.ecosystem())));
+        cells.push(Cell::from(escape_terminal_text(finding.ecosystem())));
     }
     cells.push(Cell::from(status).style(class_style(class)));
     let metric_style = if selected {

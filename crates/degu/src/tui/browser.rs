@@ -79,7 +79,7 @@ impl GroupBy {
                 let class = Class::of(finding, section);
                 (class.label(), Some(class))
             }
-            Self::Kind => (crate::findings::table::kind_label(finding.kind()), None),
+            Self::Kind => (crate::findings::kind_label(finding.kind()), None),
         }
     }
 }
@@ -95,7 +95,7 @@ pub struct Group {
 
 impl Group {
     pub fn label(&self) -> String {
-        crate::tui::escape::text(&self.name)
+        crate::presentation::escape_terminal_text(&self.name)
     }
 }
 

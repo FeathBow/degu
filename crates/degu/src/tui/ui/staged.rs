@@ -1,8 +1,8 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
+use crate::presentation::escape_terminal_text;
 use crate::tui::decision::Plan;
-use crate::tui::escape;
 use crate::tui::staged::Entry;
 
 use super::text::{elide, wrapped};
@@ -182,7 +182,10 @@ fn row(item: (&Entry, usize), path_width: usize, app: &App) -> Row<'static> {
         })
         .style(Style::new().fg(super::theme::ACCENT)),
         Cell::from(mark),
-        Cell::from(elide(&escape::text(&entry.label(app.home())), path_width)),
+        Cell::from(elide(
+            &escape_terminal_text(&entry.label(app.home())),
+            path_width,
+        )),
         Cell::from(Line::from(days(entry.age_days)).right_aligned()).style(
             if entry.expiring && !app.decisions().is_empty() {
                 Style::new().fg(CAUTION)

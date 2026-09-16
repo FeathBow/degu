@@ -2,7 +2,6 @@
 
 mod browser;
 mod decision;
-mod escape;
 mod report;
 mod staged;
 mod ui;

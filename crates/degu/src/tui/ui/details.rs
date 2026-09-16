@@ -1,7 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use crate::tui::escape;
+use crate::presentation::escape_terminal_text;
 use crate::tui::report::{Class, Finding, Section};
 
 use super::format;
@@ -29,7 +29,7 @@ impl Document {
         let source = content(finding, &introduction);
         let preview = preview(finding, section);
         Self {
-            label: escape::text(finding.ecosystem()),
+            label: escape_terminal_text(finding.ecosystem()),
             summary: preview_summary(finding),
             source,
             preview,
@@ -142,7 +142,7 @@ fn preview(finding: &Finding, section: Section) -> Vec<Line<'static>> {
     let class = Class::of(finding, section);
     let mut lines = vec![
         Line::from(class.label()).style(class_style(class)),
-        Line::from(escape::text(&finding.path().to_string_lossy())).bold(),
+        Line::from(escape_terminal_text(&finding.path().to_string_lossy())).bold(),
     ];
     if finding.skipped() > 0 {
         lines.push(
@@ -159,7 +159,7 @@ fn preview(finding: &Finding, section: Section) -> Vec<Line<'static>> {
         .reason
         .as_deref()
         .unwrap_or_else(|| finding.rationale());
-    lines.push(Line::from(escape::text(reason)).fg(SECONDARY));
+    lines.push(Line::from(escape_terminal_text(reason)).fg(SECONDARY));
     lines
 }
 
@@ -180,7 +180,7 @@ fn introduction(finding: &Finding, section: Section) -> Vec<Line<'static>> {
         .disposition()
         .reason
         .as_deref()
-        .map(escape::text)
+        .map(escape_terminal_text)
         .unwrap_or_default();
     let status = if reason.is_empty() {
         class.label().to_owned()
@@ -188,7 +188,7 @@ fn introduction(finding: &Finding, section: Section) -> Vec<Line<'static>> {
         format!("{} · {reason}", class.label())
     };
     vec![
-        Line::from(escape::text(&finding.path().to_string_lossy())).bold(),
+        Line::from(escape_terminal_text(&finding.path().to_string_lossy())).bold(),
         Line::from(status).style(class_style(class)),
     ]
 }
@@ -202,7 +202,7 @@ fn content(finding: &Finding, introduction: &[Line<'static>]) -> Vec<Line<'stati
         Line::from(other_measurements(finding)),
         Line::default(),
         heading("Why this status"),
-        Line::from(escape::text(finding.rationale())),
+        Line::from(escape_terminal_text(finding.rationale())),
         Line::default(),
         heading("Classification"),
     ]);
@@ -237,13 +237,13 @@ fn other_measurements(finding: &Finding) -> String {
 fn metadata(finding: &Finding) -> Vec<String> {
     [
         ("Source", finding.ecosystem()),
-        ("Kind", crate::findings::table::kind_label(finding.kind())),
+        ("Kind", crate::findings::kind_label(finding.kind())),
         (
             "Cleanup reason",
             finding.disposition().reason.as_deref().unwrap_or("-"),
         ),
     ]
     .into_iter()
-    .map(|(label, value)| format!("{label}: {}", escape::text(value)))
+    .map(|(label, value)| format!("{label}: {}", escape_terminal_text(value)))
     .collect()
 }

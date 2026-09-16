@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use degu_core::ecosystem::DetectCtx;
 
 use super::claims::interrupted_purge_claims;
-use super::expiry::{SECONDS_PER_DAY, fallback_age};
+use super::expiry::{ExpiryContext, SECONDS_PER_DAY, fallback_age, should_purge_expired_entry};
 use super::journal::OperationLog;
 use super::reconcile::{TrashOplogInfo, reconciled_trash_info};
 use super::storage::trash_roots;
@@ -20,6 +20,12 @@ pub(crate) struct TrashEntry {
     pub(crate) age_days: u64,
     pub(crate) ambiguous: bool,
     pub(crate) interrupted_purge: bool,
+    /// The next confirmed clean purges this entry whether or not anyone asks,
+    /// because degu runs no background timer. This is the expiry planner's own
+    /// predicate, not an age comparison: an ambiguous entry never expires, and
+    /// an entry without a recorded staging time must be old by both ctime and
+    /// mtime.
+    pub(crate) expiring: bool,
     /// The size is a lower bound: the measure was truncated, skipped paths, or
     /// left directories unvisited.
     pub(crate) lower_bound: bool,
@@ -28,6 +34,7 @@ pub(crate) struct TrashEntry {
 struct EntryInspection<'a> {
     entry: PathBuf,
     info: Option<&'a TrashOplogInfo>,
+    recorded: &'a HashMap<PathBuf, TrashOplogInfo>,
     now: jiff::Timestamp,
     interrupted_purge: bool,
 }
@@ -65,6 +72,7 @@ fn root_entries(
         rows.push(inspect_entry(EntryInspection {
             entry,
             info,
+            recorded,
             now,
             interrupted_purge: false,
         })?);
@@ -73,6 +81,7 @@ fn root_entries(
         rows.push(inspect_entry(EntryInspection {
             entry: claim,
             info: None,
+            recorded,
             now,
             interrupted_purge: true,
         })?);
@@ -92,6 +101,11 @@ fn inspect_entry(request: EntryInspection<'_>) -> Result<TrashEntry> {
         age_days: entry_age_days(request.info, &meta, request.now),
         ambiguous: request.info.is_some_and(|value| value.ambiguous),
         interrupted_purge: request.interrupted_purge,
+        expiring: should_purge_expired_entry(
+            &request.entry,
+            &meta,
+            ExpiryContext::new(request.recorded, request.now),
+        ),
         lower_bound: stats.truncated || stats.skipped_total > 0 || stats.unvisited_dirs > 0,
         entry: request.entry,
     })

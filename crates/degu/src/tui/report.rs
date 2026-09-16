@@ -119,11 +119,17 @@ impl Class {
         }
     }
 
+    /// The printed report's own labels. A reader should not have to learn the
+    /// same three words twice, so the strings live in one place.
     pub fn label(self) -> &'static str {
+        crate::presentation::cleanup::label(self.mode())
+    }
+
+    fn mode(self) -> DispositionMode {
         match self {
-            Self::Ready => "Ready to clean",
-            Self::NeedsReview => "Needs review",
-            Self::NotManaged => "Not managed",
+            Self::Ready => DispositionMode::Eligible,
+            Self::NeedsReview => DispositionMode::OptIn,
+            Self::NotManaged => DispositionMode::ReportOnly,
         }
     }
 }

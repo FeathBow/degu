@@ -312,6 +312,7 @@ mod tests {
             age_days: 3,
             ambiguous: false,
             interrupted_purge: false,
+            expiring: false,
             lower_bound: false,
         }
     }

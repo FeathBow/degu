@@ -28,7 +28,6 @@ pub(super) struct ScanReport {
     /// JSON schema is frozen).
     pub(super) incomplete_regions: IncompleteRegions,
     pub(super) has_effective_project_roots: bool,
-    pub(super) project_roots: Vec<std::path::PathBuf>,
     pub(super) json: bool,
     pub(super) details: bool,
     pub(super) summary: bool,
@@ -67,10 +66,22 @@ struct ScanRequest {
     run: CollectionRunOptions,
     scope: ScanScope,
     ui: Ui,
+    /// Whether project roots carry cleanup authority. `degu scan` reports, so
+    /// configured roots join its discovery; the interactive review decides
+    /// what to clean, so it must collect under the authority its clean will
+    /// have. Showing a location a configured root discovered would offer a
+    /// decision the clean then refuses to honour.
+    project_roots: ProjectRootAuthority,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProjectRootAuthority {
+    ReadOnlyDiscovery,
+    CleanupAuthorized,
 }
 
 impl ScanRequest {
-    fn new(args: ScanArgs, ui: Ui) -> Self {
+    fn new(args: ScanArgs, ui: Ui, project_roots: ProjectRootAuthority) -> Self {
         let scope = ScanScope::from_args(&args);
         Self {
             details: args.details,
@@ -78,19 +89,27 @@ impl ScanRequest {
             run: CollectionRunOptions::new(args.output, args.limits, ui.colors),
             scope,
             ui,
+            project_roots,
         }
     }
 }
 
+/// The context comes back with the report so one command works from one set
+/// of account and home facts; resolving it twice invites two that disagree.
 pub(crate) fn collect_for_review(
     args: ScanArgs,
     ui: Ui,
-) -> Result<(crate::tui::ScanReport, Filters)> {
-    let report = prepare(ScanRequest::new(args, ui))?;
-    let filters = Filters {
-        roots: report.project_roots,
-        ..report.scope.clean_scope().filters
-    };
+) -> Result<(crate::tui::ScanReport, Filters, DetectCtx)> {
+    let report = prepare(ScanRequest::new(
+        args,
+        ui,
+        ProjectRootAuthority::CleanupAuthorized,
+    ))?;
+    // The roots stay the ones the scope carries, which are the roots typed on
+    // the command line. `report.project_roots` is the discovery set, and a
+    // configured root in it would become a cleanup authority the reader never
+    // granted.
+    let filters = report.scope.clean_scope().filters;
     Ok((
         crate::tui::ScanReport::new(
             report.findings,
@@ -98,6 +117,7 @@ pub(crate) fn collect_for_review(
             report.completeness,
         ),
         filters,
+        report.ctx,
     ))
 }
 
@@ -106,7 +126,11 @@ pub(crate) fn run(args: ScanArgs, ui: Ui) -> Result<()> {
         anyhow::bail!("--details cannot be used with --summary unless --json is also set");
     }
     let started = std::time::Instant::now();
-    let mut report = prepare(ScanRequest::new(args, ui))?;
+    let mut report = prepare(ScanRequest::new(
+        args,
+        ui,
+        ProjectRootAuthority::ReadOnlyDiscovery,
+    ))?;
     report.elapsed = Some(started.elapsed());
     output::print(&report)
 }
@@ -115,24 +139,23 @@ fn prepare(request: ScanRequest) -> Result<ScanReport> {
     let ctx = DetectCtx::from_process()?;
     let config = load_config(&ctx)?;
     let runtime_enabled = request.scope.runtime_requested() || config.runtime;
-    let has_effective_project_roots =
-        request.scope.has_explicit_roots() || !config.roots.is_empty();
+    let has_effective_project_roots = request.scope.has_explicit_roots()
+        || (request.project_roots == ProjectRootAuthority::ReadOnlyDiscovery
+            && !config.roots.is_empty());
     let sources =
         SourceSelection::from_only(request.scope.only_ids(), runtime_enabled, &config.disable)?;
-    let project_roots = if sources.includes_project_sources() {
-        crate::collection::requested_roots(
-            &ctx,
-            crate::collection::ProjectRoots::ReadOnlyDiscovery(request.scope.roots().to_vec()),
-            &config,
-        )
-    } else {
-        Vec::new()
+    let collection_request = match request.project_roots {
+        ProjectRootAuthority::ReadOnlyDiscovery => CollectionRequest::scan(
+            request.scope.roots().to_vec(),
+            sources,
+            request.run.indicator_color_enabled,
+        ),
+        ProjectRootAuthority::CleanupAuthorized => CollectionRequest::clean(
+            request.scope.roots().to_vec(),
+            sources,
+            request.run.indicator_color_enabled,
+        ),
     };
-    let collection_request = CollectionRequest::scan(
-        request.scope.roots().to_vec(),
-        sources,
-        request.run.indicator_color_enabled,
-    );
     let ctx = ctx.with_max_concurrency(resolve_max_concurrency(
         request.run.max_concurrency,
         &config,
@@ -160,7 +183,6 @@ fn prepare(request: ScanRequest) -> Result<ScanReport> {
         completeness,
         incomplete_regions,
         has_effective_project_roots,
-        project_roots,
         json: request.run.json,
         details: request.details,
         summary: request.summary,

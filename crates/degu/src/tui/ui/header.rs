@@ -66,7 +66,7 @@ fn plan_label(app: &App) -> String {
     format!(
         "{verb}: {} · {}",
         super::format::locations(plan.locations),
-        super::format::bytes(plan.bytes)
+        super::format::plan_size(plan)
     )
 }
 

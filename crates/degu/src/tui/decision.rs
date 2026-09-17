@@ -10,13 +10,32 @@ use crate::tui::report::{Class, Section};
 pub struct Decisions {
     chosen: BTreeSet<PathBuf>,
     default: BTreeSet<PathBuf>,
-    sizes: BTreeMap<PathBuf, u64>,
+    sizes: BTreeMap<PathBuf, (u64, bool)>,
 }
 
-#[derive(Default, Clone, Copy)]
+/// What a plan would move, carrying the same honesty the rest of the report
+/// carries: a size measured from a truncated walk is a floor, and a sum that
+/// overflowed is a floor too.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Plan {
     pub locations: usize,
     pub bytes: u64,
+    /// At least one member's size was a lower bound, or the sum saturated.
+    pub lower_bound: bool,
+}
+
+impl Plan {
+    pub fn add(&mut self, bytes: u64, lower_bound: bool) {
+        self.locations += 1;
+        self.lower_bound |= lower_bound;
+        match self.bytes.checked_add(bytes) {
+            Some(sum) => self.bytes = sum,
+            None => {
+                self.bytes = u64::MAX;
+                self.lower_bound = true;
+            }
+        }
+    }
 }
 
 impl Decisions {
@@ -28,7 +47,12 @@ impl Decisions {
             .collect();
         let sizes = cache
             .iter()
-            .map(|finding| (finding.path().to_path_buf(), finding.bytes_allocated()))
+            .map(|finding| {
+                (
+                    finding.path().to_path_buf(),
+                    (finding.bytes_allocated(), finding.measurement_incomplete()),
+                )
+            })
             .collect();
         Self {
             chosen: default.clone(),
@@ -38,14 +62,10 @@ impl Decisions {
     }
 
     pub fn plan(&self) -> Plan {
-        let mut plan = Plan {
-            locations: self.chosen.len(),
-            bytes: 0,
-        };
+        let mut plan = Plan::default();
         for path in &self.chosen {
-            plan.bytes = plan
-                .bytes
-                .saturating_add(self.sizes.get(path).copied().unwrap_or_default());
+            let (bytes, lower_bound) = self.sizes.get(path).copied().unwrap_or_default();
+            plan.add(bytes, lower_bound);
         }
         plan
     }
@@ -168,6 +188,29 @@ mod tests {
             min_size: Some(1024),
             top: Some(5),
         }
+    }
+
+    /// A floor anywhere in the plan makes the whole plan a floor, and a sum
+    /// that overflows is one too. Reporting either as exact would overstate
+    /// what a clean recovers.
+    #[test]
+    fn a_bounded_member_makes_the_whole_plan_a_lower_bound() {
+        let mut plan = Plan::default();
+        plan.add(10, false);
+        assert!(!plan.lower_bound);
+        plan.add(20, true);
+        assert!(plan.lower_bound);
+        assert_eq!(plan.bytes, 30);
+        assert_eq!(plan.locations, 2);
+    }
+
+    #[test]
+    fn a_saturating_sum_is_reported_as_a_lower_bound() {
+        let mut plan = Plan::default();
+        plan.add(u64::MAX, false);
+        plan.add(1, false);
+        assert_eq!(plan.bytes, u64::MAX);
+        assert!(plan.lower_bound);
     }
 
     #[test]

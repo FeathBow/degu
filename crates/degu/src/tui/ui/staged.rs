@@ -49,7 +49,7 @@ fn notice_lines(app: &App) -> Vec<Line<'static>> {
         Line::from(format!(
             "Staged: {} · {}. Staged data still counts against quota.",
             format::locations(total.locations),
-            format::bytes(total.bytes)
+            format::plan_size(total)
         ))
         .fg(SECONDARY),
     ];
@@ -81,9 +81,9 @@ fn outcome_line(app: &App) -> Line<'static> {
     Line::from(format!(
         "Outside both purge plans: {} · {}. This clean would stage {} · {}.",
         format::locations(remaining.locations),
-        format::bytes(remaining.bytes),
+        format::plan_size(remaining),
         format::locations(clean.locations),
-        format::bytes(clean.bytes)
+        format::plan_size(clean)
     ))
     .fg(SECONDARY)
 }
@@ -92,7 +92,7 @@ fn plan_line(label: &str, plan: Plan) -> Line<'static> {
     Line::from(format!(
         "{label}: {} · {}.",
         format::locations(plan.locations),
-        format::bytes(plan.bytes)
+        format::plan_size(plan)
     ))
 }
 

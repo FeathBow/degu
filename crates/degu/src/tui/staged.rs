@@ -164,8 +164,7 @@ impl Staged {
     fn total(&self, keep: impl Fn(&Entry) -> bool) -> Plan {
         let mut plan = Plan::default();
         for entry in self.entries.iter().filter(|entry| keep(entry)) {
-            plan.locations += 1;
-            plan.bytes = plan.bytes.saturating_add(entry.bytes);
+            plan.add(entry.bytes, entry.lower_bound);
         }
         plan
     }

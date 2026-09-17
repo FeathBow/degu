@@ -63,6 +63,18 @@ pub fn count_total(total: Total) -> String {
     bound(count(total.value), total.saturated)
 }
 
+/// A plan's size, marked when it is only a floor — either because a member
+/// was measured from a truncated walk or because the sum saturated. The row
+/// tables already mark a bounded measurement this way.
+pub fn plan_size(plan: crate::tui::decision::Plan) -> String {
+    let size = bytes(plan.bytes);
+    if plan.lower_bound {
+        format!("\u{2265} {size}")
+    } else {
+        size
+    }
+}
+
 fn bound(value: String, saturated: bool) -> String {
     if saturated {
         format!("over {value}")

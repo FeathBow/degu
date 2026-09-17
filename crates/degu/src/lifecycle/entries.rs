@@ -22,9 +22,9 @@ pub(crate) struct TrashEntry {
     pub(crate) interrupted_purge: bool,
     /// The next confirmed clean purges this entry whether or not anyone asks,
     /// because degu runs no background timer. This is the expiry planner's own
-    /// predicate, not an age comparison: an ambiguous entry never expires, and
-    /// an entry without a recorded staging time must be old by both ctime and
-    /// mtime.
+    /// predicate, not an age comparison: an ambiguous entry never expires, an
+    /// interrupted claim never expires, and an entry without a recorded
+    /// staging time must be old by both ctime and mtime.
     pub(crate) expiring: bool,
     /// The size is a lower bound: the measure was truncated, skipped paths, or
     /// left directories unvisited.
@@ -101,11 +101,15 @@ fn inspect_entry(request: EntryInspection<'_>) -> Result<TrashEntry> {
         age_days: entry_age_days(request.info, &meta, request.now),
         ambiguous: request.info.is_some_and(|value| value.ambiguous),
         interrupted_purge: request.interrupted_purge,
-        expiring: should_purge_expired_entry(
-            &request.entry,
-            &meta,
-            ExpiryContext::new(request.recorded, request.now),
-        ),
+        // The expiry walk skips the whole claims directory, so a claim never
+        // expires however old it is. Asking the age predicate anyway would
+        // promise a removal that no clean performs.
+        expiring: !request.interrupted_purge
+            && should_purge_expired_entry(
+                &request.entry,
+                &meta,
+                ExpiryContext::new(request.recorded, request.now),
+            ),
         lower_bound: stats.truncated || stats.skipped_total > 0 || stats.unvisited_dirs > 0,
         entry: request.entry,
     })
@@ -129,5 +133,73 @@ fn non_negative_age(staged_at: jiff::Timestamp, now: jiff::Timestamp) -> Duratio
         Duration::ZERO
     } else {
         age.unsigned_abs()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    const EIGHT_DAYS: u64 = 8 * SECONDS_PER_DAY;
+
+    fn aged_dir(parent: &Path, name: &str) -> PathBuf {
+        let path = parent.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(path.join("payload.bin"), b"staged").unwrap();
+        path
+    }
+
+    fn inspect(entry: PathBuf, interrupted_purge: bool, age_secs: u64) -> TrashEntry {
+        let recorded = HashMap::new();
+        let now = jiff::Timestamp::now() + std::time::Duration::from_secs(age_secs);
+        inspect_entry(EntryInspection {
+            entry,
+            info: None,
+            recorded: &recorded,
+            now,
+            interrupted_purge,
+        })
+        .unwrap()
+    }
+
+    /// `Trash::entries_matching` skips the claims directory, so the expiry plan
+    /// never contains a claim however old it is. Reporting one as expiring
+    /// would tell a reader a clean removes something it retains.
+    #[test]
+    fn an_interrupted_claim_never_expires_however_old_it_is() {
+        let root = tempfile::tempdir().unwrap();
+        let claim = aged_dir(root.path(), "purge-interrupted");
+
+        let row = inspect(claim, true, EIGHT_DAYS);
+
+        assert!(row.age_days >= 8, "the fixture must read as old");
+        assert!(
+            !row.expiring,
+            "an interrupted claim was reported as expiring"
+        );
+    }
+
+    /// An ordinary staged entry of the same age does expire, so the assertion
+    /// above is about the claim and not about the fixture.
+    #[test]
+    fn an_ordinary_entry_of_the_same_age_does_expire() {
+        let root = tempfile::tempdir().unwrap();
+        let entry = aged_dir(root.path(), "0001-cache");
+
+        let row = inspect(entry, false, EIGHT_DAYS);
+
+        assert!(row.expiring);
+    }
+
+    #[test]
+    fn a_fresh_entry_does_not_expire() {
+        let root = tempfile::tempdir().unwrap();
+        let entry = aged_dir(root.path(), "0002-cache");
+
+        let row = inspect(entry, false, 0);
+
+        assert!(!row.expiring);
     }
 }

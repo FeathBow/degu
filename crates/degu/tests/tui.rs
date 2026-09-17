@@ -1,9 +1,15 @@
 //! The interactive review decides what to clean, so what it offers must be
 //! what a clean could act on. These drive the real binary over a PTY.
 
+#[path = "support/clean_run.rs"]
+mod clean_run;
 #[allow(dead_code)]
 #[path = "support/mod.rs"]
 mod common;
+#[path = "support/pip_cache.rs"]
+mod pip_cache;
+#[path = "support/pip_fixture.rs"]
+mod pip_fixture;
 #[path = "support/pty.rs"]
 mod pty;
 
@@ -213,26 +219,24 @@ fn the_review_keeps_the_scan_selection_options() {
 /// rather than staging more on the way out of a keystroke the reader declined.
 #[test]
 fn declining_the_purge_stops_the_clean_that_was_chosen_with_it() {
-    let home = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
-    let config = config_home_with_roots(&[]);
-
-    // One cache already staged, so the trash has something to choose; another
-    // still on disk, so the clean half has work of its own.
-    let staged_origin = platform_cache(home.path(), "go-build");
-    std::fs::create_dir_all(&staged_origin).unwrap();
-    std::fs::write(staged_origin.join("blob.bin"), vec![0u8; CACHE_BYTES]).unwrap();
-    common::make_tree_non_shared_writable(home.path()).unwrap();
-    stage_everything(home.path(), config.path(), state.path());
+    // The staging fixture is the suite's own: a test that re-invents it can
+    // fail for reasons that have nothing to do with what it is checking.
+    let (home, state, _) = pip_fixture::create();
+    clean_run::run(home.path(), state.path());
     let trash = state.path().join("degu/trash");
     let before = entry_names(&trash);
-    assert_eq!(before.len(), 1, "the fixture must stage exactly one entry");
+    assert_eq!(
+        before.len(),
+        1,
+        "the staging fixture produced no entry, so the trash view has nothing to choose"
+    );
 
-    let kept = platform_cache(home.path(), "pip");
-    std::fs::create_dir_all(&kept).unwrap();
-    std::fs::write(kept.join("wheel.whl"), vec![0u8; CACHE_BYTES]).unwrap();
-    common::make_tree_non_shared_writable(home.path()).unwrap();
+    // Seed the same origin again so the clean half has work of its own; the
+    // test is only meaningful if a clean would have done something.
+    let kept = pip_cache::seed(home.path());
+    assert!(kept.exists());
 
+    let config = config_home_with_roots(&[]);
     let out = run_pty(PtyRun {
         body: r#"
 spawn -noecho sh -c {stty rows 40 columns 120; exec "$DEGU_BIN" --color never tui}
@@ -253,12 +257,12 @@ send "no\r"
     });
 
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "a declined purge reported success");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("the clean was not run either")
+        stderr.contains("the clean was not run either")
             || stdout.contains("the clean was not run either"),
-        "stdout: {stdout}\nstderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "stdout: {stdout}\nstderr: {stderr}"
     );
     assert_eq!(
         entry_names(&trash),
@@ -268,21 +272,6 @@ send "no\r"
     assert!(
         kept.exists(),
         "the clean ran even though the purge chosen with it did not"
-    );
-}
-
-fn stage_everything(home: &Path, config_home: &Path, state: &Path) {
-    let out = common::isolated_degu()
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", config_home)
-        .env("XDG_STATE_HOME", state)
-        .args(["clean", "--yes"])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
     );
 }
 

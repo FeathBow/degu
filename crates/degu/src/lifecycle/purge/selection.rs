@@ -14,6 +14,16 @@ pub(crate) fn plan_selected_trash(
     ctx: &DetectCtx,
     selection: &[PathBuf],
 ) -> Result<TrashPurgePlan> {
+    // The operation log records an absolute origin, so a selector typed
+    // relative to the shell's directory would match nothing and purge nothing
+    // while still reporting success. Resolve it the way `--entry` resolves
+    // its own: absolute and free of `.`, but with `..` left alone, because
+    // removing it lexically is unsound across a symlink.
+    let selection = selection
+        .iter()
+        .map(std::path::absolute)
+        .collect::<std::io::Result<Vec<_>>>()
+        .context("failed to resolve the selected original paths")?;
     let records = OperationLog::new(ctx).read()?;
     let recorded = reconciled_trash_info(&records);
     plan_matching_trash(ctx, |entry| {

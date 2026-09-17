@@ -619,3 +619,72 @@ fn purge_path_does_not_match_a_sibling_sharing_a_name_prefix() {
         "a lexical prefix reached a sibling it does not contain"
     );
 }
+
+/// The operation log records an absolute origin. A selector typed relative to
+/// the shell's directory used to match nothing and report a successful purge
+/// of zero entries, which reads as "there was nothing there".
+#[test]
+fn purge_path_resolves_a_selector_against_the_current_directory() {
+    let (home, state, pip, _) = two_staged_origins();
+    // The origins are resolved; the shell's directory has to be too, or the
+    // selector resolves to a path the operation log never recorded.
+    let resolved_home = std::fs::canonicalize(home.path()).unwrap();
+    let relative = pip.strip_prefix(&resolved_home).unwrap().to_path_buf();
+    assert!(
+        relative.is_relative(),
+        "the fixture must produce a relative selector"
+    );
+
+    let out = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .current_dir(&resolved_home)
+        .args(["trash", "purge", "--yes", "--path"])
+        .arg(&relative)
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let left = remaining_origins(&state);
+    assert_eq!(
+        left.len(),
+        1,
+        "a relative selector matched nothing: {left:?}"
+    );
+    assert!(left[0].contains("go-build"), "left: {left:?}");
+}
+
+/// `.` components are removed by the same resolution, so a path a shell would
+/// hand through unchanged still names the origin it points at.
+#[test]
+fn purge_path_accepts_a_selector_carrying_a_dot_component() {
+    let (home, state, pip, _) = two_staged_origins();
+    let parent = pip.parent().unwrap();
+    let name = pip.file_name().unwrap();
+    let dotted = parent.join(".").join(name);
+
+    let out = run(
+        &home,
+        &state,
+        &[
+            "trash",
+            "purge",
+            "--yes",
+            "--path",
+            dotted.to_str().unwrap(),
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let left = remaining_origins(&state);
+    assert_eq!(left.len(), 1, "left: {left:?}");
+    assert!(left[0].contains("go-build"), "left: {left:?}");
+}

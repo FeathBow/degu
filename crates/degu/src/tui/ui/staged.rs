@@ -168,12 +168,7 @@ fn row(item: (&Entry, usize), path_width: usize, app: &App) -> Row<'static> {
     } else {
         Style::new().fg(EDGE)
     };
-    let size = format::bytes(entry.bytes);
-    let size = if entry.lower_bound {
-        format!("≥ {size}")
-    } else {
-        size
-    };
+    let size = format::bounded_bytes(entry.bytes, entry.lower_bound);
     Row::new(vec![
         Cell::from(if position == staged.cursor() {
             "▸"

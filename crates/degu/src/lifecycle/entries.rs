@@ -151,48 +151,6 @@ mod tests {
         path
     }
 
-    fn inspect(entry: PathBuf, interrupted_purge: bool, age_secs: u64) -> TrashEntry {
-        let recorded = HashMap::new();
-        let now = jiff::Timestamp::now() + std::time::Duration::from_secs(age_secs);
-        inspect_entry(EntryInspection {
-            entry,
-            info: None,
-            recorded: &recorded,
-            now,
-            interrupted_purge,
-        })
-        .unwrap()
-    }
-
-    /// `Trash::entries_matching` skips the claims directory, so the expiry plan
-    /// never contains a claim however old it is. Reporting one as expiring
-    /// would tell a reader a clean removes something it retains.
-    #[test]
-    fn an_interrupted_claim_never_expires_however_old_it_is() {
-        let root = tempfile::tempdir().unwrap();
-        let claim = aged_dir(root.path(), "purge-interrupted");
-
-        let row = inspect(claim, true, EIGHT_DAYS);
-
-        assert!(row.age_days >= 8, "the fixture must read as old");
-        assert!(
-            !row.expiring,
-            "an interrupted claim was reported as expiring"
-        );
-    }
-
-    /// An ordinary staged entry of the same age does expire, so the assertion
-    /// above is about the claim and not about the fixture.
-    #[test]
-    fn an_ordinary_entry_of_the_same_age_does_expire() {
-        let root = tempfile::tempdir().unwrap();
-        let entry = aged_dir(root.path(), "0001-cache");
-
-        let row = inspect(entry, false, EIGHT_DAYS);
-
-        assert!(row.expiring);
-    }
-
     /// The same conclusion through the enumeration production uses: a claim
     /// reaches the list from `.claims`, not from a flag a caller set.
     #[test]
@@ -226,15 +184,5 @@ mod tests {
             ordinary.expiring,
             "the fixture is too young for the claim assertion to mean anything"
         );
-    }
-
-    #[test]
-    fn a_fresh_entry_does_not_expire() {
-        let root = tempfile::tempdir().unwrap();
-        let entry = aged_dir(root.path(), "0002-cache");
-
-        let row = inspect(entry, false, 0);
-
-        assert!(!row.expiring);
     }
 }

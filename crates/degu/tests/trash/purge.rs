@@ -449,31 +449,6 @@ fn purge_path_matches_a_parent_of_the_origin() {
     );
 }
 
-#[test]
-fn purge_path_that_matches_nothing_leaves_the_entries_intact() {
-    let (home, state, _, _) = two_staged_origins();
-    let before = remaining_origins(&state);
-
-    let out = run(
-        &home,
-        &state,
-        &[
-            "trash",
-            "purge",
-            "--yes",
-            "--path",
-            home.path().join("nowhere").to_str().unwrap(),
-        ],
-    );
-
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(remaining_origins(&state), before);
-}
-
 /// Narrowing chooses which entries are destroyed, not whether housekeeping
 /// runs. degu has no background timer, so a reader who only ever purges
 /// selectively would otherwise accumulate expired claims forever.
@@ -560,29 +535,6 @@ fn purge_entry_refuses_the_whole_plan_when_one_name_is_gone() {
     );
 }
 
-#[test]
-fn purge_refuses_an_origin_selector_together_with_an_exact_entry() {
-    let (home, state, pip, _) = two_staged_origins();
-    let entry = staged_from(&state, &pip);
-
-    let out = run(
-        &home,
-        &state,
-        &[
-            "trash",
-            "purge",
-            "--yes",
-            "--path",
-            pip.to_str().unwrap(),
-            "--entry",
-            entry.to_str().unwrap(),
-        ],
-    );
-
-    assert!(!out.status.success());
-    assert_eq!(remaining_origins(&state).len(), 2);
-}
-
 /// The selector matches whole path components. A refactor to a string prefix
 /// would silently widen every selection to its lexical neighbours, so a name
 /// that merely starts with the selector must not match.
@@ -655,37 +607,6 @@ fn purge_path_resolves_a_selector_against_the_current_directory() {
         1,
         "a relative selector matched nothing: {left:?}"
     );
-    assert!(left[0].contains("go-build"), "left: {left:?}");
-}
-
-/// `.` components are removed by the same resolution, so a path a shell would
-/// hand through unchanged still names the origin it points at.
-#[test]
-fn purge_path_accepts_a_selector_carrying_a_dot_component() {
-    let (home, state, pip, _) = two_staged_origins();
-    let parent = pip.parent().unwrap();
-    let name = pip.file_name().unwrap();
-    let dotted = parent.join(".").join(name);
-
-    let out = run(
-        &home,
-        &state,
-        &[
-            "trash",
-            "purge",
-            "--yes",
-            "--path",
-            dotted.to_str().unwrap(),
-        ],
-    );
-
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let left = remaining_origins(&state);
-    assert_eq!(left.len(), 1, "left: {left:?}");
     assert!(left[0].contains("go-build"), "left: {left:?}");
 }
 

@@ -11,9 +11,8 @@ use super::super::trash::Trash;
 use super::plan::{PlannedTrashEntry, PurgePlanBatch, TrashPurgePlan};
 
 /// A selected purge plan, with the selectors that reached no staged origin.
-/// A selector that matches nothing is a legitimate outcome — nothing from
-/// there is staged — but it is indistinguishable from a mistyped path unless
-/// the command says which one found nothing.
+/// Matching nothing is a legitimate outcome, and indistinguishable from a
+/// mistyped path unless the command can say which selector found nothing.
 pub(crate) struct SelectedTrashPlan {
     pub(crate) plan: TrashPurgePlan,
     pub(crate) unmatched: Vec<PathBuf>,
@@ -29,30 +28,23 @@ pub(crate) fn plan_selected_trash(
         .collect::<Result<Vec<_>>>()?;
     let records = OperationLog::new(ctx).read()?;
     let recorded = reconciled_trash_info(&records);
-    let matched = std::cell::RefCell::new(vec![false; selection.len()]);
+    let selects = |original: &Path| selection.iter().any(|chosen| original.starts_with(chosen));
     let plan = plan_matching_trash(ctx, |entry| {
-        let Some(info) = recorded.get(entry) else {
-            return false;
-        };
-        let mut matched = matched.borrow_mut();
-        let mut hit = false;
-        for (index, chosen) in selection.iter().enumerate() {
-            if info.original.starts_with(chosen) {
-                matched[index] = true;
-                hit = true;
-            }
-        }
-        hit
+        recorded
+            .get(entry)
+            .is_some_and(|info| selects(&info.original))
     })?;
-    let matched = matched.into_inner();
-    Ok(SelectedTrashPlan {
-        unmatched: selection
-            .into_iter()
-            .zip(matched)
-            .filter_map(|(path, hit)| (!hit).then_some(path))
-            .collect(),
-        plan,
-    })
+    let planned = plan
+        .entries()
+        .filter_map(|entry| recorded.get(entry))
+        .map(|info| info.original.as_path())
+        .collect::<Vec<_>>();
+    let unmatched = selection
+        .iter()
+        .filter(|chosen| !planned.iter().any(|origin| origin.starts_with(chosen)))
+        .cloned()
+        .collect();
+    Ok(SelectedTrashPlan { plan, unmatched })
 }
 
 /// Bring a selector into the namespace the operation log records.

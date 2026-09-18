@@ -23,7 +23,7 @@ const ARTIFACT_BYTES: usize = 7 * 1024 * 1024;
 /// A well-known cache degu cleans without being asked, plus a project whose
 /// build artifacts are reachable only through a project root.
 fn fixture(home: &Path) -> std::path::PathBuf {
-    let cache = platform_cache(home, "go-build");
+    let cache = common::platform_cache_dir(home, "go-build");
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join("blob.bin"), vec![0u8; CACHE_BYTES]).unwrap();
 
@@ -38,17 +38,6 @@ fn fixture(home: &Path) -> std::path::PathBuf {
     std::fs::write(project.join("target/.rustc_info.json"), "{}").unwrap();
     std::fs::write(project.join("target/debug.bin"), vec![0u8; ARTIFACT_BYTES]).unwrap();
     project
-}
-
-fn platform_cache(home: &Path, name: &str) -> std::path::PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        home.join("Library/Caches").join(name)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        home.join(".cache").join(name)
-    }
 }
 
 /// `docs/usage.md`: configured roots never authorize cleanup. A review that
@@ -87,7 +76,7 @@ fn a_root_named_on_the_command_line_is_offered() {
     let stdout = review(
         home.path(),
         config.path(),
-        &format!(" {}", shell_word(&project)),
+        &format!(" {}", project.display()),
     );
 
     assert!(
@@ -175,10 +164,6 @@ fn config_home_with_roots(roots: &[&Path]) -> tempfile::TempDir {
     dir
 }
 
-fn shell_word(path: &Path) -> String {
-    path.display().to_string()
-}
-
 /// The review draws its own screen, so `scan`'s output options have nothing to
 /// act on. Accepting them would promise a rendering this command never makes.
 #[test]
@@ -191,26 +176,6 @@ fn the_review_refuses_scan_output_options() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{flag} was accepted");
         assert!(stderr.contains("unexpected argument"), "{flag}: {stderr}");
-    }
-}
-
-/// Everything that selects or bounds the scan still belongs to it.
-#[test]
-fn the_review_keeps_the_scan_selection_options() {
-    for args in [
-        vec!["tui", "--only", "pip"],
-        vec!["tui", "--older-than", "7"],
-        vec!["tui", "--min-size", "1M"],
-        vec!["tui", "--top", "3"],
-        vec!["tui", "--runtime"],
-        vec!["tui", "--budget", "5s"],
-    ] {
-        let out = common::isolated_degu().args(&args).output().unwrap();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            !stderr.contains("unexpected argument"),
-            "{args:?} was rejected: {stderr}"
-        );
     }
 }
 

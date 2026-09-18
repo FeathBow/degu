@@ -22,7 +22,7 @@ use housekeeping::purge_expired_claims;
 pub(crate) use plan::PlannedTrashEntry;
 use plan::PurgePlanBatch;
 pub(crate) use plan::{ExpiryPlan, TrashPurgePlan};
-pub(crate) use selection::{plan_named_trash, plan_selected_trash};
+pub(crate) use selection::{SelectedTrashPlan, plan_named_trash, plan_selected_trash};
 use transaction::{PurgeOperation, append_record, purge_claimed, report_claim_failure};
 
 #[derive(Default)]

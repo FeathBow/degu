@@ -688,3 +688,107 @@ fn purge_path_accepts_a_selector_carrying_a_dot_component() {
     assert_eq!(left.len(), 1, "left: {left:?}");
     assert!(left[0].contains("go-build"), "left: {left:?}");
 }
+
+/// The operation log records a resolved origin, so a selector that reaches the
+/// same place through `..` names the same entry. Comparing lexically would
+/// silently match nothing and report a successful purge of zero entries.
+#[test]
+fn purge_path_accepts_a_selector_carrying_a_parent_component() {
+    let (home, state, pip, _) = two_staged_origins();
+    let parent = pip.parent().unwrap();
+    let detoured = parent
+        .join("..")
+        .join(parent.file_name().unwrap())
+        .join(pip.file_name().unwrap());
+
+    let out = run(
+        &home,
+        &state,
+        &[
+            "trash",
+            "purge",
+            "--yes",
+            "--path",
+            detoured.to_str().unwrap(),
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let left = remaining_origins(&state);
+    assert_eq!(left.len(), 1, "a `..` selector matched nothing: {left:?}");
+    assert!(left[0].contains("go-build"), "left: {left:?}");
+}
+
+/// The same place reached through a symlinked ancestor is the same place. The
+/// staged origin is gone by now, so only the surviving ancestor can be
+/// resolved — which is enough to land in the recorded namespace.
+#[test]
+fn purge_path_accepts_a_selector_through_a_symlinked_ancestor() {
+    let (home, state, pip, _) = two_staged_origins();
+    let caches = pip.parent().unwrap();
+    let alias = home.path().join("cache-alias");
+    symlink(caches, &alias).unwrap();
+    let through_alias = alias.join(pip.file_name().unwrap());
+
+    let out = run(
+        &home,
+        &state,
+        &[
+            "trash",
+            "purge",
+            "--yes",
+            "--path",
+            through_alias.to_str().unwrap(),
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let left = remaining_origins(&state);
+    assert_eq!(
+        left.len(),
+        1,
+        "a symlinked ancestor matched nothing: {left:?}"
+    );
+    assert!(left[0].contains("go-build"), "left: {left:?}");
+}
+
+/// A selector that reaches no staged origin is legitimate, but it must say so:
+/// otherwise a mistyped path is indistinguishable from an empty selection.
+#[test]
+fn purge_path_names_a_selector_that_reached_nothing() {
+    let (home, state, _, _) = two_staged_origins();
+    let absent = home.path().join("Library/Caches/never-staged");
+    let before = remaining_origins(&state);
+
+    let out = run(
+        &home,
+        &state,
+        &[
+            "trash",
+            "purge",
+            "--yes",
+            "--path",
+            absent.to_str().unwrap(),
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("never-staged") && stderr.contains("removed nothing"),
+        "an unmatched selector was not named: {stderr}"
+    );
+    assert_eq!(remaining_origins(&state), before);
+}

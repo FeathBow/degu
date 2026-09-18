@@ -193,6 +193,41 @@ mod tests {
         assert!(row.expiring);
     }
 
+    /// The same conclusion through the enumeration production uses: a claim
+    /// reaches the list from `.claims`, not from a flag a caller set.
+    #[test]
+    fn a_claim_found_by_the_real_enumeration_does_not_expire() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let claims = root.path().join(".claims");
+        std::fs::create_dir_all(&claims).unwrap();
+        std::fs::set_permissions(&claims, std::fs::Permissions::from_mode(0o700)).unwrap();
+        aged_dir(&claims, "purge-interrupted");
+        let staged = aged_dir(root.path(), "0001-cache");
+
+        let recorded = HashMap::new();
+        let now = jiff::Timestamp::now() + std::time::Duration::from_secs(EIGHT_DAYS);
+        let rows = root_entries(root.path(), &recorded, now).unwrap();
+
+        let claim = rows
+            .iter()
+            .find(|row| row.interrupted_purge)
+            .expect("the claims directory was not enumerated");
+        assert!(
+            !claim.expiring,
+            "an enumerated claim was reported as expiring"
+        );
+
+        let ordinary = rows
+            .iter()
+            .find(|row| row.entry == staged)
+            .expect("the staged entry was not enumerated");
+        assert!(
+            ordinary.expiring,
+            "the fixture is too young for the claim assertion to mean anything"
+        );
+    }
+
     #[test]
     fn a_fresh_entry_does_not_expire() {
         let root = tempfile::tempdir().unwrap();

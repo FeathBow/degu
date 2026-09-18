@@ -26,7 +26,11 @@ pub(super) fn run(args: TrashPurgeArgs, ui: Ui) -> Result<()> {
     let plan = if !args.entry.is_empty() {
         session.plan_purge_entries(&args.entry)?
     } else if !args.path.is_empty() {
-        session.plan_purge_selected(&args.path)?
+        let selected = session.plan_purge_selected(&args.path)?;
+        // Nothing staged from a named origin is a legitimate outcome, but it
+        // reads exactly like a mistyped path unless the selector is named.
+        report_unmatched(&selected.unmatched, ui);
+        selected.plan
     } else {
         session.plan_purge_all()?
     };
@@ -85,6 +89,19 @@ pub(super) fn run(args: TrashPurgeArgs, ui: Ui) -> Result<()> {
         anyhow::bail!("one or more trash entries failed to purge")
     }
     output_result
+}
+
+fn report_unmatched(unmatched: &[std::path::PathBuf], ui: Ui) {
+    for path in unmatched {
+        crate::presentation::print_stderr_note(
+            crate::presentation::Severity::Warning,
+            &ui.prose(&format!(
+                "no staged entry came from {}; this selector removed nothing.",
+                escape_terminal_text(&path.display().to_string())
+            )),
+            ui.colors,
+        );
+    }
 }
 
 fn print_json_report(

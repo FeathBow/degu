@@ -448,7 +448,7 @@ pub(crate) struct TrashPurgeArgs {
     /// Proceed without prompting
     #[arg(long)]
     pub(crate) yes: bool,
-    /// Keep only entries staged from at or under this original path, resolved against the current directory; repeatable
+    /// Keep only entries staged from at or under this original path, resolved the way the origin was recorded; repeatable
     #[arg(long, conflicts_with = "entry")]
     pub(crate) path: Vec<PathBuf>,
     /// Select the exact managed trash entry shown by trash list; repeatable

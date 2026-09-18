@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 pub(crate) use entries::TrashEntry;
 pub(crate) use expiry::TRASH_RETENTION_DAYS;
 pub(crate) use identity::EntryIdentity;
-pub(crate) use purge::{ExpiryPlan, PurgeReport, TrashPurgePlan};
+pub(crate) use purge::{ExpiryPlan, PurgeReport, SelectedTrashPlan, TrashPurgePlan};
 pub(crate) use stage::{
     CapturedCleanPlan, CleanExecution, CleanExecutionFailure, cleaned_resources,
 };
@@ -193,7 +193,7 @@ impl MutationSession {
         purge::plan_all_trash(&self.lifecycle.ctx)
     }
 
-    pub(crate) fn plan_purge_selected(&self, selection: &[PathBuf]) -> Result<TrashPurgePlan> {
+    pub(crate) fn plan_purge_selected(&self, selection: &[PathBuf]) -> Result<SelectedTrashPlan> {
         purge::plan_selected_trash(&self.lifecycle.ctx, selection)
     }
 

@@ -15,11 +15,11 @@ s             Sort by size, inodes, age, or path
 tab           Switch cache / node-runtime section
 t             Show the staging trash, and come back
 3 / enter     Open the selected record in full
-space         Put the selected finding in the plan, or take it out
+space         Put the selected finding or staged entry in, or take it out
 p             Preview the clean these choices describe
-c             Run both, each with the CLI's own plan and confirmation
+c             Run what you decided: the purge, the clean, or both
 PgUp/PgDn     Move by one visible page
-home/end      First / last finding or detail line
+home/end      First / last row, or first / last detail line
 Esc           Back; clear a filter; otherwise quit
 ?             Show / close this help
 q, Ctrl-C/D   Quit

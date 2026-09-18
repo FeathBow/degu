@@ -41,30 +41,38 @@ fn areas(area: Rect, lines: &[Line<'_>]) -> (Rect, Rect) {
 
 fn notice_lines(app: &App) -> Vec<Line<'static>> {
     let staged = app.staged();
-    let total = staged.total_plan();
-    let chosen = staged.chosen_plan();
-    let cleaning = !app.decisions().is_empty();
-    let expiring = staged.expiring_plan(cleaning);
+    let clean = app.decisions().plan();
+    let cleaning = clean.locations > 0;
+    let summary = staged.summary(cleaning);
     let mut lines = vec![
         Line::from(format!(
             "Staged: {} · {}. Staged data still counts against quota.",
-            format::locations(total.locations),
-            format::plan_size(total)
+            format::locations(summary.total.locations),
+            format::plan_size(summary.total)
         ))
         .fg(SECONDARY),
     ];
-    if chosen.locations > 0 {
-        lines.push(plan_line("Chosen for permanent deletion", chosen).fg(ROSE));
+    if summary.chosen.locations > 0 {
+        lines.push(plan_line("Chosen for permanent deletion", summary.chosen).fg(ROSE));
     }
-    if expiring.locations > 0 {
-        lines.push(plan_line("Also in this clean's expiry plan", expiring).fg(CAUTION));
-    } else if !cleaning && staged.expiring_plan(true).locations > 0 {
+    if summary.expiring.locations > 0 {
+        lines.push(plan_line("Also in this clean's expiry plan", summary.expiring).fg(CAUTION));
+    } else if !cleaning && staged.summary(true).expiring.locations > 0 {
         lines.push(Line::from("No clean selected; automatic expiry will not run.").fg(SECONDARY));
     }
-    if chosen.locations > 0 || expiring.locations > 0 || cleaning {
-        lines.push(outcome_line(app));
+    if summary.chosen.locations > 0 || summary.expiring.locations > 0 || cleaning {
+        lines.push(
+            Line::from(format!(
+                "Outside both purge plans: {} · {}. This clean would stage {} · {}.",
+                format::locations(summary.remaining.locations),
+                format::plan_size(summary.remaining),
+                format::locations(clean.locations),
+                format::plan_size(clean)
+            ))
+            .fg(SECONDARY),
+        );
     }
-    if chosen.locations > 0 || expiring.locations > 0 {
+    if summary.chosen.locations > 0 || summary.expiring.locations > 0 {
         lines.push(
             Line::from(
                 "Unsupported purge entries stay staged. The CLI rechecks and confirms each plan.",
@@ -73,19 +81,6 @@ fn notice_lines(app: &App) -> Vec<Line<'static>> {
         );
     }
     lines
-}
-
-fn outcome_line(app: &App) -> Line<'static> {
-    let clean = app.decisions().plan();
-    let remaining = app.staged().remaining_plan(clean.locations > 0);
-    Line::from(format!(
-        "Outside both purge plans: {} · {}. This clean would stage {} · {}.",
-        format::locations(remaining.locations),
-        format::plan_size(remaining),
-        format::locations(clean.locations),
-        format::plan_size(clean)
-    ))
-    .fg(SECONDARY)
 }
 
 fn plan_line(label: &str, plan: Plan) -> Line<'static> {

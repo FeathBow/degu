@@ -17,7 +17,7 @@ struct Review {
 
 impl Review {
     fn collect(args: TuiArgs, ui: Ui) -> Result<Self> {
-        let limits = args.limits;
+        let limits = args.selection.limits;
         let args = crate::cli::ScanArgs::from(args);
         let (report, filters, ctx) = crate::commands::scan::collect_for_review(args, ui)?;
         // One read-only pass over the trash. Each row already carries whether

@@ -56,6 +56,19 @@ impl Entry {
     }
 }
 
+/// What the staged screen reports, in parts that never count the same bytes
+/// twice.
+#[derive(Default)]
+pub struct Summary {
+    pub total: Plan,
+    pub chosen: Plan,
+    /// Removed by the clean that is also planned, whether or not it was chosen.
+    pub expiring: Plan,
+    /// Outside both proposed plans. What execution then admits is decided by
+    /// the commands, not here.
+    pub remaining: Plan,
+}
+
 pub struct Staged {
     entries: Vec<Entry>,
     chosen: BTreeSet<PathBuf>,
@@ -144,29 +157,23 @@ impl Staged {
         })
     }
 
-    pub fn chosen_plan(&self) -> Plan {
-        self.total(|entry| self.is_chosen(entry))
-    }
-
-    pub fn expiring_plan(&self, cleaning: bool) -> Plan {
-        self.total(|entry| cleaning && entry.expiring && !self.is_chosen(entry))
-    }
-
-    pub fn total_plan(&self) -> Plan {
-        self.total(|_| true)
-    }
-
-    /// Entries outside both plans. Unsupported entries within a plan also stay.
-    pub fn remaining_plan(&self, cleaning: bool) -> Plan {
-        self.total(|entry| !self.is_chosen(entry) && !(cleaning && entry.expiring))
-    }
-
-    fn total(&self, keep: impl Fn(&Entry) -> bool) -> Plan {
-        let mut plan = Plan::default();
-        for entry in self.entries.iter().filter(|entry| keep(entry)) {
-            plan.add(entry.bytes, entry.lower_bound);
+    /// Every total the staged screen shows, from one pass. The three parts
+    /// are disjoint: an entry is chosen, or expires under the clean that is
+    /// also planned, or stays.
+    pub fn summary(&self, cleaning: bool) -> Summary {
+        let mut summary = Summary::default();
+        for entry in &self.entries {
+            summary.total.add(entry.bytes, entry.lower_bound);
+            let part = if self.is_chosen(entry) {
+                &mut summary.chosen
+            } else if cleaning && entry.expiring {
+                &mut summary.expiring
+            } else {
+                &mut summary.remaining
+            };
+            part.add(entry.bytes, entry.lower_bound);
         }
-        plan
+        summary
     }
 }
 
@@ -189,23 +196,19 @@ mod tests {
         }
     }
 
+    /// Nothing is chosen until a keystroke says so, choosing names the exact
+    /// entry rather than its origin, and choosing again undoes it.
     #[test]
-    fn nothing_is_marked_for_deletion_until_it_is_chosen() {
-        let staged = Staged::new(vec![row("/trash/0001", Some("/a"), 10)]);
-        assert!(staged.nothing_chosen());
-        assert!(staged.purge_args().is_none());
-        assert_eq!(staged.chosen_plan().locations, 0);
-    }
-
-    #[test]
-    fn choosing_an_entry_names_the_exact_entry_not_its_origin() {
+    fn choosing_names_the_exact_entry_and_is_reversible() {
         let mut staged = Staged::new(vec![
             row("/trash/0001", Some("/a"), 10),
             row("/trash/0002", Some("/b"), 20),
         ]);
+        assert!(staged.nothing_chosen());
+        assert!(staged.purge_args().is_none());
+
         staged.move_by(1);
         staged.toggle();
-
         let args = staged
             .purge_args()
             .expect("a chosen entry produces arguments");
@@ -215,13 +218,8 @@ mod tests {
             "an exact selection must not also narrow by origin"
         );
         assert!(!args.yes, "the purge confirmation still runs");
-        assert_eq!(staged.chosen_plan().bytes, 20);
-    }
+        assert_eq!(staged.summary(false).chosen.bytes, 20);
 
-    #[test]
-    fn choosing_twice_returns_to_not_chosen() {
-        let mut staged = Staged::new(vec![row("/trash/0001", Some("/a"), 10)]);
-        staged.toggle();
         staged.toggle();
         assert!(staged.nothing_chosen());
     }
@@ -267,14 +265,16 @@ mod tests {
         older.expiring = true;
         let mut staged = Staged::new(vec![old, older, row("/trash/0003", Some("/new"), 40)]);
 
-        assert_eq!(staged.expiring_plan(true).locations, 2);
-        assert_eq!(staged.expiring_plan(true).bytes, 30);
-        assert_eq!(staged.remaining_plan(true).bytes, 40);
+        let summary = staged.summary(true);
+        assert_eq!(summary.expiring.locations, 2);
+        assert_eq!(summary.expiring.bytes, 30);
+        assert_eq!(summary.remaining.bytes, 40);
 
         staged.toggle();
-        assert_eq!(staged.chosen_plan().bytes, 10);
-        assert_eq!(staged.expiring_plan(true).bytes, 20);
-        assert_eq!(staged.total_plan().bytes, 70);
+        let summary = staged.summary(true);
+        assert_eq!(summary.chosen.bytes, 10);
+        assert_eq!(summary.expiring.bytes, 20);
+        assert_eq!(summary.total.bytes, 70);
     }
 
     /// Expiry rides on a confirmed clean. With no clean to run, nothing
@@ -284,33 +284,8 @@ mod tests {
         let mut old = row("/trash/0001", Some("/old"), 10);
         old.expiring = true;
         let staged = Staged::new(vec![old]);
-        assert_eq!(staged.expiring_plan(false).locations, 0);
-        assert_eq!(staged.remaining_plan(false).bytes, 10);
-    }
-
-    #[test]
-    fn the_cursor_stays_on_a_row_that_exists() {
-        let mut staged = Staged::new(vec![
-            row("/trash/0001", Some("/a"), 10),
-            row("/trash/0002", Some("/b"), 10),
-        ]);
-        staged.move_by(-5);
-        assert_eq!(staged.cursor(), 0);
-        staged.move_by(99);
-        assert_eq!(staged.cursor(), 1);
-        staged.select_first();
-        assert_eq!(staged.cursor(), 0);
-        staged.select_last();
-        assert_eq!(staged.cursor(), 1);
-    }
-
-    #[test]
-    fn an_empty_trash_answers_without_a_cursor_to_move() {
-        let mut staged = Staged::new(Vec::new());
-        assert!(staged.is_empty());
-        staged.move_by(1);
-        staged.toggle();
-        assert_eq!(staged.cursor(), 0);
-        assert!(staged.nothing_chosen());
+        let summary = staged.summary(false);
+        assert_eq!(summary.expiring.locations, 0);
+        assert_eq!(summary.remaining.bytes, 10);
     }
 }

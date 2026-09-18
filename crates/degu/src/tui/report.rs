@@ -119,8 +119,6 @@ impl Class {
         }
     }
 
-    /// The printed report's own labels. A reader should not have to learn the
-    /// same three words twice, so the strings live in one place.
     pub fn label(self) -> &'static str {
         crate::presentation::cleanup::label(self.mode())
     }

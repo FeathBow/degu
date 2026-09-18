@@ -241,17 +241,6 @@ mod tests {
     }
 
     #[test]
-    fn deciding_twice_returns_to_where_it_started() {
-        let mut decisions = Decisions::new(&[ready("/y"), review("/r")]);
-        for finding in [review("/r"), ready("/y")] {
-            decisions.toggle(&finding, Section::Cache);
-            decisions.toggle(&finding, Section::Cache);
-        }
-        assert!(decisions.is_chosen(&ready("/y")));
-        assert!(!decisions.is_chosen(&review("/r")));
-    }
-
-    #[test]
     fn dropping_everything_leaves_nothing_to_run() {
         let mut decisions = Decisions::new(&[ready("/y")]);
         decisions.toggle(&ready("/y"), Section::Cache);
@@ -266,6 +255,8 @@ mod tests {
     #[test]
     fn choosing_a_review_finding_asks_for_review_and_keeps_the_rest() {
         let mut decisions = Decisions::new(&[ready("/y"), review("/r"), review("/other")]);
+        decisions.toggle(&review("/other"), Section::Cache);
+        decisions.toggle(&review("/other"), Section::Cache);
         decisions.toggle(&review("/r"), Section::Cache);
 
         let args = decisions

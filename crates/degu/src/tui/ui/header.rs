@@ -52,7 +52,7 @@ fn masthead(app: &App, width: usize) -> Line<'static> {
 
 fn plan_label(app: &App) -> String {
     let (plan, verb) = if app.view() == View::Staged {
-        (app.staged().chosen_plan(), "To delete permanently")
+        (app.staged().summary(true).chosen, "To delete permanently")
     } else {
         (app.decisions().plan(), "In the plan")
     };

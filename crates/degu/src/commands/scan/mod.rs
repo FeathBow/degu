@@ -86,7 +86,7 @@ impl ScanRequest {
         Self {
             details: args.details,
             summary: args.summary,
-            run: CollectionRunOptions::new(args.output, args.limits, ui.colors),
+            run: CollectionRunOptions::new(args.output, args.selection.limits, ui.colors),
             scope,
             ui,
             project_roots,
@@ -105,9 +105,8 @@ pub(crate) fn collect_for_review(
         ui,
         ProjectRootAuthority::CleanupAuthorized,
     ))?;
-    // The roots stay the ones the scope carries, which are the roots typed on
-    // the command line. Anything wider here becomes a cleanup authority the
-    // reader never granted, since these filters end up in `CleanArgs`.
+    // These filters end up in `CleanArgs`, so the roots must stay the ones the
+    // scope carries.
     let filters = report.scope.clean_scope().filters;
     Ok((
         crate::tui::ScanReport::new(

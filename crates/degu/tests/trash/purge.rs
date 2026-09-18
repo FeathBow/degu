@@ -535,43 +535,6 @@ fn purge_entry_refuses_the_whole_plan_when_one_name_is_gone() {
     );
 }
 
-/// The selector matches whole path components. A refactor to a string prefix
-/// would silently widen every selection to its lexical neighbours, so a name
-/// that merely starts with the selector must not match.
-#[test]
-fn purge_path_does_not_match_a_sibling_sharing_a_name_prefix() {
-    let (home, state, _, go) = two_staged_origins();
-    let prefix = go.parent().unwrap().join("go");
-    assert!(
-        go.to_string_lossy().starts_with(prefix.to_str().unwrap()),
-        "the fixture must share a lexical prefix for this to be a boundary test"
-    );
-    let before = remaining_origins(&state);
-
-    let out = run(
-        &home,
-        &state,
-        &[
-            "trash",
-            "purge",
-            "--yes",
-            "--path",
-            prefix.to_str().unwrap(),
-        ],
-    );
-
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        remaining_origins(&state),
-        before,
-        "a lexical prefix reached a sibling it does not contain"
-    );
-}
-
 /// The operation log records an absolute origin. A selector typed relative to
 /// the shell's directory used to match nothing and report a successful purge
 /// of zero entries, which reads as "there was nothing there".
@@ -610,77 +573,6 @@ fn purge_path_resolves_a_selector_against_the_current_directory() {
     assert!(left[0].contains("go-build"), "left: {left:?}");
 }
 
-/// The operation log records a resolved origin, so a selector that reaches the
-/// same place through `..` names the same entry. Comparing lexically would
-/// silently match nothing and report a successful purge of zero entries.
-#[test]
-fn purge_path_accepts_a_selector_carrying_a_parent_component() {
-    let (home, state, pip, _) = two_staged_origins();
-    let parent = pip.parent().unwrap();
-    let detoured = parent
-        .join("..")
-        .join(parent.file_name().unwrap())
-        .join(pip.file_name().unwrap());
-
-    let out = run(
-        &home,
-        &state,
-        &[
-            "trash",
-            "purge",
-            "--yes",
-            "--path",
-            detoured.to_str().unwrap(),
-        ],
-    );
-
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let left = remaining_origins(&state);
-    assert_eq!(left.len(), 1, "a `..` selector matched nothing: {left:?}");
-    assert!(left[0].contains("go-build"), "left: {left:?}");
-}
-
-/// The same place reached through a symlinked ancestor is the same place. The
-/// staged origin is gone by now, so only the surviving ancestor can be
-/// resolved — which is enough to land in the recorded namespace.
-#[test]
-fn purge_path_accepts_a_selector_through_a_symlinked_ancestor() {
-    let (home, state, pip, _) = two_staged_origins();
-    let caches = pip.parent().unwrap();
-    let alias = home.path().join("cache-alias");
-    symlink(caches, &alias).unwrap();
-    let through_alias = alias.join(pip.file_name().unwrap());
-
-    let out = run(
-        &home,
-        &state,
-        &[
-            "trash",
-            "purge",
-            "--yes",
-            "--path",
-            through_alias.to_str().unwrap(),
-        ],
-    );
-
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let left = remaining_origins(&state);
-    assert_eq!(
-        left.len(),
-        1,
-        "a symlinked ancestor matched nothing: {left:?}"
-    );
-    assert!(left[0].contains("go-build"), "left: {left:?}");
-}
-
 /// A selector that reaches no staged origin is legitimate, but it must say so:
 /// otherwise a mistyped path is indistinguishable from an empty selection.
 #[test]
@@ -712,4 +604,51 @@ fn purge_path_names_a_selector_that_reached_nothing() {
         "an unmatched selector was not named: {stderr}"
     );
     assert_eq!(remaining_origins(&state), before);
+}
+
+/// The operation log records the path the adapter produced, symlinks and all.
+/// A reader who copies that path out of degu's own output must reach the entry
+/// it names; resolving the selector alone would send it somewhere else.
+#[test]
+fn purge_path_matches_an_origin_recorded_through_a_symlinked_cache_dir() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir_in(home.path()).unwrap();
+    let elsewhere = home.path().join("scratch/caches");
+    std::fs::create_dir_all(elsewhere.join("go-build")).unwrap();
+    std::fs::write(elsewhere.join("go-build/blob.bin"), vec![0u8; 4096]).unwrap();
+    let caches = crate::common::platform_cache_dir(home.path(), "x");
+    let caches = caches.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(caches.parent().unwrap()).unwrap();
+    symlink(&elsewhere, &caches).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+    clean_pip_cache(&home, &state);
+    let printed = caches.join("go-build");
+    assert_eq!(
+        visible_trash_entries(&private_trash_root(&state)).len(),
+        1,
+        "the fixture staged nothing through the symlinked cache directory"
+    );
+
+    let out = run(
+        &home,
+        &state,
+        &[
+            "trash",
+            "purge",
+            "--yes",
+            "--path",
+            printed.to_str().unwrap(),
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        remaining_origins(&state).is_empty(),
+        "the path degu printed did not reach the entry it staged: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

@@ -270,75 +270,61 @@ fn parse_decimal_uid(value: &str) -> Result<u32, String> {
     Ok(uid)
 }
 
+/// What a scan looks at and how far it goes. `scan` reports and `tui` decides,
+/// but both choose the same locations by the same rules, so these live in one
+/// place rather than drifting apart in two copies.
+#[derive(Args)]
+pub(crate) struct ScanSelectionArgs {
+    #[command(flatten)]
+    pub(crate) limits: ScanLimitArgs,
+    /// Keep only findings using at least this much space on disk (bytes, K, M, G, T)
+    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+    pub(crate) min_size: Option<u64>,
+    /// Keep only the N largest findings; applies per section (cache findings and node-runtime findings are filtered independently)
+    #[arg(long, value_name = "N")]
+    pub(crate) top: Option<usize>,
+    /// Keep only findings untouched for at least this many days
+    #[arg(long, value_name = "DAYS")]
+    pub(crate) older_than: Option<u64>,
+    /// Show only findings from this source ID; repeatable
+    #[arg(long)]
+    pub(crate) only: Vec<String>,
+    #[arg(long, help = RUNTIME_HELP)]
+    pub(crate) runtime: bool,
+    /// Project roots whose build artifacts are added to the usual cache scan
+    pub(crate) roots: Vec<PathBuf>,
+}
+
 #[derive(Args)]
 pub(crate) struct ScanArgs {
     #[command(flatten)]
     pub(crate) output: JsonArgs,
-    #[command(flatten)]
-    pub(crate) limits: ScanLimitArgs,
     /// Show each finding with its full absolute path, kind, rationale, and cleanup reason; ignored by --json
     #[arg(short, long)]
     pub(crate) details: bool,
     /// Group findings by source instead of listing individual paths
     #[arg(long)]
     pub(crate) summary: bool,
-    /// Keep only findings using at least this much space on disk (bytes, K, M, G, T)
-    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
-    pub(crate) min_size: Option<u64>,
-    /// Keep only the N largest findings; applies per section (cache findings and node-runtime findings are filtered independently)
-    #[arg(long, value_name = "N")]
-    pub(crate) top: Option<usize>,
-    /// Keep only findings untouched for at least this many days
-    #[arg(long, value_name = "DAYS")]
-    pub(crate) older_than: Option<u64>,
-    /// Show only findings from this source ID; repeatable
-    #[arg(long)]
-    pub(crate) only: Vec<String>,
-    #[arg(long, help = RUNTIME_HELP)]
-    pub(crate) runtime: bool,
-    /// Project roots whose build artifacts are added to the usual cache scan
-    pub(crate) roots: Vec<PathBuf>,
+    #[command(flatten)]
+    pub(crate) selection: ScanSelectionArgs,
 }
 
 /// The interactive review draws its own output, so `scan`'s output options
-/// have nothing to act on here. It takes only what selects and bounds the
-/// scan; accepting `--json`, `--details` or `--summary` would promise a
-/// rendering this command never produces.
+/// have nothing to act on here. Accepting `--json`, `--details` or `--summary`
+/// would promise a rendering this command never produces.
 #[derive(Args)]
 pub(crate) struct TuiArgs {
     #[command(flatten)]
-    pub(crate) limits: ScanLimitArgs,
-    /// Keep only findings using at least this much space on disk (bytes, K, M, G, T)
-    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
-    pub(crate) min_size: Option<u64>,
-    /// Keep only the N largest findings; applies per section (cache findings and node-runtime findings are filtered independently)
-    #[arg(long, value_name = "N")]
-    pub(crate) top: Option<usize>,
-    /// Keep only findings untouched for at least this many days
-    #[arg(long, value_name = "DAYS")]
-    pub(crate) older_than: Option<u64>,
-    /// Show only findings from this source ID; repeatable
-    #[arg(long)]
-    pub(crate) only: Vec<String>,
-    #[arg(long, help = RUNTIME_HELP)]
-    pub(crate) runtime: bool,
-    /// Project roots whose build artifacts are added to the usual cache scan
-    pub(crate) roots: Vec<PathBuf>,
+    pub(crate) selection: ScanSelectionArgs,
 }
 
 impl From<TuiArgs> for ScanArgs {
     fn from(args: TuiArgs) -> Self {
         Self {
             output: JsonArgs { json: false },
-            limits: args.limits,
             details: false,
             summary: false,
-            min_size: args.min_size,
-            top: args.top,
-            older_than: args.older_than,
-            only: args.only,
-            runtime: args.runtime,
-            roots: args.roots,
+            selection: args.selection,
         }
     }
 }

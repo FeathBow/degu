@@ -1,7 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Padding};
 
-use crate::report::Class;
+use crate::tui::report::Class;
 
 pub const BACKGROUND: Color = Color::Rgb(24, 28, 41);
 pub const SURFACE: Color = Color::Rgb(32, 38, 55);

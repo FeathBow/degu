@@ -1,8 +1,8 @@
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use crate::escape;
-use crate::report::{Class, Finding, Section};
+use crate::presentation::escape_terminal_text;
+use crate::tui::report::{Class, Finding, Section};
 
 use super::format;
 
@@ -29,7 +29,7 @@ impl Document {
         let source = content(finding, &introduction);
         let preview = preview(finding, section);
         Self {
-            label: escape::text(&finding.ecosystem),
+            label: escape_terminal_text(finding.ecosystem()),
             summary: preview_summary(finding),
             source,
             preview,
@@ -111,13 +111,13 @@ impl Document {
 }
 
 fn preview_summary(finding: &Finding) -> String {
-    let bound = if finding.skipped > 0 { "≥" } else { "" };
+    let bound = if finding.skipped() > 0 { "≥" } else { "" };
     let age = finding
-        .age_days
+        .age_days()
         .map_or_else(|| "unknown".to_owned(), |days| format!("{days}d"));
     format!(
         "allocated {bound}{} · age {age}",
-        format::bytes(finding.bytes_allocated)
+        format::bytes(finding.bytes_allocated())
     )
 }
 
@@ -139,27 +139,27 @@ fn preview_lines(source: &[Line<'static>], summary: &str, width: u16) -> Vec<Lin
 }
 
 fn preview(finding: &Finding, section: Section) -> Vec<Line<'static>> {
+    let class = Class::of(finding, section);
     let mut lines = vec![
-        Line::from(Class::of(finding, section).label())
-            .style(class_style(Class::of(finding, section))),
-        Line::from(escape::text(&finding.path)).bold(),
+        Line::from(class.label()).style(class_style(class)),
+        Line::from(escape_terminal_text(&finding.path().to_string_lossy())).bold(),
     ];
-    if finding.skipped > 0 {
+    if finding.skipped() > 0 {
         lines.push(
             Line::from(format!(
                 "! {} skipped · allocated ≥{}",
-                format::count(finding.skipped),
-                format::bytes(finding.bytes_allocated)
+                format::count(finding.skipped()),
+                format::bytes(finding.bytes_allocated())
             ))
             .fg(CAUTION),
         );
     }
-    let reason = if finding.disposition.reason.is_empty() {
-        &finding.rationale
-    } else {
-        &finding.disposition.reason
-    };
-    lines.push(Line::from(escape::text(reason)).fg(SECONDARY));
+    let reason = finding
+        .disposition()
+        .reason
+        .as_deref()
+        .unwrap_or_else(|| finding.rationale());
+    lines.push(Line::from(escape_terminal_text(reason)).fg(SECONDARY));
     lines
 }
 
@@ -176,14 +176,19 @@ fn reflow(source: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
 
 fn introduction(finding: &Finding, section: Section) -> Vec<Line<'static>> {
     let class = Class::of(finding, section);
-    let reason = escape::text(&finding.disposition.reason);
+    let reason = finding
+        .disposition()
+        .reason
+        .as_deref()
+        .map(escape_terminal_text)
+        .unwrap_or_default();
     let status = if reason.is_empty() {
         class.label().to_owned()
     } else {
         format!("{} · {reason}", class.label())
     };
     vec![
-        Line::from(escape::text(&finding.path)).bold(),
+        Line::from(escape_terminal_text(&finding.path().to_string_lossy())).bold(),
         Line::from(status).style(class_style(class)),
     ]
 }
@@ -197,7 +202,7 @@ fn content(finding: &Finding, introduction: &[Line<'static>]) -> Vec<Line<'stati
         Line::from(other_measurements(finding)),
         Line::default(),
         heading("Why this status"),
-        Line::from(escape::text(&finding.rationale)),
+        Line::from(escape_terminal_text(finding.rationale())),
         Line::default(),
         heading("Classification"),
     ]);
@@ -210,40 +215,35 @@ fn heading(label: &'static str) -> Line<'static> {
 }
 
 fn sizes(finding: &Finding) -> String {
-    let floor = if finding.skipped > 0 { "≥" } else { "" };
+    let floor = if finding.skipped() > 0 { "≥" } else { "" };
     format!(
-        "Allocated {floor}{} · Apparent {} · Inodes {}",
-        format::bytes(finding.bytes_allocated),
-        format::bytes(finding.bytes_apparent),
-        format::count(finding.inodes),
+        "Allocated {floor}{} · Inodes {}",
+        format::bytes(finding.bytes_allocated()),
+        format::count(finding.inodes()),
     )
 }
 
 fn other_measurements(finding: &Finding) -> String {
     let age = finding
-        .age_days
+        .age_days()
         .map_or_else(|| "unknown".to_owned(), |days| format!("{days}d"));
     format!(
         "Hardlinked {} · age {age} · {} skipped",
-        format::bytes(finding.bytes_hardlinked),
-        format::count(finding.skipped)
+        format::bytes(finding.bytes_hardlinked()),
+        format::count(finding.skipped())
     )
 }
 
 fn metadata(finding: &Finding) -> Vec<String> {
-    let recovery = finding
-        .recovery
-        .as_ref()
-        .map_or("unknown", |recovery| recovery.kind.as_str());
     [
-        ("Ecosystem", finding.ecosystem.as_str()),
-        ("Kind", finding.kind.as_str()),
-        ("Disposition", finding.disposition.mode.as_str()),
-        ("Recovery", recovery),
-        ("Ownership", finding.ownership.as_str()),
-        ("Confidence", finding.confidence.as_str()),
+        ("Source", finding.ecosystem()),
+        ("Kind", crate::findings::kind_label(finding.kind())),
+        (
+            "Cleanup reason",
+            finding.disposition().reason.as_deref().unwrap_or("-"),
+        ),
     ]
     .into_iter()
-    .map(|(label, value)| format!("{label}: {}", escape::text(value)))
+    .map(|(label, value)| format!("{label}: {}", escape_terminal_text(value)))
     .collect()
 }

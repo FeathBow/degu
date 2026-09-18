@@ -1,8 +1,8 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
-use crate::escape;
-use crate::report::{Class, Finding, Section};
+use crate::presentation::escape_terminal_text;
+use crate::tui::report::{Class, Finding, Section};
 
 use super::format;
 use super::text::elide;
@@ -11,6 +11,7 @@ use super::{App, Focus, window_start};
 
 const TABLE_OVERHEAD: usize = 3;
 const CURSOR_WIDTH: usize = 1;
+const MARK_WIDTH: usize = 1;
 const STATUS_WIDTH: usize = 14;
 const ECOSYSTEM_WIDTH: usize = 14;
 const FULL_STATUS_MIN_WIDTH: usize = 55;
@@ -33,7 +34,7 @@ impl Columns {
         };
         let ecosystem = inner >= ECOSYSTEM_MIN_WIDTH;
         let ecosystem_space = if ecosystem { ECOSYSTEM_WIDTH + 1 } else { 0 };
-        let fixed = CURSOR_WIDTH + status + metric + TABLE_OVERHEAD + ecosystem_space;
+        let fixed = CURSOR_WIDTH + MARK_WIDTH + status + metric + TABLE_OVERHEAD + ecosystem_space;
         Self {
             path: inner.saturating_sub(fixed).max(1),
             status,
@@ -45,6 +46,7 @@ impl Columns {
     fn widths(&self) -> Vec<Constraint> {
         let mut widths = vec![
             Constraint::Length(CURSOR_WIDTH as u16),
+            Constraint::Length(MARK_WIDTH as u16),
             Constraint::Min(self.path as u16),
         ];
         if self.ecosystem {
@@ -61,7 +63,7 @@ impl Columns {
         } else {
             ""
         };
-        let mut cells = vec![Cell::from(""), Cell::from("PATH")];
+        let mut cells = vec![Cell::from(""), Cell::from(""), Cell::from("PATH")];
         if self.ecosystem {
             cells.push(Cell::from("ECOSYSTEM"));
         }
@@ -125,12 +127,21 @@ fn finding_row(item: (&Finding, usize), columns: &Columns, app: &App) -> Row<'st
         symbol(class)
     };
     let selected = position == app.browser().selected();
+    let mark = match (class, app.decisions().is_chosen(finding)) {
+        (Class::NotManaged, _) => " ",
+        (_, true) => "✓",
+        (_, false) => "○",
+    };
     let mut cells = vec![
         Cell::from(if selected { "▸" } else { " " }).style(Style::new().fg(ACCENT)),
-        Cell::from(elide(&escape::text(&finding.path), columns.path)),
+        Cell::from(mark).style(class_style(class)),
+        Cell::from(elide(
+            &escape_terminal_text(&finding.path().to_string_lossy()),
+            columns.path,
+        )),
     ];
     if columns.ecosystem {
-        cells.push(Cell::from(escape::text(&finding.ecosystem)));
+        cells.push(Cell::from(escape_terminal_text(finding.ecosystem())));
     }
     cells.push(Cell::from(status).style(class_style(class)));
     let metric_style = if selected {
@@ -160,11 +171,9 @@ fn symbol(class: Class) -> &'static str {
 
 fn empty_message(app: &App) -> &'static str {
     let browser = app.browser();
-    if !browser.coverage().was_requested() {
+    if !browser.coverage().is_requested() {
         return match browser.section() {
-            Section::Runtime => {
-                "Runtime was not scanned.\nCreate a report with degu scan --runtime --json."
-            }
+            Section::Runtime => "Runtime was not scanned.\nRun degu tui --runtime to include it.",
             Section::Cache => "Cache was not scanned in this report.",
         };
     }

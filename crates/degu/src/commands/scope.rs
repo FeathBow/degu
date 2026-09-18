@@ -20,13 +20,13 @@ impl ScanScope {
     pub(crate) fn from_args(args: &ScanArgs) -> Self {
         Self {
             filters: Filters {
-                roots: args.roots.clone(),
-                only: args.only.clone(),
-                older_than: args.older_than,
-                min_size: args.min_size,
-                top: args.top,
+                roots: args.selection.roots.clone(),
+                only: args.selection.only.clone(),
+                older_than: args.selection.older_than,
+                min_size: args.selection.min_size,
+                top: args.selection.top,
             },
-            runtime: args.runtime,
+            runtime: args.selection.runtime,
         }
     }
 

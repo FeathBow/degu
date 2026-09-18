@@ -128,6 +128,12 @@ degu trash purge     # or permanently delete what you reviewed
 
 Only **Ready to clean** enters the default plan. For one **Needs review** location, the scan prints a shorter `degu clean -dn --review PATH` preview; the resulting `Next` command keeps the same exact selection.
 
+When the decision is about one location rather than a rule, `degu tui` brings the scan, the clean, and a selective purge onto one screen: it shows the findings and the staging trash together, you choose per location what to clean and what to permanently delete, and it hands your choices to the same `clean` and `trash purge` implementations with their own plans and confirmations. Recovery stays a command of its own — `degu undo` restores the latest clean, and nothing in the review does that for you.
+
+```sh
+degu tui
+```
+
 Staged data stays reversible and still counts against quota until purged; choose one recovery branch per clean operation. A confirmed mutating clean also permanently purges trash entries at least seven days old. On very large shared filesystems a full first scan can take minutes:
 
 ```sh
@@ -145,7 +151,7 @@ degu scan .
 degu clean . --dry-run
 ```
 
-To include a project tree in every scan, add it to `roots` in the [configuration](https://github.com/FeathBow/degu/blob/main/docs/configuration.md); `clean` still requires the root as an explicit argument.
+To include a project tree in every `degu scan`, add it to `roots` in the [configuration](https://github.com/FeathBow/degu/blob/main/docs/configuration.md). Configured roots are for reading: `clean` and `tui` both require the root as an explicit argument before anything under it can enter a plan.
 
 ### Check filesystem quota
 

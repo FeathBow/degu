@@ -106,9 +106,33 @@ degu trash list
 degu trash purge
 ```
 
+`--path` narrows that plan to entries staged from at or under a path, so space can be reclaimed from one origin while the rest stay restorable by `degu undo`. It is repeatable, takes the same confirmation as a full purge, and matches the origin recorded in the operation log — the selector is resolved the same way that origin was, so a relative path, a `..`, or a symlinked ancestor all name the place they point at. The staged location itself is gone by then, so only the part of the path that still exists can be resolved; a selector that reaches no staged origin says so rather than reporting a purge of nothing:
+
+```sh
+degu trash purge --path ~/.cache/huggingface
+```
+
+To select one particular staged copy, use `--entry` with its trash path from `degu trash list`. It is repeatable, matches the exact entry rather than its original location, and cannot be combined with `--path`. If a selected entry is no longer available, the command refuses the selected plan. Interrupted purge claims remain part of the full-purge workflow.
+
 A sealed purge interrupted after its durable WAL claim is different: startup marks it `RecoveryRequired`; it does not become a legacy claim that `trash purge` may guess or retry.
 
 For immediate permanent deletion, use `degu clean --purge`. Successfully purged entries cannot be restored. The [staging, undo, and purge policy](safety.md#staging-undo-and-purge) defines the confirmations and fixed-plan guarantees for both purge commands.
+
+## Review and decide interactively
+
+The commands above express a policy. Some decisions are not a policy: on a node where the reclaimable space is model and compile caches, which model is coming back next week and which is not is a judgement about one location, and a rule cannot capture it. Writing it down means transcribing paths out of a report that has already scrolled past.
+
+```sh
+degu tui
+```
+
+This runs the scan a clean would run, shows its findings alongside the current staging trash, and lets you decide per location. Project roots are the one difference from `degu scan`: a review collects under the authority its clean will have, so it covers the roots named on its own command line and not the ones configured for read-only discovery — exactly the set `degu clean` acts on. Pass a root to `degu tui PATH` to decide on it, or run `degu scan` to read what the configured roots hold. Space puts a finding in the clean plan or takes it out; **Ready to clean** findings start in it and **Needs review** findings start out, so including one is still an explicit act for one location at a time. **Not managed** findings cannot be put in from here, exactly as they cannot from the command line. `t` shows the staging trash, where space chooses entries for permanent deletion; nothing there is chosen for you. `c` runs what you decided.
+
+The interface passes its choices to `degu trash purge` and `degu clean`. Clean requests preserve the scan's filters, project roots, and limits, and explicitly name every chosen finding, including the initial Ready to clean selection. Staged choices use `--entry`, so copies from the same original location can be selected independently. Permanent deletion runs first. Each half prints its own plan and takes its own confirmation, including typing the word for irreversible removal; refusing permanent deletion cancels the clean with it. The equivalent command line is printed before each, with quoted paths and the same arguments.
+
+Because there is no background timer, a confirmed clean also runs the [seven-day expiry plan](safety.md#staging-undo-and-purge). The staged screen uses that plan to distinguish expiry candidates from explicitly chosen entries and entries outside both plans. Unsupported purge entries remain staged; displayed plan sizes do not promise an equal reduction in quota. If every clean finding is unselected, `p` reports an empty selection and `c` runs only any explicitly chosen trash purge, without automatic expiry.
+
+`degu tui` requires an interactive terminal on both stdin and stdout, and refuses before taking the screen. Use `degu scan` for output that survives a pipe or a log.
 
 ## Tool-native reclaim (advanced)
 

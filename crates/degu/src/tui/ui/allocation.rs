@@ -1,8 +1,8 @@
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use crate::browser::Browser;
-use crate::report::Total;
+use crate::tui::browser::Browser;
+use crate::tui::report::Total;
 
 use super::App;
 use super::format::bytes_total;
@@ -106,7 +106,7 @@ pub fn selected_share(frame: &mut Frame, area: Rect, app: &App) {
         };
         Line::from(message).fg(theme::SECONDARY)
     } else {
-        let ratio = finding.bytes_allocated as f64 / browser.allocated().value as f64;
+        let ratio = finding.bytes_allocated() as f64 / browser.allocated().value as f64;
         let bar_width = width.saturating_sub(PERCENT_WIDTH);
         let filled = (ratio * bar_width as f64).round() as usize;
         Line::from(vec![

@@ -1,5 +1,5 @@
-use crate::browser::SortBy;
-use crate::report::{Coverage, Finding, Total};
+use crate::tui::browser::SortBy;
+use crate::tui::report::{Coverage, Finding, Total};
 
 const UNIT_BASE: u64 = 1024;
 const DECIMAL_BASE: f64 = 10.0;
@@ -50,12 +50,33 @@ pub fn count(value: u64) -> String {
     out
 }
 
+pub fn locations(count: usize) -> String {
+    let suffix = if count == 1 { "" } else { "s" };
+    format!("{count} location{suffix}")
+}
+
 pub fn bytes_total(total: Total) -> String {
     bound(bytes(total.value), total.saturated)
 }
 
 pub fn count_total(total: Total) -> String {
     bound(count(total.value), total.saturated)
+}
+
+/// A size that is only a floor, marked as one. Rows and totals carry the
+/// same mark so a truncated measurement is never read as exact anywhere.
+pub fn bounded_bytes(value: u64, lower_bound: bool) -> String {
+    let size = bytes(value);
+    if lower_bound {
+        format!("≥ {size}")
+    } else {
+        size
+    }
+}
+
+/// A plan is a floor when any member was, or when the sum saturated.
+pub fn plan_size(plan: crate::tui::decision::Plan) -> String {
+    bounded_bytes(plan.bytes, plan.lower_bound)
 }
 
 fn bound(value: String, saturated: bool) -> String {
@@ -67,18 +88,20 @@ fn bound(value: String, saturated: bool) -> String {
 }
 
 pub fn coverage_label(coverage: Coverage) -> &'static str {
-    match coverage {
-        Coverage::Complete => "Complete scan",
-        Coverage::NotRequested => "Not scanned",
-        Coverage::Truncated => "truncated",
-        Coverage::Incomplete => "incomplete",
-        Coverage::Unknown => "completeness unknown",
+    if !coverage.is_requested() {
+        "Not scanned"
+    } else if coverage.is_truncated() {
+        "truncated"
+    } else if coverage.is_incomplete() {
+        "incomplete"
+    } else {
+        "Complete scan"
     }
 }
 
 pub fn coverage_warning(coverage: Coverage) -> Option<String> {
     coverage
-        .is_floor()
+        .is_lower_bound()
         .then(|| format!("{} — totals are a floor", coverage_label(coverage)))
 }
 
@@ -92,9 +115,9 @@ pub fn metric_heading(sort: SortBy) -> &'static str {
 
 pub fn metric(finding: &Finding, sort: SortBy) -> String {
     match sort {
-        SortBy::Size | SortBy::Path => bytes(finding.bytes_allocated),
-        SortBy::Inodes => count(finding.inodes),
-        SortBy::Age => age(finding.age_days),
+        SortBy::Size | SortBy::Path => bytes(finding.bytes_allocated()),
+        SortBy::Inodes => count(finding.inodes()),
+        SortBy::Age => age(finding.age_days()),
     }
 }
 

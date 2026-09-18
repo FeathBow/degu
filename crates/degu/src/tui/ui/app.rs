@@ -1,8 +1,9 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::browser::{Browser, SortBy};
-use crate::escape;
-use crate::report::{ScanReport, Section};
+use crate::tui::browser::{Browser, SortBy};
+use crate::tui::decision::Decisions;
+use crate::tui::report::{ScanReport, Section};
+use crate::tui::staged::Staged;
 
 use super::allocation::{self, Segment};
 use super::derived::Derived;
@@ -16,19 +17,30 @@ pub enum Focus {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Quit,
+    Preview,
+    Clean,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Browser,
+    Staged,
     Details,
     Help,
 }
 
 pub struct App {
     browser: Browser,
-    source: String,
+    decisions: Decisions,
+    staged: Staged,
+    home: std::path::PathBuf,
     view: View,
     focus: Focus,
     page_size: usize,
     group_page_size: usize,
+    staged_page_size: usize,
     document: Derived<Document, Option<(Section, usize)>>,
     metric_width: Derived<usize, (Section, SortBy, usize)>,
     allocation: Derived<Vec<Segment>, Section>,
@@ -36,18 +48,22 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(report: ScanReport, source: String) -> Self {
+    pub fn new(report: ScanReport, staged: Staged, home: std::path::PathBuf) -> Self {
+        let decisions = Decisions::new(report.section(Section::Cache));
         let browser = Browser::new(report);
-        let document = Derived::new(document_key(&browser), || document(&browser));
+        let document = Derived::new(browser.selection(), || document(&browser));
         let metric_width = Derived::new(metric_key(&browser), || metric_width(&browser));
         let allocation = Derived::new(browser.section(), || allocation::segments(&browser));
         Self {
             browser,
-            source: escape::text(&source),
+            decisions,
+            staged,
+            home,
             view: View::Browser,
             focus: Focus::Findings,
             page_size: 1,
             group_page_size: 1,
+            staged_page_size: 1,
             document,
             metric_width,
             allocation,
@@ -58,19 +74,27 @@ impl App {
     fn refresh(&mut self) {
         let browser = &self.browser;
         self.document
-            .refresh(document_key(browser), || document(browser));
+            .refresh(browser.selection(), || document(browser));
         self.metric_width
             .refresh(metric_key(browser), || metric_width(browser));
         self.allocation
             .refresh(browser.section(), || allocation::segments(browser));
     }
 
-    pub fn browser(&self) -> &Browser {
-        &self.browser
+    pub fn decisions(&self) -> &Decisions {
+        &self.decisions
     }
 
-    pub fn source(&self) -> &str {
-        &self.source
+    pub fn staged(&self) -> &Staged {
+        &self.staged
+    }
+
+    pub fn home(&self) -> &std::path::Path {
+        &self.home
+    }
+
+    pub fn browser(&self) -> &Browser {
+        &self.browser
     }
 
     pub fn view(&self) -> View {
@@ -98,19 +122,23 @@ impl App {
         self.group_page_size = groups;
     }
 
-    pub fn handle(&mut self, key: KeyEvent) -> bool {
+    pub fn resize_staged(&mut self, entries: usize) {
+        self.staged_page_size = entries;
+    }
+
+    pub fn handle(&mut self, key: KeyEvent) -> Option<Outcome> {
         let control_quit = key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c' | 'd'));
         if key.code == KeyCode::Char('q') || control_quit {
-            return true;
+            return Some(Outcome::Quit);
         }
         match key.code {
             KeyCode::Esc => match self.view {
                 View::Help => self.view = self.help_return,
-                View::Details => self.view = View::Browser,
+                View::Details | View::Staged => self.view = View::Browser,
                 View::Browser => {
                     if !self.browser.clear_filter() {
-                        return true;
+                        return Some(Outcome::Quit);
                     }
                 }
             },
@@ -123,16 +151,25 @@ impl App {
                 }
             }
             code => match self.view {
-                View::Browser => self.browse(code),
+                View::Browser => {
+                    if let Some(outcome) = self.browse(code) {
+                        return Some(outcome);
+                    }
+                }
+                View::Staged => {
+                    if let Some(outcome) = self.review_staged(code) {
+                        return Some(outcome);
+                    }
+                }
                 View::Details => self.scroll(code),
                 View::Help => {}
             },
         }
         self.refresh();
-        false
+        None
     }
 
-    fn browse(&mut self, code: KeyCode) {
+    fn browse(&mut self, code: KeyCode) -> Option<Outcome> {
         let page_size = match self.focus {
             Focus::Groups => self.group_page_size,
             Focus::Findings => self.page_size,
@@ -142,7 +179,7 @@ impl App {
                 Focus::Groups => self.browser.filter_by(delta),
                 Focus::Findings => self.browser.move_by(delta),
             }
-            return;
+            return None;
         }
         match code {
             KeyCode::Home | KeyCode::End => {
@@ -151,7 +188,7 @@ impl App {
                     let position = if last { self.browser.groups().len() } else { 0 };
                     self.browser
                         .filter_by(position as isize - self.browser.group_position() as isize);
-                    return;
+                    return None;
                 }
                 if last {
                     self.browser.select_last();
@@ -179,10 +216,39 @@ impl App {
                     self.view = View::Details;
                 }
             }
+            KeyCode::Char('t') => self.view = View::Staged,
+            KeyCode::Char('p') => return Some(Outcome::Preview),
+            KeyCode::Char('c') if self.has_work() => return Some(Outcome::Clean),
+            KeyCode::Char(' ') => {
+                if let Some(finding) = self.browser.selected_finding() {
+                    self.decisions.toggle(finding, self.browser.section());
+                }
+            }
             KeyCode::Char('1') => self.focus = Focus::Groups,
             KeyCode::Char('2') => self.focus = Focus::Findings,
             _ => {}
         }
+        None
+    }
+
+    fn review_staged(&mut self, code: KeyCode) -> Option<Outcome> {
+        if let Some(delta) = movement(code, self.staged_page_size) {
+            self.staged.move_by(delta);
+            return None;
+        }
+        match code {
+            KeyCode::Home => self.staged.select_first(),
+            KeyCode::End => self.staged.select_last(),
+            KeyCode::Char(' ') => self.staged.toggle(),
+            KeyCode::Char('t') => self.view = View::Browser,
+            KeyCode::Char('c') if self.has_work() => return Some(Outcome::Clean),
+            _ => {}
+        }
+        None
+    }
+
+    pub fn has_work(&self) -> bool {
+        !self.decisions.is_empty() || !self.staged.nothing_chosen()
     }
 
     fn scroll(&mut self, code: KeyCode) {
@@ -206,11 +272,6 @@ fn document(browser: &Browser) -> Document {
         .unwrap_or_default()
 }
 
-fn document_key(browser: &Browser) -> Option<(Section, usize)> {
-    browser.selection()
-}
-
-// Sized from every finding currently listed.
 fn metric_key(browser: &Browser) -> (Section, SortBy, usize) {
     (
         browser.section(),

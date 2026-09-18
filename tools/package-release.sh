@@ -70,6 +70,7 @@ write_man_page degu-admin.1 admin
 write_man_page degu-admin-setup.1 admin setup
 write_man_page degu-quota.1 quota
 write_man_page degu-scan.1 scan
+write_man_page degu-tui.1 tui
 write_man_page degu-clean.1 clean
 write_man_page degu-undo.1 undo
 write_man_page degu-trash.1 trash

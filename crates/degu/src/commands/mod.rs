@@ -21,6 +21,7 @@ pub(crate) mod scan;
 mod scope;
 mod setup;
 pub(crate) mod trash;
+pub(crate) mod tui;
 pub(crate) mod undo;
 
 pub(crate) struct CollectionRunOptions {

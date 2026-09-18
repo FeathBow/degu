@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 pub(crate) use entries::TrashEntry;
 pub(crate) use expiry::TRASH_RETENTION_DAYS;
 pub(crate) use identity::EntryIdentity;
-pub(crate) use purge::{ExpiryPlan, PurgeReport, TrashPurgePlan};
+pub(crate) use purge::{ExpiryPlan, PurgeReport, SelectedTrashPlan, TrashPurgePlan};
 pub(crate) use stage::{
     CapturedCleanPlan, CleanExecution, CleanExecutionFailure, cleaned_resources,
 };
@@ -191,6 +191,14 @@ impl MutationSession {
 
     pub(crate) fn plan_purge_all(&self) -> Result<TrashPurgePlan> {
         purge::plan_all_trash(&self.lifecycle.ctx)
+    }
+
+    pub(crate) fn plan_purge_selected(&self, selection: &[PathBuf]) -> Result<SelectedTrashPlan> {
+        purge::plan_selected_trash(&self.lifecycle.ctx, selection)
+    }
+
+    pub(crate) fn plan_purge_entries(&self, entries: &[PathBuf]) -> Result<TrashPurgePlan> {
+        purge::plan_named_trash(&self.lifecycle.ctx, entries)
     }
 
     /// Post-confirmation classification and sealed execution. Unsupported

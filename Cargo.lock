@@ -375,6 +375,7 @@ dependencies = [
  "getrandom",
  "jiff",
  "libc",
+ "ratatui",
  "rustix",
  "serde",
  "serde_json",
@@ -415,18 +416,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
-]
-
-[[package]]
-name = "degu-tui"
-version = "0.1.7"
-dependencies = [
- "anyhow",
- "crossterm",
- "ratatui",
- "serde",
- "serde_json",
- "unicode-width",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use crate::browser::Group;
+use crate::tui::browser::Group;
 
 use super::format::{bytes_total, count};
 use super::text::{columns, elide, pad};
@@ -95,7 +95,7 @@ fn row(app: &App, position: usize, width: u16) -> [Line<'static>; ROW_HEIGHT] {
 
 pub fn filter_line(frame: &mut Frame, area: Rect, app: &App) {
     let browser = app.browser();
-    if !browser.coverage().was_requested() {
+    if !browser.coverage().is_requested() {
         return;
     }
     let name = browser

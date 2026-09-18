@@ -28,7 +28,8 @@ clap.workspace = true
 clap_complete.workspace = true
 clap_mangen.workspace = true
 comfy-table.workspace = true
-crossterm.workspace = true
+crossterm = { workspace = true, features = ["events"] }
+ratatui.workspace = true
 terminal_size.workspace = true
 anyhow.workspace = true
 serde.workspace = true

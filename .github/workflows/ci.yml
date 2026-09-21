@@ -114,6 +114,12 @@ jobs:
           sudo setquota -u "$(id -u)" 2048 4096 20 40 "${mount_point}"
           dd if=/dev/zero of="${mount_point}/allocated.bin" bs=1024 count=128 status=none
           mkdir "${mount_point}/one" "${mount_point}/two"
+      # Built before it is timed. The budget is there to stop a quota syscall
+      # hanging the job, and this runner has no cargo cache, so leaving the
+      # build inside it spends the budget on compiling the dependency graph
+      # instead: the run that failed reached degu itself with nine seconds left.
+      - name: Build the quota test
+        run: cargo build --locked -p degu --test quota
       - name: Test authoritative ext4 quota
         run: timeout 60s cargo test --locked -p degu --test quota quota_linux_ext4_fixture_reports_configured_limits -- --ignored --exact
       - name: Unmount quota fixture

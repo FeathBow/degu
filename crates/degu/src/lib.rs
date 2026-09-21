@@ -8,6 +8,8 @@ mod collection;
 mod commands;
 mod configuration;
 mod findings;
+#[cfg(test)]
+mod fork_gate;
 mod lifecycle;
 mod native;
 mod output;

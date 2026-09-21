@@ -18,7 +18,12 @@ fn selection(path: PathBuf) -> NativeExecutableSelection {
 
 fn copied_binary(directory: &Path, source: &Path) -> PathBuf {
     let executable = directory.join("uv-fixture");
-    std::fs::copy(source, &executable).unwrap();
+    {
+        // The copy holds a write descriptor, and a fork in another thread
+        // inherits it. Whoever execs this file next would then see a writer.
+        let _exclusive = crate::fork_gate::exec_fresh_file();
+        std::fs::copy(source, &executable).unwrap();
+    }
     std::fs::set_permissions(&executable, Permissions::from_mode(0o700)).unwrap();
     executable
 }
@@ -40,6 +45,7 @@ fn probe_fixture(
         ))],
         other => panic!("unknown fixture mode: {other:?}"),
     };
+    let _exclusive = crate::fork_gate::exec_fresh_file();
     probe_uv_executable_with(
         selection(path),
         arguments,
@@ -158,14 +164,15 @@ fn unsafe_mode_and_ancestor_are_refused_before_execution() {
 fn macos_acl_and_execution_security_xattrs_fail_closed() {
     let acl_temp = private_tempdir();
     let acl_executable = copied_binary(acl_temp.path(), Path::new("/bin/echo"));
-    assert!(
+    let planted = {
+        let _shared = crate::fork_gate::forking();
         std::process::Command::new("/bin/chmod")
             .args(["+a", "everyone allow write"])
             .arg(&acl_executable)
             .status()
             .unwrap()
-            .success()
-    );
+    };
+    assert!(planted.success());
     assert!(matches!(
         open_selected_executable(&selection(acl_executable)),
         Err(UvExecutableProbeError::UnsafePath { .. })
@@ -173,14 +180,15 @@ fn macos_acl_and_execution_security_xattrs_fail_closed() {
 
     let xattr_temp = private_tempdir();
     let xattr_executable = copied_binary(xattr_temp.path(), Path::new("/bin/echo"));
-    assert!(
+    let marked = {
+        let _shared = crate::fork_gate::forking();
         std::process::Command::new("/usr/bin/xattr")
             .args(["-w", "com.apple.quarantine", "0081;degu-test"])
             .arg(&xattr_executable)
             .status()
             .unwrap()
-            .success()
-    );
+    };
+    assert!(marked.success());
     assert!(matches!(
         open_selected_executable(&selection(xattr_executable)),
         Err(UvExecutableProbeError::UnsafePath { .. })

@@ -843,6 +843,7 @@ mod tests {
         let root = target.join("pip");
         let tag = root.join(CACHEDIR_TAG);
         std::fs::create_dir_all(&root).unwrap();
+        let _shared = crate::fork_gate::forking();
         let status = std::process::Command::new("mkfifo")
             .arg(&tag)
             .status()

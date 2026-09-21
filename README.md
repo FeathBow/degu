@@ -6,11 +6,14 @@
 
 <p align="center"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue?style=flat-square" alt="License: MIT OR Apache-2.0"> <img src="https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-lightgrey?style=flat-square" alt="Platforms: Linux and macOS"></p>
 
-<p align="center"><img src="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/demo.svg" alt="degu scan output: Ready to clean, Needs review, and Not managed tiers with sizes, reasons, and a copyable preview command" width="92%"></p>
-<p align="center"><sub>Real output from a small demo tree; on a working ML node, model and package caches routinely reach tens of gigabytes.</sub></p>
+<p align="center"><a href="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/demo-light.svg"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/demo-dark.svg">
+  <img src="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/demo-light.svg" alt="degu scan of a synthetic fixture at ML-node scale: 13.6 GiB across five caches, split into Ready to clean, Needs review with its reason per location, and Not managed, followed by a copyable preview command" width="92%">
+</picture></a></p>
+<p align="center"><sub>Real output, from a synthetic fixture whose allocated bytes match a working ML node. Not a benchmark: five large files are not a real cache's directory and inode load. Tap for a readable copy.</sub></p>
 
 <details>
-<summary>The same scan, redirected — copy-pasteable and pinned byte-exact by a contract test</summary>
+<summary>A smaller scan as text — copy-pasteable, and kept true by a contract test that rebuilds the fixture and re-runs the CLI against this block</summary>
 
 ```console
 $ degu scan
@@ -133,6 +136,9 @@ When the decision is about one location rather than a rule, `degu tui` brings th
 ```sh
 degu tui
 ```
+
+<p align="center"><a href="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/review.svg"><img src="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/review.svg" alt="degu tui mid-decision: a 7.23 GiB Needs review model checked into the plan alongside the Ready to clean pip cache, two review locations left unchecked, the Not managed cache unselectable, and the header totalling what a clean would move" width="92%"></a></p>
+<p align="center"><sub>One Needs review location chosen; the header totals what a clean would move. Tap either image for a readable copy. Space decides a row, and <code>c</code> hands whichever plans were decided to the existing commands — here the staging trash is empty, so it would run <code>clean</code> alone.</sub></p>
 
 Staged data stays reversible and still counts against quota until purged; choose one recovery branch per clean operation. A confirmed mutating clean also permanently purges trash entries at least seven days old. On very large shared filesystems a full first scan can take minutes:
 

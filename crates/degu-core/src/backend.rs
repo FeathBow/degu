@@ -1088,8 +1088,8 @@ fn current_groups() -> Result<BTreeSet<u32>, LocalModeRevalidationFailure> {
 
 fn checked_acl(fd: RawFd) -> Result<(), LocalModeRevalidationFailure> {
     match probe_acl(fd) {
-        AclProbe::Absent => Ok(()),
-        AclProbe::Present => Err(LocalModeRevalidationFailure::AclPresent),
+        AclProbe::Absent | AclProbe::NonGranting => Ok(()),
+        AclProbe::Granting => Err(LocalModeRevalidationFailure::AclPresent),
         AclProbe::Unknown => Err(LocalModeRevalidationFailure::AclProbeUnknown),
     }
 }
@@ -1297,32 +1297,46 @@ fn finish_certification(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AclProbe {
+    /// The object carries no ACL.
     Absent,
-    Present,
+    /// An ACL is present and none of its entries can widen access. macOS puts
+    /// `group:everyone deny delete` on every account home; it takes a
+    /// permission away and gives none, so it cannot reach past the mode bits.
+    NonGranting,
+    /// An ACL is present that can grant access the mode bits do not show.
+    Granting,
+    /// The ACL could not be read, which is uncertainty, not absence.
     Unknown,
 }
 
-/// Requires that an already-held object have no access/default POSIX ACL on
-/// Linux and no extended ACL on macOS. Probe errors and unsupported platforms
-/// are uncertainty and therefore fail closed.
+/// Requires that an already-held object carry no ACL able to grant access
+/// beyond its mode bits: no access/default POSIX ACL on Linux, and on macOS no
+/// extended ACL with an allow entry. Probe errors and unsupported platforms are
+/// uncertainty and therefore fail closed.
 pub fn require_held_fd_acl_absent<Fd: AsFd>(fd: Fd) -> Result<(), CertificationError> {
     require_acl_absent(probe_acl(fd.as_fd().as_raw_fd()))
 }
 
 fn require_acl_absent(probe: AclProbe) -> Result<(), CertificationError> {
     match probe {
-        AclProbe::Absent => Ok(()),
-        AclProbe::Present => Err(CertificationError::AclPresent),
+        // The question this answers is whether anyone but the owner can reach
+        // the object. An entry that only denies cannot widen access, so it
+        // cannot be the way in, and refusing it rejected every macOS account
+        // home rather than anything dangerous.
+        AclProbe::Absent | AclProbe::NonGranting => Ok(()),
+        AclProbe::Granting => Err(CertificationError::AclPresent),
         AclProbe::Unknown => Err(CertificationError::AclProbeUnknown),
     }
 }
 
 #[cfg(any(target_os = "linux", test))]
 fn combine_acl_probes(probes: &[AclProbe]) -> AclProbe {
-    if probes.contains(&AclProbe::Present) {
-        AclProbe::Present
+    if probes.contains(&AclProbe::Granting) {
+        AclProbe::Granting
     } else if probes.contains(&AclProbe::Unknown) {
         AclProbe::Unknown
+    } else if probes.contains(&AclProbe::NonGranting) {
+        AclProbe::NonGranting
     } else {
         AclProbe::Absent
     }
@@ -1342,7 +1356,10 @@ fn probe_linux_xattr(fd: RawFd, name: &std::ffi::CStr) -> AclProbe {
     // asks only for the attribute length and cannot write memory.
     let result = unsafe { libc::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0) };
     if result >= 0 {
-        AclProbe::Present
+        // POSIX ACLs carry no deny entries, so any entry beyond the minimal
+        // three can only widen access. Reading the blob to tell a minimal ACL
+        // apart is a separate question from the one macOS forced.
+        AclProbe::Granting
     } else if io::Error::last_os_error().raw_os_error() == Some(libc::ENODATA) {
         AclProbe::Absent
     } else {
@@ -1353,15 +1370,21 @@ fn probe_linux_xattr(fd: RawFd, name: &std::ffi::CStr) -> AclProbe {
 #[cfg(target_os = "macos")]
 fn probe_acl(fd: RawFd) -> AclProbe {
     type Acl = *mut libc::c_void;
+    type AclEntry = *mut libc::c_void;
     unsafe extern "C" {
         fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> Acl;
+        fn acl_get_entry(acl: Acl, entry_id: libc::c_int, entry: *mut AclEntry) -> libc::c_int;
+        fn acl_get_tag_type(entry: AclEntry, tag_type: *mut libc::c_int) -> libc::c_int;
         fn acl_free(object: *mut libc::c_void) -> libc::c_int;
     }
     const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+    const ACL_NEXT_ENTRY: libc::c_int = -1;
+    const ACL_EXTENDED_ALLOW: libc::c_int = 1;
+    const ACL_EXTENDED_DENY: libc::c_int = 2;
 
     // On macOS, acl_get_fd_np returns NULL with ENOENT when the object has no
-    // extended ACL. A non-null ACL is therefore itself presence evidence.
-    // Other NULL errno values are probe uncertainty and fail closed.
+    // extended ACL. Other NULL errno values are probe uncertainty.
     // SAFETY: fd is live; a non-null returned ACL is released exactly once.
     let acl = unsafe { acl_get_fd_np(fd, ACL_TYPE_EXTENDED) };
     if acl.is_null() {
@@ -1371,9 +1394,38 @@ fn probe_acl(fd: RawFd) -> AclProbe {
             AclProbe::Unknown
         };
     }
+
+    // Every entry is read, because only an allow entry can grant access the
+    // mode bits do not show. A tag that is neither allow nor deny is a shape
+    // this does not understand and is treated as uncertainty.
+    let mut verdict = AclProbe::NonGranting;
+    let mut entry: AclEntry = std::ptr::null_mut();
+    let mut which = ACL_FIRST_ENTRY;
+    // SAFETY: acl is live for the walk; entry is only read after a success.
+    while unsafe { acl_get_entry(acl, which, &raw mut entry) } == 0 {
+        which = ACL_NEXT_ENTRY;
+        let mut tag: libc::c_int = 0;
+        // SAFETY: entry came from a successful acl_get_entry on a live acl.
+        if unsafe { acl_get_tag_type(entry, &raw mut tag) } != 0 {
+            verdict = AclProbe::Unknown;
+            break;
+        }
+        match tag {
+            ACL_EXTENDED_DENY => {}
+            ACL_EXTENDED_ALLOW => {
+                verdict = AclProbe::Granting;
+                break;
+            }
+            _ => {
+                verdict = AclProbe::Unknown;
+                break;
+            }
+        }
+    }
+
     // SAFETY: acl came from acl_get_fd_np and is not used after this call.
     if unsafe { acl_free(acl) } == 0 {
-        AclProbe::Present
+        verdict
     } else {
         AclProbe::Unknown
     }
@@ -1757,16 +1809,28 @@ mod tests {
             AclProbe::Unknown
         );
         assert_eq!(
-            combine_acl_probes(&[AclProbe::Unknown, AclProbe::Present]),
-            AclProbe::Present
+            combine_acl_probes(&[AclProbe::Unknown, AclProbe::Granting]),
+            AclProbe::Granting
+        );
+        // A non-granting entry is not uncertainty and must not be read as one.
+        assert_eq!(
+            combine_acl_probes(&[AclProbe::Absent, AclProbe::NonGranting]),
+            AclProbe::NonGranting
+        );
+        assert_eq!(
+            combine_acl_probes(&[AclProbe::NonGranting, AclProbe::Unknown]),
+            AclProbe::Unknown
         );
     }
 
     #[test]
     fn acl_presence_and_probe_uncertainty_fail_closed() {
         assert_eq!(require_acl_absent(AclProbe::Absent), Ok(()));
+        // An entry that only denies cannot be the way in, and refusing it
+        // rejected every macOS account home.
+        assert_eq!(require_acl_absent(AclProbe::NonGranting), Ok(()));
         assert_eq!(
-            require_acl_absent(AclProbe::Present),
+            require_acl_absent(AclProbe::Granting),
             Err(CertificationError::AclPresent)
         );
         assert_eq!(

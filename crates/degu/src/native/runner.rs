@@ -1572,7 +1572,14 @@ mod tests {
         let temp = tempfile::tempfile().unwrap();
         // SAFETY: temp is live and the successful result is immediately owned.
         let raw = unsafe { libc::fcntl(temp.as_raw_fd(), libc::F_DUPFD, target_fd) };
-        assert_eq!(raw, target_fd);
+        // F_DUPFD gives the lowest free descriptor at or above the target, so
+        // a sibling test that opened one first moves this up. Landing above
+        // the stale bound is what the test needs, not landing exactly here.
+        assert!(
+            raw >= target_fd,
+            "F_DUPFD above {target_fd}: {}",
+            std::io::Error::last_os_error()
+        );
         // SAFETY: raw is a fresh successful F_DUPFD result.
         let high_fd = unsafe { OwnedFd::from_raw_fd(raw) };
         assert!(

@@ -255,7 +255,7 @@ fn classify_error(error: &StoreActivationError) -> FailureClassification {
             let mut failure = FailureClassification::new(
                 ReadinessStatus::Missing,
                 "neither the administrator-hardened nor self-managed authority is provisioned",
-                "run 'degu init --initial' only for first use, or ask an administrator to provision the system authority",
+                "run 'degu init', which refuses if this account has already activated a store, or ask an administrator to provision the system authority",
             );
             failure.system_path = Some(system.clone());
             failure.self_managed_path = Some(self_managed.clone());
@@ -274,11 +274,10 @@ fn classify_error(error: &StoreActivationError) -> FailureClassification {
             failure.self_managed_path = Some(self_managed.clone());
             failure
         }
-        StoreActivationError::SelfInitializationRequired
-        | StoreActivationError::InitialAssertionRequired => FailureClassification::new(
+        StoreActivationError::SelfInitializationRequired => FailureClassification::new(
             ReadinessStatus::Missing,
             "the self-managed anchor has no durable initial-use declaration",
-            "run 'degu init --initial' only if this account has never activated a store; otherwise investigate lost authority",
+            "run 'degu init'; it refuses if this account has already activated a store, which would mean the authority was lost rather than never made",
         ),
         StoreActivationError::AccountBaseChanged { expected, .. } => {
             let mut failure = FailureClassification::new(
@@ -321,7 +320,7 @@ fn classify_error(error: &StoreActivationError) -> FailureClassification {
             let mut failure = FailureClassification::new(
                 ReadinessStatus::Missing,
                 "the selected activation authority is not provisioned",
-                "run 'degu init --initial' only if no earlier authority exists; otherwise investigate the missing namespace",
+                "run 'degu init'; it refuses if an earlier store was activated, which would mean the namespace is missing rather than absent",
             );
             failure.path = Some(path.clone());
             failure
@@ -695,6 +694,6 @@ mod tests {
         assert!(output.contains("System path     /fixed/system/anchor"));
         assert!(output.contains("Self path       /fixed/self/anchor"));
         assert!(output.contains("Writes degu state no"));
-        assert!(output.contains("run 'degu init --initial'"));
+        assert!(output.contains("run 'degu init'"));
     }
 }

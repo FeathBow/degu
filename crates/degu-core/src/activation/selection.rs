@@ -410,12 +410,8 @@ fn require_current_self_path(expected: &Path) -> Result<(), StoreActivationError
 /// Provision and durably declare the current non-root account's self-managed
 /// authority. `initial` is the caller's assertion that no earlier authority was
 /// lost; it is never repair, migration, or recovery permission.
-pub fn initialize_current_euid_self_authority(
-    initial: bool,
-) -> Result<SelfAuthorityInitializationOutcome, SelfAuthorityInitializationError> {
-    if !initial {
-        return Err(StoreActivationError::InitialAssertionRequired.into());
-    }
+pub fn initialize_current_euid_self_authority()
+-> Result<SelfAuthorityInitializationOutcome, SelfAuthorityInitializationError> {
     let system_locator = ActivationAnchorLocator::for_current_euid()?;
     if let Some(system) = open_authority_candidate(&system_locator)? {
         return Err(StoreActivationError::SystemAuthorityPresent {

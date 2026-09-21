@@ -260,8 +260,6 @@ pub enum StoreActivationError {
     SelectedAuthorityLost { selected: PathBuf, witness: PathBuf },
     #[error("self-managed activation requires an explicit initial declaration")]
     SelfInitializationRequired,
-    #[error("self-managed initialization requires an explicit initial-use assertion")]
-    InitialAssertionRequired,
     #[error("self-managed initialization is blocked by an existing system authority at {path}")]
     SystemAuthorityPresent { path: PathBuf },
     #[error("activation record locator is invalid")]

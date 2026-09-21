@@ -55,7 +55,7 @@ const SUPPORTED_CASES: &[&[&str]] = &[
         "1",
     ],
     &["doctor", JSON, "--help"],
-    &["init", "--initial", JSON, "--help"],
+    &["init", JSON, "--help"],
     &["quota", JSON, "--help"],
     &[
         "reclaim",

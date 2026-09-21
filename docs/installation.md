@@ -11,14 +11,14 @@ degu doctor
 This selector check is read-only. It reports the chosen authority mode and activation state and never creates or repairs state.
 
 - **`ready`** — continue with `degu clean -n`.
-- **`missing`** — run `degu init --initial` only when this account has never activated a store; otherwise investigate possible authority loss. An administrator may provision the system authority instead.
+- **`missing`** — run `degu init`. It refuses when this account has already activated a store, because then the authority is lost rather than absent and a new one would strand everything staged in the old store. An administrator may provision the system authority instead.
 - **`split_authority` or `recovery_required`** — stop and investigate the recorded authorities and store; never choose one, reinitialize, or remove records automatically.
 - **`unsafe`, `unsupported`, or `uncertain`** — stop and investigate; do not recreate, chmod, or fall back to another path.
 
-`degu init --initial` derives the effective UID and account home from the account database and provisions only the fixed self-managed path. It accepts no UID, path, HOME, XDG, cwd, or configuration selector, rejects root, and never activates a store or repairs an existing object:
+`degu init` derives the effective UID and account home from the account database and provisions only the fixed self-managed path. It accepts no UID, path, HOME, XDG, cwd, or configuration selector, rejects root, and never activates a store or repairs an existing object. It refuses outright when the account's sealed-staging store carries an activation record, so provisioning can never be mistaken for recovery:
 
 ```sh
-degu init --initial
+degu init
 degu doctor
 ```
 

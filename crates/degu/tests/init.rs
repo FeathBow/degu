@@ -4,13 +4,16 @@ fn degu() -> Command {
     Command::cargo_bin("degu").unwrap()
 }
 
+/// `init` derives everything from the account database, so a caller cannot
+/// point it anywhere. Each of these is refused by argument parsing, before any
+/// provisioning could run — which is also why the bare command is not exercised
+/// here: it would provision whoever runs the suite.
 #[test]
-fn init_accepts_no_uid_path_or_initial_override() {
-    degu().args(["init"]).assert().failure().stdout("");
+fn init_accepts_no_uid_or_path_selector() {
     for args in [
-        vec!["init", "--initial", "--uid", "1000"],
-        vec!["init", "--initial", "--anchor-path", "/tmp/caller-selected"],
-        vec!["init", "--initial", "/tmp/caller-selected"],
+        vec!["init", "--uid", "1000"],
+        vec!["init", "--anchor-path", "/tmp/caller-selected"],
+        vec!["init", "/tmp/caller-selected"],
     ] {
         let output = degu().args(&args).output().unwrap();
         assert!(!output.status.success(), "unexpected success: {args:?}");
@@ -36,7 +39,7 @@ fn root_cannot_enter_self_managed_initialization_even_with_test_root_bypass() {
         .env("XDG_STATE_HOME", state.path())
         .env("XDG_CONFIG_HOME", home.path())
         .env("DEGU_ALLOW_ROOT", "1")
-        .args(["init", "--initial", "--json"])
+        .args(["init", "--json"])
         .assert()
         .failure()
         .stdout("");

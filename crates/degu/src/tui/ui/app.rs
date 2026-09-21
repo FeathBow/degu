@@ -42,6 +42,15 @@ impl View {
 }
 
 pub struct App {
+    /// Whether this account can run a cleanup at all.
+    ///
+    /// Asked once before the review opens, because the answer does not change
+    /// while it is open and finding out at the end wastes every decision the
+    /// reader made. Browsing still works without it; only running does not.
+    /// Why it cannot is left to `degu doctor`, which distinguishes setup that
+    /// was never done from setup that went missing — a difference this screen
+    /// has no room to explain and no business deciding.
+    blocked: bool,
     browser: Browser,
     decisions: Decisions,
     staged: Staged,
@@ -58,13 +67,19 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(report: ScanReport, staged: Staged, home: std::path::PathBuf) -> Self {
+    pub fn new(
+        report: ScanReport,
+        staged: Staged,
+        home: std::path::PathBuf,
+        blocked: bool,
+    ) -> Self {
         let decisions = Decisions::new(report.section(Section::Cache));
         let browser = Browser::new(report);
         let document = Derived::new(browser.selection(), || document(&browser, &home));
         let metric_width = Derived::new(metric_key(&browser), || metric_width(&browser));
         let allocation = Derived::new(browser.section(), || allocation::segments(&browser));
         Self {
+            blocked,
             browser,
             decisions,
             staged,
@@ -160,7 +175,7 @@ impl App {
                     self.view = View::Help;
                 }
             }
-            KeyCode::Char('c') if self.has_work() && self.view.runs_cleanup() => {
+            KeyCode::Char('c') if self.can_run() && self.view.runs_cleanup() => {
                 return Some(Outcome::Clean);
             }
             code => match self.view {
@@ -260,6 +275,16 @@ impl App {
 
     pub fn has_work(&self) -> bool {
         !self.decisions.is_empty() || !self.staged.nothing_chosen()
+    }
+
+    /// Whether running is unavailable here.
+    pub fn blocked(&self) -> bool {
+        self.blocked
+    }
+
+    /// Whether `c` would reach a command that can do anything.
+    pub fn can_run(&self) -> bool {
+        !self.blocked && self.has_work()
     }
 
     fn scroll(&mut self, code: KeyCode) {

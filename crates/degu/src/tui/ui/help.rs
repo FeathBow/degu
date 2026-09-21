@@ -190,7 +190,7 @@ pub fn draw(frame: &mut Frame, area: Rect) {
 }
 
 pub fn footer(frame: &mut Frame, area: Rect, app: &App) {
-    let run = app.has_work() && app.view().runs_cleanup();
+    let run = app.can_run() && app.view().runs_cleanup();
     let keys = footer_keys(app.view(), run, area.width);
     frame.render_widget(Paragraph::new(footer_line(&keys)), area);
 }

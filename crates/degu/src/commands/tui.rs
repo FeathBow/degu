@@ -27,7 +27,7 @@ impl Review {
         let staged =
             crate::tui::Staged::new(crate::lifecycle::Lifecycle::new(&ctx).trash_entries()?);
         Ok(Self {
-            app: App::new(report, staged, ctx.home),
+            app: App::new(report, staged, ctx.home, cleanup_blocked()),
             filters,
             limits,
         })
@@ -38,6 +38,15 @@ impl Review {
             .decisions()
             .clean_args(&self.filters, self.limits, dry_run)
     }
+}
+
+/// Whether a cleanup cannot run for this account.
+///
+/// The same question `degu doctor` asks, asked before the review opens. Left
+/// until `c`, it answers after the reader has already decided everything, and
+/// it cannot change while the review is up.
+fn cleanup_blocked() -> bool {
+    degu_core::activation::check_current_euid_authority_readiness().is_err()
 }
 
 pub(crate) fn run(args: TuiArgs, ui: Ui) -> Result<()> {

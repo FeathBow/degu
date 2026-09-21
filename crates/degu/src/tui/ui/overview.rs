@@ -99,10 +99,15 @@ fn scope(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         lines.extend([Line::from(coverage_label(coverage)), Line::default()]);
     }
-    lines.extend([
-        Line::default(),
-        Line::from("No file moves until you confirm the plan.").fg(SECONDARY),
-    ]);
+    lines.push(Line::default());
+    if app.blocked() {
+        // Saying "no file moves until you confirm" would be a promise this
+        // account cannot keep: nothing moves at all until setup is done. The
+        // header names the command that explains which setup is missing.
+        lines.push(Line::from("Account setup is needed first.").fg(CAUTION));
+    } else {
+        lines.push(Line::from("No file moves until you confirm the plan.").fg(SECONDARY));
+    }
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })

@@ -48,7 +48,113 @@ struct LogFailureJson<'a> {
     restored: bool,
 }
 
-pub(crate) fn run(json: bool, ui: crate::runtime::Ui) -> Result<()> {
+/// Move staged entries back by hand when the store no longer authenticates.
+///
+/// `undo` refuses in this state for a good reason: an unauthenticated store is
+/// not vouched for, so degu will not write its contents back on its own
+/// authority. But the entries are ordinary files, their origins are recorded
+/// outside the store, and `degu trash list` reads them without activating
+/// anything — so refusing left people with data they could see, could not
+/// recover through degu, and no next step.
+///
+/// This does not activate the store, open the WAL, or pretend the contents are
+/// verified. It moves files and says so. The broken store is then renamed
+/// aside, not deleted, so `degu init` can set the account up again and the
+/// evidence survives for whoever wants to look at it.
+fn rescue_unauthenticated(json: bool, ui: crate::runtime::Ui) -> Result<()> {
+    let ctx = degu_core::ecosystem::DetectCtx::from_process()?;
+    if degu_core::activation::check_current_euid_authority_readiness().is_ok() {
+        anyhow::bail!(
+            "this account's store authenticates; run 'degu undo' without \
+             --accept-unauthenticated-store"
+        );
+    }
+
+    let entries = Lifecycle::new(&ctx).trash_entries()?;
+    let store = crate::lifecycle::sealed_staging_store_path(&ctx);
+    if entries.is_empty() && !store.exists() {
+        return print_none(json);
+    }
+
+    let restorable: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| entry.original.as_ref().map(|origin| (entry, origin)))
+        .collect();
+    stdoutln!(
+        "The store at {} no longer authenticates. These entries are readable, but degu cannot \
+         verify their contents are what it staged.",
+        escaped(&store.display().to_string())
+    )?;
+    for (entry, origin) in &restorable {
+        stdoutln!(
+            "  {} -> {}",
+            escaped(&entry.entry.display().to_string()),
+            escaped(&origin.display().to_string())
+        )?;
+    }
+    let unknown = entries.len() - restorable.len();
+    if unknown > 0 {
+        stdoutln!("  {unknown} entries record no origin and are left where they are.")?;
+    }
+
+    if !crate::commands::prompt::confirm_restore_unverified(ui.colors)? {
+        stdoutln!("Canceled; nothing was moved.")?;
+        return Ok(());
+    }
+
+    let mut restored = 0usize;
+    for (entry, origin) in &restorable {
+        if origin.exists() {
+            stdoutln!(
+                "  skipped {}: something already occupies it",
+                escaped(&origin.display().to_string())
+            )?;
+            continue;
+        }
+        if let Some(parent) = origin.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::rename(&entry.entry, origin) {
+            Ok(()) => {
+                restored += 1;
+                stdoutln!(
+                    "  restored {} (contents not verified)",
+                    escaped(&origin.display().to_string())
+                )?;
+            }
+            Err(error) => stdoutln!(
+                "  failed {}: {error}",
+                escaped(&origin.display().to_string())
+            )?,
+        }
+    }
+
+    if store.exists() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        let archived = store.with_file_name(format!(
+            "{}.broken-{stamp}",
+            store.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        std::fs::rename(&store, &archived)?;
+        stdoutln!(
+            "\nThe unauthenticated store was archived to\n  {}\nNothing was deleted. Run 'degu \
+             init' to set this account up again, or keep the archive for investigation.",
+            escaped(&archived.display().to_string())
+        )?;
+    }
+    stdoutln!("\nMoved {restored} of {} entries.", restorable.len())
+}
+
+pub(crate) fn run(
+    accept_unauthenticated_store: bool,
+    json: bool,
+    ui: crate::runtime::Ui,
+) -> Result<()> {
+    if accept_unauthenticated_store {
+        return rescue_unauthenticated(json, ui);
+    }
     let ctx = degu_core::ecosystem::DetectCtx::from_process()?;
     let mut session = Lifecycle::new(&ctx).lock()?;
     let Some(report) = session.undo_latest()? else {

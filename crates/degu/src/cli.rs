@@ -190,6 +190,10 @@ pub(crate) enum Command {
     Clean(CleanArgs),
     /// Restore the latest staged clean operation
     Undo {
+        /// Move staged entries back when the store no longer authenticates,
+        /// without verifying their contents, and archive the broken store
+        #[arg(long)]
+        accept_unauthenticated_store: bool,
         #[command(flatten)]
         output: JsonArgs,
     },

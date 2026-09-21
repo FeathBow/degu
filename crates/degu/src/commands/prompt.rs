@@ -42,6 +42,21 @@ pub(crate) fn confirm_native_reclaim(colors: OutputColors) -> Result<bool> {
     })
 }
 
+pub(crate) fn confirm_restore_unverified(colors: OutputColors) -> Result<bool> {
+    crossterm::style::force_color_output(colors.stderr);
+    let prompt = semantic::paint(
+        "Type 'restore unverified' to move these back: ",
+        Tone::Destructive,
+        colors.stderr,
+    );
+    crossterm::style::force_color_output(colors.stdout);
+    confirm(Confirmation {
+        non_tty_error: "restoring from an unauthenticated store requires a terminal",
+        prompt: &prompt,
+        accepted: Accepted::RestoreUnverified,
+    })
+}
+
 struct Confirmation<'a> {
     non_tty_error: &'a str,
     prompt: &'a str,
@@ -52,6 +67,7 @@ enum Accepted {
     Yes,
     Purge,
     Prune,
+    RestoreUnverified,
 }
 
 impl Accepted {
@@ -60,6 +76,7 @@ impl Accepted {
             Self::Yes => matches!(input, "y" | "Y"),
             Self::Purge => input == "purge",
             Self::Prune => input == "prune",
+            Self::RestoreUnverified => input == "restore unverified",
         }
     }
 }
@@ -86,6 +103,9 @@ mod tests {
         assert!(!Accepted::Prune.matches("Prune"));
         assert!(!Accepted::Prune.matches("purge"));
         assert!(Accepted::Purge.matches("purge"));
+        assert!(Accepted::RestoreUnverified.matches("restore unverified"));
+        assert!(!Accepted::RestoreUnverified.matches("restore"));
+        assert!(!Accepted::RestoreUnverified.matches("y"));
         assert!(!Accepted::Purge.matches("prune"));
     }
 }

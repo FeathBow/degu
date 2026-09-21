@@ -1,0 +1,155 @@
+<svg class="rich-terminal" viewBox="0 0 1238 733.1999999999999" xmlns="http://www.w3.org/2000/svg">
+    <!-- Generated with Rich https://www.textualize.io -->
+    <style>
+
+
+
+
+    .terminal-degu-matrix {
+        font-family: "Fira Code", "DejaVu Sans Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+        font-size: 20px;
+        line-height: 24.4px;
+        font-variant-east-asian: full-width;
+    }
+
+    .terminal-degu-title {
+        font-size: 18px;
+        font-weight: bold;
+        font-family: arial;
+    }
+
+    .terminal-degu-r1 { fill: #d0d4dc }
+.terminal-degu-r2 { fill: #d0d4dc;font-weight: bold }
+.terminal-degu-r3 { fill: #96c490;font-weight: bold }
+.terminal-degu-r4 { fill: #868990 }
+.terminal-degu-r5 { fill: #d6b160;font-weight: bold }
+.terminal-degu-r6 { fill: #7ec7ce;font-weight: bold }
+.terminal-degu-r7 { fill: #7ec7ce }
+    </style>
+
+    <defs>
+    <clipPath id="terminal-degu-clip-terminal">
+      <rect x="0" y="0" width="1219.0" height="682.1999999999999" />
+    </clipPath>
+    <clipPath id="terminal-degu-line-0">
+    <rect x="0" y="1.5" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-1">
+    <rect x="0" y="25.9" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-2">
+    <rect x="0" y="50.3" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-3">
+    <rect x="0" y="74.7" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-4">
+    <rect x="0" y="99.1" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-5">
+    <rect x="0" y="123.5" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-6">
+    <rect x="0" y="147.9" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-7">
+    <rect x="0" y="172.3" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-8">
+    <rect x="0" y="196.7" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-9">
+    <rect x="0" y="221.1" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-10">
+    <rect x="0" y="245.5" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-11">
+    <rect x="0" y="269.9" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-12">
+    <rect x="0" y="294.3" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-13">
+    <rect x="0" y="318.7" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-14">
+    <rect x="0" y="343.1" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-15">
+    <rect x="0" y="367.5" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-16">
+    <rect x="0" y="391.9" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-17">
+    <rect x="0" y="416.3" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-18">
+    <rect x="0" y="440.7" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-19">
+    <rect x="0" y="465.1" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-20">
+    <rect x="0" y="489.5" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-21">
+    <rect x="0" y="513.9" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-22">
+    <rect x="0" y="538.3" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-23">
+    <rect x="0" y="562.7" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-24">
+    <rect x="0" y="587.1" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-25">
+    <rect x="0" y="611.5" width="1220" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-degu-line-26">
+    <rect x="0" y="635.9" width="1220" height="24.65"/>
+            </clipPath>
+    </defs>
+
+    <rect fill="#181a1f" stroke="rgba(255,255,255,0.35)" stroke-width="1" x="1" y="1" width="1236" height="731.2" rx="8"/><text class="terminal-degu-title" fill="#d0d4dc" text-anchor="middle" x="618" y="27">degu</text>
+            <g transform="translate(26,22)">
+            </g>
+
+    <g transform="translate(9, 41)" clip-path="url(#terminal-degu-clip-terminal)">
+
+    <g class="terminal-degu-matrix">
+    <text class="terminal-degu-r1" x="0" y="20" textLength="134.2" clip-path="url(#terminal-degu-line-0)">$&#160;degu&#160;scan</text><text class="terminal-degu-r1" x="1220" y="20" textLength="12.2" clip-path="url(#terminal-degu-line-0)">
+</text><text class="terminal-degu-r2" x="0" y="44.4" textLength="439.2" clip-path="url(#terminal-degu-line-1)">13.6&#160;GiB&#160;detected&#160;across&#160;5&#160;locations</text><text class="terminal-degu-r1" x="439.2" y="44.4" textLength="36.6" clip-path="url(#terminal-degu-line-1)">&#160;·&#160;</text><text class="terminal-degu-r3" x="475.8" y="44.4" textLength="268.4" clip-path="url(#terminal-degu-line-1)">2.1&#160;GiB&#160;ready&#160;to&#160;clean</text><text class="terminal-degu-r1" x="1220" y="44.4" textLength="12.2" clip-path="url(#terminal-degu-line-1)">
+</text><text class="terminal-degu-r1" x="1220" y="68.8" textLength="12.2" clip-path="url(#terminal-degu-line-2)">
+</text><text class="terminal-degu-r3" x="0" y="93.2" textLength="170.8" clip-path="url(#terminal-degu-line-3)">Ready&#160;to&#160;clean</text><text class="terminal-degu-r1" x="170.8" y="93.2" textLength="36.6" clip-path="url(#terminal-degu-line-3)">&#160;·&#160;</text><text class="terminal-degu-r4" x="207.4" y="93.2" textLength="122" clip-path="url(#terminal-degu-line-3)">1&#160;location</text><text class="terminal-degu-r4" x="329.4" y="93.2" textLength="36.6" clip-path="url(#terminal-degu-line-3)">&#160;·&#160;</text><text class="terminal-degu-r3" x="366" y="93.2" textLength="85.4" clip-path="url(#terminal-degu-line-3)">2.1&#160;GiB</text><text class="terminal-degu-r1" x="1220" y="93.2" textLength="12.2" clip-path="url(#terminal-degu-line-3)">
+</text><text class="terminal-degu-r2" x="12.2" y="117.6" textLength="73.2" clip-path="url(#terminal-degu-line-4)">source</text><text class="terminal-degu-r2" x="109.8" y="117.6" textLength="85.4" clip-path="url(#terminal-degu-line-4)">on&#160;disk</text><text class="terminal-degu-r2" x="231.8" y="117.6" textLength="48.8" clip-path="url(#terminal-degu-line-4)">idle</text><text class="terminal-degu-r2" x="305" y="117.6" textLength="73.2" clip-path="url(#terminal-degu-line-4)">inodes</text><text class="terminal-degu-r2" x="402.6" y="117.6" textLength="48.8" clip-path="url(#terminal-degu-line-4)">path</text><text class="terminal-degu-r1" x="1220" y="117.6" textLength="12.2" clip-path="url(#terminal-degu-line-4)">
+</text><text class="terminal-degu-r1" x="0" y="142" textLength="109.8" clip-path="url(#terminal-degu-line-5)">&#160;pip&#160;&#160;&#160;&#160;&#160;</text><text class="terminal-degu-r2" x="109.8" y="142" textLength="85.4" clip-path="url(#terminal-degu-line-5)">2.1&#160;GiB</text><text class="terminal-degu-r4" x="219.6" y="142" textLength="61" clip-path="url(#terminal-degu-line-5)">today</text><text class="terminal-degu-r4" x="366" y="142" textLength="12.2" clip-path="url(#terminal-degu-line-5)">4</text><text class="terminal-degu-r1" x="378.2" y="142" textLength="170.8" clip-path="url(#terminal-degu-line-5)">&#160;&#160;~/.cache/pip</text><text class="terminal-degu-r1" x="1220" y="142" textLength="12.2" clip-path="url(#terminal-degu-line-5)">
+</text><text class="terminal-degu-r1" x="1220" y="166.4" textLength="12.2" clip-path="url(#terminal-degu-line-6)">
+</text><text class="terminal-degu-r5" x="0" y="190.8" textLength="146.4" clip-path="url(#terminal-degu-line-7)">Needs&#160;review</text><text class="terminal-degu-r1" x="146.4" y="190.8" textLength="36.6" clip-path="url(#terminal-degu-line-7)">&#160;·&#160;</text><text class="terminal-degu-r4" x="183" y="190.8" textLength="134.2" clip-path="url(#terminal-degu-line-7)">3&#160;locations</text><text class="terminal-degu-r4" x="317.2" y="190.8" textLength="36.6" clip-path="url(#terminal-degu-line-7)">&#160;·&#160;</text><text class="terminal-degu-r5" x="353.8" y="190.8" textLength="97.6" clip-path="url(#terminal-degu-line-7)">10.3&#160;GiB</text><text class="terminal-degu-r1" x="1220" y="190.8" textLength="12.2" clip-path="url(#terminal-degu-line-7)">
+</text><text class="terminal-degu-r4" x="0" y="215.2" textLength="683.2" clip-path="url(#terminal-degu-line-8)">Excluded&#160;by&#160;default;&#160;preview&#160;a&#160;path&#160;before&#160;including&#160;it.</text><text class="terminal-degu-r1" x="1220" y="215.2" textLength="12.2" clip-path="url(#terminal-degu-line-8)">
+</text><text class="terminal-degu-r2" x="12.2" y="239.6" textLength="73.2" clip-path="url(#terminal-degu-line-9)">source</text><text class="terminal-degu-r2" x="195.2" y="239.6" textLength="85.4" clip-path="url(#terminal-degu-line-9)">on&#160;disk</text><text class="terminal-degu-r2" x="317.2" y="239.6" textLength="48.8" clip-path="url(#terminal-degu-line-9)">idle</text><text class="terminal-degu-r2" x="390.4" y="239.6" textLength="73.2" clip-path="url(#terminal-degu-line-9)">inodes</text><text class="terminal-degu-r2" x="488" y="239.6" textLength="73.2" clip-path="url(#terminal-degu-line-9)">reason</text><text class="terminal-degu-r2" x="756.4" y="239.6" textLength="48.8" clip-path="url(#terminal-degu-line-9)">path</text><text class="terminal-degu-r1" x="1220" y="239.6" textLength="12.2" clip-path="url(#terminal-degu-line-9)">
+</text><text class="terminal-degu-r1" x="0" y="264" textLength="195.2" clip-path="url(#terminal-degu-line-10)">&#160;huggingface&#160;&#160;&#160;&#160;</text><text class="terminal-degu-r2" x="195.2" y="264" textLength="85.4" clip-path="url(#terminal-degu-line-10)">7.2&#160;GiB</text><text class="terminal-degu-r4" x="305" y="264" textLength="61" clip-path="url(#terminal-degu-line-10)">today</text><text class="terminal-degu-r4" x="451.4" y="264" textLength="12.2" clip-path="url(#terminal-degu-line-10)">3</text><text class="terminal-degu-r1" x="463.6" y="264" textLength="707.6" clip-path="url(#terminal-degu-line-10)">&#160;&#160;costly&#160;to&#160;regenerate&#160;&#160;~/…/models--meta-llama--Llama-3-8B</text><text class="terminal-degu-r1" x="1220" y="264" textLength="12.2" clip-path="url(#terminal-degu-line-10)">
+</text><text class="terminal-degu-r1" x="0" y="288.4" textLength="305" clip-path="url(#terminal-degu-line-11)">&#160;conda&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;2.3&#160;GiB&#160;&#160;</text><text class="terminal-degu-r4" x="305" y="288.4" textLength="61" clip-path="url(#terminal-degu-line-11)">today</text><text class="terminal-degu-r4" x="451.4" y="288.4" textLength="12.2" clip-path="url(#terminal-degu-line-11)">2</text><text class="terminal-degu-r1" x="463.6" y="288.4" textLength="451.4" clip-path="url(#terminal-degu-line-11)">&#160;&#160;breaks&#160;consumers&#160;&#160;&#160;&#160;&#160;&#160;~/.conda/pkgs</text><text class="terminal-degu-r1" x="1220" y="288.4" textLength="12.2" clip-path="url(#terminal-degu-line-11)">
+</text><text class="terminal-degu-r1" x="0" y="312.8" textLength="305" clip-path="url(#terminal-degu-line-12)">&#160;torch&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;760.0&#160;MiB&#160;&#160;</text><text class="terminal-degu-r4" x="305" y="312.8" textLength="61" clip-path="url(#terminal-degu-line-12)">today</text><text class="terminal-degu-r4" x="451.4" y="312.8" textLength="12.2" clip-path="url(#terminal-degu-line-12)">3</text><text class="terminal-degu-r1" x="463.6" y="312.8" textLength="463.6" clip-path="url(#terminal-degu-line-12)">&#160;&#160;costly&#160;to&#160;regenerate&#160;&#160;~/.cache/torch</text><text class="terminal-degu-r1" x="1220" y="312.8" textLength="12.2" clip-path="url(#terminal-degu-line-12)">
+</text><text class="terminal-degu-r1" x="1220" y="337.2" textLength="12.2" clip-path="url(#terminal-degu-line-13)">
+</text><text class="terminal-degu-r2" x="0" y="361.6" textLength="134.2" clip-path="url(#terminal-degu-line-14)">Not&#160;managed</text><text class="terminal-degu-r1" x="134.2" y="361.6" textLength="36.6" clip-path="url(#terminal-degu-line-14)">&#160;·&#160;</text><text class="terminal-degu-r4" x="170.8" y="361.6" textLength="122" clip-path="url(#terminal-degu-line-14)">1&#160;location</text><text class="terminal-degu-r4" x="292.8" y="361.6" textLength="36.6" clip-path="url(#terminal-degu-line-14)">&#160;·&#160;</text><text class="terminal-degu-r2" x="329.4" y="361.6" textLength="85.4" clip-path="url(#terminal-degu-line-14)">1.2&#160;GiB</text><text class="terminal-degu-r1" x="1220" y="361.6" textLength="12.2" clip-path="url(#terminal-degu-line-14)">
+</text><text class="terminal-degu-r4" x="0" y="386" textLength="597.8" clip-path="url(#terminal-degu-line-15)">Reported&#160;only;&#160;degu&#160;never&#160;cleans&#160;these&#160;locations.</text><text class="terminal-degu-r1" x="1220" y="386" textLength="12.2" clip-path="url(#terminal-degu-line-15)">
+</text><text class="terminal-degu-r2" x="12.2" y="410.4" textLength="73.2" clip-path="url(#terminal-degu-line-16)">source</text><text class="terminal-degu-r2" x="109.8" y="410.4" textLength="85.4" clip-path="url(#terminal-degu-line-16)">on&#160;disk</text><text class="terminal-degu-r2" x="231.8" y="410.4" textLength="48.8" clip-path="url(#terminal-degu-line-16)">idle</text><text class="terminal-degu-r2" x="305" y="410.4" textLength="73.2" clip-path="url(#terminal-degu-line-16)">inodes</text><text class="terminal-degu-r2" x="402.6" y="410.4" textLength="73.2" clip-path="url(#terminal-degu-line-16)">reason</text><text class="terminal-degu-r2" x="585.6" y="410.4" textLength="48.8" clip-path="url(#terminal-degu-line-16)">path</text><text class="terminal-degu-r1" x="1220" y="410.4" textLength="12.2" clip-path="url(#terminal-degu-line-16)">
+</text><text class="terminal-degu-r1" x="0" y="434.8" textLength="109.8" clip-path="url(#terminal-degu-line-17)">&#160;uv&#160;&#160;&#160;&#160;&#160;&#160;</text><text class="terminal-degu-r2" x="109.8" y="434.8" textLength="85.4" clip-path="url(#terminal-degu-line-17)">1.2&#160;GiB</text><text class="terminal-degu-r4" x="219.6" y="434.8" textLength="61" clip-path="url(#terminal-degu-line-17)">today</text><text class="terminal-degu-r4" x="366" y="434.8" textLength="12.2" clip-path="url(#terminal-degu-line-17)">2</text><text class="terminal-degu-r1" x="378.2" y="434.8" textLength="341.6" clip-path="url(#terminal-degu-line-17)">&#160;&#160;managed&#160;by&#160;uv&#160;&#160;~/.cache/uv</text><text class="terminal-degu-r1" x="1220" y="434.8" textLength="12.2" clip-path="url(#terminal-degu-line-17)">
+</text><text class="terminal-degu-r1" x="1220" y="459.2" textLength="12.2" clip-path="url(#terminal-degu-line-18)">
+</text><text class="terminal-degu-r6" x="0" y="483.6" textLength="671" clip-path="url(#terminal-degu-line-19)">Preview&#160;the&#160;largest&#160;Needs&#160;review&#160;location&#160;(no&#160;changes):</text><text class="terminal-degu-r1" x="1220" y="483.6" textLength="12.2" clip-path="url(#terminal-degu-line-19)">
+</text><text class="terminal-degu-r7" x="24.4" y="508" textLength="963.8" clip-path="url(#terminal-degu-line-20)">degu&#160;clean&#160;-dn&#160;--review&#160;~/.cache/huggingface/hub/models--meta-llama--Llama-3-8B</text><text class="terminal-degu-r1" x="1220" y="508" textLength="12.2" clip-path="url(#terminal-degu-line-20)">
+</text><text class="terminal-degu-r4" x="0" y="532.4" textLength="1037" clip-path="url(#terminal-degu-line-21)">If&#160;the&#160;preview&#160;looks&#160;right,&#160;run&#160;its&#160;Next&#160;command;&#160;it&#160;keeps&#160;the&#160;same&#160;path&#160;and&#160;filters.</text><text class="terminal-degu-r1" x="1220" y="532.4" textLength="12.2" clip-path="url(#terminal-degu-line-21)">
+</text><text class="terminal-degu-r1" x="1220" y="556.8" textLength="12.2" clip-path="url(#terminal-degu-line-22)">
+</text><text class="terminal-degu-r7" x="0" y="581.2" textLength="793" clip-path="url(#terminal-degu-line-23)">Scan&#160;build&#160;artifacts&#160;under&#160;this&#160;project,&#160;or&#160;any&#160;parent&#160;directory:</text><text class="terminal-degu-r1" x="1220" y="581.2" textLength="12.2" clip-path="url(#terminal-degu-line-23)">
+</text><text class="terminal-degu-r7" x="24.4" y="605.6" textLength="134.2" clip-path="url(#terminal-degu-line-24)">degu&#160;scan&#160;.</text><text class="terminal-degu-r1" x="1220" y="605.6" textLength="12.2" clip-path="url(#terminal-degu-line-24)">
+</text><text class="terminal-degu-r1" x="1220" y="630" textLength="12.2" clip-path="url(#terminal-degu-line-25)">
+</text><text class="terminal-degu-r6" x="0" y="654.4" textLength="61" clip-path="url(#terminal-degu-line-26)">Next:</text><text class="terminal-degu-r1" x="1220" y="654.4" textLength="12.2" clip-path="url(#terminal-degu-line-26)">
+</text><text class="terminal-degu-r7" x="24.4" y="678.8" textLength="158.6" clip-path="url(#terminal-degu-line-27)">degu&#160;clean&#160;-n</text><text class="terminal-degu-r1" x="1220" y="678.8" textLength="12.2" clip-path="url(#terminal-degu-line-27)">
+</text>
+    </g>
+    </g>
+</svg>

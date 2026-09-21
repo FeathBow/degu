@@ -164,6 +164,14 @@ pub(super) fn assert_non_empty_array<'a>(value: &'a Value, label: &str) -> &'a [
     array
 }
 
+/// Every spelling a scan section's completeness can take.
+pub(super) fn assert_completeness(value: &Value) {
+    assert_string_enum(
+        value,
+        &["not_requested", "truncated", "incomplete", "complete"],
+    );
+}
+
 fn assert_string_enum(value: &Value, variants: &[&str]) {
     let observed = value.as_str().unwrap();
     assert!(

@@ -237,6 +237,15 @@ impl FailureClassification {
     }
 }
 
+/// What `doctor` would tell someone to do about this activation failure.
+///
+/// Every command that cannot activate hits the same wall, and the person who
+/// hits it is the one who did not run `doctor` first. Reading the remedy from
+/// the same classification keeps one answer rather than two that drift.
+pub(crate) fn activation_remedy(error: &StoreActivationError) -> &'static str {
+    classify_error(error).remediation
+}
+
 fn classify_error(error: &StoreActivationError) -> FailureClassification {
     match error {
         StoreActivationError::NoAuthority {

@@ -157,8 +157,14 @@ where
     })?;
     let desired = parent.join(SEALED_STAGING_STORE_NAME);
 
-    activate(&desired)
-        .context("failed to discover or activate the current account sealed-staging store")
+    activate(&desired).map_err(|error| {
+        // The state is the same one `degu doctor` reports, so say what doctor
+        // says. Without this the reader gets two paths and no way forward.
+        let remedy = crate::commands::doctor::activation_remedy(&error);
+        anyhow::Error::new(error)
+            .context(remedy)
+            .context("failed to discover or activate the current account sealed-staging store")
+    })
 }
 
 pub(crate) fn acquire_mutation_lock(ctx: &DetectCtx) -> Result<std::fs::File> {

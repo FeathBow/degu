@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
@@ -24,10 +26,10 @@ pub struct Document {
 }
 
 impl Document {
-    pub fn new(finding: &Finding, section: Section) -> Self {
-        let introduction = introduction(finding, section);
+    pub fn new(finding: &Finding, section: Section, home: &Path) -> Self {
+        let introduction = introduction(finding, section, home);
         let source = content(finding, &introduction);
-        let preview = preview(finding, section);
+        let preview = preview(finding, section, home);
         Self {
             label: escape_terminal_text(finding.ecosystem()),
             summary: preview_summary(finding),
@@ -138,11 +140,15 @@ fn preview_lines(source: &[Line<'static>], summary: &str, width: u16) -> Vec<Lin
     lines
 }
 
-fn preview(finding: &Finding, section: Section) -> Vec<Line<'static>> {
+fn preview(finding: &Finding, section: Section, home: &Path) -> Vec<Line<'static>> {
     let class = Class::of(finding, section);
     let mut lines = vec![
         Line::from(class.label()).style(class_style(class)),
-        Line::from(escape_terminal_text(&finding.path().to_string_lossy())).bold(),
+        Line::from(escape_terminal_text(&crate::presentation::display_path(
+            finding.path(),
+            home,
+        )))
+        .bold(),
     ];
     if finding.skipped() > 0 {
         lines.push(
@@ -174,7 +180,7 @@ fn reflow(source: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn introduction(finding: &Finding, section: Section) -> Vec<Line<'static>> {
+fn introduction(finding: &Finding, section: Section, home: &Path) -> Vec<Line<'static>> {
     let class = Class::of(finding, section);
     let reason = finding
         .disposition()
@@ -188,7 +194,11 @@ fn introduction(finding: &Finding, section: Section) -> Vec<Line<'static>> {
         format!("{} · {reason}", class.label())
     };
     vec![
-        Line::from(escape_terminal_text(&finding.path().to_string_lossy())).bold(),
+        Line::from(escape_terminal_text(&crate::presentation::display_path(
+            finding.path(),
+            home,
+        )))
+        .bold(),
         Line::from(status).style(class_style(class)),
     ]
 }

@@ -9,7 +9,9 @@ use super::text::{elide, wrapped};
 use super::theme::{CAUTION, EDGE, ROSE, SECONDARY, panel};
 use super::{App, format, window_start};
 
-const TABLE_OVERHEAD: usize = 3;
+/// One space between each pair of the five columns.
+const COLUMN_GAPS: usize = 4;
+const TABLE_CHROME: usize = 3;
 const CURSOR_WIDTH: usize = 1;
 const MARK_WIDTH: usize = 1;
 const AGE_WIDTH: usize = 9;
@@ -25,7 +27,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
 
 pub fn page_size(area: Rect, app: &App) -> usize {
     let (_, list) = areas(area, &notice_lines(app));
-    usize::from(list.height).saturating_sub(TABLE_OVERHEAD)
+    usize::from(list.height).saturating_sub(TABLE_CHROME)
 }
 
 fn areas(area: Rect, lines: &[Line<'_>]) -> (Rect, Rect) {
@@ -103,9 +105,9 @@ fn listing(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let inner = panel("").inner(area);
-    let page_size = usize::from(area.height).saturating_sub(TABLE_OVERHEAD);
+    let page_size = usize::from(area.height).saturating_sub(TABLE_CHROME);
     let path_width = usize::from(inner.width)
-        .saturating_sub(CURSOR_WIDTH + MARK_WIDTH + AGE_WIDTH + SIZE_WIDTH + TABLE_OVERHEAD)
+        .saturating_sub(CURSOR_WIDTH + MARK_WIDTH + AGE_WIDTH + SIZE_WIDTH + COLUMN_GAPS)
         .max(1);
     let first = window_start(staged.cursor(), staged.entries().len(), page_size);
     let rows = staged

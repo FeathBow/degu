@@ -9,7 +9,10 @@ use super::text::elide;
 use super::theme::{ACCENT, SECONDARY, SELECTION, class_style, focused_panel, panel};
 use super::{App, Focus, window_start};
 
-const TABLE_OVERHEAD: usize = 3;
+/// One space between each pair of columns. Five columns without the
+/// ecosystem name leaves four gaps; the ecosystem column carries its own.
+const COLUMN_GAPS: usize = 4;
+const TABLE_CHROME: usize = 3;
 const CURSOR_WIDTH: usize = 1;
 const MARK_WIDTH: usize = 1;
 const STATUS_WIDTH: usize = 14;
@@ -34,7 +37,7 @@ impl Columns {
         };
         let ecosystem = inner >= ECOSYSTEM_MIN_WIDTH;
         let ecosystem_space = if ecosystem { ECOSYSTEM_WIDTH + 1 } else { 0 };
-        let fixed = CURSOR_WIDTH + MARK_WIDTH + status + metric + TABLE_OVERHEAD + ecosystem_space;
+        let fixed = CURSOR_WIDTH + MARK_WIDTH + status + metric + COLUMN_GAPS + ecosystem_space;
         Self {
             path: inner.saturating_sub(fixed).max(1),
             status,
@@ -76,7 +79,7 @@ impl Columns {
 }
 
 pub fn page_size(area: Rect) -> usize {
-    usize::from(area.height).saturating_sub(TABLE_OVERHEAD)
+    usize::from(area.height).saturating_sub(TABLE_CHROME)
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
@@ -136,7 +139,10 @@ fn finding_row(item: (&Finding, usize), columns: &Columns, app: &App) -> Row<'st
         Cell::from(if selected { "▸" } else { " " }).style(Style::new().fg(ACCENT)),
         Cell::from(mark).style(class_style(class)),
         Cell::from(elide(
-            &escape_terminal_text(&finding.path().to_string_lossy()),
+            &escape_terminal_text(&crate::presentation::display_path(
+                finding.path(),
+                app.home(),
+            )),
             columns.path,
         )),
     ];

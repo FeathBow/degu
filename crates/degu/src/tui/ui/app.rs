@@ -23,12 +23,22 @@ pub enum Outcome {
     Clean,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Browser,
     Staged,
     Details,
     Help,
+}
+
+impl View {
+    /// Whether `c` runs the decided plans from here.
+    ///
+    /// The footer offers the key by asking this, and `handle` accepts it by
+    /// asking this, so the screen cannot name a key the keyboard will ignore.
+    pub const fn runs_cleanup(self) -> bool {
+        matches!(self, Self::Browser | Self::Staged)
+    }
 }
 
 pub struct App {
@@ -51,7 +61,7 @@ impl App {
     pub fn new(report: ScanReport, staged: Staged, home: std::path::PathBuf) -> Self {
         let decisions = Decisions::new(report.section(Section::Cache));
         let browser = Browser::new(report);
-        let document = Derived::new(browser.selection(), || document(&browser));
+        let document = Derived::new(browser.selection(), || document(&browser, &home));
         let metric_width = Derived::new(metric_key(&browser), || metric_width(&browser));
         let allocation = Derived::new(browser.section(), || allocation::segments(&browser));
         Self {
@@ -74,7 +84,7 @@ impl App {
     fn refresh(&mut self) {
         let browser = &self.browser;
         self.document
-            .refresh(browser.selection(), || document(browser));
+            .refresh(browser.selection(), || document(browser, &self.home));
         self.metric_width
             .refresh(metric_key(browser), || metric_width(browser));
         self.allocation
@@ -150,6 +160,9 @@ impl App {
                     self.view = View::Help;
                 }
             }
+            KeyCode::Char('c') if self.has_work() && self.view.runs_cleanup() => {
+                return Some(Outcome::Clean);
+            }
             code => match self.view {
                 View::Browser => {
                     if let Some(outcome) = self.browse(code) {
@@ -218,7 +231,6 @@ impl App {
             }
             KeyCode::Char('t') => self.view = View::Staged,
             KeyCode::Char('p') => return Some(Outcome::Preview),
-            KeyCode::Char('c') if self.has_work() => return Some(Outcome::Clean),
             KeyCode::Char(' ') => {
                 if let Some(finding) = self.browser.selected_finding() {
                     self.decisions.toggle(finding, self.browser.section());
@@ -241,7 +253,6 @@ impl App {
             KeyCode::End => self.staged.select_last(),
             KeyCode::Char(' ') => self.staged.toggle(),
             KeyCode::Char('t') => self.view = View::Browser,
-            KeyCode::Char('c') if self.has_work() => return Some(Outcome::Clean),
             _ => {}
         }
         None
@@ -265,10 +276,10 @@ impl App {
     }
 }
 
-fn document(browser: &Browser) -> Document {
+fn document(browser: &Browser, home: &std::path::Path) -> Document {
     browser
         .selected_finding()
-        .map(|finding| Document::new(finding, browser.section()))
+        .map(|finding| Document::new(finding, browser.section(), home))
         .unwrap_or_default()
 }
 

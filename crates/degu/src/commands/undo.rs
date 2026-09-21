@@ -61,20 +61,70 @@ struct LogFailureJson<'a> {
 /// verified. It moves files and says so. The broken store is then renamed
 /// aside, not deleted, so `degu init` can set the account up again and the
 /// evidence survives for whoever wants to look at it.
-fn rescue_unauthenticated(json: bool, ui: crate::runtime::Ui) -> Result<()> {
+/// Rename an authority whose store is gone, so setup can run again.
+fn archive_lost_authority(anchor: &std::path::Path, ui: crate::runtime::Ui) -> Result<()> {
+    stdoutln!(
+        "The recorded authority at {} no longer has the store it authenticated. Nothing staged \
+         under it can be recovered: the store is gone, not unreadable.",
+        escaped(&anchor.display().to_string())
+    )?;
+    if !crate::commands::prompt::confirm_restore_unverified(ui.colors)? {
+        stdoutln!("Canceled; nothing was moved.")?;
+        return Ok(());
+    }
+    let archived = archived_name(anchor);
+    std::fs::rename(anchor, &archived)?;
+    stdoutln!(
+        "The stale authority was archived to\n  {}\nNothing was deleted. Run 'degu init' to set \
+         this account up again.",
+        escaped(&archived.display().to_string())
+    )
+}
+
+fn archived_name(path: &std::path::Path) -> std::path::PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    path.with_file_name(format!(
+        "{}.broken-{stamp}",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ))
+}
+
+fn rescue_unauthenticated(ui: crate::runtime::Ui) -> Result<()> {
+    use degu_core::activation::StoreActivationKind;
+
     let ctx = degu_core::ecosystem::DetectCtx::from_process()?;
-    if degu_core::activation::check_current_euid_authority_readiness().is_ok() {
-        anyhow::bail!(
-            "this account's store authenticates; run 'degu undo' without \
-             --accept-unauthenticated-store"
-        );
+    // Recovery shows up two ways: readiness succeeds and reports an activation
+    // that no longer matches its store, or it fails outright. Anything else
+    // means the normal path works and this one has no business running.
+    let anchor = match degu_core::activation::check_current_euid_authority_readiness() {
+        Ok(readiness) => match readiness.activation() {
+            StoreActivationKind::Lost | StoreActivationKind::CorruptOrReplaced => {
+                readiness.path().to_path_buf()
+            }
+            _ => anyhow::bail!(
+                "this account's store authenticates; run 'degu undo' without \
+                 --accept-unauthenticated-store"
+            ),
+        },
+        Err(degu_core::activation::StoreActivationError::SelectedAuthorityLost {
+            selected,
+            ..
+        }) => selected,
+        Err(other) => return Err(anyhow::Error::new(other)),
+    };
+
+    let store = crate::lifecycle::sealed_staging_store_path(&ctx);
+    // The authority can outlive the store it authenticated. There is nothing
+    // to move back then — the entries went with it — but the stale anchor
+    // still blocks setup, and clearing it is the way out this command exists
+    // to give.
+    if !store.exists() {
+        return archive_lost_authority(&anchor, ui);
     }
 
     let entries = Lifecycle::new(&ctx).trash_entries()?;
-    let store = crate::lifecycle::sealed_staging_store_path(&ctx);
-    if entries.is_empty() && !store.exists() {
-        return print_none(json);
-    }
 
     let restorable: Vec<_> = entries
         .iter()
@@ -130,13 +180,7 @@ fn rescue_unauthenticated(json: bool, ui: crate::runtime::Ui) -> Result<()> {
     }
 
     if store.exists() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.as_secs());
-        let archived = store.with_file_name(format!(
-            "{}.broken-{stamp}",
-            store.file_name().unwrap_or_default().to_string_lossy()
-        ));
+        let archived = archived_name(&store);
         std::fs::rename(&store, &archived)?;
         stdoutln!(
             "\nThe unauthenticated store was archived to\n  {}\nNothing was deleted. Run 'degu \
@@ -153,7 +197,7 @@ pub(crate) fn run(
     ui: crate::runtime::Ui,
 ) -> Result<()> {
     if accept_unauthenticated_store {
-        return rescue_unauthenticated(json, ui);
+        return rescue_unauthenticated(ui);
     }
     let ctx = degu_core::ecosystem::DetectCtx::from_process()?;
     let mut session = Lifecycle::new(&ctx).lock()?;

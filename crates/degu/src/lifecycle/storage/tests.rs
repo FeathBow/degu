@@ -61,18 +61,29 @@ fn mount_identity_probe_does_not_require_directory_read_permission() {
     assert!(result.is_ok(), "{result:?}");
 }
 
+/// The trash is private; the namespace it sits in is the one setup publishes
+/// the activation anchor under.
+///
+/// `<state>/degu` is both. Creating it private made whichever subsystem ran
+/// first decide its mode, and a `degu undo` that failed for want of an
+/// authority left 0700 behind that `degu init` then refused forever with
+/// "public activation-anchor component mode is not exactly 0755". Privacy
+/// belongs to the entries inside, which carry their own modes.
 #[test]
-fn managed_trash_root_is_private() {
+fn the_trash_is_private_inside_a_namespace_setup_can_publish_under() {
     let dir = tempfile::tempdir().unwrap();
     let root = ensure_managed_trash_root(&dir.path().join("degu/trash"), "trash").unwrap();
 
     let mode = std::fs::symlink_metadata(&root).unwrap().mode() & 0o777;
-    assert_eq!(mode, 0o700);
+    assert_eq!(mode, 0o700, "the trash itself stays owner-only");
     let parent_mode = std::fs::symlink_metadata(root.parent().unwrap())
         .unwrap()
         .mode()
         & 0o777;
-    assert_eq!(parent_mode, 0o700);
+    assert_eq!(
+        parent_mode, 0o755,
+        "provisioning requires this component to be exactly 0755"
+    );
 }
 
 #[test]

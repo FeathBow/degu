@@ -5,6 +5,7 @@ use degu_core::safety::Guard;
 use std::collections::HashSet;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 const TRASHROOTS_FILE: &str = "degu/trashroots";
@@ -168,6 +169,9 @@ pub(crate) fn acquire_mutation_lock(ctx: &DetectCtx) -> Result<std::fs::File> {
         .create(true)
         .write(true)
         .truncate(false)
+        // Owner-only in its own right: the directory above is the published
+        // anchor namespace and is not private.
+        .mode(0o600)
         .open(&path)
         .with_context(|| format!("failed to open mutation lock {}", path.display()))?;
     match file.try_lock() {

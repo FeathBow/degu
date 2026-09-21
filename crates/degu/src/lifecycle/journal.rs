@@ -1,4 +1,5 @@
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -33,6 +34,9 @@ impl OperationLog {
             .create(true)
             .read(true)
             .append(true)
+            // The record names the paths this account cleaned, and the
+            // directory above it is the published anchor namespace.
+            .mode(0o600)
             .open(&self.path)?;
         isolate_partial_tail(&mut file)?;
         file.write_all(line.as_bytes())

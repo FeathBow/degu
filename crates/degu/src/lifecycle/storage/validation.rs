@@ -7,6 +7,12 @@ use anyhow::{Context, Result};
 use super::STATE_TRASH_NAME;
 
 const PRIVATE_DIR_MODE: u32 = 0o700;
+// `<state>/degu` is also the namespace the activation anchor is published
+// under, and provisioning requires that component to be exactly 0755. Creating
+// it private here made whichever subsystem ran first decide the mode, and a
+// failed `degu undo` left 0700 behind that `degu init` then refused forever.
+// Privacy belongs to the entries inside it, which carry their own modes.
+const NAMESPACE_DIR_MODE: u32 = 0o755;
 const SHARED_WRITE_MASK: u32 = 0o022;
 const STICKY_BIT: u32 = 0o1000;
 
@@ -106,7 +112,7 @@ pub(super) fn ensure_state_parent(parent: &Path) -> Result<()> {
     std::fs::create_dir_all(ancestor)
         .with_context(|| format!("failed to create {}", ancestor.display()))?;
     let mut builder = std::fs::DirBuilder::new();
-    builder.mode(PRIVATE_DIR_MODE);
+    builder.mode(NAMESPACE_DIR_MODE);
     match builder.create(parent) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),

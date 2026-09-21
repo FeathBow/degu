@@ -620,6 +620,10 @@ fn run_preflighted_output<Parsed, ParseError>(
     refresh_descriptor_limit: impl FnOnce() -> io::Result<i32>,
     parse: impl FnOnce(&[u8], &[u8]) -> Result<Parsed, ParseError>,
 ) -> Result<NativeRunReport<Parsed, ParseError>, NativeRunnerError> {
+    // Every exec degu makes passes here, so the test binary's forks are kept
+    // out of another thread's write-then-exec window from one site.
+    #[cfg(test)]
+    let _shared = crate::fork_gate::forking();
     let mut command = Command::new(&declaration.executable);
     command
         .args(&declaration.arguments)
@@ -1251,6 +1255,7 @@ mod tests {
 
     #[test]
     fn post_spawn_error_returns_only_after_killed_child_is_reaped() {
+        let _shared = crate::fork_gate::forking();
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", HELPER_TEST, "--nocapture"])
@@ -1502,10 +1507,46 @@ mod tests {
         assert!(!marker.exists());
     }
 
-    #[test]
-    fn prepared_execution_refreshes_descriptor_bound_after_prepare() {
+    /// A live descriptor numbered above `bound`, or the reason there can be none.
+    ///
+    /// `descriptor_scan_limit` reports the highest slot in use, which climbs
+    /// while sibling tests open files, so a fixed offset above it can cross
+    /// RLIMIT_NOFILE and F_DUPFD then fails outright. Ask for the offset, fall
+    /// back to the highest slot the limit allows, and say so if even that is
+    /// not above the bound.
+    fn descriptor_above(bound: i32) -> std::io::Result<(std::os::fd::OwnedFd, i32)> {
         use std::os::fd::{FromRawFd, OwnedFd};
 
+        let mut limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        let soft = |limit: &rustix::process::Rlimit| {
+            limit.current.and_then(|soft| i32::try_from(soft).ok())
+        };
+        // Sibling tests fill the table, so the soft limit can sit below the
+        // slot this needs. Raising it to the hard limit is the process's own
+        // to do and only ever widens what is available.
+        if soft(&limit).is_some_and(|soft| soft - 1 <= bound) {
+            limit.current = limit.maximum;
+            let _ = rustix::process::setrlimit(rustix::process::Resource::Nofile, limit);
+            limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        }
+        let ceiling = soft(&limit).map_or(bound + 100, |soft| (bound + 100).min(soft - 1));
+        if ceiling <= bound {
+            return Err(std::io::Error::other(format!(
+                "no descriptor slot above {bound} within this process's limit"
+            )));
+        }
+        let temp = tempfile::tempfile()?;
+        // SAFETY: temp is live and a successful result is immediately owned.
+        let raw = unsafe { libc::fcntl(temp.as_raw_fd(), libc::F_DUPFD, ceiling) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: raw is a fresh successful F_DUPFD result.
+        Ok((unsafe { OwnedFd::from_raw_fd(raw) }, raw))
+    }
+
+    #[test]
+    fn prepared_execution_refreshes_descriptor_bound_after_prepare() {
         let target_fd = descriptor_scan_limit().unwrap().checked_add(100).unwrap();
         let request = NativeActionRequest::new(
             degu_adapters::native::NativeActionIdentity::new("fake", "descriptor-check").unwrap(),
@@ -1537,17 +1578,10 @@ mod tests {
         .unwrap();
         let prepared = prepare_native_action(request).unwrap();
 
-        let temp = tempfile::tempfile().unwrap();
-        // Open the non-CLOEXEC descriptor only after preparation. Since the
-        // requested slot is above the then-current table, F_DUPFD returns it.
-        // SAFETY: temp is live and the successful result is immediately owned.
-        let raw = unsafe { libc::fcntl(temp.as_raw_fd(), libc::F_DUPFD, target_fd) };
-        assert_eq!(
-            raw, target_fd,
-            "failed to create controlled high descriptor"
-        );
-        // SAFETY: raw is a fresh successful F_DUPFD result.
-        let high_fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // Opened only after preparation, so the slot is above the table the
+        // preparation saw.
+        let (high_fd, _raw) =
+            descriptor_above(target_fd - 1).expect("a controlled high descriptor");
         // SAFETY: high_fd remains live through child execution.
         assert_eq!(
             unsafe { libc::fcntl(high_fd.as_raw_fd(), libc::F_GETFD) },
@@ -1565,30 +1599,12 @@ mod tests {
 
     #[test]
     fn fallback_refresh_covers_a_descriptor_opened_after_a_stale_bound() {
-        use std::os::fd::{FromRawFd, OwnedFd};
-
         let stale_limit = descriptor_scan_limit().unwrap();
-        let target_fd = stale_limit.checked_add(50).unwrap();
-        let temp = tempfile::tempfile().unwrap();
-        // SAFETY: temp is live and the successful result is immediately owned.
-        let raw = unsafe { libc::fcntl(temp.as_raw_fd(), libc::F_DUPFD, target_fd) };
-        // F_DUPFD gives the lowest free descriptor at or above the target, so
-        // a sibling test that opened one first moves this up. Landing above
-        // the stale bound is what the test needs, not landing exactly here.
-        assert!(
-            raw >= target_fd,
-            "F_DUPFD above {target_fd}: {}",
-            std::io::Error::last_os_error()
-        );
-        // SAFETY: raw is a fresh successful F_DUPFD result.
-        let high_fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        assert!(
-            raw >= stale_limit,
-            "the stale bound must miss this descriptor"
-        );
+        let (high_fd, raw) = descriptor_above(stale_limit).expect("a controlled high descriptor");
 
         let refreshed_limit = descriptor_scan_limit().unwrap();
         assert!(refreshed_limit > raw);
+        let _shared = crate::fork_gate::forking();
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", HELPER_TEST, "--nocapture"])

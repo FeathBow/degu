@@ -49,11 +49,16 @@ impl Review {
 fn cleanup_blocked() -> bool {
     use degu_core::activation::StoreActivationKind;
 
+    // Asked about the anchor a cleanup would open, not the one the account
+    // database names: `doctor` reports the platform authority and ignores the
+    // mutation seam on purpose, and borrowing its answer here blocked `c` in
+    // environments where the cleanup would have run.
+    //
     // Readiness succeeds while reporting an activation that no longer matches
     // its store, which `degu doctor` classifies as recovery_required. Asking
     // only whether the call failed let the review offer `c` in exactly the
     // state where running is impossible.
-    match degu_core::activation::check_current_euid_authority_readiness() {
+    match degu_core::activation::check_current_euid_mutation_readiness() {
         Ok(readiness) => matches!(
             readiness.activation(),
             StoreActivationKind::Lost | StoreActivationKind::CorruptOrReplaced

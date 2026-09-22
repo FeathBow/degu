@@ -304,6 +304,10 @@ where
         .create(true)
         .read(true)
         .append(true)
+        // Owner-only in its own right, like the lock and the operation log:
+        // the directory above is the published anchor namespace, and this
+        // names every absolute trash root this account uses.
+        .mode(0o600)
         .open(&registry)
         .with_context(|| format!("failed to open {}", registry.display()))?;
     isolate_partial_tail(&mut file)

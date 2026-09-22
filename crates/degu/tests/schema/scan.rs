@@ -59,7 +59,10 @@ fn scan_runtime_json_schema_is_frozen() {
     // whatever TMPDIR says, so on a shared machine it meets directories it
     // cannot read and correctly reports an incomplete scan. What is frozen
     // here is the spelling, not which of them this host produces.
-    assert_completeness(&json["completeness"]["runtime"]);
+    assert_completeness(
+        &json["completeness"]["runtime"],
+        &["truncated", "incomplete", "complete"],
+    );
 }
 
 fn stale_tmpdir() -> tempfile::TempDir {

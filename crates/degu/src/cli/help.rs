@@ -40,10 +40,9 @@ mod tests {
 
     /// Every subcommand is named in the template.
     ///
-    /// The groups above are written out by hand, so a command added to the
-    /// enum reaches `--help` only if someone also adds it here. `tui` shipped
-    /// without that, and the ordering test guarding this file was a hand-kept
-    /// list too, so it missed the same command. Ask clap instead.
+    /// The groups above are written by hand, so a command added to the enum
+    /// reaches `--help` only if someone also adds it here. Ask clap rather
+    /// than keeping a second hand-written list that can miss the same one.
     #[test]
     fn the_help_template_names_every_subcommand() {
         let command = crate::cli::Cli::command();

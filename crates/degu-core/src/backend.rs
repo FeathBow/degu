@@ -1401,8 +1401,17 @@ fn probe_acl(fd: RawFd) -> AclProbe {
     let mut verdict = AclProbe::NonGranting;
     let mut entry: AclEntry = std::ptr::null_mut();
     let mut which = ACL_FIRST_ENTRY;
-    // SAFETY: acl is live for the walk; entry is only read after a success.
-    while unsafe { acl_get_entry(acl, which, &raw mut entry) } == 0 {
+    loop {
+        // SAFETY: acl is live for the walk; entry is only read after a success.
+        if unsafe { acl_get_entry(acl, which, &raw mut entry) } != 0 {
+            // Only EINVAL means the walk ran out of entries. Anything else is
+            // a failed read, and a failed read is not evidence that no entry
+            // grants anything.
+            if io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL) {
+                verdict = AclProbe::Unknown;
+            }
+            break;
+        }
         which = ACL_NEXT_ENTRY;
         let mut tag: libc::c_int = 0;
         // SAFETY: entry came from a successful acl_get_entry on a live acl.

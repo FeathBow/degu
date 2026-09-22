@@ -164,12 +164,12 @@ pub(super) fn assert_non_empty_array<'a>(value: &'a Value, label: &str) -> &'a [
     array
 }
 
-/// Every spelling a scan section's completeness can take.
-pub(super) fn assert_completeness(value: &Value) {
-    assert_string_enum(
-        value,
-        &["not_requested", "truncated", "incomplete", "complete"],
-    );
+/// The spellings a scan section's completeness may take here.
+///
+/// A section that was asked for cannot come back `not_requested`, so callers
+/// pass what this run actually requested rather than the whole enum.
+pub(super) fn assert_completeness(value: &Value, allowed: &[&str]) {
+    assert_string_enum(value, allowed);
 }
 
 fn assert_string_enum(value: &Value, variants: &[&str]) {
@@ -190,10 +190,7 @@ pub(super) fn assert_finding(value: &Value) {
     // Null is part of this field, not an absence of it: `age_days` is an
     // `Option<u64>`, and a directory whose mtime cannot be read has no age to
     // report. The runtime scan reaches /tmp and /var/tmp whatever TMPDIR says,
-    // so on a shared machine it meets other accounts' directories and this
-    // assertion decided the suite by what happened to be in /tmp. It has been
-    // worked around twice — once by renaming a system directory out of the way
-    // — rather than read as the contract it is.
+    // so on a shared machine it meets directories belonging to other accounts.
     let age = &value["age_days"];
     assert!(
         age.is_u64() || age.is_null(),
@@ -264,42 +261,4 @@ pub(super) fn assert_op_record(value: &Value, require_reclamation_id: bool) {
     }
     assert_string_enum(&value["action"], &["purge", "restore", "trash"]);
     assert_oplog_outcome(&value["outcome"]);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A finding whose age could not be read is still a valid finding.
-    ///
-    /// `age_days` is an `Option<u64>` and null in practice: a directory the
-    /// walk cannot read has no age to report. The runtime scan reaches /tmp
-    /// and /var/tmp whatever TMPDIR says, so on a shared machine it meets such
-    /// directories belonging to other accounts, and requiring a number here
-    /// decided the suite by what happened to be in /tmp. That was worked
-    /// around twice — once by renaming a system directory out of the way —
-    /// before being read as the contract it is.
-    #[test]
-    fn a_finding_with_no_readable_age_satisfies_the_schema() {
-        let mut finding = serde_json::json!({
-            "age_days": 3,
-            "bytes_allocated": 4096,
-            "bytes_apparent": 4096,
-            "bytes_hardlinked": 0,
-            "confidence": "verified",
-            "disposition": {"mode": "report_only", "reason": "not_managed"},
-            "ecosystem": "tmp",
-            "inodes": 1,
-            "kind": "other",
-            "ownership": "standalone",
-            "path": "/tmp/example",
-            "rationale": "fixture",
-            "recovery": {"kind": "unknown"},
-            "skipped": 0,
-            "truncated": false,
-        });
-        assert_finding(&finding);
-        finding["age_days"] = Value::Null;
-        assert_finding(&finding);
-    }
 }

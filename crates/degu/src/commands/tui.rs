@@ -43,10 +43,23 @@ impl Review {
 /// Whether a cleanup cannot run for this account.
 ///
 /// The same question `degu doctor` asks, asked before the review opens. Left
-/// until `c`, it answers after the reader has already decided everything, and
-/// it cannot change while the review is up.
+/// until `c`, it answers after the reader has already decided everything.
+/// Asked once: another process could provision or break the account while the
+/// review is open, and the command it hands off to checks again anyway.
 fn cleanup_blocked() -> bool {
-    degu_core::activation::check_current_euid_authority_readiness().is_err()
+    use degu_core::activation::StoreActivationKind;
+
+    // Readiness succeeds while reporting an activation that no longer matches
+    // its store, which `degu doctor` classifies as recovery_required. Asking
+    // only whether the call failed let the review offer `c` in exactly the
+    // state where running is impossible.
+    match degu_core::activation::check_current_euid_authority_readiness() {
+        Ok(readiness) => matches!(
+            readiness.activation(),
+            StoreActivationKind::Lost | StoreActivationKind::CorruptOrReplaced
+        ),
+        Err(_) => true,
+    }
 }
 
 pub(crate) fn run(args: TuiArgs, ui: Ui) -> Result<()> {

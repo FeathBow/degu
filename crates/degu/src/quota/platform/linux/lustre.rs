@@ -209,6 +209,10 @@ fn capture(
 }
 
 fn spawn_lfs(binary: &Path, mount: &MountInfo, euid: u32) -> Result<Child, ProbeError> {
+    // Shares the gate the native runner's exec takes, so a fork here cannot
+    // land inside another thread's write-then-exec window.
+    #[cfg(test)]
+    let _shared = crate::fork_gate::forking();
     // Hardened exec: absolute path only, no shell, argv fixed to
     // ["quota", "-u", <numeric euid>, <mount point>], an emptied environment
     // with a pinned C locale, a neutral working directory, and closed stdin.
@@ -644,8 +648,8 @@ fn parse_trailers(lines: std::str::Lines<'_>, euid: u32) -> Result<(), Incomplet
 #[cfg(test)]
 mod tests {
     use super::{
-        CappedStream, Execution, LFS_TIMEOUT, MountInfo, Parsed, ProbeError, QuotaGraceState,
-        capture, countdown_seconds, parse, require_rooted_mount_point, successful_stdout,
+        CappedStream, LFS_TIMEOUT, MountInfo, Parsed, ProbeError, QuotaGraceState, capture,
+        countdown_seconds, parse, require_rooted_mount_point, successful_stdout,
         verify_statfs_is_lustre,
     };
     use std::path::{Path, PathBuf};
@@ -1050,6 +1054,9 @@ mod tests {
 
     fn stub(dir: &Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
+        // Held across the write: a fork in another thread would inherit this
+        // descriptor and the exec below would then see a writer.
+        let _exclusive = crate::fork_gate::exec_fresh_file();
         let path = dir.join("lfs-stub.sh");
         std::fs::write(&path, body).unwrap();
         let mut permissions = std::fs::metadata(&path).unwrap().permissions();
@@ -1061,26 +1068,6 @@ mod tests {
     fn success_status() -> ExitStatus {
         use std::os::unix::process::ExitStatusExt;
         ExitStatus::from_raw(0)
-    }
-
-    // A parallel test's fork can briefly hold a write handle to a freshly written
-    // stub, so its exec races ETXTBSY; retry until the sibling exec clears it.
-    fn capture_stub(
-        script: &Path,
-        mount: &MountInfo,
-        timeout: Duration,
-    ) -> Result<Execution, ProbeError> {
-        for _ in 0..100 {
-            match capture(script, mount, EUID, timeout) {
-                Err(ProbeError::Unavailable { reason, .. })
-                    if reason.contains("Text file busy") =>
-                {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                result => return result,
-            }
-        }
-        capture(script, mount, EUID, timeout)
     }
 
     #[test]
@@ -1106,7 +1093,7 @@ mod tests {
             "#!/bin/sh\necho 'lfs quota: quotas are not enabled.' >&2\nexit 1\n",
         );
         let mount = test_mount();
-        let execution = capture_stub(&script, &mount, LFS_TIMEOUT).unwrap();
+        let execution = capture(&script, &mount, EUID, LFS_TIMEOUT).unwrap();
         let error = successful_stdout(&mount, execution).unwrap_err();
         assert!(
             matches!(error, ProbeError::NotConfigured { .. }),
@@ -1122,7 +1109,7 @@ mod tests {
             "#!/bin/sh\necho 'lfs quota: cannot resolve mount' >&2\nexit 4\n",
         );
         let mount = test_mount();
-        let execution = capture_stub(&script, &mount, LFS_TIMEOUT).unwrap();
+        let execution = capture(&script, &mount, EUID, LFS_TIMEOUT).unwrap();
         let error = successful_stdout(&mount, execution).unwrap_err();
         let ProbeError::Unavailable { reason, .. } = error else {
             panic!("non-zero exit must be unavailable: {error:?}");
@@ -1134,7 +1121,7 @@ mod tests {
     fn lustre_exec_kills_and_reports_a_child_that_exceeds_the_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let script = stub(dir.path(), "#!/bin/sh\nexec sleep 30\n");
-        let error = capture_stub(&script, &test_mount(), Duration::from_millis(200)).unwrap_err();
+        let error = capture(&script, &test_mount(), EUID, Duration::from_millis(200)).unwrap_err();
         let ProbeError::Unavailable { reason, .. } = error else {
             panic!("timeout must be unavailable: {error:?}");
         };
@@ -1146,7 +1133,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let script = stub(dir.path(), "#!/bin/sh\necho 'hello from the stub'\n");
         let mount = test_mount();
-        let execution = capture_stub(&script, &mount, LFS_TIMEOUT).unwrap();
+        let execution = capture(&script, &mount, EUID, LFS_TIMEOUT).unwrap();
         let stdout = successful_stdout(&mount, execution).unwrap();
         assert_eq!(stdout, "hello from the stub\n");
     }

@@ -1547,7 +1547,7 @@ mod tests {
 
     #[test]
     fn prepared_execution_refreshes_descriptor_bound_after_prepare() {
-        let target_fd = descriptor_scan_limit().unwrap().checked_add(100).unwrap();
+        let bound = descriptor_scan_limit().unwrap();
         let request = NativeActionRequest::new(
             degu_adapters::native::NativeActionIdentity::new("fake", "descriptor-check").unwrap(),
             degu_adapters::native::NativeExecutableSelection::explicit(
@@ -1564,10 +1564,7 @@ mod tests {
                     OsString::from(HELPER_MODE),
                     OsString::from("descriptor-policy"),
                 ),
-                (
-                    OsString::from(HELPER_FD),
-                    OsString::from(target_fd.to_string()),
-                ),
+                (OsString::from(HELPER_FD), OsString::from(bound.to_string())),
             ]),
             RequestedProcessContract::AuditedCooperativeProcessGroup,
             Duration::from_secs(5),
@@ -1580,8 +1577,8 @@ mod tests {
 
         // Opened only after preparation, so the slot is above the table the
         // preparation saw.
-        let (high_fd, _raw) =
-            descriptor_above(target_fd - 1).expect("a controlled high descriptor");
+        let (high_fd, raw) = descriptor_above(bound).expect("a controlled high descriptor");
+        assert!(raw > bound, "the prepared bound must miss this descriptor");
         // SAFETY: high_fd remains live through child execution.
         assert_eq!(
             unsafe { libc::fcntl(high_fd.as_raw_fd(), libc::F_GETFD) },
@@ -1780,11 +1777,27 @@ mod tests {
             }
             "success" => println!("HELPER_OK"),
             "descriptor-policy" => {
-                let fd = std::env::var(HELPER_FD).unwrap().parse::<i32>().unwrap();
-                // SAFETY: probing a numeric descriptor with F_GETFD does not
-                // dereference memory. The child policy must have closed it.
-                assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+                // The bound, not one descriptor above it. The parent opens its
+                // controlled descriptor after preparation, so which slot it
+                // lands on depends on what sibling tests hold; naming a number
+                // here made the child probe a descriptor nobody had opened and
+                // pass for it. Sweeping proves the policy closed everything
+                // above the bound, whichever slot that was.
+                let bound = std::env::var(HELPER_FD).unwrap().parse::<i32>().unwrap();
+                let ceiling = rustix::process::getrlimit(rustix::process::Resource::Nofile)
+                    .current
+                    .and_then(|soft| i32::try_from(soft).ok())
+                    .unwrap_or(bound + 4096);
+                for fd in (bound + 1)..ceiling {
+                    // SAFETY: probing a numeric descriptor with F_GETFD does
+                    // not dereference memory.
+                    assert_eq!(
+                        unsafe { libc::fcntl(fd, libc::F_GETFD) },
+                        -1,
+                        "descriptor {fd} survived the child policy"
+                    );
+                    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+                }
                 println!("DESCRIPTORS_CLOSED");
             }
             "environment" => {

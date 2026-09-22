@@ -64,11 +64,10 @@ fn mount_identity_probe_does_not_require_directory_read_permission() {
 /// The trash is private; the namespace it sits in is the one setup publishes
 /// the activation anchor under.
 ///
-/// `<state>/degu` is both. Creating it private made whichever subsystem ran
-/// first decide its mode, and a `degu undo` that failed for want of an
-/// authority left 0700 behind that `degu init` then refused forever with
-/// "public activation-anchor component mode is not exactly 0755". Privacy
-/// belongs to the entries inside, which carry their own modes.
+/// `<state>/degu` is both, and provisioning requires exactly 0755 of it.
+/// Creating it private blocks setup for good, because provisioning is
+/// create-only and never repairs. Privacy belongs to the entries inside,
+/// which carry their own modes.
 #[test]
 fn the_trash_is_private_inside_a_namespace_setup_can_publish_under() {
     let dir = tempfile::tempdir().unwrap();

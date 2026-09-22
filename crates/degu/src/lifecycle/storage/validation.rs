@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
@@ -8,9 +9,8 @@ use super::STATE_TRASH_NAME;
 
 const PRIVATE_DIR_MODE: u32 = 0o700;
 // `<state>/degu` is also the namespace the activation anchor is published
-// under, and provisioning requires that component to be exactly 0755. Creating
-// it private here made whichever subsystem ran first decide the mode, and a
-// failed `degu undo` left 0700 behind that `degu init` then refused forever.
+// under, and provisioning requires that component to be exactly 0755. Whatever
+// creates it first decides its mode, so it has to be the mode setup needs.
 // Privacy belongs to the entries inside it, which carry their own modes.
 const NAMESPACE_DIR_MODE: u32 = 0o755;
 const SHARED_WRITE_MASK: u32 = 0o022;
@@ -114,11 +114,41 @@ pub(super) fn ensure_state_parent(parent: &Path) -> Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.mode(NAMESPACE_DIR_MODE);
     match builder.create(parent) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("failed to create {}", parent.display())),
-    }?;
+        Ok(()) => {
+            // DirBuilder's mode is still masked by the umask, and provisioning
+            // wants this component to be exactly 0755. Under a restrictive
+            // umask the created directory would refuse setup just as the old
+            // hard-coded 0700 did.
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(NAMESPACE_DIR_MODE))
+                .with_context(|| format!("failed to set the mode of {}", parent.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to create {}", parent.display()));
+        }
+    }
+    narrow_private_entries(parent)?;
     validate_trash_parent(parent)
+}
+
+/// Take back the privacy these files used to inherit from a 0700 parent.
+///
+/// They carry their own mode now, but an account set up by an earlier version
+/// has them at whatever the umask gave, inside a namespace that is readable by
+/// design. Narrowing is safe to do unasked; widening would not be.
+fn narrow_private_entries(parent: &Path) -> Result<()> {
+    for name in ["lock", "ops.jsonl", "trashroots"] {
+        let path = parent.join(name);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() || metadata.mode() & 0o177 == 0 {
+            continue;
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to narrow {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn validate_root_name(root: &Path, expected_name: &str) -> Result<()> {

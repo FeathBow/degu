@@ -20,7 +20,7 @@ After staging, choose one outcome:
   degu trash purge
 
 First mutation on this account? Run 'degu doctor'; if setup is missing,
-run 'degu init'; it refuses when a store was already activated.
+run 'degu init'; it refuses when this account's store was already activated.
 Run 'degu <command> --help' for command details.";
 
 const SCAN_EXAMPLES: &str = "Examples:
@@ -45,7 +45,7 @@ const INIT_EXAMPLES: &str = "Example:
   degu init --json | jq .
       Emit the provisioning outcome as JSON
 
-This command accepts no UID or path. --initial is an explicit assertion that no
+This command accepts no UID or path. It refuses when this account's store
 earlier authority was lost; it does not activate a store, repair an unsafe
 namespace, migrate authority, or clear recovery state.";
 
@@ -190,10 +190,6 @@ pub(crate) enum Command {
     Clean(CleanArgs),
     /// Restore the latest staged clean operation
     Undo {
-        /// Move staged entries back when the store no longer authenticates,
-        /// without verifying their contents, and archive the broken store
-        #[arg(long)]
-        accept_unauthenticated_store: bool,
         #[command(flatten)]
         output: JsonArgs,
     },

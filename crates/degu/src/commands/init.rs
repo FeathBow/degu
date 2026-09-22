@@ -20,8 +20,13 @@ const ACTION: &str = "self_managed_account_setup";
 /// degu used to ask the person to assert which situation this was, through a
 /// mandatory `--initial`. The assertion was unverifiable by construction and
 /// unenforced in practice — nothing looked — so it refused first use and let
-/// the dangerous case through. The store says which situation this is, and
-/// says it in the same record that later refuses the undo.
+/// the dangerous case through. The store says which situation this is, in the
+/// same record that later refuses the undo.
+///
+/// This reads the store the current environment points at. A store staged
+/// under a different `XDG_STATE_HOME` is not visible here, so a clean result
+/// is evidence and not proof: it catches the case degu itself creates by
+/// default, which is the one people land in.
 fn refuse_if_a_store_is_already_activated() -> Result<()> {
     let ctx = DetectCtx::from_process().context("failed to read this account's environment")?;
     refuse_activated_store_in(&ctx)
@@ -30,8 +35,14 @@ fn refuse_if_a_store_is_already_activated() -> Result<()> {
 fn refuse_activated_store_in(ctx: &DetectCtx) -> Result<()> {
     let store = crate::lifecycle::sealed_staging_store_path(ctx);
     let binding = store.join(degu_core::activation::STORE_BINDING_NAME);
-    if !binding.exists() {
-        return Ok(());
+    // `exists()` answers "no" for a path it cannot stat and for a dangling
+    // symlink, which are not absence.
+    match std::fs::symlink_metadata(&binding) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", binding.display()));
+        }
+        Ok(_) => {}
     }
     anyhow::bail!(
         "this account has already activated a sealed-staging store at {}, so its authority is \

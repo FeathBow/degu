@@ -117,7 +117,7 @@ degu doctor
 degu init
 ```
 
-Use `--initial` only when no earlier degu authority or store was lost. An administrator may instead provision the optional system authority. `split_authority`, `recovery_required`, `unsafe`, `unsupported`, or `uncertain` requires investigation; `init` never repairs state, chooses a UID or path, activates an empty store, or clears recovery.
+`init` refuses when this account's store carries an activation record, which means an earlier authority was lost rather than never made. An administrator may instead provision the optional system authority. `split_authority`, `recovery_required`, `unsafe`, `unsupported`, or `uncertain` requires investigation; `init` never repairs state, chooses a UID or path, activates an empty store, or clears recovery.
 
 After setup, the daily lifecycle remains five short commands:
 

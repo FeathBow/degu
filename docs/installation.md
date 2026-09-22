@@ -15,7 +15,7 @@ This selector check is read-only. It reports the chosen authority mode and activ
 - **`split_authority` or `recovery_required`** — stop and investigate the recorded authorities and store; never choose one, reinitialize, or remove records automatically.
 - **`unsafe`, `unsupported`, or `uncertain`** — stop and investigate; do not recreate, chmod, or fall back to another path.
 
-`degu init` derives the effective UID and account home from the account database and provisions only the fixed self-managed path. It accepts no UID, path, HOME, XDG, cwd, or configuration selector, rejects root, and never activates a store or repairs an existing object. It refuses outright when the account's sealed-staging store carries an activation record, so provisioning can never be mistaken for recovery:
+`degu init` derives the effective UID and account home from the account database and provisions only the fixed self-managed path. It accepts no UID, path, HOME, XDG, cwd, or configuration selector, rejects root, and never activates a store or repairs an existing object. It refuses when the sealed-staging store the current environment points at carries an activation record, which is how provisioning is kept from standing in for recovery. A store staged under a different `XDG_STATE_HOME` is outside what that check can see:
 
 ```sh
 degu init

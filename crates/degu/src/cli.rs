@@ -41,13 +41,14 @@ const QUOTA_EXAMPLES: &str = "Examples:
 
 const INIT_EXAMPLES: &str = "Example:
   degu init
-      Assert first use, then provision and declare this non-root account's fixed authority
+      Provision and declare this non-root account's fixed authority
   degu init --json | jq .
       Emit the provisioning outcome as JSON
 
-This command accepts no UID or path. It refuses when this account's store
-earlier authority was lost; it does not activate a store, repair an unsafe
-namespace, migrate authority, or clear recovery state.";
+This command accepts no UID or path. It refuses when the sealed-staging store
+this environment names already carries an activation record, which means an
+earlier authority was lost rather than never made. It does not activate a
+store, repair an unsafe namespace, migrate authority, or clear recovery state.";
 
 const DOCTOR_EXAMPLES: &str = "Examples:
   degu doctor

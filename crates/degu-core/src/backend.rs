@@ -1356,9 +1356,10 @@ fn probe_linux_xattr(fd: RawFd, name: &std::ffi::CStr) -> AclProbe {
     // asks only for the attribute length and cannot write memory.
     let result = unsafe { libc::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0) };
     if result >= 0 {
-        // POSIX ACLs carry no deny entries, so any entry beyond the minimal
-        // three can only widen access. Reading the blob to tell a minimal ACL
-        // apart is a separate question from the one macOS forced.
+        // Presence only: the blob is not parsed here. POSIX ACLs carry no
+        // deny entries, so an ACL that is present may widen access, and
+        // telling a minimal one apart is a separate question from the one
+        // macOS forced.
         AclProbe::Granting
     } else if io::Error::last_os_error().raw_os_error() == Some(libc::ENODATA) {
         AclProbe::Absent

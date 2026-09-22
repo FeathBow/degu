@@ -94,6 +94,17 @@ const UNSUPPORTED_CASES: &[(&[&str], &str)] = &[
     (&["doctor", BUDGET, "1s"], BUDGET),
     (&["init", BUDGET, "1s"], BUDGET),
     (&["init", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
+    // `init` derives everything from the account database, so a caller cannot
+    // point it anywhere. Argument parsing refuses these before any
+    // provisioning could run, which is also why the bare command is not
+    // exercised anywhere: it would provision whoever runs the suite.
+    (&["init", "--uid", "1000"], "--uid"),
+    (
+        &["init", "--anchor-path", "/tmp/caller-selected"],
+        "--anchor-path",
+    ),
+    (&["init", "--initial"], "--initial"),
+    (&["init", "/tmp/caller-selected"], "/tmp/caller-selected"),
     (&["doctor", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),
     (&["quota", BUDGET, "1s"], BUDGET),
     (&["quota", MAX_CONCURRENCY, "1"], MAX_CONCURRENCY),

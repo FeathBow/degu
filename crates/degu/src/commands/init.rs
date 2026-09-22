@@ -6,27 +6,6 @@ use degu_core::ecosystem::DetectCtx;
 
 const ACTION: &str = "self_managed_account_setup";
 
-/// Provision the fixed current-account anchor and durably declare it as the
-/// self-managed authority. Store activation remains a separate, selector-guarded
-/// lifecycle transition.
-/// Refuse to publish a fresh authority over a store that has already been
-/// activated.
-///
-/// The two situations `missing` covers are first use and an authority that
-/// went missing, and only the second is dangerous: a new authority does not
-/// authenticate the existing store, so everything staged in it becomes
-/// visible through `degu trash list` and unrecoverable through `degu undo`.
-///
-/// degu used to ask the person to assert which situation this was, through a
-/// mandatory `--initial`. The assertion was unverifiable by construction and
-/// unenforced in practice — nothing looked — so it refused first use and let
-/// the dangerous case through. The store says which situation this is, in the
-/// same record that later refuses the undo.
-///
-/// This reads the store the current environment points at. A store staged
-/// under a different `XDG_STATE_HOME` is not visible here, so a clean result
-/// is evidence and not proof: it catches the case degu itself creates by
-/// default, which is the one people land in.
 fn refuse_if_a_store_is_already_activated() -> Result<()> {
     let ctx = DetectCtx::from_process().context("failed to read this account's environment")?;
     refuse_activated_store_in(&ctx)
@@ -53,6 +32,27 @@ fn refuse_activated_store_in(ctx: &DetectCtx) -> Result<()> {
     )
 }
 
+/// Provision the fixed current-account anchor and durably declare it as the
+/// self-managed authority. Store activation remains a separate, selector-guarded
+/// lifecycle transition.
+/// Refuse to publish a fresh authority over a store that has already been
+/// activated.
+///
+/// The two situations `missing` covers are first use and an authority that
+/// went missing, and only the second is dangerous: a new authority does not
+/// authenticate the existing store, so everything staged in it becomes
+/// visible through `degu trash list` and unrecoverable through `degu undo`.
+///
+/// degu used to ask the person to assert which situation this was, through a
+/// mandatory `--initial`. The assertion was unverifiable by construction and
+/// unenforced in practice — nothing looked — so it refused first use and let
+/// the dangerous case through. The store says which situation this is, in the
+/// same record that later refuses the undo.
+///
+/// This reads the store the current environment points at. A store staged
+/// under a different `XDG_STATE_HOME` is not visible here, so a clean result
+/// is evidence and not proof: it catches the case degu itself creates by
+/// default, which is the one people land in.
 pub(crate) fn run(json: bool) -> Result<()> {
     refuse_if_a_store_is_already_activated()?;
     let outcome = match initialize_current_euid_self_authority() {

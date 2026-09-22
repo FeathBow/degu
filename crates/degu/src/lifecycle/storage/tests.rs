@@ -85,6 +85,60 @@ fn the_trash_is_private_inside_a_namespace_setup_can_publish_under() {
     );
 }
 
+/// An account an earlier version left at 0700 is migrated, not refused.
+///
+/// Provisioning wants this component to be exactly 0755. Creating it private
+/// blocks setup for good, because provisioning is create-only and never
+/// repairs, so the namespace has to be brought forward here. The entries
+/// inside are narrowed before it widens, never after.
+#[test]
+fn an_existing_private_namespace_is_migrated_and_its_entries_narrowed_first() {
+    let base = tempfile::tempdir().unwrap();
+    let parent = base.path().join("degu");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for name in ["lock", "ops.jsonl", "trashroots"] {
+        std::fs::write(parent.join(name), b"").unwrap();
+        std::fs::set_permissions(parent.join(name), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+    }
+
+    super::validation::ensure_state_parent(&parent).unwrap();
+
+    assert_eq!(
+        std::fs::symlink_metadata(&parent).unwrap().mode() & 0o777,
+        0o755,
+        "the namespace must reach the mode provisioning requires"
+    );
+    for name in ["lock", "ops.jsonl", "trashroots"] {
+        assert_eq!(
+            std::fs::symlink_metadata(parent.join(name)).unwrap().mode() & 0o777,
+            0o600,
+            "{name} must not stay readable inside a published namespace"
+        );
+    }
+}
+
+/// A link where the namespace belongs is refused before anything is chmodded.
+#[test]
+fn a_symlinked_namespace_is_refused_before_its_entries_are_touched() {
+    let base = tempfile::tempdir().unwrap();
+    let elsewhere = base.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let victim = elsewhere.join("ops.jsonl");
+    std::fs::write(&victim, b"").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let parent = base.path().join("degu");
+    std::os::unix::fs::symlink(&elsewhere, &parent).unwrap();
+
+    assert!(super::validation::ensure_state_parent(&parent).is_err());
+    assert_eq!(
+        std::fs::symlink_metadata(&victim).unwrap().mode() & 0o777,
+        0o644,
+        "the refusal must come before anything through the link is changed"
+    );
+}
+
 #[test]
 fn unsafe_cross_device_parent_is_rejected() {
     let dir = tempfile::tempdir().unwrap();

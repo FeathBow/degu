@@ -124,6 +124,14 @@ fn compact(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .split(area);
     let mut lines = vec![summary(app, usize::from(area.width))];
+    if app.blocked() {
+        // The wide layout says this in the scope panel, which this one does
+        // not draw. Without it a narrow terminal shows only a missing key.
+        lines.push(Line::from(vec![
+            Span::styled("! ", Style::new().fg(CAUTION)),
+            Span::raw("account setup needed - run 'degu doctor'"),
+        ]));
+    }
     if let Some(warning) = coverage_warning(browser.coverage()) {
         lines.push(Line::from(vec![
             Span::styled("! ", Style::new().fg(CAUTION)),

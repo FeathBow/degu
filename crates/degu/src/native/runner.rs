@@ -1119,7 +1119,10 @@ mod tests {
 
     const HELPER_TEST: &str = "native::runner::tests::controlled_helper_process";
     const HELPER_MODE: &str = "DEGU_NATIVE_RUNNER_HELPER_MODE";
+    /// One descriptor the child must find closed.
     const HELPER_FD: &str = "DEGU_NATIVE_RUNNER_HELPER_FD";
+    /// A bound above which the child must find nothing open.
+    const HELPER_FD_BOUND: &str = "DEGU_NATIVE_RUNNER_HELPER_FD_BOUND";
 
     fn native_request(executable: PathBuf, paths: Vec<PathBuf>) -> NativeActionRequest {
         NativeActionRequest::new(
@@ -1522,10 +1525,12 @@ mod tests {
             limit.current.and_then(|soft| i32::try_from(soft).ok())
         };
         // Sibling tests fill the table, so the soft limit can sit below the
-        // slot this needs. Raising it to the hard limit is the process's own
-        // to do and only ever widens what is available.
+        // slot this needs. Raise it by just enough rather than to the hard
+        // limit: every test in this binary shares the process, and a limit in
+        // the millions is not this test's to impose on them.
         if soft(&limit).is_some_and(|soft| soft - 1 <= bound) {
-            limit.current = limit.maximum;
+            let wanted = u64::try_from(bound + 200).unwrap_or(u64::MAX);
+            limit.current = Some(limit.maximum.map_or(wanted, |hard| wanted.min(hard)));
             let _ = rustix::process::setrlimit(rustix::process::Resource::Nofile, limit);
             limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
         }
@@ -1564,7 +1569,10 @@ mod tests {
                     OsString::from(HELPER_MODE),
                     OsString::from("descriptor-policy"),
                 ),
-                (OsString::from(HELPER_FD), OsString::from(bound.to_string())),
+                (
+                    OsString::from(HELPER_FD_BOUND),
+                    OsString::from(bound.to_string()),
+                ),
             ]),
             RequestedProcessContract::AuditedCooperativeProcessGroup,
             Duration::from_secs(5),
@@ -1777,18 +1785,23 @@ mod tests {
             }
             "success" => println!("HELPER_OK"),
             "descriptor-policy" => {
-                // The bound, not one descriptor above it. The parent opens its
-                // controlled descriptor after preparation, so which slot it
-                // lands on depends on what sibling tests hold; naming a number
-                // here made the child probe a descriptor nobody had opened and
-                // pass for it. Sweeping proves the policy closed everything
-                // above the bound, whichever slot that was.
-                let bound = std::env::var(HELPER_FD).unwrap().parse::<i32>().unwrap();
-                let ceiling = rustix::process::getrlimit(rustix::process::Resource::Nofile)
-                    .current
-                    .and_then(|soft| i32::try_from(soft).ok())
-                    .unwrap_or(bound + 4096);
-                for fd in (bound + 1)..ceiling {
+                // Two shapes, because two things are worth asserting and one
+                // number cannot carry both. A caller that opened a descriptor
+                // names it and this checks that exact slot; a caller that only
+                // knows the bound preparation saw names the bound and this
+                // sweeps above it. Reading one as the other is how a check of
+                // a descriptor nobody opened came to pass for a real one.
+                let exact = std::env::var(HELPER_FD)
+                    .ok()
+                    .map(|value| value.parse::<i32>().unwrap());
+                let bound = std::env::var(HELPER_FD_BOUND)
+                    .ok()
+                    .map(|value| value.parse::<i32>().unwrap());
+                assert!(
+                    exact.is_some() || bound.is_some(),
+                    "the descriptor-policy helper was told nothing to check"
+                );
+                let closed = |fd: i32| {
                     // SAFETY: probing a numeric descriptor with F_GETFD does
                     // not dereference memory.
                     assert_eq!(
@@ -1797,6 +1810,17 @@ mod tests {
                         "descriptor {fd} survived the child policy"
                     );
                     assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+                };
+                if let Some(fd) = exact {
+                    closed(fd);
+                }
+                if let Some(bound) = bound {
+                    // A window, not the whole table: a soft limit in the
+                    // millions would spend the test in fcntl. The controlled
+                    // descriptor is opened just above the bound.
+                    for fd in (bound + 1)..=(bound + 1024) {
+                        closed(fd);
+                    }
                 }
                 println!("DESCRIPTORS_CLOSED");
             }

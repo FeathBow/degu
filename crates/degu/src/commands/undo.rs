@@ -48,19 +48,11 @@ struct LogFailureJson<'a> {
     restored: bool,
 }
 
-/// Move staged entries back by hand when the store no longer authenticates.
+/// Restore the latest staged clean through the authenticated store.
 ///
-/// `undo` refuses in this state for a good reason: an unauthenticated store is
-/// not vouched for, so degu will not write its contents back on its own
-/// authority. But the entries are ordinary files, their origins are recorded
-/// outside the store, and `degu trash list` reads them without activating
-/// anything — so refusing left people with data they could see, could not
-/// recover through degu, and no next step.
-///
-/// This does not activate the store, open the WAL, or pretend the contents are
-/// verified. It moves files and says so. The broken store is then renamed
-/// aside, not deleted, so `degu init` can set the account up again and the
-/// evidence survives for whoever wants to look at it.
+/// Every move goes through the mutation lock, the held parents and the object
+/// identity the staging path recorded, so a destination that appeared since
+/// the plan was made is refused rather than replaced.
 pub(crate) fn run(json: bool, ui: crate::runtime::Ui) -> Result<()> {
     let ctx = degu_core::ecosystem::DetectCtx::from_process()?;
     let mut session = Lifecycle::new(&ctx).lock()?;

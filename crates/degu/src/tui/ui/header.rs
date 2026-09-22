@@ -76,6 +76,10 @@ fn plan_label(app: &App) -> String {
 }
 
 fn plan_tone(app: &App) -> Color {
+    // A plan that cannot run is not ready, whatever its size.
+    if app.blocked() {
+        return CAUTION;
+    }
     if app.view() == View::Staged {
         if app.staged().nothing_chosen() {
             SECONDARY

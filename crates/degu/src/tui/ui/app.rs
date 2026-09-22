@@ -44,9 +44,9 @@ impl View {
 pub struct App {
     /// Whether this account can run a cleanup at all.
     ///
-    /// Asked once before the review opens, because the answer does not change
-    /// while it is open and finding out at the end wastes every decision the
-    /// reader made. Browsing still works without it; only running does not.
+    /// Asked once before the review opens, because finding out at the end
+    /// wastes every decision the reader made. Browsing still works without it;
+    /// only running does not, and the command `c` hands off to checks again.
     /// Why it cannot is left to `degu doctor`, which distinguishes setup that
     /// was never done from setup that went missing — a difference this screen
     /// has no room to explain and no business deciding.

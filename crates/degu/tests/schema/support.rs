@@ -164,6 +164,14 @@ pub(super) fn assert_non_empty_array<'a>(value: &'a Value, label: &str) -> &'a [
     array
 }
 
+/// The spellings a scan section's completeness may take here.
+///
+/// A section that was asked for cannot come back `not_requested`, so callers
+/// pass what this run actually requested rather than the whole enum.
+pub(super) fn assert_completeness(value: &Value, allowed: &[&str]) {
+    assert_string_enum(value, allowed);
+}
+
 fn assert_string_enum(value: &Value, variants: &[&str]) {
     let observed = value.as_str().unwrap();
     assert!(
@@ -179,7 +187,15 @@ pub(super) fn assert_finding(value: &Value) {
     } else {
         assert_keys(value, FINDING_KEYS);
     }
-    assert!(value["age_days"].is_number());
+    // Null is part of this field, not an absence of it: `age_days` is an
+    // `Option<u64>`, and a directory whose mtime cannot be read has no age to
+    // report. The runtime scan reaches /tmp and /var/tmp whatever TMPDIR says,
+    // so on a shared machine it meets directories belonging to other accounts.
+    let age = &value["age_days"];
+    assert!(
+        age.is_u64() || age.is_null(),
+        "age_days should be a number or null, got {age}"
+    );
     assert_string_enum(&value["kind"], &finding_kind_variants());
     assert_string_enum(&value["confidence"], &["unverified", "verified"]);
     assert_string_enum(

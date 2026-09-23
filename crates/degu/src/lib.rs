@@ -8,6 +8,8 @@ mod collection;
 mod commands;
 mod configuration;
 mod findings;
+#[cfg(test)]
+mod fork_gate;
 mod lifecycle;
 mod native;
 mod output;
@@ -79,7 +81,7 @@ fn dispatch(command: Command, ui: runtime::Ui) -> Result<()> {
     match command {
         Command::Scan(args) => commands::scan::run(args, ui),
         Command::Tui(args) => commands::tui::run(args, ui),
-        Command::Init { initial, output } => commands::init::run(initial, output.json),
+        Command::Init { output } => commands::init::run(output.json),
         Command::Admin { .. } => unreachable!("handled by dedicated root-only dispatch"),
         Command::Doctor { output } => commands::doctor::run(output.json),
         Command::Quota(args) => commands::quota::run(args, ui),

@@ -72,7 +72,7 @@ For datasets, checkpoints, and unknown large files, pair degu with a disk-usage 
 | Operation | Setup | Boundary |
 |---|---|---|
 | `scan`, `quota`, `clean -n` | none | read-only; dry-run creates no degu state |
-| degu-managed `clean`, `undo`, `trash purge` | `degu init --initial` for first-use self-managed authority, or optional administrator setup | runs without elevation; anchor, WAL, and each source/trash mount domain independently require a certified ext4/XFS/APFS backend |
+| degu-managed `clean`, `undo`, `trash purge` | `degu init` for self-managed authority, or optional administrator setup | runs without elevation; anchor, WAL, and each source/trash mount domain independently require a certified ext4/XFS/APFS backend |
 | `reclaim uv` | explicit executable and cache root | irreversible tool-native mutation; no account anchor, degu trash, or undo |
 
 Unsupported filesystems never gain sealed authority. See the [safety model](docs/safety.md) for compatibility and recovery behavior.
@@ -114,10 +114,10 @@ degu doctor
 `ready` means continue. If it reports `missing`, initialize only the fixed authority for the current non-root account:
 
 ```sh
-degu init --initial
+degu init
 ```
 
-Use `--initial` only when no earlier degu authority or store was lost. An administrator may instead provision the optional system authority. `split_authority`, `recovery_required`, `unsafe`, `unsupported`, or `uncertain` requires investigation; `init` never repairs state, chooses a UID or path, activates an empty store, or clears recovery.
+`init` refuses when this account's store carries an activation record, which means an earlier authority was lost rather than never made. An administrator may instead provision the optional system authority. `split_authority`, `recovery_required`, `unsafe`, `unsupported`, or `uncertain` requires investigation; `init` never repairs state, chooses a UID or path, activates an empty store, or clears recovery.
 
 After setup, the daily lifecycle remains five short commands:
 

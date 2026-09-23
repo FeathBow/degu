@@ -27,7 +27,7 @@ impl Review {
         let staged =
             crate::tui::Staged::new(crate::lifecycle::Lifecycle::new(&ctx).trash_entries()?);
         Ok(Self {
-            app: App::new(report, staged, ctx.home),
+            app: App::new(report, staged, ctx.home, cleanup_blocked()),
             filters,
             limits,
         })
@@ -37,6 +37,33 @@ impl Review {
         self.app
             .decisions()
             .clean_args(&self.filters, self.limits, dry_run)
+    }
+}
+
+/// Whether a cleanup cannot run for this account.
+///
+/// The same question `degu doctor` asks, asked before the review opens. Left
+/// until `c`, it answers after the reader has already decided everything.
+/// Asked once: another process could provision or break the account while the
+/// review is open, and the command it hands off to checks again anyway.
+fn cleanup_blocked() -> bool {
+    use degu_core::activation::StoreActivationKind;
+
+    // Asked about the anchor a cleanup would open, not the one the account
+    // database names: `doctor` reports the platform authority and ignores the
+    // mutation seam on purpose, and borrowing its answer here blocked `c` in
+    // environments where the cleanup would have run.
+    //
+    // Readiness succeeds while reporting an activation that no longer matches
+    // its store, which `degu doctor` classifies as recovery_required. Asking
+    // only whether the call failed let the review offer `c` in exactly the
+    // state where running is impossible.
+    match degu_core::activation::check_current_euid_mutation_readiness() {
+        Ok(readiness) => matches!(
+            readiness.activation(),
+            StoreActivationKind::Lost | StoreActivationKind::CorruptOrReplaced
+        ),
+        Err(_) => true,
     }
 }
 

@@ -620,6 +620,10 @@ fn run_preflighted_output<Parsed, ParseError>(
     refresh_descriptor_limit: impl FnOnce() -> io::Result<i32>,
     parse: impl FnOnce(&[u8], &[u8]) -> Result<Parsed, ParseError>,
 ) -> Result<NativeRunReport<Parsed, ParseError>, NativeRunnerError> {
+    // Every exec degu makes passes here, so the test binary's forks are kept
+    // out of another thread's write-then-exec window from one site.
+    #[cfg(test)]
+    let _shared = crate::fork_gate::forking();
     let mut command = Command::new(&declaration.executable);
     command
         .args(&declaration.arguments)
@@ -1115,7 +1119,10 @@ mod tests {
 
     const HELPER_TEST: &str = "native::runner::tests::controlled_helper_process";
     const HELPER_MODE: &str = "DEGU_NATIVE_RUNNER_HELPER_MODE";
+    /// One descriptor the child must find closed.
     const HELPER_FD: &str = "DEGU_NATIVE_RUNNER_HELPER_FD";
+    /// A bound above which the child must find nothing open.
+    const HELPER_FD_BOUND: &str = "DEGU_NATIVE_RUNNER_HELPER_FD_BOUND";
 
     fn native_request(executable: PathBuf, paths: Vec<PathBuf>) -> NativeActionRequest {
         NativeActionRequest::new(
@@ -1251,6 +1258,7 @@ mod tests {
 
     #[test]
     fn post_spawn_error_returns_only_after_killed_child_is_reaped() {
+        let _shared = crate::fork_gate::forking();
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", HELPER_TEST, "--nocapture"])
@@ -1502,11 +1510,49 @@ mod tests {
         assert!(!marker.exists());
     }
 
-    #[test]
-    fn prepared_execution_refreshes_descriptor_bound_after_prepare() {
+    /// A live descriptor numbered above `bound`, or the reason there can be none.
+    ///
+    /// `descriptor_scan_limit` reports the highest slot in use, which climbs
+    /// while sibling tests open files, so a fixed offset above it can cross
+    /// RLIMIT_NOFILE and F_DUPFD then fails outright. Ask for the offset, fall
+    /// back to the highest slot the limit allows, and say so if even that is
+    /// not above the bound.
+    fn descriptor_above(bound: i32) -> std::io::Result<(std::os::fd::OwnedFd, i32)> {
         use std::os::fd::{FromRawFd, OwnedFd};
 
-        let target_fd = descriptor_scan_limit().unwrap().checked_add(100).unwrap();
+        let mut limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        let soft = |limit: &rustix::process::Rlimit| {
+            limit.current.and_then(|soft| i32::try_from(soft).ok())
+        };
+        // Sibling tests fill the table, so the soft limit can sit below the
+        // slot this needs. Raise it by just enough rather than to the hard
+        // limit: every test in this binary shares the process, and a limit in
+        // the millions is not this test's to impose on them.
+        if soft(&limit).is_some_and(|soft| soft - 1 <= bound) {
+            let wanted = u64::try_from(bound + 200).unwrap_or(u64::MAX);
+            limit.current = Some(limit.maximum.map_or(wanted, |hard| wanted.min(hard)));
+            let _ = rustix::process::setrlimit(rustix::process::Resource::Nofile, limit);
+            limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        }
+        let ceiling = soft(&limit).map_or(bound + 100, |soft| (bound + 100).min(soft - 1));
+        if ceiling <= bound {
+            return Err(std::io::Error::other(format!(
+                "no descriptor slot above {bound} within this process's limit"
+            )));
+        }
+        let temp = tempfile::tempfile()?;
+        // SAFETY: temp is live and a successful result is immediately owned.
+        let raw = unsafe { libc::fcntl(temp.as_raw_fd(), libc::F_DUPFD, ceiling) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: raw is a fresh successful F_DUPFD result.
+        Ok((unsafe { OwnedFd::from_raw_fd(raw) }, raw))
+    }
+
+    #[test]
+    fn prepared_execution_refreshes_descriptor_bound_after_prepare() {
+        let bound = descriptor_scan_limit().unwrap();
         let request = NativeActionRequest::new(
             degu_adapters::native::NativeActionIdentity::new("fake", "descriptor-check").unwrap(),
             degu_adapters::native::NativeExecutableSelection::explicit(
@@ -1524,8 +1570,8 @@ mod tests {
                     OsString::from("descriptor-policy"),
                 ),
                 (
-                    OsString::from(HELPER_FD),
-                    OsString::from(target_fd.to_string()),
+                    OsString::from(HELPER_FD_BOUND),
+                    OsString::from(bound.to_string()),
                 ),
             ]),
             RequestedProcessContract::AuditedCooperativeProcessGroup,
@@ -1537,17 +1583,10 @@ mod tests {
         .unwrap();
         let prepared = prepare_native_action(request).unwrap();
 
-        let temp = tempfile::tempfile().unwrap();
-        // Open the non-CLOEXEC descriptor only after preparation. Since the
-        // requested slot is above the then-current table, F_DUPFD returns it.
-        // SAFETY: temp is live and the successful result is immediately owned.
-        let raw = unsafe { libc::fcntl(temp.as_raw_fd(), libc::F_DUPFD, target_fd) };
-        assert_eq!(
-            raw, target_fd,
-            "failed to create controlled high descriptor"
-        );
-        // SAFETY: raw is a fresh successful F_DUPFD result.
-        let high_fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // Opened only after preparation, so the slot is above the table the
+        // preparation saw.
+        let (high_fd, raw) = descriptor_above(bound).expect("a controlled high descriptor");
+        assert!(raw > bound, "the prepared bound must miss this descriptor");
         // SAFETY: high_fd remains live through child execution.
         assert_eq!(
             unsafe { libc::fcntl(high_fd.as_raw_fd(), libc::F_GETFD) },
@@ -1565,23 +1604,12 @@ mod tests {
 
     #[test]
     fn fallback_refresh_covers_a_descriptor_opened_after_a_stale_bound() {
-        use std::os::fd::{FromRawFd, OwnedFd};
-
         let stale_limit = descriptor_scan_limit().unwrap();
-        let target_fd = stale_limit.checked_add(50).unwrap();
-        let temp = tempfile::tempfile().unwrap();
-        // SAFETY: temp is live and the successful result is immediately owned.
-        let raw = unsafe { libc::fcntl(temp.as_raw_fd(), libc::F_DUPFD, target_fd) };
-        assert_eq!(raw, target_fd);
-        // SAFETY: raw is a fresh successful F_DUPFD result.
-        let high_fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        assert!(
-            raw >= stale_limit,
-            "the stale bound must miss this descriptor"
-        );
+        let (high_fd, raw) = descriptor_above(stale_limit).expect("a controlled high descriptor");
 
         let refreshed_limit = descriptor_scan_limit().unwrap();
         assert!(refreshed_limit > raw);
+        let _shared = crate::fork_gate::forking();
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", HELPER_TEST, "--nocapture"])
@@ -1757,11 +1785,43 @@ mod tests {
             }
             "success" => println!("HELPER_OK"),
             "descriptor-policy" => {
-                let fd = std::env::var(HELPER_FD).unwrap().parse::<i32>().unwrap();
-                // SAFETY: probing a numeric descriptor with F_GETFD does not
-                // dereference memory. The child policy must have closed it.
-                assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+                // Two shapes, because two things are worth asserting and one
+                // number cannot carry both. A caller that opened a descriptor
+                // names it and this checks that exact slot; a caller that only
+                // knows the bound preparation saw names the bound and this
+                // sweeps above it. Reading one as the other is how a check of
+                // a descriptor nobody opened came to pass for a real one.
+                let exact = std::env::var(HELPER_FD)
+                    .ok()
+                    .map(|value| value.parse::<i32>().unwrap());
+                let bound = std::env::var(HELPER_FD_BOUND)
+                    .ok()
+                    .map(|value| value.parse::<i32>().unwrap());
+                assert!(
+                    exact.is_some() || bound.is_some(),
+                    "the descriptor-policy helper was told nothing to check"
+                );
+                let closed = |fd: i32| {
+                    // SAFETY: probing a numeric descriptor with F_GETFD does
+                    // not dereference memory.
+                    assert_eq!(
+                        unsafe { libc::fcntl(fd, libc::F_GETFD) },
+                        -1,
+                        "descriptor {fd} survived the child policy"
+                    );
+                    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+                };
+                if let Some(fd) = exact {
+                    closed(fd);
+                }
+                if let Some(bound) = bound {
+                    // A window, not the whole table: a soft limit in the
+                    // millions would spend the test in fcntl. The controlled
+                    // descriptor is opened just above the bound.
+                    for fd in (bound + 1)..=(bound + 1024) {
+                        closed(fd);
+                    }
+                }
                 println!("DESCRIPTORS_CLOSED");
             }
             "environment" => {

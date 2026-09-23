@@ -2,14 +2,60 @@ use anyhow::{Context, Result};
 use degu_core::activation::{
     SelfAuthorityInitializationError, initialize_current_euid_self_authority,
 };
+use degu_core::ecosystem::DetectCtx;
 
 const ACTION: &str = "self_managed_account_setup";
+
+fn refuse_if_a_store_is_already_activated() -> Result<()> {
+    let ctx = DetectCtx::from_process().context("failed to read this account's environment")?;
+    refuse_activated_store_in(&ctx)
+}
+
+fn refuse_activated_store_in(ctx: &DetectCtx) -> Result<()> {
+    let store = crate::lifecycle::sealed_staging_store_path(ctx);
+    let binding = store.join(degu_core::activation::STORE_BINDING_NAME);
+    // `exists()` answers "no" for a path it cannot stat and for a dangling
+    // symlink, which are not absence.
+    match std::fs::symlink_metadata(&binding) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", binding.display()));
+        }
+        Ok(_) => {}
+    }
+    anyhow::bail!(
+        "this account has already activated a sealed-staging store at {}, so its authority is \
+         missing rather than absent. Publishing a new one would leave everything staged in that \
+         store unrecoverable. Run 'degu doctor' and inspect the recorded anchor and store before \
+         changing either.",
+        store.display()
+    )
+}
 
 /// Provision the fixed current-account anchor and durably declare it as the
 /// self-managed authority. Store activation remains a separate, selector-guarded
 /// lifecycle transition.
-pub(crate) fn run(initial: bool, json: bool) -> Result<()> {
-    let outcome = match initialize_current_euid_self_authority(initial) {
+/// Refuse to publish a fresh authority over a store that has already been
+/// activated.
+///
+/// The two situations `missing` covers are first use and an authority that
+/// went missing, and only the second is dangerous: a new authority does not
+/// authenticate the existing store, so everything staged in it becomes
+/// visible through `degu trash list` and unrecoverable through `degu undo`.
+///
+/// degu used to ask the person to assert which situation this was, through a
+/// mandatory `--initial`. The assertion was unverifiable by construction and
+/// unenforced in practice — nothing looked — so it refused first use and let
+/// the dangerous case through. The store says which situation this is, in the
+/// same record that later refuses the undo.
+///
+/// This reads the store the current environment points at. A store staged
+/// under a different `XDG_STATE_HOME` is not visible here, so a clean result
+/// is evidence and not proof: it catches the case degu itself creates by
+/// default, which is the one people land in.
+pub(crate) fn run(json: bool) -> Result<()> {
+    refuse_if_a_store_is_already_activated()?;
+    let outcome = match initialize_current_euid_self_authority() {
         Ok(outcome) => outcome,
         Err(error @ SelfAuthorityInitializationError::PostProvision(_)) => {
             let SelfAuthorityInitializationError::PostProvision(failure) = &error else {
@@ -53,6 +99,34 @@ fn finish_failed_initialization(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ctx_with_state(state: &std::path::Path) -> DetectCtx {
+        DetectCtx::for_test(
+            state.to_path_buf(),
+            [("XDG_STATE_HOME".to_owned(), state.as_os_str().to_owned())],
+        )
+    }
+
+    /// The refusal that replaced `--initial`.
+    ///
+    /// Exercised here rather than through the binary because `degu init`
+    /// derives its target from the account database: a test that ran it would
+    /// provision whoever ran the suite.
+    #[test]
+    fn a_store_that_was_activated_refuses_a_fresh_authority() {
+        let state = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_state(state.path());
+        refuse_activated_store_in(&ctx).expect("nothing staged yet");
+
+        let store = crate::lifecycle::sealed_staging_store_path(&ctx);
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join(degu_core::activation::STORE_BINDING_NAME), b"").unwrap();
+
+        let refusal = refuse_activated_store_in(&ctx).expect_err("an activated store refuses");
+        let message = format!("{refusal}");
+        assert!(message.contains("already activated"), "{message}");
+        assert!(message.contains("unrecoverable"), "{message}");
+    }
 
     #[test]
     fn post_provision_failure_dominates_a_closed_stdout_consumer() {

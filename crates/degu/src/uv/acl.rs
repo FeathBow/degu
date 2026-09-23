@@ -115,6 +115,7 @@ mod tests {
     use std::process::Command;
 
     fn add_acl(path: &std::path::Path, rule: &str) {
+        let _shared = crate::fork_gate::forking();
         let status = Command::new("/bin/chmod")
             .args(["+a", rule])
             .arg(path)
@@ -124,6 +125,7 @@ mod tests {
     }
 
     fn clear_first_acl(path: &std::path::Path) {
+        let _shared = crate::fork_gate::forking();
         let status = Command::new("/bin/chmod")
             .args(["-a#", "0"])
             .arg(path)

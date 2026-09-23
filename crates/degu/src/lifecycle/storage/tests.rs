@@ -61,18 +61,82 @@ fn mount_identity_probe_does_not_require_directory_read_permission() {
     assert!(result.is_ok(), "{result:?}");
 }
 
+/// The trash is private; the namespace it sits in is the one setup publishes
+/// the activation anchor under.
+///
+/// `<state>/degu` is both, and provisioning requires exactly 0755 of it.
+/// Creating it private blocks setup for good, because provisioning is
+/// create-only and never repairs. Privacy belongs to the entries inside,
+/// which carry their own modes.
 #[test]
-fn managed_trash_root_is_private() {
+fn the_trash_is_private_inside_a_namespace_setup_can_publish_under() {
     let dir = tempfile::tempdir().unwrap();
     let root = ensure_managed_trash_root(&dir.path().join("degu/trash"), "trash").unwrap();
 
     let mode = std::fs::symlink_metadata(&root).unwrap().mode() & 0o777;
-    assert_eq!(mode, 0o700);
+    assert_eq!(mode, 0o700, "the trash itself stays owner-only");
     let parent_mode = std::fs::symlink_metadata(root.parent().unwrap())
         .unwrap()
         .mode()
         & 0o777;
-    assert_eq!(parent_mode, 0o700);
+    assert_eq!(
+        parent_mode, 0o755,
+        "provisioning requires this component to be exactly 0755"
+    );
+}
+
+/// An account an earlier version left at 0700 is migrated, not refused.
+///
+/// Provisioning wants this component to be exactly 0755. Creating it private
+/// blocks setup for good, because provisioning is create-only and never
+/// repairs, so the namespace has to be brought forward here. The entries
+/// inside are narrowed before it widens, never after.
+#[test]
+fn an_existing_private_namespace_is_migrated_and_its_entries_narrowed_first() {
+    let base = tempfile::tempdir().unwrap();
+    let parent = base.path().join("degu");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for name in ["lock", "ops.jsonl", "trashroots"] {
+        std::fs::write(parent.join(name), b"").unwrap();
+        std::fs::set_permissions(parent.join(name), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+    }
+
+    super::validation::ensure_state_parent(&parent).unwrap();
+
+    assert_eq!(
+        std::fs::symlink_metadata(&parent).unwrap().mode() & 0o777,
+        0o755,
+        "the namespace must reach the mode provisioning requires"
+    );
+    for name in ["lock", "ops.jsonl", "trashroots"] {
+        assert_eq!(
+            std::fs::symlink_metadata(parent.join(name)).unwrap().mode() & 0o777,
+            0o600,
+            "{name} must not stay readable inside a published namespace"
+        );
+    }
+}
+
+/// A link where the namespace belongs is refused before anything is chmodded.
+#[test]
+fn a_symlinked_namespace_is_refused_before_its_entries_are_touched() {
+    let base = tempfile::tempdir().unwrap();
+    let elsewhere = base.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let victim = elsewhere.join("ops.jsonl");
+    std::fs::write(&victim, b"").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let parent = base.path().join("degu");
+    std::os::unix::fs::symlink(&elsewhere, &parent).unwrap();
+
+    assert!(super::validation::ensure_state_parent(&parent).is_err());
+    assert_eq!(
+        std::fs::symlink_metadata(&victim).unwrap().mode() & 0o777,
+        0o644,
+        "the refusal must come before anything through the link is changed"
+    );
 }
 
 #[test]

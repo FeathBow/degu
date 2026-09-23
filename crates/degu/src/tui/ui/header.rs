@@ -51,6 +51,11 @@ fn masthead(app: &App, width: usize) -> Line<'static> {
 }
 
 fn plan_label(app: &App) -> String {
+    // A plan total answers "what would running do", which is not the question
+    // when running is unavailable. This line is the width the remedy needs.
+    if app.blocked() {
+        return "Cleanup unavailable - run 'degu doctor'".to_owned();
+    }
     let (plan, verb) = if app.view() == View::Staged {
         (app.staged().summary(true).chosen, "To delete permanently")
     } else {
@@ -71,6 +76,10 @@ fn plan_label(app: &App) -> String {
 }
 
 fn plan_tone(app: &App) -> Color {
+    // A plan that cannot run is not ready, whatever its size.
+    if app.blocked() {
+        return CAUTION;
+    }
     if app.view() == View::Staged {
         if app.staged().nothing_chosen() {
             SECONDARY

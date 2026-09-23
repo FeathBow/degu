@@ -178,6 +178,7 @@ fn assert_top_help_order() {
         &output,
         &[
             "\n  scan",
+            "\n  tui",
             "\n  doctor",
             "\n  quota",
             "\n  init",

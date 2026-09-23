@@ -35,6 +35,7 @@ pub(crate) use purge::{ExpiryPlan, PurgeReport, SelectedTrashPlan, TrashPurgePla
 pub(crate) use stage::{
     CapturedCleanPlan, CleanExecution, CleanExecutionFailure, cleaned_resources,
 };
+pub(crate) use storage::sealed_staging_store_path;
 pub(crate) use undo::{UndoAmbiguousEntry, UndoEntry, UndoFailedEntry, UndoLogFailure, UndoReport};
 
 pub(crate) struct Lifecycle {

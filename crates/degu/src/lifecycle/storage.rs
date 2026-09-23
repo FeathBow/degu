@@ -5,6 +5,7 @@ use degu_core::safety::Guard;
 use std::collections::HashSet;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 const TRASHROOTS_FILE: &str = "degu/trashroots";
@@ -156,8 +157,14 @@ where
     })?;
     let desired = parent.join(SEALED_STAGING_STORE_NAME);
 
-    activate(&desired)
-        .context("failed to discover or activate the current account sealed-staging store")
+    activate(&desired).map_err(|error| {
+        // The state is the same one `degu doctor` reports, so say what doctor
+        // says. Without this the reader gets two paths and no way forward.
+        let remedy = crate::commands::doctor::activation_remedy(&error);
+        anyhow::Error::new(error)
+            .context(remedy)
+            .context("failed to discover or activate the current account sealed-staging store")
+    })
 }
 
 pub(crate) fn acquire_mutation_lock(ctx: &DetectCtx) -> Result<std::fs::File> {
@@ -168,6 +175,9 @@ pub(crate) fn acquire_mutation_lock(ctx: &DetectCtx) -> Result<std::fs::File> {
         .create(true)
         .write(true)
         .truncate(false)
+        // Owner-only in its own right: the directory above is the published
+        // anchor namespace and is not private.
+        .mode(0o600)
         .open(&path)
         .with_context(|| format!("failed to open mutation lock {}", path.display()))?;
     match file.try_lock() {
@@ -294,6 +304,10 @@ where
         .create(true)
         .read(true)
         .append(true)
+        // Owner-only in its own right, like the lock and the operation log:
+        // the directory above is the published anchor namespace, and this
+        // names every absolute trash root this account uses.
+        .mode(0o600)
         .open(&registry)
         .with_context(|| format!("failed to open {}", registry.display()))?;
     isolate_partial_tail(&mut file)

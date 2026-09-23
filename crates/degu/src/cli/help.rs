@@ -3,6 +3,7 @@ pub(super) const TOP_LEVEL_HELP_TEMPLATE: &str = "{about-with-newline}
 
 Inspect:
   scan         Inspect known caches and selected project roots
+  tui          Review findings interactively and clean what you choose
   doctor       Check whether required account setup is ready
   quota        Report authoritative filesystem quota for one path
 
@@ -32,3 +33,27 @@ Reference:
 
 Options:
 {options}{after-help}";
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    /// Every subcommand is named in the template.
+    ///
+    /// The groups above are written by hand, so a command added to the enum
+    /// reaches `--help` only if someone also adds it here. Ask clap rather
+    /// than keeping a second hand-written list that can miss the same one.
+    #[test]
+    fn the_help_template_names_every_subcommand() {
+        let command = crate::cli::Cli::command();
+        let missing: Vec<&str> = command
+            .get_subcommands()
+            .map(clap::Command::get_name)
+            .filter(|name| !super::TOP_LEVEL_HELP_TEMPLATE.contains(&format!("\n  {name} ")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the top-level help lists no {missing:?}; add them to a group in this file"
+        );
+    }
+}

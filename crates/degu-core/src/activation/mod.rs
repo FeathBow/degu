@@ -78,7 +78,8 @@ pub use selection::{
     ActivationAuthorityMode, AuthorityClaimPublicationState, CurrentEuidAuthorityReadiness,
     SelfAuthorityInitializationError, SelfAuthorityInitializationOutcome,
     SelfAuthorityInitializationPostProvisionError, activate_current_euid_store,
-    check_current_euid_authority_readiness, initialize_current_euid_self_authority,
+    check_current_euid_authority_readiness, check_current_euid_mutation_readiness,
+    initialize_current_euid_self_authority,
 };
 #[cfg(test)]
 use selection::{
@@ -260,8 +261,6 @@ pub enum StoreActivationError {
     SelectedAuthorityLost { selected: PathBuf, witness: PathBuf },
     #[error("self-managed activation requires an explicit initial declaration")]
     SelfInitializationRequired,
-    #[error("self-managed initialization requires an explicit initial-use assertion")]
-    InitialAssertionRequired,
     #[error("self-managed initialization is blocked by an existing system authority at {path}")]
     SystemAuthorityPresent { path: PathBuf },
     #[error("activation record locator is invalid")]

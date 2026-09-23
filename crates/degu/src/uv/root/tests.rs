@@ -529,14 +529,15 @@ fn macos_extended_acl_on_a_traversed_directory_fails_closed() {
     let root = temp.path().join("root");
     let bucket = root.join("archive-v0");
     create_private_dir_all(&bucket).unwrap();
-    assert!(
+    let planted = {
+        let _shared = crate::fork_gate::forking();
         std::process::Command::new("/bin/chmod")
             .args(["+a", "everyone allow add_file"])
             .arg(&bucket)
             .status()
             .unwrap()
-            .success()
-    );
+    };
+    assert!(planted.success());
     assert!(matches!(
         seal(&root),
         Err(UvCacheRootSealError::UnsafePath { .. })

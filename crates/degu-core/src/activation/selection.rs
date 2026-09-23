@@ -408,14 +408,12 @@ fn require_current_self_path(expected: &Path) -> Result<(), StoreActivationError
 }
 
 /// Provision and durably declare the current non-root account's self-managed
-/// authority. `initial` is the caller's assertion that no earlier authority was
-/// lost; it is never repair, migration, or recovery permission.
-pub fn initialize_current_euid_self_authority(
-    initial: bool,
-) -> Result<SelfAuthorityInitializationOutcome, SelfAuthorityInitializationError> {
-    if !initial {
-        return Err(StoreActivationError::InitialAssertionRequired.into());
-    }
+/// authority. Create-only: it is never repair, migration, or recovery
+/// permission, and it refuses an authority that already exists. Deciding
+/// whether an earlier one was lost belongs to the caller, which reads the
+/// store for an activation record before asking for this.
+pub fn initialize_current_euid_self_authority()
+-> Result<SelfAuthorityInitializationOutcome, SelfAuthorityInitializationError> {
     let system_locator = ActivationAnchorLocator::for_current_euid()?;
     if let Some(system) = open_authority_candidate(&system_locator)? {
         return Err(StoreActivationError::SystemAuthorityPresent {
@@ -522,9 +520,30 @@ where
 
 /// Inspect and select the current account's existing authority without creating
 /// an anchor, store, or activation record.
+///
+/// Reports the platform authority this account really has, which is what
+/// `doctor` is for, so it reads the account database and ignores the
+/// mutation-only test seam.
 pub fn check_current_euid_authority_readiness()
 -> Result<CurrentEuidAuthorityReadiness, StoreActivationError> {
-    let selection = select_current_euid_authority()?;
+    readiness_from(select_current_euid_authority()?)
+}
+
+/// The same question, asked about the anchor a mutation would open.
+///
+/// Anything deciding whether to offer a cleanup has to ask about the authority
+/// the cleanup will actually reach, not the one the account database names.
+/// Where nothing redirects the anchor the two answers are identical, which is
+/// every real account; they part only under the mutation seam, and answering
+/// from the account database there refuses work that would have succeeded.
+pub fn check_current_euid_mutation_readiness()
+-> Result<CurrentEuidAuthorityReadiness, StoreActivationError> {
+    readiness_from(production_authority_selection()?)
+}
+
+fn readiness_from(
+    selection: AuthoritySelection,
+) -> Result<CurrentEuidAuthorityReadiness, StoreActivationError> {
     if selection.mode == ActivationAuthorityMode::SelfManaged
         && selection.selected.claim.is_none()
         && matches!(

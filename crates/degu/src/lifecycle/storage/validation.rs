@@ -1,4 +1,6 @@
+use rustix::fs::{Mode, OFlags};
 use std::ffi::OsStr;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
@@ -7,6 +9,11 @@ use anyhow::{Context, Result};
 use super::STATE_TRASH_NAME;
 
 const PRIVATE_DIR_MODE: u32 = 0o700;
+// `<state>/degu` is also the namespace the activation anchor is published
+// under, and provisioning requires that component to be exactly 0755. Whatever
+// creates it first decides its mode, so it has to be the mode setup needs.
+// Privacy belongs to the entries inside it, which carry their own modes.
+const NAMESPACE_DIR_MODE: u32 = 0o755;
 const SHARED_WRITE_MASK: u32 = 0o022;
 const STICKY_BIT: u32 = 0o1000;
 
@@ -106,13 +113,69 @@ pub(super) fn ensure_state_parent(parent: &Path) -> Result<()> {
     std::fs::create_dir_all(ancestor)
         .with_context(|| format!("failed to create {}", ancestor.display()))?;
     let mut builder = std::fs::DirBuilder::new();
-    builder.mode(PRIVATE_DIR_MODE);
+    builder.mode(NAMESPACE_DIR_MODE);
     match builder.create(parent) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("failed to create {}", parent.display())),
-    }?;
-    validate_trash_parent(parent)
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to create {}", parent.display()));
+        }
+    }
+    // Validated before anything inside it is touched: a pathname chmod through
+    // an unvalidated parent would follow a symlink planted where this expects
+    // a directory.
+    validate_trash_parent(parent)?;
+
+    let held = rustix::fs::open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("failed to open {}", parent.display()))?;
+    narrow_private_entries(&held, parent)?;
+    // Widened last, so no entry is ever reachable through a 0755 namespace
+    // while it still carries a mode from a 0700 one. Provisioning wants this
+    // component to be exactly 0755, and DirBuilder's mode is masked by the
+    // umask, so the mode is set rather than requested — on an account an
+    // earlier version left at 0700 as well as on a fresh one.
+    rustix::fs::fchmod(&held, Mode::from_raw_mode(NAMESPACE_DIR_MODE as _))
+        .with_context(|| format!("failed to set the mode of {}", parent.display()))?;
+    Ok(())
+}
+
+/// Take back the privacy these files used to inherit from a 0700 parent.
+///
+/// They carry their own mode now, but an account set up by an earlier version
+/// has them at whatever the umask gave, inside a namespace that is readable by
+/// design. Narrowing is safe to do unasked; widening would not be. Every step
+/// is relative to the held directory and refuses to follow a link, so nothing
+/// outside this namespace can be reached by substituting an entry.
+fn narrow_private_entries(held: &OwnedFd, parent: &Path) -> Result<()> {
+    for name in ["lock", "ops.jsonl", "trashroots"] {
+        let entry = match rustix::fs::openat(
+            held,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(entry) => entry,
+            Err(rustix::io::Errno::NOENT) => continue,
+            // A link where a regular file belongs, or a name that cannot be
+            // opened at all, is not evidence that there is nothing to narrow.
+            Err(error) => {
+                return Err(std::io::Error::from(error))
+                    .with_context(|| format!("failed to inspect {}", parent.join(name).display()));
+            }
+        };
+        let stat = rustix::fs::fstat(&entry)
+            .with_context(|| format!("failed to inspect {}", parent.join(name).display()))?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_mode & 0o177 == 0 {
+            continue;
+        }
+        rustix::fs::fchmod(&entry, Mode::from_raw_mode(0o600 as _))
+            .with_context(|| format!("failed to narrow {}", parent.join(name).display()))?;
+    }
+    Ok(())
 }
 
 fn validate_root_name(root: &Path, expected_name: &str) -> Result<()> {

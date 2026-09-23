@@ -20,7 +20,7 @@ After staging, choose one outcome:
   degu trash purge
 
 First mutation on this account? Run 'degu doctor'; if setup is missing,
-run 'degu init --initial' only for first use.
+run 'degu init'; it refuses when this account's store was already activated.
 Run 'degu <command> --help' for command details.";
 
 const SCAN_EXAMPLES: &str = "Examples:
@@ -40,14 +40,15 @@ const QUOTA_EXAMPLES: &str = "Examples:
       Emit authoritative quota data as JSON";
 
 const INIT_EXAMPLES: &str = "Example:
-  degu init --initial
-      Assert first use, then provision and declare this non-root account's fixed authority
-  degu init --initial --json | jq .
+  degu init
+      Provision and declare this non-root account's fixed authority
+  degu init --json | jq .
       Emit the provisioning outcome as JSON
 
-This command accepts no UID or path. --initial is an explicit assertion that no
-earlier authority was lost; it does not activate a store, repair an unsafe
-namespace, migrate authority, or clear recovery state.";
+This command accepts no UID or path. It refuses when the sealed-staging store
+this environment names already carries an activation record, which means an
+earlier authority was lost rather than never made. It does not activate a
+store, repair an unsafe namespace, migrate authority, or clear recovery state.";
 
 const DOCTOR_EXAMPLES: &str = "Examples:
   degu doctor
@@ -179,9 +180,6 @@ pub(crate) enum Command {
     /// Provision or validate this account's fixed self-managed activation anchor
     #[command(after_help = INIT_EXAMPLES)]
     Init {
-        /// Assert that this account has never activated a degu store
-        #[arg(long, required = true)]
-        initial: bool,
         #[command(flatten)]
         output: JsonArgs,
     },

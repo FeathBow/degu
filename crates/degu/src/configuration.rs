@@ -76,12 +76,39 @@ fn validate_config(config: &Config) -> Result<()> {
             degu_core::config::MAX_SCAN_CONCURRENCY
         );
     }
+    validate_advisory(&config.advisory)?;
     validate_disabled_adapters(&config.disable)?;
     for entry in &config.protect {
         validate_protect_entry(entry)?;
     }
     for entry in &config.roots {
         validate_root_entry(entry)?;
+    }
+    Ok(())
+}
+
+/// The advisor is named the way every other trusted host tool is named: by an
+/// absolute, lexically normalized path. Nothing resolves through `PATH`, so a
+/// directory that happens to precede it cannot substitute a different program.
+fn validate_advisory(advisory: &degu_core::config::AdvisoryConfig) -> Result<()> {
+    if advisory.timeout_seconds == 0
+        || advisory.timeout_seconds > degu_core::config::MAX_ADVISORY_TIMEOUT_SECONDS
+    {
+        anyhow::bail!(
+            "advisory.timeout_seconds must be between 1 and {}",
+            degu_core::config::MAX_ADVISORY_TIMEOUT_SECONDS
+        );
+    }
+    let Some(command) = advisory.command.as_deref() else {
+        return Ok(());
+    };
+    let path = Path::new(command);
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        anyhow::bail!("advisory.command must be an absolute path, got {command:?}");
+    }
+    if !components.all(|component| matches!(component, Component::Normal(_))) {
+        anyhow::bail!("advisory.command must not contain . or .. components, got {command:?}");
     }
     Ok(())
 }
@@ -150,4 +177,48 @@ fn validate_no_glob_or_parent(kind: &str, entry: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use degu_core::config::AdvisoryConfig;
+
+    fn advisory(command: Option<&str>, timeout_seconds: u64) -> AdvisoryConfig {
+        AdvisoryConfig {
+            enabled: true,
+            command: command.map(str::to_owned),
+            timeout_seconds,
+        }
+    }
+
+    /// Named the way every other trusted host tool is named. A relative name
+    /// would be resolved by whatever `PATH` happened to hold, which is a
+    /// different program than the one the reader reviewed.
+    #[test]
+    fn a_relative_advisor_is_refused() {
+        let error = super::validate_advisory(&advisory(Some("degu-advise"), 20))
+            .expect_err("a relative advisor");
+        assert!(error.to_string().contains("absolute"), "{error}");
+    }
+
+    #[test]
+    fn a_traversing_advisor_is_refused() {
+        let error = super::validate_advisory(&advisory(Some("/opt/../bin/advise"), 20))
+            .expect_err("a traversing advisor");
+        assert!(error.to_string().contains(".."), "{error}");
+    }
+
+    #[test]
+    fn an_absolute_advisor_is_accepted() {
+        assert!(super::validate_advisory(&advisory(Some("/opt/bin/advise"), 20)).is_ok());
+    }
+
+    /// A bound that is zero never runs and a bound that is hours long is not a
+    /// bound. Both are configuration mistakes worth naming.
+    #[test]
+    fn an_unusable_bound_is_refused() {
+        assert!(super::validate_advisory(&advisory(None, 0)).is_err());
+        assert!(super::validate_advisory(&advisory(None, 10_000)).is_err());
+        assert!(super::validate_advisory(&advisory(None, 20)).is_ok());
+    }
 }

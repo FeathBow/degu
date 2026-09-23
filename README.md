@@ -140,6 +140,8 @@ degu tui
 <p align="center"><a href="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/review.svg"><img src="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/review.svg" alt="degu tui mid-decision: a 7.23 GiB Needs review model checked into the plan alongside the Ready to clean pip cache, two review locations left unchecked, the Not managed cache unselectable, and the header totalling what a clean would move" width="92%"></a></p>
 <p align="center"><sub>One Needs review location chosen; the header totals what a clean would move. Tap either image for a readable copy. Space decides a row, and <code>c</code> hands whichever plans were decided to the existing commands — here the staging trash is empty, so it would run <code>clean</code> alone.</sub></p>
 
+The review also carries an advisory block on the locations degu could not classify, which is exactly where a reader has the least to go on. It separates what degu measured from what degu concluded, and — when you point `advisory.command` at a program of your own — from what that program thinks, marked `~` on every line and headed as unverified. degu speaks no model protocol and holds no credential: it hands your program a signature on standard input under the same bounds it runs any host tool, and which model, endpoint or key that program uses is its business, not degu's. Set nothing and nothing runs and nothing is sent, which is what an untouched install does on a login node.
+
 Staged data stays reversible and still counts against quota until purged; choose one recovery branch per clean operation. A confirmed mutating clean also permanently purges trash entries at least seven days old. On very large shared filesystems a full first scan can take minutes:
 
 ```sh

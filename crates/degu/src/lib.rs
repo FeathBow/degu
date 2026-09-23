@@ -3,6 +3,7 @@
 //!
 //! Output discipline: stdout carries command data only; diagnostics and logs go to stderr so machine-readable output remains pipe-safe.
 
+mod advisory;
 mod cli;
 mod collection;
 mod commands;

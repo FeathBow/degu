@@ -69,6 +69,13 @@ impl ScanReport {
         }
     }
 
+    /// The cache findings, which are the only ones an advisory is asked about:
+    /// runtime diagnostics are Not managed by construction, not by anything an
+    /// advisor could speak to.
+    pub fn findings(&self) -> &[Finding] {
+        &self.findings
+    }
+
     pub fn section(&self, section: Section) -> &[Finding] {
         match section {
             Section::Cache => &self.findings,

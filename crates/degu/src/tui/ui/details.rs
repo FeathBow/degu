@@ -26,9 +26,14 @@ pub struct Document {
 }
 
 impl Document {
-    pub fn new(finding: &Finding, section: Section, home: &Path) -> Self {
+    pub fn new(
+        finding: &Finding,
+        section: Section,
+        home: &Path,
+        advisories: &crate::advisory::Advisories,
+    ) -> Self {
         let introduction = introduction(finding, section, home);
-        let source = content(finding, &introduction);
+        let source = content(finding, &introduction, advisories);
         let preview = preview(finding, section, home);
         Self {
             label: escape_terminal_text(finding.ecosystem()),
@@ -203,20 +208,97 @@ fn introduction(finding: &Finding, section: Section, home: &Path) -> Vec<Line<'s
     ]
 }
 
-fn content(finding: &Finding, introduction: &[Line<'static>]) -> Vec<Line<'static>> {
+fn content(
+    finding: &Finding,
+    introduction: &[Line<'static>],
+    advisories: &crate::advisory::Advisories,
+) -> Vec<Line<'static>> {
     let mut lines = introduction.to_vec();
     lines.extend([
         Line::default(),
-        heading("Storage"),
+        heading("Measured by degu"),
         Line::from(sizes(finding)),
         Line::from(other_measurements(finding)),
         Line::default(),
-        heading("Why this status"),
+        heading("Why this status - degu"),
         Line::from(escape_terminal_text(finding.rationale())),
         Line::default(),
         heading("Classification"),
     ]);
     lines.extend(metadata(finding).into_iter().map(Line::from));
+    lines.extend(advisory(finding, advisories));
+    lines
+}
+
+/// Marks characters a foreign program wrote, and nothing else.
+///
+/// A pane scrolls and a heading does not travel with the text under it, so the
+/// mark repeats on every line the advisor produced. degu's own lines inside the
+/// same block — who answered, that nobody did, that an answer came without a way
+/// to check it — never carry it: a mark that sometimes means "degu wrote this
+/// about an advisor" stops distinguishing anything.
+const ADVISORY_MARK: &str = "~ ";
+
+/// The advisory block, which appears only where a reader is actually stuck.
+///
+/// degu classified everything else, so an advisory there would be a second
+/// opinion about a settled question. Here there is no degu answer, which is why
+/// the section exists and why its heading has to say that what follows is not
+/// one.
+fn advisory(finding: &Finding, advisories: &crate::advisory::Advisories) -> Vec<Line<'static>> {
+    use crate::advisory::Unavailable;
+
+    if advisories.disabled() || !crate::advisory::is_unrecognized(finding) {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        Line::default(),
+        Line::from("AI advisory - unverified, not a degu classification")
+            .fg(CAUTION)
+            .bold(),
+    ];
+    match (
+        advisories.for_path(finding.path()),
+        advisories.unavailable(),
+    ) {
+        (Some(advice), _) => {
+            if let Some(source) = advisories.source() {
+                lines.push(
+                    Line::from(format!("answered by {}", escape_terminal_text(source)))
+                        .fg(SECONDARY),
+                );
+            }
+            lines.push(Line::from(format!("{ADVISORY_MARK}{}", advice.summary)).fg(CAUTION));
+            match advice.check.as_deref() {
+                Some(check) => lines
+                    .push(Line::from(format!("{ADVISORY_MARK}to check, run: {check}")).fg(CAUTION)),
+                // Without one the reader has only the advisor's confidence,
+                // which is not evidence and is not presented as any.
+                None => lines.push(
+                    Line::from(format!(
+                        "{ADVISORY_MARK}no way to check this was offered; treat it as a hint"
+                    ))
+                    .fg(SECONDARY),
+                ),
+            }
+        }
+        (None, Some(Unavailable::NotConfigured)) => lines.push(
+            Line::from(
+                "no advisor is configured; set advisory.command in config.toml to enable one",
+            )
+            .fg(SECONDARY),
+        ),
+        (None, Some(Unavailable::Failed(reason))) => lines.push(
+            Line::from(format!(
+                "the advisor produced nothing: {}",
+                escape_terminal_text(reason)
+            ))
+            .fg(SECONDARY),
+        ),
+        (None, None) => {
+            lines.push(Line::from("the advisor said nothing about this location").fg(SECONDARY));
+        }
+    }
     lines
 }
 
@@ -256,4 +338,239 @@ fn metadata(finding: &Finding) -> Vec<String> {
     .into_iter()
     .map(|(label, value)| format!("{label}: {}", escape_terminal_text(value)))
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::advisory::{Advice, Advisories, Unavailable};
+    use degu_core::finding::{
+        FindingCandidate, FindingKind, FindingSource, Ownership, Recovery, RegenCost,
+        finalize_findings,
+    };
+    use std::path::PathBuf;
+
+    const SUBJECT: &str = "/home/account/.cache/mystery";
+
+    fn finding(recovery: Recovery, ownership: Ownership) -> Finding {
+        finalize_findings(
+            vec![FindingCandidate {
+                ecosystem: "artifacts".to_owned(),
+                path: PathBuf::from(SUBJECT),
+                kind: FindingKind::Other,
+                bytes_apparent: 4096,
+                bytes_allocated: 4096,
+                age_days: Some(30),
+                bytes_hardlinked: 0,
+                inodes: 1,
+                skipped: 0,
+                truncated: false,
+                unvisited_dirs: 0,
+                shared_writable_dirs: 0,
+                parent_grants_foreign_mutation: false,
+                protected_boundaries: 0,
+                protected_credential_boundaries: 0,
+                recovery,
+                ownership,
+                hazard: None,
+                rationale: "degu recognized nothing here".to_owned(),
+            }],
+            FindingSource::WellKnownRoot,
+        )
+        .pop()
+        .expect("one finalized finding")
+    }
+
+    fn unrecognized() -> Finding {
+        finding(Recovery::Unknown, Ownership::Standalone)
+    }
+
+    fn classified() -> Finding {
+        finding(
+            Recovery::Regenerable {
+                cost: RegenCost::Cheap,
+            },
+            Ownership::Standalone,
+        )
+    }
+
+    fn advised() -> Advisories {
+        Advisories::for_test(
+            [(
+                PathBuf::from(SUBJECT),
+                Advice {
+                    summary: "a build cache for some tool".to_owned(),
+                    check: Some("tool cache dir".to_owned()),
+                },
+            )],
+            None,
+            Some("/opt/bin/advise"),
+        )
+    }
+
+    fn rendered(finding: &Finding, advisories: &Advisories) -> Vec<String> {
+        let introduction = introduction(finding, Section::Cache, Path::new("/home/account"));
+        content(finding, &introduction, advisories)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    fn block(finding: &Finding, advisories: &Advisories) -> Vec<String> {
+        advisory(finding, advisories)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// The heading is the whole point: a reader scanning the pane has to be able
+    /// to tell a sentence degu stands behind from one it is only relaying.
+    #[test]
+    fn an_advisory_says_it_is_neither_verified_nor_a_classification() {
+        let lines = block(&unrecognized(), &advised());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "AI advisory - unverified, not a degu classification"),
+            "{lines:#?}"
+        );
+    }
+
+    /// A pane scrolls and a heading does not travel with the text under it, so
+    /// the mark repeats on every line the advisor produced.
+    #[test]
+    fn every_line_an_advisor_produced_is_marked() {
+        let lines = block(&unrecognized(), &advised());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("a build cache for some tool")
+                    && line.starts_with(ADVISORY_MARK)),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("tool cache dir") && line.starts_with(ADVISORY_MARK)),
+            "{lines:#?}"
+        );
+    }
+
+    /// The advisor is named, because "a model said so" and "this program of mine
+    /// said so" are different things to the reader deciding.
+    /// Naming the advisor is degu reporting who spoke, so it is degu's own line
+    /// and must not wear the mark that means an advisor wrote the characters.
+    #[test]
+    fn the_program_that_answered_is_named_in_degus_voice() {
+        let lines = block(&unrecognized(), &advised());
+        let attribution = lines
+            .iter()
+            .find(|line| line.contains("/opt/bin/advise"))
+            .expect("the advisor is named");
+        assert!(
+            !attribution.starts_with(ADVISORY_MARK),
+            "degu's attribution wore the advisory mark: {attribution}"
+        );
+    }
+
+    /// The mark means "a foreign program wrote this". Degu's own measurements and
+    /// its own reason must never carry it, or the mark stops meaning anything.
+    #[test]
+    fn degu_never_marks_its_own_words() {
+        let finding = unrecognized();
+        // Exactly the two strings the advisor produced in this fixture. Spelled
+        // out rather than taken from the advisory, so a line that picks up the
+        // mark without being the advisor's words fails here.
+        for line in rendered(&finding, &advised()) {
+            if line.starts_with(ADVISORY_MARK) {
+                assert!(
+                    line.contains("a build cache for some tool") || line.contains("tool cache dir"),
+                    "degu marked a line it wrote itself: {line}"
+                );
+            }
+        }
+        let lines = rendered(&finding, &advised());
+        assert!(
+            lines.iter().any(|line| line == "Measured by degu"),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line == "Why this status - degu"),
+            "{lines:#?}"
+        );
+    }
+
+    /// degu classified this one. A second opinion about a settled question is
+    /// noise at best, and at worst reads as a competing verdict.
+    #[test]
+    fn a_classified_finding_gets_no_advisory_at_all() {
+        assert!(block(&classified(), &advised()).is_empty());
+        let lines = rendered(&classified(), &advised());
+        assert!(
+            !lines.iter().any(|line| line.contains("AI advisory")),
+            "{lines:#?}"
+        );
+    }
+
+    /// Silence would read as "degu has nothing to say", which is not what an
+    /// unconfigured advisor means.
+    #[test]
+    fn an_unconfigured_advisor_says_so_in_degus_own_voice() {
+        let advisories = Advisories::for_test([], Some(Unavailable::NotConfigured), None);
+        let lines = block(&unrecognized(), &advisories);
+        assert!(
+            lines.iter().any(|line| line.contains("advisory.command")),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with(ADVISORY_MARK)),
+            "degu marked its own explanation as an advisory: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn an_advisor_that_failed_is_reported_rather_than_hidden() {
+        let advisories = Advisories::for_test(
+            [],
+            Some(Unavailable::Failed("exceeded its 20s bound".to_owned())),
+            Some("/opt/bin/advise"),
+        );
+        let lines = block(&unrecognized(), &advisories);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("exceeded its 20s bound")),
+            "{lines:#?}"
+        );
+    }
+
+    /// Turning the pane off removes it. A reader who said "not this" must not
+    /// keep getting a heading telling them an advisor said nothing — that is a
+    /// different statement, and it is the one they turned off.
+    #[test]
+    fn a_disabled_advisory_draws_no_block() {
+        assert!(block(&unrecognized(), &Advisories::disabled_for_test()).is_empty());
+    }
+
+    /// An answer with no way to check it is an appeal to the advisor's
+    /// confidence. The pane says so rather than letting it read as settled.
+    #[test]
+    fn an_answer_without_a_check_is_named_a_hint() {
+        let advisories = Advisories::for_test(
+            [(
+                PathBuf::from(SUBJECT),
+                Advice {
+                    summary: "probably a cache".to_owned(),
+                    check: None,
+                },
+            )],
+            None,
+            Some("/opt/bin/advise"),
+        );
+        let lines = block(&unrecognized(), &advisories);
+        assert!(
+            lines.iter().any(|line| line.contains("treat it as a hint")),
+            "{lines:#?}"
+        );
+    }
 }

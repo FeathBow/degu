@@ -28,6 +28,9 @@ pub(super) struct ScanReport {
     /// JSON schema is frozen).
     pub(super) incomplete_regions: IncompleteRegions,
     pub(super) has_effective_project_roots: bool,
+    /// Carried from the same config read the collection used, so the review
+    /// cannot consult one file and collect against another.
+    pub(super) advisory: degu_core::config::AdvisoryConfig,
     pub(super) json: bool,
     pub(super) details: bool,
     pub(super) summary: bool,
@@ -96,10 +99,19 @@ impl ScanRequest {
 
 /// The context comes back with the report so one command works from one set
 /// of account and home facts; resolving it twice invites two that disagree.
-pub(crate) fn collect_for_review(
-    args: ScanArgs,
-    ui: Ui,
-) -> Result<(crate::tui::ScanReport, Filters, DetectCtx)> {
+/// Everything the interactive review needs from one collection.
+///
+/// Named rather than a tuple because the review reads four unrelated things out
+/// of it, and a positional fourth is the kind of thing a later caller gets
+/// wrong.
+pub(crate) struct ReviewCollection {
+    pub(crate) report: crate::tui::ScanReport,
+    pub(crate) filters: Filters,
+    pub(crate) ctx: DetectCtx,
+    pub(crate) advisory: degu_core::config::AdvisoryConfig,
+}
+
+pub(crate) fn collect_for_review(args: ScanArgs, ui: Ui) -> Result<ReviewCollection> {
     let report = prepare(ScanRequest::new(
         args,
         ui,
@@ -108,15 +120,16 @@ pub(crate) fn collect_for_review(
     // These filters end up in `CleanArgs`, so the roots must stay the ones the
     // scope carries.
     let filters = report.scope.clean_scope().filters;
-    Ok((
-        crate::tui::ScanReport::new(
+    Ok(ReviewCollection {
+        report: crate::tui::ScanReport::new(
             report.findings,
             report.runtime_findings,
             report.completeness,
         ),
         filters,
-        report.ctx,
-    ))
+        ctx: report.ctx,
+        advisory: report.advisory,
+    })
 }
 
 pub(crate) fn run(args: ScanArgs, ui: Ui) -> Result<()> {
@@ -181,6 +194,7 @@ fn prepare(request: ScanRequest) -> Result<ScanReport> {
         completeness,
         incomplete_regions,
         has_effective_project_roots,
+        advisory: config.advisory,
         json: request.run.json,
         details: request.details,
         summary: request.summary,

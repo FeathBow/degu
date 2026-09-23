@@ -643,6 +643,22 @@ mod tests {
         );
     }
 
+    /// Running somebody's program costs them something, and a scan where degu
+    /// classified everything has nothing to ask about. The advisor is never
+    /// started just because it is configured.
+    #[test]
+    fn nothing_to_ask_about_starts_no_program() {
+        let findings = [eligible("/home/account/.cache/pip")];
+        let config = AdvisoryConfig {
+            command: Some("/nonexistent/degu-advisor".to_owned()),
+            ..AdvisoryConfig::default()
+        };
+        // A missing program would report a failure if it were reached at all.
+        let advisories = consult(&config, &findings, &home());
+        assert_eq!(advisories.unavailable(), None);
+        assert_eq!(advisories.source(), Some("/nonexistent/degu-advisor"));
+    }
+
     #[test]
     fn a_request_is_bounded_in_subjects() {
         let paths: Vec<String> = (0..MAX_SUBJECTS + 10)

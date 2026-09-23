@@ -40,14 +40,24 @@ const MAX_CHECK_CHARS: usize = 160;
 
 /// What degu tells an advisor about one thing it could not classify.
 ///
-/// The account home is elided the way it is everywhere else degu prints a path,
-/// so a signature carries the shape of a location rather than the account it
-/// belongs to. Nothing below the named directory is described: no file list, no
+/// A signature carries the shape of a location, never the account it belongs
+/// to. Under the account home that is the elided path degu prints everywhere
+/// else. Outside it there is no prefix degu can remove and still leave anything
+/// meaningful, and an absolute path on a shared filesystem carries the account
+/// name inside it — `/scratch/<user>/...` is the ordinary case on the machines
+/// degu targets — so only the last component goes, and the subject says the
+/// rest was withheld rather than letting an advisor read a truncated path as a
+/// whole one.
+///
+/// Nothing below the named directory is described either: no file list, no
 /// contents, no names of the reader's own work.
 #[derive(serde::Serialize)]
 struct Subject {
     id: String,
     path: String,
+    /// The ancestors were not sent, because they could not be anonymized.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    ancestors_withheld: bool,
     name: String,
     ecosystem: String,
     kind: &'static str,
@@ -305,27 +315,44 @@ fn subjects(findings: &[Finding], home: &Path) -> Vec<Subject> {
     chosen
         .into_iter()
         .enumerate()
-        .map(|(index, finding)| Subject {
-            id: index.to_string(),
-            path: crate::presentation::display_path(finding.path(), home),
-            name: finding
-                .path()
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            ecosystem: finding.ecosystem().to_owned(),
-            kind: crate::findings::kind_label(finding.kind()),
-            bytes_allocated: finding.bytes_allocated(),
-            inodes: finding.inodes(),
-            age_days: finding.age_days(),
-            measurement_incomplete: finding.measurement_incomplete(),
-            reason: finding
-                .disposition()
-                .reason
-                .clone()
-                .unwrap_or_else(|| "unknown".to_owned()),
+        .map(|(index, finding)| {
+            let (path, ancestors_withheld) = named(finding.path(), home);
+            Subject {
+                id: index.to_string(),
+                path,
+                ancestors_withheld,
+                name: finding
+                    .path()
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                ecosystem: finding.ecosystem().to_owned(),
+                kind: crate::findings::kind_label(finding.kind()),
+                bytes_allocated: finding.bytes_allocated(),
+                inodes: finding.inodes(),
+                age_days: finding.age_days(),
+                measurement_incomplete: finding.measurement_incomplete(),
+                reason: finding
+                    .disposition()
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_owned()),
+            }
         })
         .collect()
+}
+
+/// How one location is named to an advisor, and whether its ancestors were
+/// dropped to get there.
+fn named(path: &Path, home: &Path) -> (String, bool) {
+    if path.starts_with(home) {
+        return (crate::presentation::display_path(path, home), false);
+    }
+    let last = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    (last, true)
 }
 
 /// Consult the configured advisor about what degu could not classify.
@@ -610,6 +637,36 @@ mod tests {
         assert!(sent("~/.cache/shared"), "{asked:?}");
         assert!(!sent("~/Documents"), "a settled user asset was sent");
         assert!(!sent("~/.cache/pip"), "a classified cache was sent");
+    }
+
+    /// A cache outside the account home has no prefix degu can remove: on the
+    /// machines degu targets the ordinary case is `/scratch/<user>/...`, where
+    /// the account name is a path component. Only the last component goes, and
+    /// the subject admits the rest was dropped.
+    #[test]
+    fn a_location_outside_the_home_travels_without_its_ancestors() {
+        let findings = [unknown_recovery("/scratch/someuser/weirdcache")];
+        let subjects = subjects(&findings, &home());
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0].path, "weirdcache");
+        assert!(subjects[0].ancestors_withheld);
+        let payload = serde_json::to_string(&Request {
+            degu_advisory_request: 1,
+            subjects: &subjects,
+        })
+        .expect("a request encodes");
+        assert!(!payload.contains("someuser"), "{payload}");
+        assert!(!payload.contains("/scratch"), "{payload}");
+    }
+
+    /// Under the home the elided path is already anonymous, so the shape is
+    /// kept whole and nothing is claimed to be withheld.
+    #[test]
+    fn a_location_under_the_home_keeps_its_shape() {
+        let findings = [unknown_recovery("/home/account/.cache/mystery")];
+        let subjects = subjects(&findings, &home());
+        assert_eq!(subjects[0].path, "~/.cache/mystery");
+        assert!(!subjects[0].ancestors_withheld);
     }
 
     /// The account home never leaves the machine: a signature carries the shape

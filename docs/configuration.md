@@ -79,7 +79,9 @@ On a login node with no egress, put nothing there. degu runs no program and send
 
 ### What degu sends
 
-Only findings degu could not classify — those whose reason is that recovery or ownership is unknown. A location degu withheld because it recognized a user asset, a tool-coordinated directory, a credential boundary, or a shared-writable parent is already decided, and is never sent. The account home is elided the way it is everywhere else degu prints a path, and nothing below the named directory is described: no file list, no contents, no names of your own work. At most 32 locations go in one request, largest first.
+Only findings degu could not classify — those whose reason is that recovery or ownership is unknown. A location degu withheld because it recognized a user asset, a tool-coordinated directory, a credential boundary, or a shared-writable parent is already decided, and is never sent. Nothing below the named directory is described: no file list, no contents, no names of your own work. At most 32 locations go in one request, largest first.
+
+A signature carries the shape of a location, never the account it belongs to. Under your home the home is elided, as it is everywhere else degu prints a path. Outside it there is no prefix degu can remove and still leave anything meaningful, and an absolute path on a shared filesystem has the account name inside it — `/scratch/<user>/…` is the ordinary case on the machines degu targets — so only the last component is sent and `ancestors_withheld` says the rest was dropped. An advisor sees less about those, which is the trade: degu does not send a path it cannot make anonymous.
 
 ```json
 {
@@ -100,6 +102,8 @@ Only findings degu could not classify — those whose reason is that recovery or
   ]
 }
 ```
+
+A location outside your home arrives as `{"path": "some-tool", "ancestors_withheld": true, …}`; the field is absent when the whole shape was sent.
 
 ### What degu reads back
 

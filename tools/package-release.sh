@@ -81,6 +81,7 @@ write_man_page degu-reclaim-uv.1 reclaim uv
 write_man_page degu-relocate.1 relocate
 write_man_page degu-ops.1 ops
 write_man_page degu-adapters.1 adapters
+write_man_page degu-config.1 config
 write_man_page degu-completions.1 completions
 write_man_page degu-man.1 man
 

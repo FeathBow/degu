@@ -93,6 +93,115 @@ pub(crate) struct Advice {
     pub(crate) check: Option<String>,
 }
 
+/// Where an advisor is found without any configuration.
+///
+/// Dropping an executable at `$XDG_CONFIG_HOME/degu/advisor` is the whole
+/// setup. An account with no such file consults nobody and sends nothing, which
+/// is what an untouched install has to do on a login node; an account that put
+/// one there has already answered the question, and answered it knowing what it
+/// was for. Asking during setup would take that answer before the reader has
+/// ever met the kind of location it is about.
+pub(crate) const CONVENTION_NAME: &str = "advisor";
+
+/// How degu found the advisor it is about to run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// Named by `advisory.command`.
+    Configured,
+    /// Found at the conventional path, with nothing configured.
+    Convention,
+}
+
+/// What degu will do about an advisor, decided before one runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Resolution {
+    Found {
+        path: PathBuf,
+        origin: Origin,
+    },
+    /// Nothing named and nothing at the conventional path.
+    Absent {
+        convention: PathBuf,
+    },
+    /// Something is there that degu will not run, and why.
+    ///
+    /// Never silently skipped: a reader who put a file there meant it to be
+    /// used, and one degu declines to exec is a thing they need told.
+    Refused {
+        path: PathBuf,
+        reason: String,
+    },
+}
+
+/// Decide which advisor to run, if any.
+///
+/// A configured path wins, because naming one is an explicit choice. The
+/// conventional path is consulted only when nothing is named.
+pub(crate) fn resolve_advisor(config: &AdvisoryConfig, config_home: &Path) -> Resolution {
+    let convention = config_home.join("degu").join(CONVENTION_NAME);
+    match config.command.as_deref() {
+        Some(command) => admit(PathBuf::from(command), Origin::Configured, &convention),
+        None => admit(convention.clone(), Origin::Convention, &convention),
+    }
+}
+
+/// An advisor runs with this account's privileges, so the question is whether
+/// anyone else decides what it does. A file another account can rewrite is one
+/// degu would be executing on their behalf.
+fn admit(path: PathBuf, origin: Origin, convention: &Path) -> Resolution {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match origin {
+                // A named path that is not there is a mistake worth reporting.
+                Origin::Configured => Resolution::Refused {
+                    path,
+                    reason: "nothing exists at this path".to_owned(),
+                },
+                // An absent convention is the ordinary case, not a mistake.
+                Origin::Convention => Resolution::Absent {
+                    convention: convention.to_path_buf(),
+                },
+            };
+        }
+        Err(error) => {
+            return Resolution::Refused {
+                path,
+                reason: format!("it could not be inspected: {error}"),
+            };
+        }
+    };
+    if !metadata.is_file() {
+        return Resolution::Refused {
+            path,
+            reason: "it is not a regular file".to_owned(),
+        };
+    }
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Resolution::Refused {
+            path,
+            reason: "it belongs to another account".to_owned(),
+        };
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o022 != 0 {
+        return Resolution::Refused {
+            path,
+            reason: "it is writable by its group or by everyone".to_owned(),
+        };
+    }
+    if mode & 0o100 == 0 {
+        return Resolution::Refused {
+            path,
+            reason: "it is not executable".to_owned(),
+        };
+    }
+    Resolution::Found { path, origin }
+}
+
 /// Why a pane has no external advisory to show.
 ///
 /// Distinguished because they mean different things to the reader: one is a
@@ -101,7 +210,11 @@ pub(crate) struct Advice {
 /// and untrue statement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Unavailable {
-    NotConfigured,
+    /// No advisor exists, carrying where one would go.
+    Absent(PathBuf),
+    /// Something is there that degu declined to run.
+    Refused(String),
+    /// An advisor ran and produced nothing usable.
     Failed(String),
 }
 
@@ -118,10 +231,9 @@ pub(crate) struct Advisories {
 }
 
 impl Advisories {
-    /// No advisor is configured. The pane still reports what degu measured.
-    pub(crate) fn not_configured() -> Self {
+    fn without(unavailable: Unavailable) -> Self {
         Self {
-            unavailable: Some(Unavailable::NotConfigured),
+            unavailable: Some(unavailable),
             ..Self::default()
         }
     }
@@ -221,25 +333,41 @@ fn subjects(findings: &[Finding], home: &Path) -> Vec<Subject> {
 /// Every failure is an absence of advice, never an error the reader has to
 /// clear: an advisory is decision support, and a review must open whether or not
 /// somebody's script worked.
-pub(crate) fn consult(config: &AdvisoryConfig, findings: &[Finding], home: &Path) -> Advisories {
+pub(crate) fn consult(
+    config: &AdvisoryConfig,
+    findings: &[Finding],
+    home: &Path,
+    config_home: &Path,
+) -> Advisories {
     if !config.enabled {
         return Advisories {
             disabled: true,
             ..Advisories::default()
         };
     }
-    let Some(command) = config.command.as_deref() else {
-        return Advisories::not_configured();
-    };
+    // Before looking for an advisor at all: a scan where degu classified
+    // everything has nothing to ask about, and neither starting somebody's
+    // program nor reporting on one they have not set up says anything useful
+    // about a screen where no advisory block will be drawn.
     let subjects = subjects(findings, home);
     if subjects.is_empty() {
-        return Advisories {
-            source: Some(command.to_owned()),
-            ..Advisories::default()
-        };
+        return Advisories::default();
     }
+    let path = match resolve_advisor(config, config_home) {
+        Resolution::Found { path, .. } => path,
+        Resolution::Absent { convention } => {
+            return Advisories::without(Unavailable::Absent(convention));
+        }
+        Resolution::Refused { path, reason } => {
+            return Advisories::without(Unavailable::Refused(format!(
+                "{} was not run because {reason}",
+                path.display()
+            )));
+        }
+    };
+    let command = path.to_string_lossy().into_owned();
     consult_with(
-        command,
+        &command,
         Duration::from_secs(config.timeout_seconds),
         &subjects,
         findings,
@@ -613,11 +741,113 @@ mod tests {
         }
     }
 
+    /// An account that has not put a script anywhere consults nobody, and the
+    /// pane is told where one would go rather than which key to set.
     #[test]
-    fn no_configured_advisor_is_reported_as_a_choice_not_a_failure() {
+    fn no_advisor_anywhere_is_reported_as_an_absence() {
+        let empty = tempfile::tempdir().expect("a config home");
         let findings = [unknown_recovery("/home/account/.cache/mystery")];
-        let advisories = consult(&AdvisoryConfig::default(), &findings, &home());
-        assert_eq!(advisories.unavailable(), Some(&Unavailable::NotConfigured));
+        let advisories = consult(&AdvisoryConfig::default(), &findings, &home(), empty.path());
+        assert_eq!(
+            advisories.unavailable(),
+            Some(&Unavailable::Absent(
+                empty.path().join("degu").join(CONVENTION_NAME)
+            ))
+        );
+    }
+
+    fn executable(directory: &Path, name: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = directory.join(name);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("a script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("a mode");
+        path
+    }
+
+    /// Dropping a script at the conventional path is the whole setup. Nothing
+    /// is configured here, and degu finds it anyway.
+    #[test]
+    fn a_script_at_the_conventional_path_needs_no_configuration() {
+        let config_home = tempfile::tempdir().expect("a config home");
+        let degu = config_home.path().join("degu");
+        std::fs::create_dir_all(&degu).expect("the degu config directory");
+        let advisor = executable(&degu, CONVENTION_NAME, 0o700);
+        assert_eq!(
+            resolve_advisor(&AdvisoryConfig::default(), config_home.path()),
+            Resolution::Found {
+                path: advisor,
+                origin: Origin::Convention
+            }
+        );
+    }
+
+    /// Naming one is an explicit choice, so it wins over whatever happens to be
+    /// at the conventional path.
+    #[test]
+    fn a_named_advisor_wins_over_the_convention() {
+        let config_home = tempfile::tempdir().expect("a config home");
+        let degu = config_home.path().join("degu");
+        std::fs::create_dir_all(&degu).expect("the degu config directory");
+        executable(&degu, CONVENTION_NAME, 0o700);
+        let named = executable(config_home.path(), "chosen", 0o700);
+        let config = AdvisoryConfig {
+            command: Some(named.to_string_lossy().into_owned()),
+            ..AdvisoryConfig::default()
+        };
+        assert_eq!(
+            resolve_advisor(&config, config_home.path()),
+            Resolution::Found {
+                path: named,
+                origin: Origin::Configured
+            }
+        );
+    }
+
+    /// An advisor runs with this account's privileges. One that another account
+    /// can rewrite would be degu executing their decision, so it is refused —
+    /// and said out loud, because a reader who put it there meant it to run.
+    #[test]
+    fn a_group_writable_advisor_is_refused_rather_than_skipped() {
+        let config_home = tempfile::tempdir().expect("a config home");
+        let degu = config_home.path().join("degu");
+        std::fs::create_dir_all(&degu).expect("the degu config directory");
+        executable(&degu, CONVENTION_NAME, 0o770);
+        let Resolution::Refused { reason, .. } =
+            resolve_advisor(&AdvisoryConfig::default(), config_home.path())
+        else {
+            panic!("a group-writable advisor was admitted");
+        };
+        assert!(reason.contains("writable"), "{reason}");
+    }
+
+    #[test]
+    fn a_non_executable_advisor_is_refused_rather_than_skipped() {
+        let config_home = tempfile::tempdir().expect("a config home");
+        let degu = config_home.path().join("degu");
+        std::fs::create_dir_all(&degu).expect("the degu config directory");
+        executable(&degu, CONVENTION_NAME, 0o600);
+        let Resolution::Refused { reason, .. } =
+            resolve_advisor(&AdvisoryConfig::default(), config_home.path())
+        else {
+            panic!("a non-executable advisor was admitted");
+        };
+        assert!(reason.contains("executable"), "{reason}");
+    }
+
+    /// A named path that is not there is a mistake; an absent convention is the
+    /// ordinary case. They must not read alike.
+    #[test]
+    fn a_named_advisor_that_is_missing_is_a_mistake_not_an_absence() {
+        let config_home = tempfile::tempdir().expect("a config home");
+        let config = AdvisoryConfig {
+            command: Some("/nonexistent/degu-advisor".to_owned()),
+            ..AdvisoryConfig::default()
+        };
+        let Resolution::Refused { reason, .. } = resolve_advisor(&config, config_home.path())
+        else {
+            panic!("a missing named advisor was not reported");
+        };
+        assert!(reason.contains("nothing exists"), "{reason}");
     }
 
     /// The pane can be turned off entirely, and then degu asks nobody anything.
@@ -632,7 +862,7 @@ mod tests {
             command: Some("/bin/advisor".to_owned()),
             ..AdvisoryConfig::default()
         };
-        let advisories = consult(&config, &findings, &home());
+        let advisories = consult(&config, &findings, &home(), Path::new("/nonexistent"));
         assert!(advisories.disabled());
         assert_eq!(advisories.unavailable(), None);
         assert_eq!(advisories.source(), None);
@@ -644,19 +874,35 @@ mod tests {
     }
 
     /// Running somebody's program costs them something, and a scan where degu
-    /// classified everything has nothing to ask about. The advisor is never
-    /// started just because it is configured.
+    /// classified everything has nothing to ask about. Observed rather than
+    /// argued: the advisor records that it ran, and it must not have.
     #[test]
     fn nothing_to_ask_about_starts_no_program() {
-        let findings = [eligible("/home/account/.cache/pip")];
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("a directory");
+        let witness = directory.path().join("ran");
+        let advisor = directory.path().join("advisor");
+        std::fs::write(
+            &advisor,
+            format!("#!/bin/sh\ntouch {}\n", witness.display()),
+        )
+        .expect("a script");
+        std::fs::set_permissions(&advisor, std::fs::Permissions::from_mode(0o700)).expect("a mode");
         let config = AdvisoryConfig {
-            command: Some("/nonexistent/degu-advisor".to_owned()),
+            command: Some(advisor.to_string_lossy().into_owned()),
             ..AdvisoryConfig::default()
         };
-        // A missing program would report a failure if it were reached at all.
-        let advisories = consult(&config, &findings, &home());
+
+        let classified = [eligible("/home/account/.cache/pip")];
+        let advisories = consult(&config, &classified, &home(), directory.path());
+        assert!(!witness.exists(), "the advisor ran with nothing to ask");
         assert_eq!(advisories.unavailable(), None);
-        assert_eq!(advisories.source(), Some("/nonexistent/degu-advisor"));
+
+        // The same advisor does run once there is something degu cannot name,
+        // so the absence above is about the question, not about the wiring.
+        let unnamed = [unknown_recovery("/home/account/.cache/mystery")];
+        let _ = consult(&config, &unnamed, &home(), directory.path());
+        assert!(witness.exists(), "the advisor was never reachable at all");
     }
 
     #[test]

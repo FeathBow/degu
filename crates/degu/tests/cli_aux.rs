@@ -14,6 +14,7 @@ const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[
     &["admin"],
     &["ops"],
     &["adapters"],
+    &["config"],
     &["completions"],
     &["man"],
 ];
@@ -190,6 +191,7 @@ fn assert_top_help_order() {
             "\n  admin",
             "\n  ops",
             "\n  adapters",
+            "\n  config",
             "\n  completions",
             "\n  man",
         ],
@@ -228,7 +230,7 @@ fn assert_completion_order(shell: &str) {
     if shell == "bash" {
         assert!(output.contains("complete -F") || output.contains("_degu"));
         assert!(output.contains(
-            "scan tui doctor init quota clean undo trash reclaim relocate admin ops adapters completions man help"
+            "scan tui doctor init quota clean undo trash reclaim relocate admin ops adapters config completions man help"
         ));
         assert!(!output.contains("degu,usage)"));
         return;
@@ -249,6 +251,7 @@ fn assert_completion_order(shell: &str) {
                 "(admin)",
                 "(ops)",
                 "(adapters)",
+                "(config)",
                 "(completions)",
                 "(man)",
             ]

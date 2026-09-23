@@ -282,12 +282,19 @@ fn advisory(finding: &Finding, advisories: &crate::advisory::Advisories) -> Vec<
                 ),
             }
         }
-        (None, Some(Unavailable::NotConfigured)) => lines.push(
-            Line::from(
-                "no advisor is configured; set advisory.command in config.toml to enable one",
-            )
+        // Where a script goes, rather than which key to set: the answer to
+        // "can something tell me what this is" is an executable the reader
+        // already trusts, and naming the place is the whole instruction.
+        (None, Some(Unavailable::Absent(convention))) => lines.push(
+            Line::from(format!(
+                "no advisor here; put an executable at {} and it is used",
+                escape_terminal_text(&convention.display().to_string())
+            ))
             .fg(SECONDARY),
         ),
+        (None, Some(Unavailable::Refused(reason))) => {
+            lines.push(Line::from(escape_terminal_text(reason)).fg(CAUTION))
+        }
         (None, Some(Unavailable::Failed(reason))) => lines.push(
             Line::from(format!(
                 "the advisor produced nothing: {}",
@@ -512,19 +519,43 @@ mod tests {
         );
     }
 
-    /// Silence would read as "degu has nothing to say", which is not what an
-    /// unconfigured advisor means.
+    /// Silence would read as "degu has nothing to say", which is not what no
+    /// advisor means. The reader is told where one goes, in degu's own voice.
     #[test]
-    fn an_unconfigured_advisor_says_so_in_degus_own_voice() {
-        let advisories = Advisories::for_test([], Some(Unavailable::NotConfigured), None);
+    fn no_advisor_names_the_place_one_would_go() {
+        let convention = PathBuf::from("/home/account/.config/degu/advisor");
+        let advisories =
+            Advisories::for_test([], Some(Unavailable::Absent(convention.clone())), None);
         let lines = block(&unrecognized(), &advisories);
         assert!(
-            lines.iter().any(|line| line.contains("advisory.command")),
+            lines
+                .iter()
+                .any(|line| line.contains(&convention.display().to_string())),
             "{lines:#?}"
         );
         assert!(
             !lines.iter().any(|line| line.starts_with(ADVISORY_MARK)),
             "degu marked its own explanation as an advisory: {lines:#?}"
+        );
+    }
+
+    /// A file the reader put there and degu declined to run is not the same as
+    /// no file. Skipping it silently would leave them waiting for an advisory
+    /// that is never coming.
+    #[test]
+    fn an_advisor_degu_declined_to_run_is_named_with_its_reason() {
+        let advisories = Advisories::for_test(
+            [],
+            Some(Unavailable::Refused(
+                "/home/account/.config/degu/advisor was not run because it is not executable"
+                    .to_owned(),
+            )),
+            None,
+        );
+        let lines = block(&unrecognized(), &advisories);
+        assert!(
+            lines.iter().any(|line| line.contains("not executable")),
+            "{lines:#?}"
         );
     }
 

@@ -30,8 +30,12 @@ impl Review {
         // Before the alternate screen, because this may run somebody's program:
         // its cost belongs to the scan the reader is already watching, not to a
         // review that has already drawn itself and then stops responding.
-        let advisories =
-            crate::advisory::consult(&collected.advisory, collected.report.findings(), &ctx.home);
+        let advisories = crate::advisory::consult(
+            &collected.advisory,
+            collected.report.findings(),
+            &ctx.home,
+            &ctx.xdg_config(),
+        );
         Ok(Self {
             app: App::new(
                 collected.report,

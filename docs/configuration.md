@@ -11,7 +11,6 @@ runtime = false
 
 [advisory]
 enabled = true
-command = "/home/you/bin/degu-advise"
 timeout_seconds = 20
 ```
 
@@ -25,7 +24,7 @@ timeout_seconds = 20
 | `max_concurrency` | Integer from 1 through 256 | Overrides the per-filesystem concurrent directory-read limit. |
 | `runtime` | Boolean | Opts `scan` into available runtime diagnostics. Defaults to `false`. |
 | `advisory.enabled` | Boolean | Shows the advisory block in the interactive review. Defaults to `true`. |
-| `advisory.command` | Absolute path | A program degu runs for an advisory about locations it could not classify. Unset by default, and nothing runs and nothing is sent without it. |
+| `advisory.command` | Absolute path | An advisor somewhere other than the conventional path. Usually unnecessary: an executable at `$XDG_CONFIG_HOME/degu/advisor` is found without any configuration. |
 | `advisory.timeout_seconds` | Integer from 1 through 120 | How long the advisor may take. Defaults to 20. |
 
 Runtime diagnostics are equivalent to passing `--runtime` to `scan`. Temporary-directory diagnostics are available on Linux and macOS; shared-memory diagnostics for `/dev/shm` are Linux-only. Their findings remain **Not managed** (`report_only` in JSON) and outside cache totals. `clean` never enables runtime adapters.
@@ -58,13 +57,25 @@ The advisory block fills that gap without entering the decision. It appears only
 
 Nothing in this block can reach a classification, a selection, or a plan. The strongest thing it can do is put a sentence on the screen, and the screen says whose sentence it is.
 
+### Setting one up
+
+There is nothing to configure. Put an executable at `$XDG_CONFIG_HOME/degu/advisor` — usually `~/.config/degu/advisor` — and degu uses it. An account with no such file consults nobody and sends nothing, which is what an untouched install does on a login node.
+
+```sh
+degu config
+```
+
+reports whether one was found, where, and why it was refused if it was. An advisor must be a regular file, owned by the account, executable, and not writable by its group or by everyone: it runs with your privileges, so a file somebody else can rewrite is one degu would be executing on their behalf. Such a file is refused and named rather than silently skipped, because a file you put there was meant to run.
+
+`advisory.command` names an advisor somewhere else, and takes precedence when set.
+
 ### degu speaks no model protocol
 
 There is no HTTP client here, no TLS stack, no provider adapter, no prompt, and no credential handling. `advisory.command` names an executable the account already trusts. degu hands it a JSON signature on standard input and reads JSON back from standard output, under the same bounds every other host tool runs under: an absolute path never resolved through `PATH`, no shell, an emptied environment, a neutral working directory, a discarded standard error, and hard limits on time and output.
 
 Which model, which endpoint, which key, and which prompt are entirely that program's business. degu could not learn any of them if it tried — the child's environment is emptied before exec, so a credential cannot even be passed through it. An advisor that calls a hosted API reads its own key; one that calls a model on the same machine reads nothing. Both are the same contract to degu, and neither makes degu something that has to be kept up to date with somebody's API.
 
-On a login node with no egress, leave `command` unset. degu runs no program and sends nothing anywhere; the block still reports what degu measured and says no advisor is configured.
+On a login node with no egress, put nothing there. degu runs no program and sends nothing anywhere; the block still reports what degu measured and names the place an advisor would go.
 
 ### What degu sends
 
@@ -115,6 +126,7 @@ Every failure is an absence of advice, never an error you have to clear: a progr
 ### Writing one
 
 ```sh
+# ~/.config/degu/advisor, mode 0700
 #!/bin/sh
 # degu hands the signature on stdin and reads JSON from stdout. Read your own
 # credentials here if you need any: degu's environment does not reach this.
@@ -122,3 +134,12 @@ input=$(cat)
 # ... ask whatever you like, or nothing at all ...
 printf '{"advice":[{"id":"0","summary":"...","check":"..."}]}\n'
 ```
+
+## Seeing what is in effect
+
+```sh
+degu config
+degu config --json
+```
+
+prints every value degu is actually using, whether the file was read or defaults were taken, and whether an advisor was found, named, or refused. It reads only; degu never rewrites the file, which is yours and carries your comments.

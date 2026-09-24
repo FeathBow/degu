@@ -393,8 +393,13 @@ pub(crate) fn consult(
         }
     };
     let command = path.to_string_lossy().into_owned();
+    // What the pane will name. Elided like every other path degu prints, so an
+    // advisor under the account home reads as `~/.config/degu/advisor` rather
+    // than spending three wrapped lines on the reader's own home.
+    let shown = crate::presentation::display_path(&path, home);
     consult_with(
         &command,
+        &shown,
         Duration::from_secs(config.timeout_seconds),
         &subjects,
         findings,
@@ -422,6 +427,7 @@ fn run_advisor(binary: &Path, input: &[u8], timeout: Duration) -> Result<Vec<u8>
 
 fn consult_with(
     command: &str,
+    shown: &str,
     timeout: Duration,
     subjects: &[Subject],
     findings: &[Finding],
@@ -433,19 +439,19 @@ fn consult_with(
         subjects,
     };
     let Ok(payload) = serde_json::to_vec(&request) else {
-        return failed(command, "the request could not be encoded");
+        return failed(shown, "the request could not be encoded");
     };
     let output = match run(Path::new(command), &payload, timeout) {
         Ok(output) => output,
-        Err(reason) => return failed(command, &reason),
+        Err(reason) => return failed(shown, &reason),
     };
     let Ok(response) = serde_json::from_slice::<Response>(&output) else {
-        return failed(command, "the advisor did not answer with a degu advisory");
+        return failed(shown, "the advisor did not answer with a degu advisory");
     };
     Advisories {
         advice: resolve(&response, subjects, findings, home),
         unavailable: None,
-        source: Some(command.to_owned()),
+        source: Some(shown.to_owned()),
         disabled: false,
     }
 }
@@ -689,6 +695,7 @@ mod tests {
         let subjects = subjects(&findings, &home());
         let advisories = consult_with(
             "/bin/advisor",
+            "~/bin/advisor",
             Duration::from_secs(1),
             &subjects,
             &findings,
@@ -712,6 +719,7 @@ mod tests {
         let subjects = subjects(&findings, &home());
         let advisories = consult_with(
             "/bin/advisor",
+            "~/bin/advisor",
             Duration::from_secs(1),
             &subjects,
             &findings,
@@ -731,6 +739,7 @@ mod tests {
         let subjects = subjects(&findings, &home());
         let advisories = consult_with(
             "/bin/advisor",
+            "~/bin/advisor",
             Duration::from_secs(1),
             &subjects,
             &findings,
@@ -751,6 +760,7 @@ mod tests {
         let subjects = subjects(&findings, &home());
         let advisories = consult_with(
             "/bin/advisor",
+            "~/bin/advisor",
             Duration::from_secs(1),
             &subjects,
             &findings,
@@ -780,6 +790,7 @@ mod tests {
         for canned in ["fails", "garbage"] {
             let advisories = consult_with(
                 "/bin/advisor",
+                "~/bin/advisor",
                 Duration::from_secs(1),
                 &subjects,
                 &findings,

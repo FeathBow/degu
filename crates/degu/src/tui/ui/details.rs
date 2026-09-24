@@ -34,7 +34,7 @@ impl Document {
     ) -> Self {
         let introduction = introduction(finding, section, home);
         let source = content(finding, &introduction, advisories);
-        let preview = preview(finding, section, home);
+        let preview = preview(finding, section, home, advisories);
         Self {
             label: escape_terminal_text(finding.ecosystem()),
             summary: preview_summary(finding),
@@ -145,7 +145,12 @@ fn preview_lines(source: &[Line<'static>], summary: &str, width: u16) -> Vec<Lin
     lines
 }
 
-fn preview(finding: &Finding, section: Section, home: &Path) -> Vec<Line<'static>> {
+fn preview(
+    finding: &Finding,
+    section: Section,
+    home: &Path,
+    advisories: &crate::advisory::Advisories,
+) -> Vec<Line<'static>> {
     let class = Class::of(finding, section);
     let mut lines = vec![
         Line::from(class.label()).style(class_style(class)),
@@ -171,6 +176,18 @@ fn preview(finding: &Finding, section: Section, home: &Path) -> Vec<Line<'static
         .as_deref()
         .unwrap_or_else(|| finding.rationale());
     lines.push(Line::from(escape_terminal_text(reason)).fg(SECONDARY));
+    // A pointer, not the advisory. Browsing a list is where a reader decides
+    // which record to open, and an advisory nobody knows about is one nobody
+    // reads; putting its text here instead would let a sentence degu does not
+    // stand behind sit in the same column as the classifications it does.
+    if !advisories.disabled()
+        && crate::advisory::is_unrecognized(finding)
+        && advisories.for_path(finding.path()).is_some()
+    {
+        lines.push(
+            Line::from("an AI advisory is available - Enter for the full record").fg(CAUTION),
+        );
+    }
     lines
 }
 
@@ -178,10 +195,31 @@ fn reflow(source: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
     source
         .iter()
         .flat_map(|line| {
-            wrapped(&line.to_string(), usize::from(width))
-                .into_iter()
-                .map(|text| Line::from(text).style(line.style))
+            let text = line.to_string();
+            match text.strip_prefix(ADVISORY_MARK) {
+                Some(body) => marked(body, line.style, width),
+                None => wrapped(&text, usize::from(width))
+                    .into_iter()
+                    .map(|text| Line::from(text).style(line.style))
+                    .collect(),
+            }
         })
+        .collect()
+}
+
+/// Re-marks every line a wrap produces.
+///
+/// The mark says a foreign program wrote these characters, so it has to reach
+/// every line those characters land on, and a wrapped continuation is one of
+/// them. Colour survives reflow on its own; a captured pane, a `--color never`
+/// transcript and a reader who cannot see colour have only the mark.
+fn marked(body: &str, style: Style, width: u16) -> Vec<Line<'static>> {
+    let inner = usize::from(width)
+        .saturating_sub(columns(ADVISORY_MARK))
+        .max(1);
+    wrapped(body, inner)
+        .into_iter()
+        .map(|text| Line::from(format!("{ADVISORY_MARK}{text}")).style(style))
         .collect()
 }
 
@@ -230,6 +268,14 @@ fn content(
     lines
 }
 
+/// How much of the advisor's path the attribution line may spend.
+///
+/// An advisor under the account home reads as `~/.config/degu/advisor` and fits
+/// anywhere. One named somewhere deeper would otherwise wrap the attribution
+/// across three lines of a small pane, which buys nothing: the tail identifies
+/// the file, and the whole path is one `degu config` away.
+const ADVISOR_NAME_BUDGET: usize = 48;
+
 /// Marks characters a foreign program wrote, and nothing else.
 ///
 /// A pane scrolls and a heading does not travel with the text under it, so the
@@ -264,8 +310,11 @@ fn advisory(finding: &Finding, advisories: &crate::advisory::Advisories) -> Vec<
         (Some(advice), _) => {
             if let Some(source) = advisories.source() {
                 lines.push(
-                    Line::from(format!("answered by {}", escape_terminal_text(source)))
-                        .fg(SECONDARY),
+                    Line::from(format!(
+                        "answered by {}",
+                        elide(&escape_terminal_text(source), ADVISOR_NAME_BUDGET)
+                    ))
+                    .fg(SECONDARY),
                 );
             }
             lines.push(Line::from(format!("{ADVISORY_MARK}{}", advice.summary)).fg(CAUTION));
@@ -465,6 +514,34 @@ mod tests {
 
     /// The advisor is named, because "a model said so" and "this program of mine
     /// said so" are different things to the reader deciding.
+    /// A deep path is cut to its tail rather than wrapped across the pane; the
+    /// whole of it is one `degu config` away.
+    #[test]
+    fn a_long_advisor_path_is_cut_to_one_line() {
+        let deep = format!("/opt/{}/advise", "segment/".repeat(12));
+        let advisories = Advisories::for_test(
+            [(
+                PathBuf::from(SUBJECT),
+                Advice {
+                    summary: "a cache".to_owned(),
+                    check: None,
+                },
+            )],
+            None,
+            Some(&deep),
+        );
+        let attribution = block(&unrecognized(), &advisories)
+            .into_iter()
+            .find(|line| line.starts_with("answered by"))
+            .expect("an attribution line");
+        assert!(attribution.contains("advise"), "{attribution}");
+        assert!(attribution.contains('…'), "{attribution}");
+        assert!(
+            super::super::text::columns(&attribution) <= 12 + ADVISOR_NAME_BUDGET,
+            "{attribution}"
+        );
+    }
+
     /// Naming the advisor is degu reporting who spoke, so it is degu's own line
     /// and must not wear the mark that means an advisor wrote the characters.
     #[test]
@@ -573,6 +650,94 @@ mod tests {
                 .any(|line| line.contains("exceeded its 20s bound")),
             "{lines:#?}"
         );
+    }
+
+    /// The mark has to reach every line the advisor's characters land on. A
+    /// heading does not travel when the pane scrolls, and it does not travel
+    /// across a wrap either; colour survives reflow on its own, but a captured
+    /// pane, a `--color never` transcript and a reader who cannot see colour
+    /// have only the mark.
+    #[test]
+    fn a_wrapped_advisory_carries_the_mark_on_every_line() {
+        let advisories = Advisories::for_test(
+            [(
+                PathBuf::from(SUBJECT),
+                Advice {
+                    summary: "layout matches a compile cache that the owning tool regenerates \
+                              on its next run, at the cost of recompilation time"
+                        .to_owned(),
+                    check: None,
+                },
+            )],
+            None,
+            Some("~/.config/degu/advisor"),
+        );
+        let wrapped: Vec<String> = reflow(&advisory(&unrecognized(), &advisories), 40)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let body: Vec<&String> = wrapped
+            .iter()
+            .filter(|line| line.contains("compile cache") || line.contains("recompilation"))
+            .collect();
+        assert!(body.len() > 1, "the fixture did not wrap: {wrapped:#?}");
+        for line in body {
+            assert!(
+                line.starts_with(ADVISORY_MARK),
+                "a wrapped continuation lost the mark: {line:?}"
+            );
+        }
+    }
+
+    /// Browsing is where a reader decides which record to open. An advisory
+    /// nobody knows about is one nobody reads.
+    #[test]
+    fn the_browser_says_an_advisory_is_there_without_quoting_it() {
+        let lines: Vec<String> = preview(
+            &unrecognized(),
+            Section::Cache,
+            Path::new("/home/account"),
+            &advised(),
+        )
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("an AI advisory is available")),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("a build cache for some tool")),
+            "the browser quoted the advisory instead of pointing at it: {lines:#?}"
+        );
+    }
+
+    /// No advisory, no pointer: the row must not promise something the record
+    /// does not hold.
+    #[test]
+    fn the_browser_points_at_nothing_when_there_is_no_advisory() {
+        let none = Advisories::for_test([], Some(Unavailable::Absent(PathBuf::from("/x"))), None);
+        for (finding, advisories) in [(unrecognized(), &none), (classified(), &advised())] {
+            let lines: Vec<String> = preview(
+                &finding,
+                Section::Cache,
+                Path::new("/home/account"),
+                advisories,
+            )
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.contains("advisory is available")),
+                "{lines:#?}"
+            );
+        }
     }
 
     /// Turning the pane off removes it. A reader who said "not this" must not

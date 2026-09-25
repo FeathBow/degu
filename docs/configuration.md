@@ -130,8 +130,8 @@ Every failure is an absence of advice, never an error you have to clear: a progr
 ### Writing one
 
 ```sh
-# ~/.config/degu/advisor, mode 0700
 #!/bin/sh
+# ~/.config/degu/advisor, mode 0700
 # degu hands the signature on stdin and reads JSON from stdout. Read your own
 # credentials here if you need any: degu's environment does not reach this.
 input=$(cat)

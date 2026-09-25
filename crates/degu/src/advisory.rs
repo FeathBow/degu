@@ -53,6 +53,11 @@ const MAX_CHECK_CHARS: usize = 160;
 /// contents, no names of the reader's own work.
 #[derive(serde::Serialize)]
 struct Subject {
+    /// The finding this subject was built from, kept so an answer can be put
+    /// back where it belongs. Never serialized: `path` is what an advisor is
+    /// shown, and that one is anonymized.
+    #[serde(skip)]
+    target: PathBuf,
     id: String,
     path: String,
     /// The ancestors were not sent, because they could not be anonymized.
@@ -318,6 +323,7 @@ fn subjects(findings: &[Finding], home: &Path) -> Vec<Subject> {
         .map(|(index, finding)| {
             let (path, ancestors_withheld) = named(finding.path(), home);
             Subject {
+                target: finding.path().to_path_buf(),
                 id: index.to_string(),
                 path,
                 ancestors_withheld,
@@ -402,8 +408,6 @@ pub(crate) fn consult(
         &shown,
         Duration::from_secs(config.timeout_seconds),
         &subjects,
-        findings,
-        home,
         run_advisor,
     )
 }
@@ -430,8 +434,6 @@ fn consult_with(
     shown: &str,
     timeout: Duration,
     subjects: &[Subject],
-    findings: &[Finding],
-    home: &Path,
     run: Runner,
 ) -> Advisories {
     let request = Request {
@@ -449,44 +451,32 @@ fn consult_with(
         return failed(shown, "the advisor did not answer with a degu advisory");
     };
     Advisories {
-        advice: resolve(&response, subjects, findings, home),
+        advice: resolve(&response, subjects),
         unavailable: None,
         source: Some(shown.to_owned()),
         disabled: false,
     }
 }
 
-/// Map answers back onto paths degu chose, never onto paths an advisor names.
+/// Map answers back onto the locations degu asked about, never onto paths an
+/// advisor names.
 ///
-/// An advisor answers by the id it was given. A path in its response is ignored
-/// entirely, so an advisor cannot attach a sentence to a location that was never
-/// part of the request.
-fn resolve(
-    response: &Response,
-    subjects: &[Subject],
-    findings: &[Finding],
-    home: &Path,
-) -> BTreeMap<PathBuf, Advice> {
+/// An advisor answers by the id it was given, and the subject carries the
+/// finding it was built from, so an answer returns to that location and nowhere
+/// else. A path in a response is ignored entirely. Keying this off the name an
+/// advisor was shown would not work: that name is anonymized for anything
+/// outside the account home, which is the ordinary case on a shared filesystem.
+fn resolve(response: &Response, subjects: &[Subject]) -> BTreeMap<PathBuf, Advice> {
     let by_id: BTreeMap<&str, &Subject> = subjects
         .iter()
         .map(|subject| (subject.id.as_str(), subject))
-        .collect();
-    let by_display: BTreeMap<String, PathBuf> = findings
-        .iter()
-        .filter(|finding| is_unrecognized(finding))
-        .map(|finding| {
-            (
-                crate::presentation::display_path(finding.path(), home),
-                finding.path().to_path_buf(),
-            )
-        })
         .collect();
     response
         .advice
         .iter()
         .filter_map(|advice| {
             let subject = by_id.get(advice.id.as_str())?;
-            let path = by_display.get(&subject.path)?;
+            let path = &subject.target;
             let summary = bounded(&advice.summary, MAX_SUMMARY_CHARS);
             if summary.is_empty() {
                 return None;
@@ -698,8 +688,6 @@ mod tests {
             "~/bin/advisor",
             Duration::from_secs(1),
             &subjects,
-            &findings,
-            &home(),
             answer("ok"),
         );
         let advice = advisories
@@ -708,6 +696,28 @@ mod tests {
         assert_eq!(advice.summary, "a build cache");
         assert_eq!(advice.check.as_deref(), Some("tool cache dir"));
         assert_eq!(advisories.unavailable(), None);
+    }
+
+    /// The ordinary case on the machines degu targets is a cache outside the
+    /// home, whose subject carries only its last component. The answer still has
+    /// to reach the location it was asked about.
+    #[test]
+    fn an_answer_reaches_a_location_outside_the_home() {
+        let findings = [unknown_recovery("/scratch/someuser/weirdcache")];
+        let subjects = subjects(&findings, &home());
+        let advisories = consult_with(
+            "/bin/advisor",
+            "~/bin/advisor",
+            Duration::from_secs(1),
+            &subjects,
+            answer("ok"),
+        );
+        assert!(
+            advisories
+                .for_path(Path::new("/scratch/someuser/weirdcache"))
+                .is_some(),
+            "advice for a location outside the home was dropped"
+        );
     }
 
     /// An advisor answers by the id it was given. Anything else it names is a
@@ -722,8 +732,6 @@ mod tests {
             "~/bin/advisor",
             Duration::from_secs(1),
             &subjects,
-            &findings,
-            &home(),
             answer("wrong-id"),
         );
         assert!(
@@ -742,8 +750,6 @@ mod tests {
             "~/bin/advisor",
             Duration::from_secs(1),
             &subjects,
-            &findings,
-            &home(),
             answer("empty-summary"),
         );
         assert!(
@@ -763,8 +769,6 @@ mod tests {
             "~/bin/advisor",
             Duration::from_secs(1),
             &subjects,
-            &findings,
-            &home(),
             answer("escapes"),
         );
         let advice = advisories
@@ -793,8 +797,6 @@ mod tests {
                 "~/bin/advisor",
                 Duration::from_secs(1),
                 &subjects,
-                &findings,
-                &home(),
                 answer(canned),
             );
             assert!(

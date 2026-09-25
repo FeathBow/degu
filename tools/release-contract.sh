@@ -19,6 +19,7 @@ degu-reclaim-uv.1
 degu-relocate.1
 degu-ops.1
 degu-adapters.1
+degu-config.1
 degu-completions.1
 degu-man.1
 "

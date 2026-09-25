@@ -14,7 +14,7 @@
 //! shape against `lfs` and is the intended next caller.
 
 use std::ffi::OsStr;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -32,7 +32,7 @@ const OUTPUT_COLLECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Why a tool produced no usable answer. None of these are the tool answering
 /// "no"; that is a successful run whose output the caller parses.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ToolError {
+pub enum ToolError {
     /// No executable exists at this path.
     #[error("no executable at {0}")]
     NotInstalled(String),
@@ -65,9 +65,9 @@ pub(crate) enum ToolError {
 /// tool that ran and reported "not found" is a successful invocation with an
 /// unsuccessful status, not an error.
 #[derive(Debug)]
-pub(crate) struct CapturedRun {
-    pub(crate) success: bool,
-    pub(crate) stdout: Vec<u8>,
+pub struct CapturedRun {
+    pub success: bool,
+    pub stdout: Vec<u8>,
 }
 
 enum Capture {
@@ -82,9 +82,37 @@ enum Capture {
 /// loader variables nor locale can change what it does or how it prints; a
 /// neutral working directory; a closed stdin; and a discarded stderr. Nothing
 /// is resolved through `PATH` and no shell is involved.
-pub(crate) fn run_capped(
+pub fn run_capped(
     binary: &Path,
     arguments: &[&OsStr],
+    timeout: Duration,
+    stdout_cap: usize,
+) -> Result<CapturedRun, ToolError> {
+    run_capped_input(binary, arguments, None, timeout, stdout_cap)
+}
+
+/// [`run_capped`] that also hands the tool `input` on its standard input.
+///
+/// Standard input is the only channel that shows the tool a payload without
+/// putting it in `argv`, where every account on a shared node can read it, or on
+/// disk, where it outlives the run. Output is already drained by a separate
+/// thread, so writing here cannot deadlock against a tool that answers while it
+/// is still being written to; a tool that stops reading early closes the pipe,
+/// and that is its answer, not an error.
+pub fn run_capped_with_input(
+    binary: &Path,
+    arguments: &[&OsStr],
+    input: &[u8],
+    timeout: Duration,
+    stdout_cap: usize,
+) -> Result<CapturedRun, ToolError> {
+    run_capped_input(binary, arguments, Some(input), timeout, stdout_cap)
+}
+
+fn run_capped_input(
+    binary: &Path,
+    arguments: &[&OsStr],
+    input: Option<&[u8]>,
     timeout: Duration,
     stdout_cap: usize,
 ) -> Result<CapturedRun, ToolError> {
@@ -94,7 +122,11 @@ pub(crate) fn run_capped(
         .env_clear()
         .env("LC_ALL", "C")
         .current_dir("/")
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -113,6 +145,22 @@ pub(crate) fn run_capped(
     std::thread::spawn(move || {
         let _ = sender.send(read_capped(stdout, stdout_cap));
     });
+
+    // On its own thread, because this caller's bound is enforced by the wait
+    // loop below and a tool that never reads its input would otherwise block the
+    // write before the loop is ever entered — a payload larger than the pipe
+    // buffer would hang past any timeout. Dropping the handle when the write
+    // finishes closes the pipe, so a tool reading to EOF sees one. A tool that
+    // stopped reading gives this thread EPIPE, which its own exit status and
+    // output already account for.
+    if let Some(payload) = input
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        let payload = payload.to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&payload);
+        });
+    }
 
     let deadline = Instant::now() + timeout;
     let mut interval = FIRST_POLL_INTERVAL;
@@ -184,6 +232,78 @@ mod tests {
 
     fn os(value: &str) -> &OsStr {
         OsStr::new(value)
+    }
+
+    /// The payload reaches the tool's standard input and nowhere else: not in
+    /// `argv`, where every account on a shared node could read it, and not on
+    /// disk, where it would outlive the run.
+    #[test]
+    fn a_payload_reaches_the_tool_on_standard_input() {
+        let cat = ["/bin/cat", "/usr/bin/cat"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.exists())
+            .expect("a host with no cat cannot run this suite");
+        let run = run_capped_with_input(
+            cat,
+            &[],
+            b"degu advisory payload",
+            Duration::from_secs(5),
+            4096,
+        )
+        .expect("cat runs");
+        assert!(run.success);
+        assert_eq!(run.stdout, b"degu advisory payload");
+    }
+
+    /// A tool that never reads its input still gets to answer. Nothing here may
+    /// turn "this program ignored the payload" into a failed run.
+    #[test]
+    fn a_tool_that_ignores_its_input_still_answers() {
+        let echo = ["/bin/echo", "/usr/bin/echo"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.exists())
+            .expect("a host with no echo cannot run this suite");
+        let run = run_capped_with_input(
+            echo,
+            &[os("answered anyway")],
+            &vec![b'x'; 256 * 1024],
+            Duration::from_secs(5),
+            4096,
+        )
+        .expect("echo runs");
+        assert!(run.success);
+        assert_eq!(run.stdout, b"answered anyway\n");
+    }
+
+    /// A tool that never reads its input and never exits must still be killed at
+    /// the bound. Writing the payload inline would block here instead, before
+    /// the bound is ever enforced.
+    #[test]
+    fn a_tool_that_never_reads_a_large_payload_still_hits_its_bound() {
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.exists())
+            .expect("a host with no sleep cannot run this suite");
+        let started = Instant::now();
+        let error = run_capped_with_input(
+            sleep,
+            &[os("30")],
+            // Comfortably past any pipe buffer, so the write cannot complete
+            // before the tool would have to read it.
+            &vec![b'x'; 4 * 1024 * 1024],
+            Duration::from_millis(500),
+            4096,
+        )
+        .expect_err("a sleeping tool cannot answer");
+        assert!(matches!(error, ToolError::Timeout { .. }), "{error:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the bound did not stop the write: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

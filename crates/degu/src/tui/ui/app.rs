@@ -55,6 +55,10 @@ pub struct App {
     decisions: Decisions,
     staged: Staged,
     home: std::path::PathBuf,
+    /// Decision support for locations degu could not classify. Read by the
+    /// details pane and by nothing else: it reaches no tier, no selection, and
+    /// no plan.
+    advisories: crate::advisory::Advisories,
     view: View,
     focus: Focus,
     page_size: usize,
@@ -72,10 +76,13 @@ impl App {
         staged: Staged,
         home: std::path::PathBuf,
         blocked: bool,
+        advisories: crate::advisory::Advisories,
     ) -> Self {
         let decisions = Decisions::new(report.section(Section::Cache));
         let browser = Browser::new(report);
-        let document = Derived::new(browser.selection(), || document(&browser, &home));
+        let document = Derived::new(browser.selection(), || {
+            document(&browser, &home, &advisories)
+        });
         let metric_width = Derived::new(metric_key(&browser), || metric_width(&browser));
         let allocation = Derived::new(browser.section(), || allocation::segments(&browser));
         Self {
@@ -84,6 +91,7 @@ impl App {
             decisions,
             staged,
             home,
+            advisories,
             view: View::Browser,
             focus: Focus::Findings,
             page_size: 1,
@@ -98,8 +106,9 @@ impl App {
 
     fn refresh(&mut self) {
         let browser = &self.browser;
-        self.document
-            .refresh(browser.selection(), || document(browser, &self.home));
+        self.document.refresh(browser.selection(), || {
+            document(browser, &self.home, &self.advisories)
+        });
         self.metric_width
             .refresh(metric_key(browser), || metric_width(browser));
         self.allocation
@@ -301,10 +310,14 @@ impl App {
     }
 }
 
-fn document(browser: &Browser, home: &std::path::Path) -> Document {
+fn document(
+    browser: &Browser,
+    home: &std::path::Path,
+    advisories: &crate::advisory::Advisories,
+) -> Document {
     browser
         .selected_finding()
-        .map(|finding| Document::new(finding, browser.section(), home))
+        .map(|finding| Document::new(finding, browser.section(), home, advisories))
         .unwrap_or_default()
 }
 

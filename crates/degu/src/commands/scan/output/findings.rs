@@ -364,6 +364,7 @@ mod tests {
 
     fn report(findings: ScanStatus, runtime: ScanStatus) -> ScanReport {
         ScanReport {
+            advisory: degu_core::config::AdvisoryConfig::default(),
             ctx: DetectCtx::from_process().unwrap(),
             findings: Vec::new(),
             runtime_findings: Vec::new(),

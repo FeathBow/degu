@@ -7,6 +7,7 @@ pub(crate) mod adapters;
 pub(crate) mod admin;
 pub(crate) mod clean;
 pub(crate) mod completions;
+pub(crate) mod config;
 pub(crate) mod doctor;
 pub(crate) mod guidance;
 pub(crate) mod init;

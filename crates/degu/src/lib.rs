@@ -3,6 +3,7 @@
 //!
 //! Output discipline: stdout carries command data only; diagnostics and logs go to stderr so machine-readable output remains pipe-safe.
 
+mod advisory;
 mod cli;
 mod collection;
 mod commands;
@@ -83,6 +84,7 @@ fn dispatch(command: Command, ui: runtime::Ui) -> Result<()> {
         Command::Tui(args) => commands::tui::run(args, ui),
         Command::Init { output } => commands::init::run(output.json),
         Command::Admin { .. } => unreachable!("handled by dedicated root-only dispatch"),
+        Command::Config(output) => commands::config::run(output.json),
         Command::Doctor { output } => commands::doctor::run(output.json),
         Command::Quota(args) => commands::quota::run(args, ui),
         Command::Reclaim { command } => commands::reclaim::run(command, ui),

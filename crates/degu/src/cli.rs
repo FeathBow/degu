@@ -220,6 +220,9 @@ pub(crate) enum Command {
     },
     /// List adapter IDs accepted by --only and configuration, plus the built-in source IDs accepted by --only
     Adapters,
+    /// Show the effective configuration, where each value came from, and
+    /// whether an advisor was found
+    Config(JsonArgs),
     /// Print shell completion script to stdout
     Completions {
         /// Shell to generate completions for

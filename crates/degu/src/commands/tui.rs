@@ -19,16 +19,32 @@ impl Review {
     fn collect(args: TuiArgs, ui: Ui) -> Result<Self> {
         let limits = args.selection.limits;
         let args = crate::cli::ScanArgs::from(args);
-        let (report, filters, ctx) = crate::commands::scan::collect_for_review(args, ui)?;
+        let collected = crate::commands::scan::collect_for_review(args, ui)?;
+        let ctx = collected.ctx;
         // One read-only pass over the trash. Each row already carries whether
         // a confirmed clean would expire it, so asking the expiry planner as
         // well would re-read the operation log and capture execution-grade
         // identities that this screen then discards.
         let staged =
             crate::tui::Staged::new(crate::lifecycle::Lifecycle::new(&ctx).trash_entries()?);
+        // Before the alternate screen, because this may run somebody's program:
+        // its cost belongs to the scan the reader is already watching, not to a
+        // review that has already drawn itself and then stops responding.
+        let advisories = crate::advisory::consult(
+            &collected.advisory,
+            collected.report.findings(),
+            &ctx.home,
+            &ctx.xdg_config(),
+        );
         Ok(Self {
-            app: App::new(report, staged, ctx.home, cleanup_blocked()),
-            filters,
+            app: App::new(
+                collected.report,
+                staged,
+                ctx.home,
+                cleanup_blocked(),
+                advisories,
+            ),
+            filters: collected.filters,
             limits,
         })
     }

@@ -8,6 +8,10 @@ protect = [".cache/my-project"]
 disable = ["ollama", "vllm"]
 max_concurrency = 2
 runtime = false
+
+[advisory]
+enabled = true
+timeout_seconds = 20
 ```
 
 ## Fields
@@ -19,6 +23,9 @@ runtime = false
 | `disable` | Array of adapter IDs | Disables registered ecosystem adapters. |
 | `max_concurrency` | Integer from 1 through 256 | Overrides the per-filesystem concurrent directory-read limit. |
 | `runtime` | Boolean | Opts `scan` into available runtime diagnostics. Defaults to `false`. |
+| `advisory.enabled` | Boolean | Shows the advisory block in the interactive review. Defaults to `true`. |
+| `advisory.command` | Absolute path | An advisor somewhere other than the conventional path. Usually unnecessary: an executable at `$XDG_CONFIG_HOME/degu/advisor` is found without any configuration. |
+| `advisory.timeout_seconds` | Integer from 1 through 120 | How long the advisor may take. Defaults to 20. |
 
 Runtime diagnostics are equivalent to passing `--runtime` to `scan`. Temporary-directory diagnostics are available on Linux and macOS; shared-memory diagnostics for `/dev/shm` are Linux-only. Their findings remain **Not managed** (`report_only` in JSON) and outside cache totals. `clean` never enables runtime adapters.
 
@@ -41,3 +48,102 @@ degu scan --only pip
 The additional `artifacts` and `checkpoints` IDs are discovery sources rather than configurable adapters. They are accepted only by `--only` and appear when a positional or configured project root is scanned.
 
 Adapter selection changes discovery coverage, but it does not bypass the operational protections described in [Safety](safety.md).
+
+## Advisory
+
+`degu tui` classifies what it can and says **Not managed** for the rest. That verdict is honest and also where a reader gets stuck: a directory degu cannot name is usually the largest thing on the node, and the only way forward has been `rm -rf`, which gives up staging, `undo`, the operation log, and every boundary check.
+
+The advisory block fills that gap without entering the decision. It appears only on findings degu could not classify, and it reports three separate things under separate headings: what degu measured, why degu says what it says, and — when an advisor is configured — what that advisor thinks. Every line an advisor produced is prefixed with `~`, and degu's own lines never are.
+
+Nothing in this block can reach a classification, a selection, or a plan. The strongest thing it can do is put a sentence on the screen, and the screen says whose sentence it is.
+
+### Setting one up
+
+There is nothing to configure. Put an executable at `$XDG_CONFIG_HOME/degu/advisor` — usually `~/.config/degu/advisor` — and degu uses it. An account with no such file consults nobody and sends nothing, which is what an untouched install does on a login node.
+
+```sh
+degu config
+```
+
+reports whether one was found, where, and why it was refused if it was. An advisor must be a regular file, owned by the account, executable, and not writable by its group or by everyone: it runs with your privileges, so a file somebody else can rewrite is one degu would be executing on their behalf. Such a file is refused and named rather than silently skipped, because a file you put there was meant to run.
+
+`advisory.command` names an advisor somewhere else, and takes precedence when set.
+
+### degu speaks no model protocol
+
+There is no HTTP client here, no TLS stack, no provider adapter, no prompt, and no credential handling. `advisory.command` names an executable the account already trusts. degu hands it a JSON signature on standard input and reads JSON back from standard output, under the same bounds every other host tool runs under: an absolute path never resolved through `PATH`, no shell, an emptied environment, a neutral working directory, a discarded standard error, and hard limits on time and output.
+
+Which model, which endpoint, which key, and which prompt are entirely that program's business. degu could not learn any of them if it tried — the child's environment is emptied before exec, so a credential cannot even be passed through it. An advisor that calls a hosted API reads its own key; one that calls a model on the same machine reads nothing. Both are the same contract to degu, and neither makes degu something that has to be kept up to date with somebody's API.
+
+On a login node with no egress, put nothing there. degu runs no program and sends nothing anywhere; the block still reports what degu measured and names the place an advisor would go.
+
+### What degu sends
+
+Only findings degu could not classify — those whose reason is that recovery or ownership is unknown. A location degu withheld because it recognized a user asset, a tool-coordinated directory, a credential boundary, or a shared-writable parent is already decided, and is never sent. Nothing below the named directory is described: no file list, no contents, no names of your own work. At most 32 locations go in one request, largest first.
+
+A signature carries the shape of a location, never the account it belongs to. Under your home the home is elided, as it is everywhere else degu prints a path. Outside it there is no prefix degu can remove and still leave anything meaningful, and an absolute path on a shared filesystem has the account name inside it — `/scratch/<user>/…` is the ordinary case on the machines degu targets — so only the last component is sent and `ancestors_withheld` says the rest was dropped. An advisor sees less about those, which is the trade: degu does not send a path it cannot make anonymous.
+
+```json
+{
+  "degu_advisory_request": 1,
+  "subjects": [
+    {
+      "id": "0",
+      "path": "~/.cache/some-tool",
+      "name": "some-tool",
+      "ecosystem": "artifacts",
+      "kind": "other",
+      "bytes_allocated": 43123456789,
+      "inodes": 812,
+      "age_days": 34,
+      "measurement_incomplete": false,
+      "reason": "recovery requirements are unknown"
+    }
+  ]
+}
+```
+
+A location outside your home arrives as `{"path": "some-tool", "ancestors_withheld": true, …}`; the field is absent when the whole shape was sent.
+
+### What degu reads back
+
+```json
+{
+  "advice": [
+    {
+      "id": "0",
+      "summary": "structure resembles a build cache written by some-tool",
+      "check": "some-tool cache dir"
+    }
+  ]
+}
+```
+
+Answers are attached by the `id` degu supplied. A path in the response is ignored entirely, so an advisor cannot attach a sentence to a location that was never part of the request. An unknown `id` is dropped, an empty summary is not an advisory, text is stripped of anything that could move a terminal cursor, and both fields are truncated.
+
+`check` is the most useful field. A summary a reader can confirm in one command becomes evidence they gathered themselves; one they cannot check is an appeal to the advisor's confidence, and the block says so rather than letting it read as settled.
+
+### When an advisor does not work
+
+Every failure is an absence of advice, never an error you have to clear: a program that is missing, exits unsuccessfully, exceeds its bound, floods its output, or answers with something that is not a degu advisory all leave the review working and say what happened. A review has to open whether or not somebody's script did.
+
+### Writing one
+
+```sh
+#!/bin/sh
+# ~/.config/degu/advisor, mode 0700
+# degu hands the signature on stdin and reads JSON from stdout. Read your own
+# credentials here if you need any: degu's environment does not reach this.
+input=$(cat)
+# ... ask whatever you like, or nothing at all ...
+printf '{"advice":[{"id":"0","summary":"...","check":"..."}]}\n'
+```
+
+## Seeing what is in effect
+
+```sh
+degu config
+degu config --json
+```
+
+prints every value degu is actually using, whether the file was read or defaults were taken, and whether an advisor was found, named, or refused. It reads only; degu never rewrites the file, which is yours and carries your comments.

@@ -27,6 +27,7 @@ Administration:
 Reference:
   ops          Show recorded clean, restore, and purge operations
   adapters     List adapter IDs accepted by --only and configuration
+  config       Show the effective configuration and where each value came from
   completions  Generate shell completions
   man          Generate a man page for degu or one command path
   help         Show command help

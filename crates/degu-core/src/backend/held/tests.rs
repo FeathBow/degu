@@ -3350,3 +3350,43 @@ fn forward_v3_max_depth_fits_a_192_fd_process_limit() {
     assert!(status.success());
     assert!(marker.exists());
 }
+/// The mode splice and the emitter must agree on where the mode starts.
+///
+/// They live 3 600 lines apart and nothing but this observes the agreement:
+/// a field added to the prefix would move the mode and silently corrupt
+/// every post-seal fingerprint, with no compile error anywhere.
+#[test]
+fn v3_mode_offset_matches_the_emitted_prefix() {
+    for path in [
+        Vec::new(),
+        b"a".to_vec(),
+        OsString::from_vec(vec![b'a', 0xff]).into_vec(),
+        b"nested/deeper/name".to_vec(),
+    ] {
+        let entry = ManifestEntry {
+            path: PathBuf::from(OsString::from_vec(path.clone())),
+            identity: NodeIdentity {
+                kind: NodeKind::Regular,
+                device: 7,
+                inode: 11,
+                incarnation: 14,
+            },
+            uid: 12,
+            gid: 13,
+            mode: 0o640,
+            content: ContentProof::Directory,
+        };
+        // A value no other field in the prefix can be mistaken for.
+        const MODE: u32 = 0xA5C3_1E7F;
+        let mut encoded = Vec::new();
+        emit_manifest_entry_v3_with_mode(&entry, MODE, |bytes| encoded.extend_from_slice(bytes));
+
+        let offset = v3_mode_offset(path.len()).expect("an offset");
+        assert_eq!(
+            &encoded[offset..offset + V3_MODE_BYTES],
+            &MODE.to_be_bytes(),
+            "the emitted prefix and v3_mode_offset disagree for a {}-byte path",
+            path.len()
+        );
+    }
+}

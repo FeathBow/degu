@@ -1,4 +1,5 @@
 mod execution;
+pub(crate) mod feasibility;
 mod plan;
 mod policy;
 mod production;

@@ -53,10 +53,10 @@ struct LogFailureJson<'a> {
 /// Every move goes through the mutation lock, the held parents and the object
 /// identity the staging path recorded, so a destination that appeared since
 /// the plan was made is refused rather than replaced.
-pub(crate) fn run(json: bool, ui: crate::runtime::Ui) -> Result<()> {
+pub(crate) fn run(json: bool, ui: crate::runtime::Ui, reclamation_id: Option<&str>) -> Result<()> {
     let ctx = degu_core::ecosystem::DetectCtx::from_process()?;
     let mut session = Lifecycle::new(&ctx).lock()?;
-    let Some(report) = session.undo_latest()? else {
+    let Some(report) = session.undo(reclamation_id)? else {
         print_none(json)?;
         return Ok(());
     };

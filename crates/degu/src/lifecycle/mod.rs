@@ -300,7 +300,8 @@ impl MutationSession {
         outcome
     }
 
-    pub(crate) fn undo_latest(&mut self) -> Result<Option<UndoReport>> {
+    /// Restore the reclamation group `wanted` names, or the latest undoable one.
+    pub(crate) fn undo(&mut self, wanted: Option<&str>) -> Result<Option<UndoReport>> {
         // Snapshot only the legacy namespace blocker before mutably borrowing
         // the exact engine. Verified undo consumes WAL-minted tokens, never
         // this path projection.
@@ -329,10 +330,11 @@ impl MutationSession {
         let blocker = |path: &Path| {
             sealed_legacy_undo_block(path, &sealed_destinations, anchors_authenticated)
         };
-        undo::undo_latest(
+        undo::undo_group(
             &self.lifecycle.ctx,
             self.sealed_staging.as_deref_mut(),
             &blocker,
+            wanted,
         )
     }
 

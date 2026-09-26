@@ -258,7 +258,7 @@ fn production_clean_reaches_verified_commit_outside_home_on_the_same_mount() {
         ctx.xdg_state().join("degu/ops.detached"),
     )
     .unwrap();
-    let undo = session.undo_latest().unwrap().unwrap();
+    let undo = session.undo(None).unwrap().unwrap();
     assert_eq!(undo.restored.len(), 1);
     assert!(undo.failed.is_empty());
     assert!(source.is_dir());
@@ -546,7 +546,7 @@ fn forged_jsonl_mapping_cannot_steal_wal_undo_authority() {
 
     // The newer unrelated group must not hide the forged member of the exact
     // WAL-selected reclamation group.
-    let undo = session.undo_latest().unwrap().unwrap();
+    let undo = session.undo(None).unwrap().unwrap();
     assert!(undo.restored.is_empty());
     assert!(!undo.failed.is_empty());
     assert!(

@@ -10,98 +10,130 @@
 //! document it did not author.
 
 use anyhow::Result;
-use degu_core::ecosystem::DetectCtx;
+use degu_core::{config::Config, ecosystem::DetectCtx};
+use std::path::{Path, PathBuf};
 
 use crate::advisory::{Origin, Resolution};
+use crate::presentation::{display_path, escape_terminal_text};
+
+struct ConfigurationReport {
+    path: PathBuf,
+    present: bool,
+    config: Config,
+    resolution: Resolution,
+    home: PathBuf,
+}
 
 pub(crate) fn run(json: bool) -> Result<()> {
-    let ctx = DetectCtx::from_process()?;
-    let path = ctx.xdg_config().join("degu/config.toml");
-    let present = path.is_file();
-    let config = crate::configuration::load_config(&ctx)?;
-    let resolution = crate::advisory::resolve_advisor(&config.advisory, &ctx.xdg_config());
-    let home = ctx.home.clone();
-    let shown = |value: &std::path::Path| crate::presentation::display_path(value, &home);
+    let report = ConfigurationReport::read()?;
+    let out = if json {
+        format!("{:#}\n", report.json())
+    } else {
+        report.human()
+    };
+    crate::output::write_stdout(out.into_bytes())
+}
 
-    if json {
-        let report = serde_json::json!({
+impl ConfigurationReport {
+    fn read() -> Result<Self> {
+        let ctx = DetectCtx::from_process()?;
+        let path = ctx.xdg_config().join("degu/config.toml");
+        let present = path.is_file();
+        let config = crate::configuration::load_config(&ctx)?;
+        let resolution = crate::advisory::resolve_advisor(&config.advisory, &ctx.xdg_config());
+        Ok(Self {
+            path,
+            present,
+            config,
+            resolution,
+            home: ctx.home,
+        })
+    }
+
+    fn shown(&self, path: &Path) -> String {
+        display_path(path, &self.home)
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
             "schema_version": 1,
             "check": "effective_configuration",
-            "file": shown(&path),
-            "file_present": present,
-            "roots": config.roots,
-            "protect": config.protect,
-            "disable": config.disable,
-            "max_concurrency": config.max_concurrency.map(std::num::NonZeroUsize::get),
-            "runtime": config.runtime,
+            "file": self.shown(&self.path),
+            "file_present": self.present,
+            "roots": self.config.roots,
+            "protect": self.config.protect,
+            "disable": self.config.disable,
+            "max_concurrency": self.config.max_concurrency.map(std::num::NonZeroUsize::get),
+            "runtime": self.config.runtime,
             "advisory": {
-                "enabled": config.advisory.enabled,
-                "timeout_seconds": config.advisory.timeout_seconds,
-                "advisor": advisor_json(&resolution, &shown),
+                "enabled": self.config.advisory.enabled,
+                "timeout_seconds": self.config.advisory.timeout_seconds,
+                "advisor": advisor_json(&self.resolution, &|path| self.shown(path)),
             },
-        });
-        return crate::output::write_stdout(format!("{report:#}\n").into_bytes());
+        })
     }
 
-    let mut out = String::new();
-    out.push_str("Configuration\n");
-    out.push_str(&format!(
-        "  file             {} ({})\n\n",
-        shown(&path),
-        if present {
-            "read"
-        } else {
-            "not present; defaults in use"
-        }
-    ));
-    out.push_str("Scanning\n");
-    out.push_str(&format!("  roots            {}\n", list(&config.roots)));
-    out.push_str(&format!("  protect          {}\n", list(&config.protect)));
-    out.push_str(&format!("  disable          {}\n", list(&config.disable)));
-    out.push_str(&format!(
-        "  max_concurrency  {}\n",
-        config.max_concurrency.map_or_else(
-            || "per-filesystem default".to_owned(),
-            |value| value.to_string()
-        )
-    ));
-    out.push_str(&format!(
-        "  runtime          {}\n\n",
-        if config.runtime { "on" } else { "off" }
-    ));
-    out.push_str("Advisory\n");
-    out.push_str(&format!(
-        "  pane             {}\n",
-        if config.advisory.enabled {
-            "on"
-        } else {
-            "off (advisory.enabled = false)"
-        }
-    ));
-    out.push_str(&format!(
-        "  advisor          {}\n",
-        advisor_line(&resolution, &shown)
-    ));
-    out.push_str(&format!(
-        "  bound            {}s\n",
-        config.advisory.timeout_seconds
-    ));
-    if config.advisory.enabled
-        && let Resolution::Absent { convention } = &resolution
-    {
-        out.push_str(&format!(
-            "\nAn advisor is any executable that reads a signature on standard input and writes\nJSON back. Put one at {} and degu uses it; degu holds no key\nand speaks no model protocol, so which model or endpoint it uses is its business.\nSee degu's configuration documentation for the exact contract.\n",
-            shown(convention)
-        ));
+    fn human(&self) -> String {
+        let mut out = format!(
+            "Configuration\n  file             {} ({})\n\n",
+            escape_terminal_text(&self.shown(&self.path)),
+            if self.present {
+                "read"
+            } else {
+                "not present; defaults in use"
+            }
+        );
+        out.push_str(&self.scanning());
+        out.push_str(&self.advisory());
+        out
     }
-    crate::output::write_stdout(out.into_bytes())
+
+    fn scanning(&self) -> String {
+        format!(
+            "Scanning\n  roots            {}\n  protect          {}\n  disable          {}\n  max_concurrency  {}\n  runtime          {}\n\n",
+            list(&self.config.roots),
+            list(&self.config.protect),
+            list(&self.config.disable),
+            self.config.max_concurrency.map_or_else(
+                || "per-filesystem default".to_owned(),
+                |value| value.to_string()
+            ),
+            if self.config.runtime { "on" } else { "off" }
+        )
+    }
+
+    fn advisory(&self) -> String {
+        let mut out = format!(
+            "Advisory\n  pane             {}\n  advisor          {}\n  bound            {}s\n",
+            if self.config.advisory.enabled {
+                "on"
+            } else {
+                "off (advisory.enabled = false)"
+            },
+            escape_terminal_text(&advisor_line(&self.resolution, &|path| self.shown(path))),
+            self.config.advisory.timeout_seconds
+        );
+        if self.config.advisory.enabled
+            && let Resolution::Absent { convention } = &self.resolution
+        {
+            out.push_str(&format!(
+                "\nAn advisor is any executable that reads a signature on standard input and writes\nJSON back. Put one at {} and degu uses it; degu holds no key\nand speaks no model protocol, so which model or endpoint it uses is its business.\nSee degu's configuration documentation for the exact contract.\n",
+                escape_terminal_text(&self.shown(convention))
+            ));
+        }
+        out
+    }
 }
 
 fn list(values: &[String]) -> String {
     if values.is_empty() {
         "(none)".to_owned()
     } else {
-        values.join(", ")
+        values
+            .iter()
+            .map(|value| escape_terminal_text(value))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 

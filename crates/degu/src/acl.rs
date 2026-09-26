@@ -1,4 +1,4 @@
-//! Minimal macOS ACL classification shared by native executable/root seals.
+//! macOS ACL mutation checks shared by advisors and native executable/root seals.
 //!
 //! The standard macOS home-directory ACL is deny-only (`everyone deny delete`)
 //! and cannot grant an attacker mutation authority. Allow entries remain
@@ -84,27 +84,30 @@ pub(crate) fn grants_mutation(fd: &impl AsFd) -> io::Result<bool> {
                 Err(error)
             };
         }
-        let mut tag = 0;
-        // SAFETY: a successful `acl_get_entry` returned a live entry belonging
-        // to `acl`; `tag` is a valid out pointer.
-        if unsafe { acl_get_tag_type(entry, &mut tag) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        match tag {
-            ACL_EXTENDED_DENY => {}
-            ACL_EXTENDED_ALLOW => {
-                let mut permissions = 0_u64;
-                // SAFETY: same live entry; `permissions` is a valid out pointer.
-                if unsafe { acl_get_permset_mask_np(entry, &mut permissions) } != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if permissions & MUTATION_PERMISSIONS != 0 {
-                    return Ok(true);
-                }
-            }
-            _ => return Ok(true),
+        if entry_grants_mutation(entry)? {
+            return Ok(true);
         }
         entry_id = ACL_NEXT_ENTRY;
+    }
+}
+
+fn entry_grants_mutation(entry: *mut libc::c_void) -> io::Result<bool> {
+    let mut tag = 0;
+    // SAFETY: the caller obtained this entry from a live, held ACL.
+    if unsafe { acl_get_tag_type(entry, &mut tag) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    match tag {
+        ACL_EXTENDED_DENY => Ok(false),
+        ACL_EXTENDED_ALLOW => {
+            let mut permissions = 0_u64;
+            // SAFETY: the same live entry and a valid output pointer.
+            if unsafe { acl_get_permset_mask_np(entry, &mut permissions) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(permissions & MUTATION_PERMISSIONS != 0)
+        }
+        _ => Ok(true),
     }
 }
 

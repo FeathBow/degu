@@ -9,6 +9,8 @@ use anyhow::{Context, Result};
 use super::STATE_TRASH_NAME;
 
 const PRIVATE_DIR_MODE: u32 = 0o700;
+const PRIVATE_FILE_MODE: u32 = 0o600;
+const PRIVATE_FILE_EXTRA_BITS: libc::mode_t = 0o177;
 // `<state>/degu` is also the namespace the activation anchor is published
 // under, and provisioning requires that component to be exactly 0755. Whatever
 // creates it first decides its mode, so it has to be the mode setup needs.
@@ -155,7 +157,7 @@ fn narrow_private_entries(held: &OwnedFd, parent: &Path) -> Result<()> {
         let entry = match rustix::fs::openat(
             held,
             name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
             Mode::empty(),
         ) {
             Ok(entry) => entry,
@@ -169,10 +171,15 @@ fn narrow_private_entries(held: &OwnedFd, parent: &Path) -> Result<()> {
         };
         let stat = rustix::fs::fstat(&entry)
             .with_context(|| format!("failed to inspect {}", parent.join(name).display()))?;
-        if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_mode & 0o177 == 0 {
+        // Open nonblocking before inspecting the held object: opening a FIFO
+        // for reading would otherwise wait forever for an unrelated writer.
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            anyhow::bail!("{} is not a regular file", parent.join(name).display());
+        }
+        if stat.st_mode & PRIVATE_FILE_EXTRA_BITS == 0 {
             continue;
         }
-        rustix::fs::fchmod(&entry, Mode::from_raw_mode(0o600 as _))
+        rustix::fs::fchmod(&entry, Mode::from_raw_mode(PRIVATE_FILE_MODE as _))
             .with_context(|| format!("failed to narrow {}", parent.join(name).display()))?;
     }
     Ok(())

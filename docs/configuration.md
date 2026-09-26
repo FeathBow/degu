@@ -67,11 +67,15 @@ degu config
 
 reports whether one was found, where, and why it was refused if it was. An advisor must be a regular file, owned by the account, executable, and not writable by its group or by everyone: it runs with your privileges, so a file somebody else can rewrite is one degu would be executing on their behalf. Such a file is refused and named rather than silently skipped, because a file you put there was meant to run.
 
+On macOS the check also inspects the executable's ACL. Mutation-granting or unreadable ACLs are refused; deny-only and read-only ACLs remain usable.
+
 `advisory.command` names an advisor somewhere else, and takes precedence when set.
 
 ### degu speaks no model protocol
 
 There is no HTTP client here, no TLS stack, no provider adapter, no prompt, and no credential handling. `advisory.command` names an executable the account already trusts. degu hands it a JSON signature on standard input and reads JSON back from standard output, under the same bounds every other host tool runs under: an absolute path never resolved through `PATH`, no shell, an emptied environment, a neutral working directory, a discarded standard error, and hard limits on time and output.
+
+An invocation runs in its own process group. Its ordinary descendants are stopped both when the wrapper exits and when the invocation reaches its time limit, so a timed-out wrapper cannot leave its worker running.
 
 Which model, which endpoint, which key, and which prompt are entirely that program's business. degu could not learn any of them if it tried — the child's environment is emptied before exec, so a credential cannot even be passed through it. An advisor that calls a hosted API reads its own key; one that calls a model on the same machine reads nothing. Both are the same contract to degu, and neither makes degu something that has to be kept up to date with somebody's API.
 

@@ -3,6 +3,8 @@
 //!
 //! Output discipline: stdout carries command data only; diagnostics and logs go to stderr so machine-readable output remains pipe-safe.
 
+#[cfg(target_os = "macos")]
+mod acl;
 mod advisory;
 mod cli;
 mod collection;

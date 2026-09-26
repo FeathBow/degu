@@ -23,11 +23,16 @@ fn refuse_activated_store_in(ctx: &DetectCtx) -> Result<()> {
         }
         Ok(_) => {}
     }
+    // Not a command to run: 'degu doctor' reports the same missing authority and
+    // names this refusal as the way forward, so sending the reader there closes a
+    // loop neither end can open. Saying so is the only honest thing this refusal
+    // can do until a supported way out exists.
     anyhow::bail!(
         "this account has already activated a sealed-staging store at {}, so its authority is \
-         missing rather than absent. Publishing a new one would leave everything staged in that \
-         store unrecoverable. Run 'degu doctor' and inspect the recorded anchor and store before \
-         changing either.",
+         missing rather than absent. Publishing a new one would abandon whatever that store still \
+         holds, and degu cannot tell from here what is recoverable in it. Inspect the recorded \
+         anchor and that store directly before changing either; 'degu doctor' reports the same \
+         missing authority and cannot resolve it.",
         store.display()
     )
 }
@@ -125,7 +130,10 @@ mod tests {
         let refusal = refuse_activated_store_in(&ctx).expect_err("an activated store refuses");
         let message = format!("{refusal}");
         assert!(message.contains("already activated"), "{message}");
-        assert!(message.contains("unrecoverable"), "{message}");
+        assert!(message.contains(&store.display().to_string()), "{message}");
+        // 'degu doctor' answers this state by naming 'degu init', so a refusal
+        // that sent the reader there would leave them circling.
+        assert!(!message.contains("Run 'degu doctor'"), "{message}");
     }
 
     #[test]

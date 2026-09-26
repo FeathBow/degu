@@ -32,6 +32,25 @@ pub(crate) struct PurgeReport {
 }
 
 impl PurgeReport {
+    /// Entries that were not deleted, and why. These are purges to retry.
+    pub(crate) fn unpurged(&self) -> impl Iterator<Item = &(PathBuf, String)> {
+        self.failed
+            .iter()
+            .filter(|(path, _)| !self.purged.contains(path))
+    }
+
+    /// Reasons recorded against entries that were deleted anyway.
+    ///
+    /// A deletion that happened cannot be undone by calling it a failure, so
+    /// these are gaps to inspect — most often an operation log that could not be
+    /// told the purge completed — rather than work to repeat. `clean --purge`
+    /// already reads the two vectors together this way.
+    pub(crate) fn gaps(&self) -> impl Iterator<Item = &(PathBuf, String)> {
+        self.failed
+            .iter()
+            .filter(|(path, _)| self.purged.contains(path))
+    }
+
     fn extend(&mut self, report: Self) {
         self.purged.extend(report.purged);
         self.failed.extend(report.failed);

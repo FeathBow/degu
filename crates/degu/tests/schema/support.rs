@@ -103,7 +103,8 @@ pub(super) const TRASH_LIST_ROW_KEYS: &[&str] = &[
     "lower_bound",
     "original",
 ];
-pub(super) const TRASH_PURGE_REPORT_KEYS: &[&str] = &["failed", "purged", "quota_observations"];
+pub(super) const TRASH_PURGE_REPORT_KEYS: &[&str] =
+    &["failed", "purged", "quota_observations", "unrecorded"];
 pub(super) const QUOTA_ACTION_KEYS: &[&str] = &[
     "id",
     "kind",

@@ -6,6 +6,7 @@ use crate::lifecycle::reconcile::TrashOplogInfo;
 
 fn oplog_info_for_test(staged_at: Option<&str>, original: &str, ambiguous: bool) -> TrashOplogInfo {
     TrashOplogInfo {
+        reclamation_id: None,
         staged_at: staged_at.map(|ts| ts.parse().unwrap()),
         original: PathBuf::from(original),
         ambiguous,

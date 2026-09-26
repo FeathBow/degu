@@ -21,6 +21,12 @@ fn trash_list_json_schema_is_frozen() {
         assert!(row["ambiguous"].is_boolean());
         assert!(row["interrupted_purge"].is_boolean());
         assert!(row["bytes_hardlinked"].is_number());
+        assert!(
+            row["reclamation_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "a staged entry names the clean that staged it: {row}"
+        );
         assert!(row["lower_bound"].is_boolean());
     }
 }

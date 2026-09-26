@@ -102,6 +102,7 @@ pub(super) const TRASH_LIST_ROW_KEYS: &[&str] = &[
     "interrupted_purge",
     "lower_bound",
     "original",
+    "reclamation_id",
 ];
 pub(super) const TRASH_PURGE_REPORT_KEYS: &[&str] =
     &["failed", "purged", "quota_observations", "unrecorded"];

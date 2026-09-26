@@ -90,6 +90,7 @@ const DETAILS_KEYS: &[&[(&str, &str)]] = &[
         ("PgUp/PgDn", "page"),
         ("Home/End", "ends"),
         ("Esc", "back"),
+        ("?", "help"),
         ("q", "quit"),
     ],
     &[
@@ -279,6 +280,32 @@ mod tests {
                         keys.is_empty() || keys.iter().any(|(key, _)| *key == "q"),
                         "{view:?} at {width} columns kept {keys:?} without the exit key"
                     );
+                }
+            }
+        }
+    }
+
+    /// Room never costs the reader an action. The candidates are ordered richest
+    /// first so that a cramped footer drops the least useful entries, which only
+    /// holds if each list keeps every action the next one names. Compared by
+    /// action rather than by key, because a narrow candidate may spell the same
+    /// binding shorter — `Enter details` for `3/Enter details` — and that is the
+    /// abbreviation working, not a loss.
+    #[test]
+    fn a_wider_footer_never_drops_an_action() {
+        for view in views() {
+            for &run in runs_for(view) {
+                for width in 0..140u16 {
+                    let narrow = footer_keys(view, run, width);
+                    let wide = footer_keys(view, run, width + 1);
+                    for (key, label) in &narrow {
+                        assert!(
+                            wide.iter().any(|(_, wider)| wider == label),
+                            "{view:?} offered {key:?} {label:?} at {width} columns and dropped \
+                             the action at {}",
+                            width + 1
+                        );
+                    }
                 }
             }
         }

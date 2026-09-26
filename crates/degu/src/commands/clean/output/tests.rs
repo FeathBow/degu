@@ -1,4 +1,4 @@
-use super::trash_resolution_error;
+use super::{staged_note, trash_resolution_error};
 use std::path::Path;
 
 #[test]
@@ -12,4 +12,19 @@ fn trash_resolution_failure_escapes_path_and_reason() {
     assert!(!rendered.chars().any(char::is_control));
     assert!(rendered.contains("/cache\\u{1b}[31m"));
     assert!(rendered.contains("cache\\nagain"));
+}
+
+#[test]
+fn a_run_needing_manual_recovery_never_offers_undo() {
+    for sealed_authority in [false, true] {
+        for purge_unsupported in [false, true] {
+            let note = staged_note(sealed_authority, true, purge_unsupported).unwrap_or_default();
+            assert!(
+                !note.contains("restore with 'degu undo'"),
+                "sealed_authority={sealed_authority} purge_unsupported={purge_unsupported}: {note}"
+            );
+        }
+        let ordinary = staged_note(sealed_authority, false, false).expect("a note");
+        assert!(ordinary.contains("restore with 'degu undo'"), "{ordinary}");
+    }
 }

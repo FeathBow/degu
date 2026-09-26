@@ -34,6 +34,37 @@ pub(super) fn print_mutation_scope(
     flush_stdout()
 }
 
+/// What a staging clean closes with, or nothing when nothing truthful is left
+/// to say.
+///
+/// Undo is offered only when every executed entry can actually use it. A run
+/// reports `Do not run undo for this entry` for the ones that cannot, and a
+/// closing line that invited undo anyway would leave the reader holding two
+/// instructions with no way to tell which one applies.
+fn staged_note(
+    sealed_authority: bool,
+    manual_recovery: bool,
+    purge_unsupported: bool,
+) -> Option<String> {
+    let quota = if manual_recovery {
+        "Still counts against quota while staged. Entries that need manual recovery cannot be restored with 'degu undo'; each one's reason is reported as an error."
+    } else {
+        "Still counts against quota while staged; restore with 'degu undo'."
+    };
+    if sealed_authority {
+        let expiry = if purge_unsupported {
+            " Internal-hardlink entries are retained because permanent purge is unsupported; unrelated purge-supported entries may be purged after seven days."
+        } else {
+            " A later clean may purge it after seven days; legacy path-based cleanup cannot delete it."
+        };
+        Some(format!("{quota}{expiry}"))
+    } else if manual_recovery {
+        None
+    } else {
+        Some(quota.to_owned())
+    }
+}
+
 fn plan_has_purge_unsupported(prepared: &PreparedClean) -> bool {
     prepared
         .preview_tree_policy_assessed()
@@ -220,25 +251,16 @@ pub(super) fn print_execution(
         );
         append_elapsed(&mut summary, elapsed, ui);
         stdoutln!("{}", ui.prose(&summary))?;
-        if executed
-            .iter()
-            .any(CleanExecution::sealed_staging_has_recovery_authority)
-        {
-            stdoutln!(
-                "{}",
-                ui.prose(
-                    if plan_has_purge_unsupported(prepared) {
-                        "Still counts against quota while staged; restore with 'degu undo'. Internal-hardlink entries are retained because permanent purge is unsupported; unrelated purge-supported entries may be purged after seven days."
-                    } else {
-                        "Still counts against quota while staged; restore with 'degu undo'. A later clean may purge it after seven days; legacy path-based cleanup cannot delete it."
-                    }
-                )
-            )?;
-        } else if executed.iter().all(|item| !item.requires_manual_recovery()) {
-            stdoutln!(
-                "{}",
-                ui.prose("Still counts against quota while staged; restore with 'degu undo'.")
-            )?;
+        if let Some(note) = staged_note(
+            executed
+                .iter()
+                .any(CleanExecution::sealed_staging_has_recovery_authority),
+            executed
+                .iter()
+                .any(CleanExecution::requires_manual_recovery),
+            plan_has_purge_unsupported(prepared),
+        ) {
+            stdoutln!("{}", ui.prose(&note))?;
         }
         Ok(())
     }

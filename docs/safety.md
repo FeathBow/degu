@@ -81,6 +81,21 @@ Sealed staging admits one finding at a time within fixed inventory bounds: 1,023
 
 `degu undo` restores the latest staged clean operation to its original paths. Restoring data does not release quota.
 
+### When the recorded store is gone
+
+An account can end up with an anchor that still holds activation records naming a store that is no longer there — a moved state directory, a reimaged node, or a swept scratch filesystem is enough. Mutation then refuses with `activation is not in a resumable never/preparing state`, and `degu doctor` reports `recovery_required` with `Activation lost`. Neither `degu init` nor administrator provisioning clears it, by design: from inside the product a store that cannot be authenticated is indistinguishable from one that still holds staged data this account can no longer reach, and degu will not decide which it was.
+
+An operator can decide it, in this order.
+
+1. `degu doctor` names the anchor under `Authority path`. In that directory, `sealed-staging.active` names the store the anchor was bound to.
+2. If that store is gone, nothing staged in it is recoverable by any means, so retiring the records that name it loses nothing.
+3. If it is still there, inspect it directly. `degu trash list` answers a different question — what the current environment can reach — and may report an empty trash while the recorded store holds staged data.
+4. Treat anything you cannot show to be empty as holding data. Move it out by hand first, or stop here.
+
+Only once the recorded store is gone or has been shown to hold nothing: copy the anchor directory aside, then remove `sealed-staging.active` and `sealed-staging.prepare` from it. Keep `sealed-staging.authority`; the durable authority claim is still valid, and it is the store binding that has to go. The next mutation activates a store again, so there is no `degu init` step and nothing to reprovision.
+
+degu ships no command for this. A command that could retire its own recovery authority would do so on the occasions an operator was wrong about what had been staged, which is exactly when the records are the only thing standing between a mistake and unrecoverable data.
+
 ## Protected paths and symlinks
 
 The safety guard rejects the entire plan if any candidate resolves onto or around a protected path. It never downgrades that condition to skipping one item.

@@ -118,6 +118,21 @@ A sealed purge interrupted after its durable WAL claim is different: startup mar
 
 For immediate permanent deletion, use `degu clean --purge`. Successfully purged entries cannot be restored. The [staging, undo, and purge policy](safety.md#staging-undo-and-purge) defines the confirmations and fixed-plan guarantees for both purge commands.
 
+## Read the operation log
+
+`degu ops` prints what degu has recorded about its own mutations: the cleans, restores, and purges it performed, oldest first.
+
+```sh
+degu ops
+degu ops --json
+```
+
+Every mutation writes twice, once as `pending` before it begins and once with its result, so the log distinguishes work that finished from work that stopped partway. The table reports a `pending` record whose completion never arrived as `interrupted`, which is how you find a mutation that did not reach its end. `--json` reports the recorded outcome verbatim and so shows such a record as `pending`; a consumer that needs the same answer looks for a `pending` record with no later record for the same action and path.
+
+The two views do not carry the same fields. The table shows the timestamp, command, action, path, and outcome. `--json` adds the degu version that wrote the record, the bytes and inodes it accounted for, the trash entry a staged copy went to, and `reclamation_id` — the identifier shared by every entry one clean moved, which `degu undo` also reports. The identifier has no column in the table, so read `--json` for it.
+
+This log is degu's account of what it did, and is not a substitute for `degu trash list`: the listing answers what can be recovered now, and the log answers what happened.
+
 ## Review and decide interactively
 
 The commands above express a policy. Some decisions are not a policy: on a node where the reclaimable space is model and compile caches, which model is coming back next week and which is not is a judgement about one location, and a rule cannot capture it. Writing it down means transcribing paths out of a report that has already scrolled past.

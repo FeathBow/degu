@@ -11,6 +11,7 @@ mod installation;
 
 const README: &str = include_str!("../../../README.md");
 const USAGE: &str = include_str!("../../../docs/usage.md");
+const SAFETY: &str = include_str!("../../../docs/safety.md");
 const MIB: usize = 1024 * 1024;
 
 #[test]
@@ -69,6 +70,58 @@ fn cli_examples_in_readme_and_usage_parse_against_the_real_cli() {
             assert_cli_help(&args);
         }
     }
+}
+
+/// Every subcommand the binary offers is named somewhere a reader can find it.
+///
+/// `degu ops` once shipped documented only in files that never enter git. The
+/// command list is read back from the binary rather than restated here, so a new
+/// subcommand cannot be added without this failing until it is documented.
+#[test]
+fn every_subcommand_is_named_in_the_published_docs() {
+    let help = Command::cargo_bin("degu")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8(help).expect("help is text");
+    let commands = subcommands(&help);
+    assert!(
+        commands.len() >= 10,
+        "read {commands:?} out of the command list"
+    );
+
+    let documents = [
+        README,
+        USAGE,
+        SAFETY,
+        installation::INSTALLATION,
+        configuration::CONFIGURATION,
+    ];
+    for command in commands {
+        let named = format!("degu {command}");
+        assert!(
+            documents.iter().any(|document| document.contains(&named)),
+            "no published document names `{named}`"
+        );
+    }
+}
+
+/// The names in `--help`, which indents each one by exactly two spaces and
+/// separates it from its summary by two more. Group headings carry no
+/// indentation and wrapped summaries carry more, so both fall out.
+fn subcommands(help: &str) -> Vec<&str> {
+    help.split("\nOptions:")
+        .next()
+        .expect("help lists its options")
+        .lines()
+        .filter_map(|line| line.strip_prefix("  ")?.split_once("  "))
+        .map(|(name, _)| name)
+        .filter(|name| !name.is_empty() && !name.starts_with(' ') && *name != "help")
+        .collect()
 }
 
 fn assert_cli_help(args: &[String]) {

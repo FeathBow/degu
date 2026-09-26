@@ -1,6 +1,6 @@
 use super::fenced_blocks;
 
-const CONFIGURATION: &str = include_str!("../../../../docs/configuration.md");
+pub(super) const CONFIGURATION: &str = include_str!("../../../../docs/configuration.md");
 
 #[test]
 fn configuration_example_parses() {

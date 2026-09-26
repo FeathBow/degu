@@ -136,3 +136,13 @@ degu --version
 The attestation confirms that the archive was produced for that tag and commit by this repository's release workflow; it does not establish that the source code is free of defects or vulnerabilities.
 
 The `export` commands above affect only the current shell. Add the appropriate bin directory to your shell profile to make it persistent.
+
+## Shell completions
+
+`degu completions` writes a completion script for one shell to standard output; where that script belongs is the shell's own convention.
+
+```sh
+degu completions bash
+degu completions zsh
+degu completions fish
+```

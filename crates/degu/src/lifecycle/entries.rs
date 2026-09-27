@@ -20,6 +20,8 @@ pub(crate) struct TrashEntry {
     pub(crate) age_days: u64,
     pub(crate) ambiguous: bool,
     pub(crate) interrupted_purge: bool,
+    /// The clean that staged this entry, when the operation log named one.
+    pub(crate) reclamation_id: Option<String>,
     /// The next confirmed clean purges this entry whether or not anyone asks,
     /// because degu runs no background timer. This is the expiry planner's own
     /// predicate, not an age comparison: an ambiguous entry never expires, an
@@ -101,6 +103,7 @@ fn inspect_entry(request: EntryInspection<'_>) -> Result<TrashEntry> {
         age_days: entry_age_days(request.info, &meta, request.now),
         ambiguous: request.info.is_some_and(|value| value.ambiguous),
         interrupted_purge: request.interrupted_purge,
+        reclamation_id: request.info.and_then(|value| value.reclamation_id.clone()),
         // The expiry walk skips the whole claims directory, so a claim never
         // expires however old it is. Asking the age predicate anyway would
         // promise a removal that no clean performs.

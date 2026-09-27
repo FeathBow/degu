@@ -30,6 +30,7 @@ struct RenderOptions<'a> {
 struct TrashJsonRow<'a> {
     entry: &'a str,
     original: Option<&'a str>,
+    reclamation_id: Option<&'a str>,
     bytes_allocated: u64,
     bytes_hardlinked: u64,
     age_days: u64,
@@ -78,6 +79,7 @@ fn representable_row(row: &TrashEntry) -> Option<TrashJsonRow<'_>> {
     Some(TrashJsonRow {
         entry,
         original,
+        reclamation_id: row.reclamation_id.as_deref(),
         bytes_allocated: row.bytes_allocated,
         bytes_hardlinked: row.bytes_hardlinked,
         age_days: row.age_days,
@@ -301,6 +303,7 @@ mod tests {
 
     fn row() -> TrashEntry {
         TrashEntry {
+            reclamation_id: None,
             entry: PathBuf::from(
                 "/state/degu/trash/0001-a-very-long-entry-name-for-responsive-layout",
             ),

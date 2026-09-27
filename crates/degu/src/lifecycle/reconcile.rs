@@ -11,6 +11,9 @@ pub(crate) struct TrashOplogInfo {
     pub(crate) original: PathBuf,
     /// The recorded operation state or object identity cannot be confirmed.
     pub(crate) ambiguous: bool,
+    /// The group one clean staged this entry as part of, when the record named
+    /// one. `degu undo` acts on a whole group, so this is what selects it.
+    pub(crate) reclamation_id: Option<String>,
 }
 
 pub(crate) fn reconciled_trash_info(records: &[OpRecord]) -> HashMap<PathBuf, TrashOplogInfo> {
@@ -43,6 +46,7 @@ pub(crate) fn reconciled_record_info(record: &OpRecord) -> Option<(PathBuf, Tras
     let info = TrashOplogInfo {
         staged_at: record.ts.parse::<jiff::Timestamp>().ok(),
         original: record.path.clone(),
+        reclamation_id: record.reclamation_id.clone(),
         ambiguous,
     };
     Some((entry, info))

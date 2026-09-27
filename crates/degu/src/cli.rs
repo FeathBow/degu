@@ -191,6 +191,10 @@ pub(crate) enum Command {
     Clean(CleanArgs),
     /// Restore the latest staged clean operation
     Undo {
+        /// Restore this reclamation group instead of the latest one; read it from
+        /// `degu trash list --json`, `degu ops --json`, or an earlier undo
+        #[arg(long, value_name = "ID")]
+        reclamation_id: Option<String>,
         #[command(flatten)]
         output: JsonArgs,
     },

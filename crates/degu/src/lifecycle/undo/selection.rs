@@ -110,10 +110,19 @@ pub(super) fn select_actionable_undo_group(records: &[OpRecord]) -> Option<UndoS
 /// Selects one exact active reclamation group independently of whichever JSONL
 /// group is globally newest. Sealed WAL group classification must use this so a
 /// newer unrelated legacy group cannot hide an unmapped same-group member.
+/// Whether a selection has anything to do: an entry to restore, or an ambiguity
+/// to report. The unnamed selector walks past a group that has neither, so a
+/// caller acting on a named group has to ask the same question rather than
+/// assume that finding the group means it can be undone.
+pub(super) struct NamedUndoGroup {
+    pub(super) selection: UndoSelection,
+    pub(super) actionable: bool,
+}
+
 pub(super) fn select_actionable_undo_group_named(
     records: &[OpRecord],
     reclamation_id: &str,
-) -> Option<UndoSelection> {
+) -> Option<NamedUndoGroup> {
     let state = active_trash_state(records);
     let active = state.indices.into_iter().collect::<HashSet<_>>();
     let group = records
@@ -136,8 +145,12 @@ pub(super) fn select_actionable_undo_group_named(
     if group.is_empty() {
         return None;
     }
-    let (selection, _) = classify_undo_group(&group, &state.ambiguous_restores);
-    Some(selection)
+    let (selection, has_restorable) = classify_undo_group(&group, &state.ambiguous_restores);
+    let actionable = has_restorable || !selection.ambiguous.is_empty();
+    Some(NamedUndoGroup {
+        selection,
+        actionable,
+    })
 }
 
 fn selected_group_cutoff(records: &[OpRecord], group: &[OpRecord]) -> Option<usize> {

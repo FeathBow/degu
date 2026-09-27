@@ -99,6 +99,12 @@ Restore the latest clean operation:
 degu undo
 ```
 
+One clean is one reclamation group, and `degu undo` on its own takes the newest group that can still be restored. To reach an earlier one, name it. The identifier is on every staged entry in `degu trash list --json`, in `degu ops --json`, and in what an earlier undo reported; naming a group that cannot be restored fails and lists the groups that can.
+
+```sh
+degu undo --reclamation-id ID
+```
+
 Or inspect every trash entry, including legacy interrupted claims and entries from earlier clean operations, then permanently delete the fixed reviewed plan:
 
 ```sh

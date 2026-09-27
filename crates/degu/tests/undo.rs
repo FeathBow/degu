@@ -66,6 +66,185 @@ fn clean_all_caches(home: &tempfile::TempDir, state: &tempfile::TempDir) {
     );
 }
 
+/// One clean is one reclamation group, and the reader who wants an older group
+/// back must be able to name it: `degu undo` on its own takes the newest.
+#[test]
+fn undo_restores_the_reclamation_group_it_is_given() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+
+    let older = seed_cache(&home, "go-build", 128 * 1024);
+    clean_one(&home, &state);
+    // Deliberately the larger of the two: the trash listing is ordered by size, so
+    // this puts the newer group first and a test that indexed into that listing
+    // instead of naming its group would reach for the wrong one.
+    let newer = seed_cache(&home, "pip", 512 * 1024);
+    clean_one(&home, &state);
+
+    let older_group = staged_group_for(&home, &state, &older);
+    let newer_group = staged_group_for(&home, &state, &newer);
+    assert_ne!(older_group, newer_group, "two cleans are two groups");
+
+    let out = undo_reclamation(&home, &state, &older_group);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(older.exists(), "the named group should be restored");
+    assert_eq!(
+        staged_reclamation_ids(&home, &state),
+        vec![newer_group],
+        "the group that was not named should still be staged"
+    );
+}
+
+/// Naming a group nothing can act on is a mistake, not an empty run: answering
+/// "nothing to undo" would read as though that group had already come back.
+#[test]
+fn undo_refuses_a_reclamation_group_it_cannot_find() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    seed_cache(&home, "go-build", 128 * 1024);
+    clean_one(&home, &state);
+
+    let out = undo_reclamation(&home, &state, "no-such-group");
+
+    assert!(!out.status.success(), "an unknown group must not exit zero");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no-such-group"), "{stderr}");
+    let staged = staged_reclamation_ids(&home, &state);
+    assert!(stderr.contains(&staged[0]), "{stderr}");
+}
+
+/// Seed one cache where the scanner probes for it, then harden the tree.
+///
+/// degu refuses a group- or world-writable ancestor, and the umask a host happens
+/// to run with decides whether `create_dir_all` produced one, so the fixture makes
+/// that deterministic the same way the pip fixture does.
+fn seed_cache(home: &tempfile::TempDir, name: &str, bytes: usize) -> PathBuf {
+    let cache = crate::common::platform_cache_dir(home.path(), name);
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("blob.bin"), vec![0u8; bytes]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+    cache
+}
+
+/// Clean whatever is seeded right now, which is one cache per call here, so each
+/// call produces one reclamation group.
+///
+/// A clean that stages nothing still exits zero, so that is asserted rather than
+/// inferred: without it, a fixture the scanner stopped offering would fail later
+/// and somewhere else.
+/// A group whose staging never moved is still recorded, and naming it must not
+/// read as a restore. Without the actionability check the run exited zero saying
+/// `Restored 0 of 0`, and the same group was offered as undoable to a reader who
+/// had named a different one.
+#[test]
+fn undo_refuses_a_named_group_whose_staging_never_moved() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = crate::common::platform_cache_dir(home.path(), "pip");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("wheel.whl"), b"cached wheel").unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+    // Recorded as begun, with the destination it would have moved to absent: the
+    // move never happened, so there is nothing to put back.
+    let never_moved = state.path().join("degu/trash/0001-pip-cache");
+    write_oplog(
+        &state,
+        &[trash_record(
+            "2000-01-01T00:00:00Z",
+            (&cache, &never_moved),
+            TrashStatus::Pending(Some("interrupted-run")),
+        )],
+    );
+
+    let named = undo_reclamation(&home, &state, "interrupted-run");
+    assert!(
+        !named.status.success(),
+        "stdout: {}",
+        String::from_utf8_lossy(&named.stdout)
+    );
+    assert!(cache.exists(), "the original must be left alone");
+
+    let other = undo_reclamation(&home, &state, "no-such-group");
+    let stderr = String::from_utf8_lossy(&other.stderr);
+    assert!(
+        !stderr.contains("interrupted-run"),
+        "a group that cannot be undone was offered: {stderr}"
+    );
+}
+
+fn clean_one(home: &tempfile::TempDir, state: &tempfile::TempDir) {
+    let out = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args(["clean", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("into the trash"),
+        "the clean staged nothing: {stdout}"
+    );
+}
+
+fn undo_reclamation(
+    home: &tempfile::TempDir,
+    state: &tempfile::TempDir,
+    id: &str,
+) -> std::process::Output {
+    degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args(["undo", "--reclamation-id", id])
+        .output()
+        .unwrap()
+}
+
+/// The groups still staged, read the way the documentation tells a reader to find
+/// them. The listing is ordered by size rather than by age, so a caller that wants
+/// one particular group names it instead of indexing into this.
+fn staged_reclamation_ids(home: &tempfile::TempDir, state: &tempfile::TempDir) -> Vec<String> {
+    staged_rows(home, state)
+        .iter()
+        .filter_map(|row| row["reclamation_id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The group that staged one cache. A staged entry is named after the directory it
+/// came from, which is what ties a row back to the cache this test cleaned.
+fn staged_group_for(home: &tempfile::TempDir, state: &tempfile::TempDir, cache: &Path) -> String {
+    let suffix = format!("-{}", cache.file_name().unwrap().to_string_lossy());
+    let rows = staged_rows(home, state);
+    let row = rows
+        .iter()
+        .find(|row| row["entry"].as_str().is_some_and(|e| e.ends_with(&suffix)))
+        .unwrap_or_else(|| panic!("no staged entry from {cache:?} in {rows:?}"));
+    row["reclamation_id"]
+        .as_str()
+        .expect("a staged entry names its clean")
+        .to_owned()
+}
+
+fn staged_rows(home: &tempfile::TempDir, state: &tempfile::TempDir) -> Vec<serde_json::Value> {
+    let out = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args(["trash", "list", "--json"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    json["entries"].as_array().cloned().unwrap_or_default()
+}
+
 fn ok_trash_records(records: &[serde_json::Value]) -> Vec<&serde_json::Value> {
     records
         .iter()

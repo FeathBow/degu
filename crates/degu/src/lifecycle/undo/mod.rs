@@ -24,22 +24,36 @@ pub(crate) use report::{
     UndoAmbiguousEntry, UndoEntry, UndoFailedEntry, UndoLogFailure, UndoReport,
 };
 
-pub(crate) fn undo_latest(
+/// Restore one reclamation group: the one `wanted` names, or the latest that can
+/// still be undone.
+pub(crate) fn undo_group(
     ctx: &DetectCtx,
     engine: Option<&mut ReadyStagingEngine>,
     blocker: &dyn Fn(&Path) -> Option<String>,
+    wanted: Option<&str>,
 ) -> Result<Option<UndoReport>> {
     let log = OperationLog::new(ctx);
     let records = log.read()?;
-    let legacy_selection = select_actionable_undo_group(&records);
+    let legacy_selection = match wanted {
+        // Finding the named group is not the same as being able to undo it: a
+        // group whose staging never moved is still recorded, and acting on it
+        // would report a restore of nothing.
+        Some(id) => selection::select_actionable_undo_group_named(&records, id)
+            .filter(|group| group.actionable)
+            .map(|group| group.selection),
+        None => select_actionable_undo_group(&records),
+    };
 
     if let Some(engine) = engine
-        && let Some(report) = undo_latest_verified(ctx, &log, &records, engine)?
+        && let Some(report) = undo_group_verified(ctx, &log, &records, engine, wanted)?
     {
         return Ok(Some(report));
     }
 
     let Some(selection) = legacy_selection else {
+        if let Some(id) = wanted {
+            return Err(no_such_undoable_group(&records, id));
+        }
         return Ok(None);
     };
     let reclamation_label = selection
@@ -53,18 +67,17 @@ pub(crate) fn undo_latest(
     Ok(Some(report))
 }
 
-fn undo_latest_verified(
+fn undo_group_verified(
     ctx: &DetectCtx,
     log: &OperationLog,
     records: &[degu_core::oplog::OpRecord],
     engine: &mut ReadyStagingEngine,
+    wanted: Option<&str>,
 ) -> Result<Option<UndoReport>> {
     let entries = engine.production_entries();
-    let Some(latest) = entries
-        .iter()
-        .rev()
-        .find(|entry| sealed_undo_active(entry.state()))
-    else {
+    let Some(latest) = entries.iter().rev().find(|entry| {
+        sealed_undo_active(entry.state()) && wanted.is_none_or(|id| entry.reclamation_id() == id)
+    }) else {
         return Ok(None);
     };
     let reclamation_id = latest.reclamation_id().to_owned();
@@ -100,7 +113,8 @@ fn undo_latest_verified(
         .collect::<Result<Vec<_>>>()?;
 
     let same_group_selection =
-        selection::select_actionable_undo_group_named(records, &reclamation_id);
+        selection::select_actionable_undo_group_named(records, &reclamation_id)
+            .map(|group| group.selection);
     if let Some(blocked) = block_mixed_group(
         &reclamation_id,
         &sealed_paths,
@@ -206,6 +220,37 @@ fn undo_latest_verified(
     }
     trace_summary(&report, &reclamation_id);
     Ok(Some(report))
+}
+
+/// A named group that nothing can act on is worth spelling out. The reader chose
+/// an identifier, so answering "nothing to undo" would read as though that group
+/// had already been restored.
+fn no_such_undoable_group(records: &[degu_core::oplog::OpRecord], wanted: &str) -> anyhow::Error {
+    let mut available = crate::lifecycle::reconcile::active_trash_state(records)
+        .indices
+        .into_iter()
+        .filter_map(|index| records[index].reclamation_id.clone())
+        .collect::<Vec<_>>();
+    available.sort_unstable();
+    available.dedup();
+    // Naming a group that cannot be undone is the mistake this message exists to
+    // correct, so offering one here would repeat it.
+    available.retain(|id| {
+        selection::select_actionable_undo_group_named(records, id)
+            .is_some_and(|group| group.actionable)
+    });
+    // Naming a group that cannot be undone is the mistake this message exists to
+    // correct, so offering one here would repeat it.
+
+    if available.is_empty() {
+        return anyhow::anyhow!(
+            "no staged clean can be undone, so reclamation {wanted} cannot be restored"
+        );
+    }
+    anyhow::anyhow!(
+        "no undoable clean is recorded as reclamation {wanted}; these can be undone: {}",
+        available.join(", ")
+    )
 }
 
 fn block_mixed_group(

@@ -184,6 +184,7 @@ mod tests {
 
     fn row(entry: &str, original: Option<&str>, bytes: u64) -> TrashEntry {
         TrashEntry {
+            reclamation_id: None,
             entry: PathBuf::from(entry),
             original: original.map(PathBuf::from),
             bytes_allocated: bytes,

@@ -73,15 +73,13 @@ fn undo_restores_the_reclamation_group_it_is_given() {
     let home = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
 
-    let older = fake_go_build_cache(&home);
-    clean_one(&home, &state, &older);
+    let older = seed_cache(&home, "go-build", 128 * 1024);
+    clean_one(&home, &state);
     // Deliberately the larger of the two: the trash listing is ordered by size, so
     // this puts the newer group first and a test that indexed into that listing
     // instead of naming its group would reach for the wrong one.
-    let newer = crate::common::platform_cache_dir(home.path(), "pip");
-    std::fs::create_dir_all(&newer).unwrap();
-    std::fs::write(newer.join("wheel.bin"), vec![0u8; 512 * 1024]).unwrap();
-    clean_one(&home, &state, &newer);
+    let newer = seed_cache(&home, "pip", 512 * 1024);
+    clean_one(&home, &state);
 
     let older_group = staged_group_for(&home, &state, &older);
     let newer_group = staged_group_for(&home, &state, &newer);
@@ -108,7 +106,8 @@ fn undo_restores_the_reclamation_group_it_is_given() {
 fn undo_refuses_a_reclamation_group_it_cannot_find() {
     let home = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
-    clean_one(&home, &state, &fake_go_build_cache(&home));
+    seed_cache(&home, "go-build", 128 * 1024);
+    clean_one(&home, &state);
 
     let out = undo_reclamation(&home, &state, "no-such-group");
 
@@ -119,18 +118,41 @@ fn undo_refuses_a_reclamation_group_it_cannot_find() {
     assert!(stderr.contains(&staged[0]), "{stderr}");
 }
 
-fn clean_one(home: &tempfile::TempDir, state: &tempfile::TempDir, path: &Path) {
+/// Seed one cache where the scanner probes for it, then harden the tree.
+///
+/// degu refuses a group- or world-writable ancestor, and the umask a host happens
+/// to run with decides whether `create_dir_all` produced one, so the fixture makes
+/// that deterministic the same way the pip fixture does.
+fn seed_cache(home: &tempfile::TempDir, name: &str, bytes: usize) -> PathBuf {
+    let cache = crate::common::platform_cache_dir(home.path(), name);
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("blob.bin"), vec![0u8; bytes]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+    cache
+}
+
+/// Clean whatever is seeded right now, which is one cache per call here, so each
+/// call produces one reclamation group.
+///
+/// A clean that stages nothing still exits zero, so that is asserted rather than
+/// inferred: without it, a fixture the scanner stopped offering would fail later
+/// and somewhere else.
+fn clean_one(home: &tempfile::TempDir, state: &tempfile::TempDir) {
     let out = degu()
         .env("HOME", home.path())
         .env("XDG_STATE_HOME", state.path())
-        .args(["clean", "--yes", "--path"])
-        .arg(path)
+        .args(["clean", "--yes"])
         .output()
         .unwrap();
     assert!(
         out.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("into the trash"),
+        "the clean staged nothing: {stdout}"
     );
 }
 

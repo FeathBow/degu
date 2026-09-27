@@ -47,7 +47,7 @@ pub(crate) fn purge_outcome(
     report: &crate::lifecycle::PurgeReport,
 ) -> crate::native::StartedActionOutcome {
     use crate::native::StartedActionOutcome;
-    if report.failed.is_empty() {
+    if report.unpurged().next().is_none() {
         StartedActionOutcome::Success
     } else if report.purged.is_empty() {
         StartedActionOutcome::Failure

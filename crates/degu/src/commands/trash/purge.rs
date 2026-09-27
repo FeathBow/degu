@@ -82,10 +82,10 @@ pub(super) fn run(args: TrashPurgeArgs, ui: Ui) -> Result<()> {
         crate::native::print_warnings(&observation, ui.colors);
         print_json_report(&report, &observation)
     } else {
-        print_human_report(&report.purged, &report.failed, ui.colors)
+        print_human_report(&report, ui.colors)
             .and_then(|()| crate::native::print_human(&observation, ui.colors))
     };
-    if !report.failed.is_empty() {
+    if report.unpurged().next().is_some() {
         anyhow::bail!("one or more trash entries failed to purge")
     }
     output_result
@@ -129,6 +129,7 @@ fn validate_json_plan(plan: &TrashPurgePlan) -> Result<()> {
 struct PurgeJsonReport<'a> {
     purged: &'a [std::path::PathBuf],
     failed: Vec<PurgeFailureJson<'a>>,
+    unrecorded: Vec<PurgeFailureJson<'a>>,
     quota_observations: serde_json::Value,
 }
 
@@ -142,16 +143,20 @@ fn json_report<'a>(
     report: &'a crate::lifecycle::PurgeReport,
     observation: &QuotaActionReport,
 ) -> PurgeJsonReport<'a> {
-    let failed = report
-        .failed
-        .iter()
-        .map(|(path, reason)| PurgeFailureJson { path, reason })
-        .collect();
     PurgeJsonReport {
         purged: &report.purged,
-        failed,
+        failed: failure_rows(report.unpurged()),
+        unrecorded: failure_rows(report.gaps()),
         quota_observations: crate::native::json(observation),
     }
+}
+
+fn failure_rows<'a>(
+    reasons: impl Iterator<Item = &'a (std::path::PathBuf, String)>,
+) -> Vec<PurgeFailureJson<'a>> {
+    reasons
+        .map(|(path, reason)| PurgeFailureJson { path, reason })
+        .collect()
 }
 
 fn print_plan(plan: &TrashPurgePlan, home: &Path, color_enabled: bool) -> Result<()> {
@@ -175,20 +180,26 @@ fn print_plan(plan: &TrashPurgePlan, home: &Path, color_enabled: bool) -> Result
 }
 
 fn print_human_report(
-    purged: &[std::path::PathBuf],
-    failed: &[(std::path::PathBuf, String)],
+    report: &crate::lifecycle::PurgeReport,
     colors: crate::runtime::OutputColors,
 ) -> Result<()> {
-    let noun = if purged.len() == 1 {
+    let noun = if report.purged.len() == 1 {
         "entry"
     } else {
         "entries"
     };
-    stdoutln!("Purged {} trash {noun}", purged.len())?;
-    for (entry, reason) in failed {
+    stdoutln!("Purged {} trash {noun}", report.purged.len())?;
+    for (entry, reason) in report.unpurged() {
         crate::presentation::print_stderr_note(
             crate::presentation::Severity::Error,
             &render_failure(entry, reason),
+            colors,
+        );
+    }
+    for (entry, reason) in report.gaps() {
+        crate::presentation::print_stderr_note(
+            crate::presentation::Severity::Warning,
+            &render_gap(entry, reason),
             colors,
         );
     }
@@ -199,6 +210,12 @@ fn render_failure(entry: &Path, reason: &str) -> String {
     let entry = escape_terminal_text(&entry.display().to_string());
     let reason = escape_terminal_text(reason);
     format!("failed to purge {entry}: {reason}")
+}
+
+fn render_gap(entry: &Path, reason: &str) -> String {
+    let entry = escape_terminal_text(&entry.display().to_string());
+    let reason = escape_terminal_text(reason);
+    format!("purged {entry}, but the outcome was not fully recorded: {reason}")
 }
 
 #[cfg(test)]
@@ -218,6 +235,40 @@ mod tests {
         keys
     }
 
+    fn not_attempted() -> crate::native::QuotaActionReport {
+        crate::native::not_attempted_action(
+            crate::native::ActionResultOwner::TrashPurgeCommand,
+            crate::native::ActionKind::TrashPurge,
+            "trash:test",
+            [],
+            crate::native::NotStartedReason::Empty,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_entry_that_was_deleted_is_never_also_reported_as_failed() {
+        let purged = Path::new("/trash/gone").to_path_buf();
+        let kept = Path::new("/trash/kept").to_path_buf();
+        let report = PurgeReport {
+            purged: vec![purged.clone()],
+            failed: vec![
+                (
+                    purged.clone(),
+                    "operation log append failed: log full".to_owned(),
+                ),
+                (kept.clone(), "claim remains after failure".to_owned()),
+            ],
+        };
+
+        let json = serde_json::to_value(json_report(&report, &not_attempted())).unwrap();
+
+        assert_eq!(json["failed"].as_array().unwrap().len(), 1);
+        assert_eq!(json["failed"][0]["path"], kept.display().to_string());
+        assert_eq!(json["unrecorded"].as_array().unwrap().len(), 1);
+        assert_eq!(json["unrecorded"][0]["path"], purged.display().to_string());
+    }
+
     #[test]
     fn purge_failure_escapes_terminal_controls() {
         let rendered = render_failure(Path::new("/home/me/trash\u{1b}[31m"), "changed\nagain");
@@ -233,16 +284,11 @@ mod tests {
                 "changed".to_owned(),
             )],
         };
-        let observation = crate::native::not_attempted_action(
-            crate::native::ActionResultOwner::TrashPurgeCommand,
-            crate::native::ActionKind::TrashPurge,
-            "trash:test",
-            [],
-            crate::native::NotStartedReason::Empty,
-        )
-        .unwrap();
-        let json = serde_json::to_value(json_report(&report, &observation)).unwrap();
-        assert_eq!(keys(&json), ["failed", "purged", "quota_observations"]);
+        let json = serde_json::to_value(json_report(&report, &not_attempted())).unwrap();
+        assert_eq!(
+            keys(&json),
+            ["failed", "purged", "quota_observations", "unrecorded"]
+        );
         assert_eq!(
             json["quota_observations"]["observation_state"],
             "not_attempted"

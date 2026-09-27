@@ -246,6 +246,18 @@ pub(crate) fn activation_remedy(error: &StoreActivationError) -> &'static str {
     classify_error(error).remediation
 }
 
+/// Nothing was decided, so nothing may be changed. The variants that reach here
+/// differ in what went unread, not in what the operator should do about it; the
+/// ones that name a path attach it so the six causes listed here can be narrowed
+/// to one location.
+fn uncertain_selection() -> FailureClassification {
+    FailureClassification::new(
+        ReadinessStatus::Uncertain,
+        "the authority selector could not authenticate all candidate state with certainty",
+        "retry after resolving account lookup, I/O, lock, ACL, mount, or backend inspection failures; do not initialize or fall back",
+    )
+}
+
 fn classify_error(error: &StoreActivationError) -> FailureClassification {
     match error {
         StoreActivationError::NoAuthority {
@@ -364,11 +376,7 @@ fn classify_error(error: &StoreActivationError) -> FailureClassification {
                 "an authority role failed deterministic type, ACL, or filesystem identity validation",
                 "do not initialize, replace, repair, or fall back; inspect the authenticated authority namespace",
             ),
-            ReadinessStatus::Uncertain => FailureClassification::new(
-                ReadinessStatus::Uncertain,
-                "the authority selector could not authenticate all candidate state with certainty",
-                "retry after resolving account lookup, I/O, lock, ACL, mount, or backend inspection failures; do not initialize or fall back",
-            ),
+            ReadinessStatus::Uncertain => uncertain_selection(),
             status => unreachable!("backend cannot classify as {status:?}"),
         },
         // An account fact that no source can supply is settled, not uncertain:
@@ -397,19 +405,17 @@ fn classify_error(error: &StoreActivationError) -> FailureClassification {
                 "correct the account entry's home directory; degu will not resolve it against the working directory",
             )
         }
-        StoreActivationError::Io { .. }
-        | StoreActivationError::Identity
+        StoreActivationError::Io { path, .. }
+        | StoreActivationError::RecordInspection { path, .. } => {
+            let mut failure = uncertain_selection();
+            failure.path = Some(path.clone());
+            failure
+        }
+        StoreActivationError::Identity
         | StoreActivationError::Store(_)
-        | StoreActivationError::RecordInspection { .. }
         | StoreActivationError::SyncUncertain(_)
         | StoreActivationError::Random(_)
-        | StoreActivationError::AccountBase(AccountBaseError::Lookup(_)) => {
-            FailureClassification::new(
-                ReadinessStatus::Uncertain,
-                "the authority selector could not authenticate all candidate state with certainty",
-                "retry after resolving account lookup, I/O, lock, ACL, mount, or backend inspection failures; do not initialize or fall back",
-            )
-        }
+        | StoreActivationError::AccountBase(AccountBaseError::Lookup(_)) => uncertain_selection(),
     }
 }
 
@@ -506,6 +512,25 @@ mod tests {
                 "witness_path",
             ]
         );
+    }
+
+    #[test]
+    fn an_uncertain_failure_keeps_the_path_it_named() {
+        let cases = [
+            StoreActivationError::Io {
+                path: path(),
+                source: std::io::Error::from_raw_os_error(libc::EIO),
+            },
+            StoreActivationError::RecordInspection {
+                path: path(),
+                reason: CertificationError::AclProbeUnknown,
+            },
+        ];
+        for error in cases {
+            let report = DoctorReport::failed(&error);
+            assert_eq!(report.status, ReadinessStatus::Uncertain);
+            assert_eq!(report.path, Some(path()), "{error}");
+        }
     }
 
     #[test]

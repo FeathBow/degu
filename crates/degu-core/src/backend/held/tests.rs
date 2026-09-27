@@ -2219,8 +2219,18 @@ fn rewalk_rejects_add_remove_replace_and_mode_change() {
                 std::fs::rename(root.join("a/file"), root.join("a/old")).unwrap();
                 std::fs::write(root.join("a/file"), b"two").unwrap();
             }
+            // Group read: held, harmless to traversal, and not a write bit a
+            // shared-writable refusal would catch before the mode comparison.
             Attack::Mode => {
-                std::fs::set_permissions(root.join("a/b"), Permissions::from_mode(0o700)).unwrap()
+                let held = root.join("a/b");
+                let before = std::fs::symlink_metadata(&held)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777;
+                let after = before ^ 0o040;
+                std::fs::set_permissions(&held, Permissions::from_mode(after)).unwrap();
+                assert_ne!(before, after, "the mode attack must change the mode");
             }
         }
         assert!(tree.rewalk_structure().is_err());

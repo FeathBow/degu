@@ -25,6 +25,19 @@ fn run(home: &Path, state: &Path, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+/// Run and require success, reporting what degu said when it refused. An assertion
+/// that hides the reason turns one failure into no evidence.
+fn expect_ok(home: &Path, state: &Path, args: &[&str], why: &str) -> std::process::Output {
+    let out = run(home, state, args);
+    assert!(
+        out.status.success(),
+        "{why}: {args:?}\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
 /// Seed one cache where the scanner probes for it, then harden the tree, because
 /// the umask a host runs with decides whether `create_dir_all` left a
 /// group-writable ancestor and degu will not clean through one.
@@ -36,8 +49,38 @@ fn seed_cache(home: &Path, byte: u8) -> std::path::PathBuf {
     cache
 }
 
-/// Every byte under `root`, so "the staged copy is still there" is measured
+/// Every byte staged right now, so "the staged copy is still there" is measured
 /// rather than inferred from a directory existing.
+///
+/// The staged location comes from degu rather than from a path this test builds:
+/// `$XDG_STATE_HOME/degu/trash` is the destination only while it sits inside the
+/// same authenticated mount domain as the source, and otherwise staging goes to a
+/// `.degu-trash` on the source mount. Asking `trash list` is also what the
+/// documented procedure tells an operator to do.
+fn staged_bytes(home: &Path, state: &Path) -> u64 {
+    staged(home, state).1
+}
+
+/// The staged entries degu reports, and their total size. Returned together so a
+/// failure names where it looked rather than only what it counted.
+fn staged(home: &Path, state: &Path) -> (Vec<String>, u64) {
+    let out = run(home, state, &["trash", "list", "--json"]);
+    assert!(
+        out.status.success(),
+        "listing needs no authority: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let entries = json["entries"]
+        .as_array()
+        .expect("a trash listing has entries")
+        .iter()
+        .map(|row| row["entry"].as_str().expect("an entry path").to_owned())
+        .collect::<Vec<_>>();
+    let bytes = entries.iter().map(|e| bytes_under(Path::new(e))).sum();
+    (entries, bytes)
+}
+
 fn bytes_under(root: &Path) -> u64 {
     let mut total = 0;
     if let Ok(entries) = std::fs::read_dir(root) {
@@ -64,16 +107,19 @@ fn retiring_the_activation_records_is_what_reaches_the_staged_data() {
     let state = tempfile::tempdir().unwrap();
 
     let cache = seed_cache(home.path(), 7);
-    assert!(
-        run(home.path(), state.path(), &["clean", "--yes"])
-            .status
-            .success(),
-        "the first clean should stage the cache and activate a store"
+    expect_ok(
+        home.path(),
+        state.path(),
+        &["clean", "--yes"],
+        "the first clean should stage the cache and activate a store",
     );
     assert!(!cache.exists(), "the clean should have staged it away");
-    let trash = state.path().join("degu/trash");
-    let staged = bytes_under(&trash);
-    assert_eq!(staged, 64 * 1024, "the staged copy should be in the trash");
+    let (entries, staged) = staged(home.path(), state.path());
+    assert_eq!(
+        staged,
+        64 * 1024,
+        "the staged copy should be where degu says it is; it listed {entries:?}"
+    );
 
     // What an environment change, a reimage, or a swept scratch filesystem does:
     // the anchor still names a store that is no longer there.
@@ -84,15 +130,9 @@ fn retiring_the_activation_records_is_what_reaches_the_staged_data() {
     // The premise the documentation rests on: the store is not where staged data
     // lives, so losing it does not lose the copy.
     assert_eq!(
-        bytes_under(&trash),
+        staged_bytes(home.path(), state.path()),
         staged,
         "the staged copy should survive the store"
-    );
-    let listed = run(home.path(), state.path(), &["trash", "list"]);
-    assert!(
-        listed.status.success(),
-        "listing needs no authority: {}",
-        String::from_utf8_lossy(&listed.stderr)
     );
 
     // Recovery is blocked while the records name the vanished store, which is why
@@ -134,10 +174,10 @@ fn retiring_the_activation_records_is_what_reaches_the_staged_data() {
 
     // And the account mutates again.
     seed_cache(home.path(), 9);
-    assert!(
-        run(home.path(), state.path(), &["clean", "--yes"])
-            .status
-            .success(),
-        "the account should stage again"
+    expect_ok(
+        home.path(),
+        state.path(),
+        &["clean", "--yes"],
+        "the account should stage again",
     );
 }

@@ -81,6 +81,23 @@ Sealed staging admits one finding at a time within fixed inventory bounds: 1,023
 
 `degu undo` restores the latest staged clean operation to its original paths. Restoring data does not release quota.
 
+### When the recorded store is gone
+
+An account can end up with an anchor holding activation records that name a store which is no longer there — a moved state directory, a reimaged node, or a swept scratch filesystem is enough. `degu doctor` then reports `recovery_required` with `Activation lost`, and every mutation, including `degu undo`, refuses with `activation is not in a resumable never/preparing state`. degu clears none of this on its own, because a store it cannot authenticate is not something it may decide about.
+
+What is staged is not in that store. `degu clean` stages into a trash directory, and the store holds the WAL and the activation binding, so an unreachable store does not put staged data out of reach: the staged copies are still on disk, and `degu trash list` still lists them because listing needs no authority. What the vanished store costs is the ability to act on them, and retiring the records is what gives that back — not a cleanup afterwards but the step that restores access.
+
+So the order is the opposite of what it looks like.
+
+1. `degu trash list` shows what is still staged. It keeps working in this state.
+2. Check whether the store the anchor records still exists — `degu doctor` names the anchor under `Authority path`, and `sealed-staging.active` names the store. A store that is still there may hold WAL state for transactions that never settled, and retiring the binding abandons that, so stop and inspect it. A store that is gone has no WAL left to abandon, and the trash is unaffected either way.
+3. Copy the anchor directory aside, then remove `sealed-staging.active` and `sealed-staging.prepare` from it. Keep `sealed-staging.authority`; the durable authority claim is still valid and it is the store binding that has to go.
+4. `degu undo` now restores what was staged, through the operation log's own recovery authority. The next mutation activates a store again, so there is no reinitialization step.
+
+Retiring those records deletes no staged data. It is worth saying plainly, because the records look like the last thing standing between the account and a loss, and the instinct is to preserve them and recover first — which in this state is the one order that does not work.
+
+degu ships no command for this. A command that could retire its own activation binding would do so on the occasions an operator was wrong about what the recorded store still held, and the WAL it abandons is exactly what an unsettled transaction needs.
+
 ## Protected paths and symlinks
 
 The safety guard rejects the entire plan if any candidate resolves onto or around a protected path. It never downgrades that condition to skipping one item.

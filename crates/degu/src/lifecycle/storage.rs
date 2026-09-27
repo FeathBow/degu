@@ -334,6 +334,30 @@ fn encode_trash_root(root: &Path) -> Result<String> {
     serde_json::to_string(encoded).map_err(Into::into)
 }
 
+/// Whether every staged entry this account has is reachable from this environment.
+///
+/// `trash_roots` enumerates the current state directory and its registry, while an
+/// activated store is recorded against an anchor the account database names. Point
+/// the state directory elsewhere and the two part company: the listing is complete
+/// for what it enumerated and empty for what the account actually staged.
+///
+/// Asked of the anchor a mutation would open, which is the store staging reaches,
+/// and answered best-effort: listing needs no authority, so a selector that cannot
+/// answer leaves the listing exactly as it was.
+pub(crate) fn activated_store_reachable(ctx: &DetectCtx) -> bool {
+    let Ok(readiness) = degu_core::activation::check_current_euid_mutation_readiness() else {
+        return true;
+    };
+    if !matches!(
+        readiness.activation(),
+        degu_core::activation::StoreActivationKind::Activated
+    ) {
+        return true;
+    }
+    let binding = sealed_staging_store_path(ctx).join(degu_core::activation::STORE_BINDING_NAME);
+    std::fs::symlink_metadata(binding).is_ok()
+}
+
 pub(crate) fn trash_roots(ctx: &DetectCtx) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
     let mut seen = HashSet::new();

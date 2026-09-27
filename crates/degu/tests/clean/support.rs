@@ -274,44 +274,7 @@ pub(super) fn assert_activation_and_wal(anchor: &std::path::Path, state: &std::p
     assert!(store.join("seal.wal").is_file());
 }
 
-pub(super) fn certify_backend(
-    path: &std::path::Path,
-) -> Result<degu_core::backend::CertifiedLocalBackend, degu_core::backend::CertificationError> {
-    let directory = std::fs::File::open(path)
-        .map_err(|_| degu_core::backend::CertificationError::InspectionFailed)?;
-    degu_core::backend::certify_held_fd_backend(&directory)
-}
-
-/// Sealed-admission fixtures require a certified backend. Linux may skip only
-/// an unsupported fixture filesystem; macOS asserts APFS so coverage cannot
-/// silently vanish; every other failure is a test failure.
-pub(super) fn require_sealed_fixture_backend(
-    path: &std::path::Path,
-) -> Option<degu_core::backend::CertifiedLocalBackend> {
-    match certify_backend(path) {
-        Ok(backend) => {
-            #[cfg(target_os = "macos")]
-            assert_eq!(
-                backend,
-                degu_core::backend::CertifiedLocalBackend::Apfs,
-                "macOS sealed fixtures must execute on APFS"
-            );
-            Some(backend)
-        }
-        #[cfg(target_os = "linux")]
-        Err(
-            degu_core::backend::CertificationError::UnsupportedFilesystem
-            | degu_core::backend::CertificationError::UnsupportedPlatform,
-        ) => {
-            eprintln!(
-                "skipping sealed fixture: uncertified filesystem at {}",
-                path.display()
-            );
-            None
-        }
-        Err(error) => panic!("sealed fixture certification failed: {error:?}"),
-    }
-}
+pub(super) use crate::common::{certify_backend, require_sealed_fixture_backend};
 
 pub(super) fn assert_output_success(output: &std::process::Output) {
     assert!(

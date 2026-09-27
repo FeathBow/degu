@@ -38,7 +38,7 @@ struct TrashJsonRow<'a> {
     lower_bound: bool,
 }
 
-pub(super) fn print_json(rows: &[TrashEntry]) -> Result<()> {
+pub(super) fn print_json(rows: &[TrashEntry], activated_store_reachable: bool) -> Result<()> {
     let (entries, omitted) = representable_rows(rows);
     if omitted > 0 {
         tracing::warn!(
@@ -49,9 +49,14 @@ pub(super) fn print_json(rows: &[TrashEntry]) -> Result<()> {
     let document = serde_json::json!({
         "entries": entries,
         "omitted": omitted,
+        "activated_store_reachable": activated_store_reachable,
     });
     stdoutln!("{}", serde_json::to_string_pretty(&document)?)
 }
+
+/// What this listing or purge plan cannot answer for, said where the empty result
+/// would otherwise read as the whole account.
+pub(super) const UNREACHABLE_ACTIVATED_STORE: &str = "this account has an activated sealed-staging store that this state directory is not the one for, so what follows covers only the trash this environment enumerates; run 'degu doctor' for the recorded authority, and use the state directory the store was activated against to reach its entries";
 
 /// A non-UTF-8 entry (or original) path would fail the whole array's
 /// serialization, losing every entry. Such rows are omitted and counted so the

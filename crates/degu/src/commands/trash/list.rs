@@ -8,9 +8,17 @@ use super::output;
 pub(super) fn run(json: bool, ui: crate::runtime::Ui) -> Result<()> {
     let ctx = DetectCtx::from_process()?;
     let rows = Lifecycle::new(&ctx).trash_entries()?;
+    let reachable = crate::lifecycle::activated_store_reachable(&ctx);
     if json {
-        output::print_json(&rows)
+        output::print_json(&rows, reachable)
     } else {
+        if !reachable {
+            crate::presentation::print_stderr_note(
+                crate::presentation::Severity::Warning,
+                output::UNREACHABLE_ACTIVATED_STORE,
+                ui.colors,
+            );
+        }
         output::print_human(&rows, &ctx.home, ui)?;
         if should_print_outcomes(&rows, ui.stdout_is_terminal) {
             output::print_outcomes(&rows, ui)?;

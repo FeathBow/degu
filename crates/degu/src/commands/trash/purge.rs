@@ -22,6 +22,15 @@ pub(super) fn run(args: TrashPurgeArgs, ui: Ui) -> Result<()> {
     if json && !yes {
         anyhow::bail!("--json requires --yes");
     }
+    // Said before the plan, because a plan that reaches nothing reads like an
+    // empty trash rather than a trash this environment cannot see.
+    if !crate::lifecycle::activated_store_reachable(&ctx) {
+        crate::presentation::print_stderr_note(
+            crate::presentation::Severity::Warning,
+            super::output::UNREACHABLE_ACTIVATED_STORE,
+            ui.colors,
+        );
+    }
     let mut session = Lifecycle::new(&ctx).lock()?;
     let plan = if !args.entry.is_empty() {
         session.plan_purge_entries(&args.entry)?

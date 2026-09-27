@@ -35,7 +35,12 @@ pub(crate) fn undo_group(
     let log = OperationLog::new(ctx);
     let records = log.read()?;
     let legacy_selection = match wanted {
-        Some(id) => selection::select_actionable_undo_group_named(&records, id),
+        // Finding the named group is not the same as being able to undo it: a
+        // group whose staging never moved is still recorded, and acting on it
+        // would report a restore of nothing.
+        Some(id) => selection::select_actionable_undo_group_named(&records, id)
+            .filter(|group| group.actionable)
+            .map(|group| group.selection),
         None => select_actionable_undo_group(&records),
     };
 
@@ -108,7 +113,8 @@ fn undo_group_verified(
         .collect::<Result<Vec<_>>>()?;
 
     let same_group_selection =
-        selection::select_actionable_undo_group_named(records, &reclamation_id);
+        selection::select_actionable_undo_group_named(records, &reclamation_id)
+            .map(|group| group.selection);
     if let Some(blocked) = block_mixed_group(
         &reclamation_id,
         &sealed_paths,
@@ -227,6 +233,15 @@ fn no_such_undoable_group(records: &[degu_core::oplog::OpRecord], wanted: &str) 
         .collect::<Vec<_>>();
     available.sort_unstable();
     available.dedup();
+    // Naming a group that cannot be undone is the mistake this message exists to
+    // correct, so offering one here would repeat it.
+    available.retain(|id| {
+        selection::select_actionable_undo_group_named(records, id)
+            .is_some_and(|group| group.actionable)
+    });
+    // Naming a group that cannot be undone is the mistake this message exists to
+    // correct, so offering one here would repeat it.
+
     if available.is_empty() {
         return anyhow::anyhow!(
             "no staged clean can be undone, so reclamation {wanted} cannot be restored"

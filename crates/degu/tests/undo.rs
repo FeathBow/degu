@@ -137,6 +137,46 @@ fn seed_cache(home: &tempfile::TempDir, name: &str, bytes: usize) -> PathBuf {
 /// A clean that stages nothing still exits zero, so that is asserted rather than
 /// inferred: without it, a fixture the scanner stopped offering would fail later
 /// and somewhere else.
+/// A group whose staging never moved is still recorded, and naming it must not
+/// read as a restore. Without the actionability check the run exited zero saying
+/// `Restored 0 of 0`, and the same group was offered as undoable to a reader who
+/// had named a different one.
+#[test]
+fn undo_refuses_a_named_group_whose_staging_never_moved() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = crate::common::platform_cache_dir(home.path(), "pip");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("wheel.whl"), b"cached wheel").unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+    // Recorded as begun, with the destination it would have moved to absent: the
+    // move never happened, so there is nothing to put back.
+    let never_moved = state.path().join("degu/trash/0001-pip-cache");
+    write_oplog(
+        &state,
+        &[trash_record(
+            "2000-01-01T00:00:00Z",
+            (&cache, &never_moved),
+            TrashStatus::Pending(Some("interrupted-run")),
+        )],
+    );
+
+    let named = undo_reclamation(&home, &state, "interrupted-run");
+    assert!(
+        !named.status.success(),
+        "stdout: {}",
+        String::from_utf8_lossy(&named.stdout)
+    );
+    assert!(cache.exists(), "the original must be left alone");
+
+    let other = undo_reclamation(&home, &state, "no-such-group");
+    let stderr = String::from_utf8_lossy(&other.stderr);
+    assert!(
+        !stderr.contains("interrupted-run"),
+        "a group that cannot be undone was offered: {stderr}"
+    );
+}
+
 fn clean_one(home: &tempfile::TempDir, state: &tempfile::TempDir) {
     let out = degu()
         .env("HOME", home.path())

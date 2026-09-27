@@ -1,9 +1,10 @@
 //! The documented way out of an account whose recorded store is gone.
 //!
 //! `docs/safety.md` tells an operator to retire two activation records by hand,
-//! because degu deliberately offers no command that could retire its own recovery
-//! authority. A documented manual procedure that stopped working would leave the
-//! account with nothing, so the steps are pinned here.
+//! and says that doing so is what makes the staged data reachable again rather
+//! than a cleanup afterwards. Both halves are pinned here, because a documented
+//! manual procedure that stopped working would leave the account with nothing,
+//! and an earlier draft of that section had the premise backwards.
 
 #[path = "support/mod.rs"]
 mod common;
@@ -15,19 +16,42 @@ fn degu() -> Command {
     common::isolated_degu()
 }
 
-fn clean(home: &Path, state: &Path) -> std::process::Output {
+fn run(home: &Path, state: &Path, args: &[&str]) -> std::process::Output {
     degu()
         .env("HOME", home)
         .env("XDG_STATE_HOME", state)
-        .args(["clean", "--yes"])
+        .args(args)
         .output()
         .unwrap()
 }
 
-fn stage_a_cache(home: &Path, name: &str) {
-    let dir = common::platform_cache_dir(home, name);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("blob.bin"), vec![0u8; 64 * 1024]).unwrap();
+/// Seed one cache where the scanner probes for it, then harden the tree, because
+/// the umask a host runs with decides whether `create_dir_all` left a
+/// group-writable ancestor and degu will not clean through one.
+fn seed_cache(home: &Path, byte: u8) -> std::path::PathBuf {
+    let cache = common::platform_cache_dir(home, "pip");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("blob.bin"), vec![byte; 64 * 1024]).unwrap();
+    common::make_tree_non_shared_writable(home).unwrap();
+    cache
+}
+
+/// Every byte under `root`, so "the staged copy is still there" is measured
+/// rather than inferred from a directory existing.
+fn bytes_under(root: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let metadata = entry.metadata().unwrap();
+            total += if metadata.is_dir() {
+                bytes_under(&path)
+            } else {
+                metadata.len()
+            };
+        }
+    }
+    total
 }
 
 #[test]
@@ -35,33 +59,52 @@ fn stage_a_cache(home: &Path, name: &str) {
     clippy::disallowed_methods,
     reason = "the documented procedure is what an operator does with their own shell, outside degu; a fixture that deleted through the verified engine would not be the procedure"
 )]
-fn retiring_the_activation_records_restores_an_account_whose_store_is_gone() {
+fn retiring_the_activation_records_is_what_reaches_the_staged_data() {
     let home = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
 
-    stage_a_cache(home.path(), "pip");
+    let cache = seed_cache(home.path(), 7);
     assert!(
-        clean(home.path(), state.path()).status.success(),
-        "the first clean should activate a store"
+        run(home.path(), state.path(), &["clean", "--yes"])
+            .status
+            .success(),
+        "the first clean should stage the cache and activate a store"
     );
+    assert!(!cache.exists(), "the clean should have staged it away");
+    let trash = state.path().join("degu/trash");
+    let staged = bytes_under(&trash);
+    assert_eq!(staged, 64 * 1024, "the staged copy should be in the trash");
 
-    // What an environment change, a reimage, or a moved state directory does to
-    // an account: the anchor still names a store that is no longer there.
+    // What an environment change, a reimage, or a swept scratch filesystem does:
+    // the anchor still names a store that is no longer there.
     let store = state.path().join("degu/sealed-staging");
     assert!(store.is_dir(), "the clean should have activated {store:?}");
     std::fs::remove_dir_all(&store).unwrap();
 
-    stage_a_cache(home.path(), "npm");
-    let blocked = clean(home.path(), state.path());
-    assert!(
-        !blocked.status.success(),
-        "a lost store must block mutation rather than build a substitute"
+    // The premise the documentation rests on: the store is not where staged data
+    // lives, so losing it does not lose the copy.
+    assert_eq!(
+        bytes_under(&trash),
+        staged,
+        "the staged copy should survive the store"
     );
+    let listed = run(home.path(), state.path(), &["trash", "list"]);
+    assert!(
+        listed.status.success(),
+        "listing needs no authority: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+
+    // Recovery is blocked while the records name the vanished store, which is why
+    // the documented order retires them first.
+    let blocked = run(home.path(), state.path(), &["undo"]);
+    assert!(!blocked.status.success(), "undo should be refused");
     assert!(
         String::from_utf8_lossy(&blocked.stderr).contains("not in a resumable"),
         "stderr: {}",
         String::from_utf8_lossy(&blocked.stderr)
     );
+    assert!(!cache.exists(), "the refused undo must restore nothing");
 
     // The documented step. The durable authority claim stays; only the records
     // that name the vanished store go.
@@ -76,10 +119,25 @@ fn retiring_the_activation_records_restores_an_account_whose_store_is_gone() {
         "the authority claim is kept, not retired"
     );
 
-    let recovered = clean(home.path(), state.path());
+    // Retiring them is what reaches the data, not a cleanup after the fact.
+    let recovered = run(home.path(), state.path(), &["undo"]);
     assert!(
         recovered.status.success(),
-        "the account should mutate again: {}",
+        "undo should work once the records are retired: {}",
         String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(
+        std::fs::read(cache.join("blob.bin")).unwrap(),
+        vec![7u8; 64 * 1024],
+        "the restored copy should be the staged bytes"
+    );
+
+    // And the account mutates again.
+    seed_cache(home.path(), 9);
+    assert!(
+        run(home.path(), state.path(), &["clean", "--yes"])
+            .status
+            .success(),
+        "the account should stage again"
     );
 }

@@ -65,7 +65,7 @@ For a record-empty authority, `doctor ready` means the authority declaration is 
 
 New staging transactions use WAL schema v12. Their first atomic frame stores one canonical mount-domain reopen pathname shared by the source and destination locators. That pathname is only a way to obtain candidate descriptors after restart: trusted-ancestry open plus the existing backend, filesystem ID, mount ID, strong parent/root identity, mode, ACL, and held-binding checks still grant recovery authority. A changed pathname, mount, or object blocks. Schema-v10 and schema-v11 transactions remain readable; v10 uses the former canonical-HOME recovery arm and never gains a synthesized external mount locator.
 
-Staging keeps the operation undoable with `degu undo`, but staged data continues to consume filesystem quota.
+Staging keeps the operation undoable with `degu undo`, but staged data continues to consume filesystem quota. What each clean, restore, and purge recorded, including the reclamation identifier that groups one clean's entries, is readable with [`degu ops`](usage.md#read-the-operation-log).
 
 A confirmed mutating `degu clean` permanently purges staging entries at least seven days old — even with an empty current plan — after all current clean items succeed. There is no background timer.
 

@@ -1,6 +1,6 @@
 use super::fenced_blocks;
 
-const INSTALLATION: &str = include_str!("../../../../docs/installation.md");
+pub(super) const INSTALLATION: &str = include_str!("../../../../docs/installation.md");
 
 #[cfg(unix)]
 #[test]

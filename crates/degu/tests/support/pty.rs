@@ -50,7 +50,12 @@ exit [lindex $result {EXPECT_WAIT_EXIT_STATUS_INDEX}]
 }
 
 pub(crate) fn run(request: PtyRun<'_>) -> Output {
-    let _serialized = PTY_GATE.lock().expect("PTY test gate poisoned");
+    // The gate serializes; it guards no data, so a panic under it leaves nothing
+    // to be poisoned by. Recovering lets each test reach and report its own
+    // failure instead of the first one's poison.
+    let _serialized = PTY_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let path = std::env::var_os("PATH").expect("PATH is required for PTY integration tests");
     crate::common::make_tree_non_shared_writable(request.home)
         .expect("failed to harden PTY HOME fixture");

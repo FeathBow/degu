@@ -16,19 +16,72 @@ pub(crate) struct TrashOplogInfo {
     pub(crate) reclamation_id: Option<String>,
 }
 
-pub(crate) fn reconciled_trash_info(records: &[OpRecord]) -> HashMap<PathBuf, TrashOplogInfo> {
+/// Recorded trash entries, matched against the ones a walk finds.
+///
+/// A record names where an entry went when it was staged, and a later run may reach
+/// that same directory under another spelling — a symlinked state directory is the
+/// same state directory. Both sides are resolved before they are compared, and one
+/// type owns that rule: a lookup site that compared the spellings instead would
+/// silently lose every origin and group the log had recorded.
+pub(crate) struct RecordedTrash {
+    by_resolved: HashMap<PathBuf, TrashOplogInfo>,
+}
+
+impl RecordedTrash {
+    pub(crate) fn get(&self, entry: &Path) -> Option<&TrashOplogInfo> {
+        self.by_resolved.get(&resolved(entry))
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&PathBuf, &TrashOplogInfo)> {
+        self.by_resolved.iter()
+    }
+
+    /// Build one from recorded entries, resolving them the way the log's own
+    /// records are resolved, so a test cannot accidentally key it by spelling.
+    #[cfg(test)]
+    pub(crate) fn from_recorded(
+        entries: impl IntoIterator<Item = (PathBuf, TrashOplogInfo)>,
+    ) -> Self {
+        Self {
+            by_resolved: entries
+                .into_iter()
+                .map(|(entry, info)| (resolved(&entry), info))
+                .collect(),
+        }
+    }
+}
+
+/// Indexing resolves like `get`, so a caller cannot reach a record by a spelling
+/// that `get` would have missed.
+impl std::ops::Index<&Path> for RecordedTrash {
+    type Output = TrashOplogInfo;
+
+    fn index(&self, entry: &Path) -> &Self::Output {
+        self.get(entry)
+            .unwrap_or_else(|| panic!("no recorded trash entry at {}", entry.display()))
+    }
+}
+
+/// As much of a path as the filesystem can resolve, and the path itself otherwise:
+/// a recorded entry whose object is gone still has to compare equal to itself.
+fn resolved(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+pub(crate) fn reconciled_trash_info(records: &[OpRecord]) -> RecordedTrash {
     let ActiveTrashState {
         indices,
         ambiguous_restores,
     } = active_trash_state(records);
-    indices
+    let by_resolved = indices
         .into_iter()
         .filter_map(|index| reconciled_record_info(&records[index]))
         .map(|(entry, mut info)| {
             info.ambiguous |= ambiguous_restores.contains(&entry);
-            (entry, info)
+            (resolved(&entry), info)
         })
-        .collect()
+        .collect();
+    RecordedTrash { by_resolved }
 }
 
 pub(crate) fn reconciled_record_info(record: &OpRecord) -> Option<(PathBuf, TrashOplogInfo)> {

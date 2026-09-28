@@ -1,7 +1,5 @@
-use super::reconcile::TrashOplogInfo;
-use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 pub(crate) const TRASH_RETENTION_DAYS: u64 = 7;
@@ -17,22 +15,19 @@ pub(crate) enum TrashEntryExpiry {
 
 #[derive(Clone, Copy)]
 pub(crate) struct ExpiryContext<'a> {
-    recorded: &'a HashMap<PathBuf, TrashOplogInfo>,
+    recorded: &'a super::reconcile::RecordedTrash,
     now: jiff::Timestamp,
 }
 
 impl<'a> ExpiryContext<'a> {
-    pub(crate) fn new(
-        recorded: &'a HashMap<PathBuf, TrashOplogInfo>,
-        now: jiff::Timestamp,
-    ) -> Self {
+    pub(crate) fn new(recorded: &'a super::reconcile::RecordedTrash, now: jiff::Timestamp) -> Self {
         Self { recorded, now }
     }
 }
 
 pub(crate) fn trash_entry_expiry(
     entry: &Path,
-    recorded: &HashMap<PathBuf, TrashOplogInfo>,
+    recorded: &super::reconcile::RecordedTrash,
 ) -> TrashEntryExpiry {
     match recorded.get(entry) {
         Some(info) if info.ambiguous => TrashEntryExpiry::Never,

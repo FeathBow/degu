@@ -114,7 +114,7 @@ fn reconciled_trash_info_reads_pendings_and_prefers_ok_records() {
     let ambiguous = info.get(&ambiguous_entry).unwrap();
     assert_eq!(ambiguous.original, ambiguous_original);
     assert!(ambiguous.ambiguous);
-    assert!(!info.contains_key(Path::new("/trash/0003-both")));
+    assert!(info.get(Path::new("/trash/0003-both")).is_none());
 }
 
 struct ReconciliationPaths<'a> {
@@ -162,8 +162,9 @@ fn reconciled_trash_info_prefers_new_pending_after_settled_ok() {
 
     let info = reconciled_trash_info(&records);
 
-    assert_eq!(info[&entry].original, new_original);
-    assert!(!info[&entry].ambiguous);
+    let recorded = info.get(&entry).expect("the entry is recorded");
+    assert_eq!(recorded.original, new_original);
+    assert!(!recorded.ambiguous);
 }
 
 #[test]

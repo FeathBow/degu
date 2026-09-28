@@ -377,21 +377,31 @@ pub(crate) fn activated_store_coverage(ctx: &DetectCtx) -> StoreCoverage {
     let Some(recorded) = readiness.store() else {
         return StoreCoverage::Complete;
     };
-    if same_store(recorded, &sealed_staging_store_path(ctx)) {
+    if holds_the_recorded_store(recorded, ctx) {
         StoreCoverage::Complete
     } else {
         StoreCoverage::Elsewhere
     }
 }
 
-/// Two locators name one store. Compared canonically where both resolve, because a
-/// state directory reached through a symlink is the same store; lexically otherwise,
-/// since a path that does not resolve cannot be the live one.
-fn same_store(recorded: &Path, here: &Path) -> bool {
-    match (std::fs::canonicalize(recorded), std::fs::canonicalize(here)) {
-        (Ok(recorded), Ok(here)) => recorded == here,
-        _ => recorded == here,
-    }
+/// Whether this environment's state directory is the one the recorded store lives
+/// under.
+///
+/// The state directories are compared, not the store paths: a `sealed-staging`
+/// symlinked at the recorded store resolves to the same file while the trash this
+/// environment enumerates is still a different directory — and coverage is about
+/// the trash. A state directory that is itself a symlink to the recorded one does
+/// enumerate that trash, which is why the comparison resolves the directory and
+/// then rebuilds the store path lexically.
+fn holds_the_recorded_store(recorded: &Path, ctx: &DetectCtx) -> bool {
+    let Some(recorded_state) = recorded.parent().and_then(Path::parent) else {
+        return false;
+    };
+    resolved(recorded_state) == resolved(&ctx.xdg_state())
+}
+
+fn resolved(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub(crate) fn trash_roots(ctx: &DetectCtx) -> Result<Vec<PathBuf>> {

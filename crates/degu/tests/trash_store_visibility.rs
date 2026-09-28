@@ -112,6 +112,21 @@ impl Sealed {
         String::from_utf8_lossy(&out.stderr).contains("sealed-staging store")
     }
 
+    /// Re-harden the fixture after a test creates a directory in it. A host running
+    /// with a permissive umask leaves a new directory group-writable, and degu
+    /// refuses to purge through one, so the fixture cannot rely on creation mode.
+    fn harden(&self) {
+        common::make_tree_non_shared_writable(self.home.path()).unwrap();
+    }
+
+    /// The `degu` directory of one state directory, created and hardened.
+    fn product_dir(&self, state: &Path) -> PathBuf {
+        let dir = state.join("degu");
+        std::fs::create_dir_all(&dir).unwrap();
+        self.harden();
+        dir
+    }
+
     fn staged_entries(&self) -> usize {
         std::fs::read_dir(self.state.path().join("degu/trash"))
             .unwrap()
@@ -152,9 +167,16 @@ fn a_copied_store_binding_does_not_make_a_listing_complete() {
 
     // Presence of a binding file is not evidence that this environment holds the
     // store the authority records: the copy names a store that is not here.
-    let forged = fixture.binding(fixture.elsewhere.path());
-    std::fs::create_dir_all(forged.parent().unwrap()).unwrap();
-    std::fs::copy(fixture.binding(fixture.state.path()), &forged).unwrap();
+    let store = fixture
+        .product_dir(fixture.elsewhere.path())
+        .join("sealed-staging");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::copy(
+        fixture.binding(fixture.state.path()),
+        store.join(degu_core::activation::STORE_BINDING_NAME),
+    )
+    .unwrap();
+    fixture.harden();
 
     assert_eq!(
         fixture.listing(fixture.elsewhere.path()),
@@ -163,4 +185,34 @@ fn a_copied_store_binding_does_not_make_a_listing_complete() {
     );
     assert!(fixture.warns(fixture.elsewhere.path(), &["trash", "purge", "--yes"]));
     assert_eq!(fixture.staged_entries(), 1);
+}
+
+#[test]
+fn a_store_symlinked_to_the_recorded_one_does_not_make_a_listing_complete() {
+    let Some(fixture) = Sealed::new() else { return };
+    fixture.stage();
+
+    // Pointing this state directory's store at the recorded one resolves to the
+    // same file, but the trash it enumerates is still its own — and coverage is
+    // about the trash.
+    std::os::unix::fs::symlink(
+        fixture.state.path().join("degu/sealed-staging"),
+        fixture
+            .product_dir(fixture.elsewhere.path())
+            .join("sealed-staging"),
+    )
+    .unwrap();
+    fixture.harden();
+
+    assert_eq!(
+        fixture.listing(fixture.elsewhere.path()),
+        (0, false),
+        "a store symlinked to the recorded one may not buy coverage"
+    );
+    assert!(fixture.warns(fixture.elsewhere.path(), &["trash", "list"]));
+    assert_eq!(
+        fixture.staged_entries(),
+        1,
+        "the listing reached nothing, so nothing may have moved"
+    );
 }

@@ -4,9 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use degu_core::authority::TransactionState;
-use degu_core::backend::{
-    HeldTreePolicyAssessmentOutcome, assess_held_tree_policy_metadata, certify_held_fd,
-};
+use degu_core::backend::HeldTreePolicyAssessmentOutcome;
 use degu_core::ecosystem::DetectCtx;
 use degu_core::finding::Finding;
 use degu_core::oplog::{ObjectIdentity, OpOutcome};
@@ -22,13 +20,10 @@ use super::super::identity;
 use super::super::journal::{OperationLog, TrashRecord, trash_record};
 use super::super::{mount, storage};
 use super::execution::CleanExecution;
+use super::feasibility::{OPEN_DIRECTORY, ProbeFailure};
 use super::policy::{self, PreparedPolicy, confined_relative};
 use super::{CapturedCleanPlan, EntryIdentity};
 
-const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
-    .union(OFlags::DIRECTORY)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::CLOEXEC);
 const TRANSACTION_ID_ATTEMPTS: usize = 128;
 const RESERVATION_ATTEMPTS: u64 = 10_000;
 const RESERVATION_WIDTH: usize = 4;
@@ -135,12 +130,15 @@ fn preflight_tree_policy(
     let root_basename = canonical_source
         .file_name()
         .ok_or_else(|| "sealed staging source has no basename".to_string())?;
-    let source_parent = open_directory(canonical_parent)
-        .map_err(|error| format!("failed to hold sealed staging source parent: {error}"))?;
-    let parent_evidence = certify_held_fd(source_parent)
-        .map_err(|error| format!("sealed staging source-parent certification failed: {error:?}"))?;
-    assess_held_tree_policy_metadata(parent_evidence, root_basename)
-        .map_err(|error| error.to_string())
+    super::feasibility::probe(canonical_parent, root_basename).map_err(|failure| match failure {
+        ProbeFailure::ParentUnavailable(error) => {
+            format!("failed to hold sealed staging source parent: {error}")
+        }
+        ProbeFailure::Certification(error) => {
+            format!("sealed staging source-parent certification failed: {error:?}")
+        }
+        ProbeFailure::Assessment(error) => error.to_string(),
+    })
 }
 
 struct HeldReservation {

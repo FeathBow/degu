@@ -1895,6 +1895,60 @@ fn staging_tree_evidence(path: &str, inode: u64) -> PersistentRecoveryEvidence {
     .unwrap()
 }
 
+/// The append path and the replay path must reject the same transitions.
+///
+/// They enforce the same guards in the same order, written out twice with two
+/// error types: `transition_inner` refuses a bad transition as it is appended,
+/// `replay_records` refuses the same history as it is read back. Nothing but
+/// this observes that they agree, and a WAL Store that accepts on append what
+/// it rejects on replay is one that leases a transaction it can never resume.
+#[test]
+fn append_and_replay_refuse_the_same_transitions() {
+    // Edges the state machine does not have, reached from a state a transaction
+    // really occupies, so the refusal is the transition and not the setup.
+    let illegal = [
+        (TransactionState::Prepared, TransactionState::Restored),
+        (
+            TransactionState::Prepared,
+            TransactionState::StagedUnverified,
+        ),
+        (TransactionState::Prepared, TransactionState::Purgeable),
+    ];
+
+    for (from, to) in illegal {
+        assert_eq!(
+            from,
+            TransactionState::Prepared,
+            "fixture starts at Prepared"
+        );
+
+        // Append refuses it.
+        let transaction = tx(0x5a);
+        let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+        wal.begin_staging(transaction, staging_metadata()).unwrap();
+        let appended = wal.transition_staging(transaction, to);
+        assert!(
+            appended.is_err(),
+            "append accepted {from:?} -> {to:?}, so this fixture proves nothing"
+        );
+
+        // The same history, written past the append guard, must not replay.
+        let mut bytes = wal.into_inner().bytes;
+        bytes.extend_from_slice(
+            &encode_frame(&SealRecord::State {
+                transaction,
+                state: to,
+            })
+            .unwrap(),
+        );
+        let parsed = parse_frames(&bytes).unwrap();
+        assert!(
+            replay_records(parsed.records).is_err(),
+            "replay accepted {from:?} -> {to:?} that append refused"
+        );
+    }
+}
+
 fn advance_to_tree_intent(wal: &mut SealWal<FaultWriter>, transaction: TransactionId) {
     wal.transition_staging(transaction, TransactionState::ParentSealIntent)
         .unwrap();

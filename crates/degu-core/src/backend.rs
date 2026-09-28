@@ -639,10 +639,26 @@ fn map_tree_assessment_failure(e: held::HeldTreeError) -> HeldTreeAssessmentFail
         ),
         E::RootNotDirectory => (HeldTreeAssessmentFailureKind::RootNotDirectory, None),
         E::Certification { path, reason } => (
+            // Enumerated rather than caught: everything below reports the same
+            // kind today, but a certification failure added later must be a
+            // decision somebody makes, not a variant that joins the generic
+            // bucket without a compile error.
             match reason {
                 CertificationError::AclPresent => HeldTreeAssessmentFailureKind::AclPresent,
                 CertificationError::NotDirectory => HeldTreeAssessmentFailureKind::RootNotDirectory,
-                _ => HeldTreeAssessmentFailureKind::CertificationFailed,
+                CertificationError::UnsupportedPlatform
+                | CertificationError::MountIdentityUnavailable
+                | CertificationError::MountInfoUnreadable
+                | CertificationError::MountInfoMalformed
+                | CertificationError::MountInfoMissing
+                | CertificationError::MountInfoAmbiguous
+                | CertificationError::UnsupportedFilesystem
+                | CertificationError::FilesystemMagicMismatch
+                | CertificationError::InspectionFailed
+                | CertificationError::AclProbeUnknown
+                | CertificationError::ProcessCredentialsUnavailable => {
+                    HeldTreeAssessmentFailureKind::CertificationFailed
+                }
             },
             Some(path),
         ),

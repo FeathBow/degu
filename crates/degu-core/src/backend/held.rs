@@ -240,12 +240,22 @@ pub(crate) struct HeldTreeLimits {
     pub max_xattr_bytes: u64,
 }
 
+/// Deepest manifest path the record protocol admits.
+///
+/// A record read back from a durable store is bytes a corrupt or hostile writer
+/// may have chosen, so the depth it claims is bounded by the protocol rather
+/// than by whatever a caller asked for. `HeldTreeLimits::max_depth` starts here
+/// and a traversal may lower it for itself; the record decoders below do not
+/// take a caller's limit at all, which is why they name this instead of reaching
+/// for `HeldTreeLimits::default()` and reading like they lost one.
+const MANIFEST_PATH_DEPTH_LIMIT: u32 = 128;
+
 impl Default for HeldTreeLimits {
     fn default() -> Self {
         Self {
             max_entries: 100_000,
             max_directories: MAX_TREE_DIRECTORIES,
-            max_depth: 128,
+            max_depth: MANIFEST_PATH_DEPTH_LIMIT,
             max_path_bytes: 16 * 1024 * 1024,
             max_manifest_bytes: 64 * 1024 * 1024,
             max_content_bytes: None,
@@ -3066,12 +3076,10 @@ fn update_manifest_v3_digest_with_mode(
     record: ManifestV3Record<'_>,
     mode: u32,
 ) -> Result<(), HeldTreeError> {
-    let mode_offset = 8_usize
-        .checked_add(record.path.len())
-        .and_then(|offset| offset.checked_add(1 + 8 + 8 + 8 + 4 + 4))
+    let mode_offset = v3_mode_offset(record.path.len())
         .ok_or_else(|| HeldTreeError::PostChanged(PathBuf::new()))?;
     let suffix_offset = mode_offset
-        .checked_add(4)
+        .checked_add(V3_MODE_BYTES)
         .ok_or_else(|| HeldTreeError::PostChanged(PathBuf::new()))?;
     let prefix = record
         .encoded
@@ -3424,7 +3432,7 @@ pub(crate) fn decode_pre_seal_directory_plan_record(
     let path_len = usize::try_from(take_u64(&mut record)?)
         .map_err(|_| ManifestV3CodecError::LengthOverflow)?;
     let path_bytes = take(&mut record, path_len)?;
-    validate_manifest_path(path_bytes, HeldTreeLimits::default().max_depth)?;
+    validate_manifest_path(path_bytes, MANIFEST_PATH_DEPTH_LIMIT)?;
     let depth = u32::from_be_bytes(take(&mut record, 4)?.try_into().unwrap());
     let path = PathBuf::from(OsStr::from_bytes(path_bytes));
     if path.components().count() != depth as usize {
@@ -3520,7 +3528,7 @@ pub(crate) fn decode_hardlink_scratch_record(
     if path.is_empty() {
         return Err(ManifestV3CodecError::InvalidPath);
     }
-    validate_manifest_path(path, HeldTreeLimits::default().max_depth)?;
+    validate_manifest_path(path, MANIFEST_PATH_DEPTH_LIMIT)?;
     let identity = NodeIdentity {
         kind: NodeKind::Regular,
         device: u64::from_be_bytes(key[1..9].try_into().unwrap()),
@@ -3634,7 +3642,7 @@ pub(crate) fn decode_structure_record(
     let path_len =
         usize::try_from(take_u64(&mut input)?).map_err(|_| ManifestV3CodecError::LengthOverflow)?;
     let path = take(&mut input, path_len)?;
-    validate_manifest_path(path, HeldTreeLimits::default().max_depth)?;
+    validate_manifest_path(path, MANIFEST_PATH_DEPTH_LIMIT)?;
     if take(&mut input, STRUCTURE_SCRATCH_RECORD_MAGIC.len())? != STRUCTURE_SCRATCH_RECORD_MAGIC {
         return Err(ManifestV3CodecError::InvalidTag);
     }
@@ -6673,6 +6681,31 @@ fn path_parent_bytes(path: &[u8]) -> Option<&[u8]> {
 
 fn emit_manifest_entry_v3(entry: &ManifestEntry, emit: impl FnMut(&[u8])) {
     emit_manifest_entry_v3_with_mode(entry, entry.mode, emit);
+}
+
+/// Width of the mode field `emit_manifest_entry_v3_with_mode` writes.
+const V3_MODE_BYTES: usize = 4;
+
+/// Where the mode field starts in a v3 record whose path is `path_len` bytes.
+///
+/// A post-seal fingerprint substitutes the WAL-applied mode into a record it
+/// must not re-encode: `ManifestV3Record` borrows the authenticated bytes, and
+/// re-emitting them would let a corrupt record be silently rewritten into a
+/// well-formed one. So the mode is spliced, and the splice needs this offset.
+///
+/// It is the sum of everything `emit_manifest_entry_v3_with_mode` writes before
+/// the mode, in that order: the path length, the path, the kind byte, the
+/// device, inode and incarnation, then uid and gid. Changing that prefix
+/// changes this, and `v3_mode_offset_matches_the_emitted_prefix` is what says so
+/// — without it the two agree only by memory, 3 600 lines apart.
+fn v3_mode_offset(path_len: usize) -> Option<usize> {
+    const PATH_LEN_BYTES: usize = 8;
+    const KIND_BYTES: usize = 1;
+    const IDENTITY_BYTES: usize = 8 + 8 + 8;
+    const OWNER_BYTES: usize = 4 + 4;
+    PATH_LEN_BYTES
+        .checked_add(path_len)?
+        .checked_add(KIND_BYTES + IDENTITY_BYTES + OWNER_BYTES)
 }
 
 fn emit_manifest_entry_v3_with_mode(entry: &ManifestEntry, mode: u32, mut emit: impl FnMut(&[u8])) {

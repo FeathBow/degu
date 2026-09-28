@@ -32,6 +32,7 @@ pub(crate) use entries::TrashEntry;
 pub(crate) use expiry::TRASH_RETENTION_DAYS;
 pub(crate) use identity::EntryIdentity;
 pub(crate) use purge::{ExpiryPlan, PurgeReport, SelectedTrashPlan, TrashPurgePlan};
+pub(crate) use stage::feasibility;
 pub(crate) use stage::{
     CapturedCleanPlan, CleanExecution, CleanExecutionFailure, cleaned_resources,
 };

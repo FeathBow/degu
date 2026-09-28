@@ -1,21 +1,15 @@
+use crate::lifecycle::feasibility::ProbeFailure;
 use crate::presentation::escape_terminal_text;
 use degu_core::backend::{
     CertificationError, HeldTreeAssessmentFailure, HeldTreeAssessmentFailureCategory,
     HeldTreeAssessmentFailureKind, HeldTreePolicyAssessmentOutcome,
     HeldTreeRegularHardLinkTopology, HeldTreeRegularXattrTopology,
-    assess_held_tree_policy_metadata, certify_held_fd,
 };
 use degu_core::finding::Finding;
-use rustix::fs::{Mode, OFlags};
 use serde_json::{Map, Value};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-
-const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
-    .union(OFlags::DIRECTORY)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::CLOEXEC);
 
 /// A data-only preview fact. It is deliberately separate from the captured
 /// clean plan: it carries no descriptor, seal lineage, WAL lease, store handle,
@@ -305,21 +299,14 @@ fn assess_path(path: &Path) -> PreviewStagingStatus {
             );
         }
     };
-    let source_parent = match rustix::fs::open(&canonical_parent, OPEN_DIRECTORY, Mode::empty()) {
-        Ok(parent) => parent,
-        Err(error) => {
-            return unavailable(
-                "source_parent_unavailable",
-                "race_or_io",
-                &format!("failed to hold sealed staging source parent: {error}"),
-            );
-        }
-    };
-    let evidence = match certify_held_fd(source_parent) {
-        Ok(evidence) => evidence,
-        Err(error) => return certification_unavailable(error),
-    };
-    match assess_held_tree_policy_metadata(evidence, basename) {
+    match crate::lifecycle::feasibility::probe(&canonical_parent, basename) {
+        Err(ProbeFailure::ParentUnavailable(error)) => unavailable(
+            "source_parent_unavailable",
+            "race_or_io",
+            &format!("failed to hold sealed staging source parent: {error}"),
+        ),
+        Err(ProbeFailure::Certification(error)) => certification_unavailable(error),
+        Err(ProbeFailure::Assessment(error)) => assessment_failure_status(error),
         Ok(HeldTreePolicyAssessmentOutcome::TreePolicyAssessed { tree, .. }) => {
             PreviewStagingStatus::TreePolicyAssessed {
                 regular_hard_links: tree.regular_hard_links,
@@ -334,7 +321,6 @@ fn assess_path(path: &Path) -> PreviewStagingStatus {
                     .to_owned(),
             }
         }
-        Err(error) => assessment_failure_status(error),
     }
 }
 

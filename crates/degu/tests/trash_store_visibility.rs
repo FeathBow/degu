@@ -44,12 +44,15 @@ fn warned(out: &std::process::Output) -> bool {
 #[test]
 fn a_listing_says_when_the_activated_store_is_not_the_one_it_walked() {
     let home = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
-    let elsewhere = tempfile::tempdir().unwrap();
     let Some(_backend) = common::require_sealed_fixture_backend(home.path()) else {
         return;
     };
 
+    // Both state directories live inside the fixture home, because a sealed store
+    // will not accept an ancestor that grants foreign rename authority and a
+    // top-level temporary directory has one.
+    let state = tempfile::tempdir_in(home.path()).unwrap();
+    let elsewhere = tempfile::tempdir_in(home.path()).unwrap();
     let cache = common::platform_cache_dir(home.path(), "pip");
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join("blob.bin"), vec![7u8; 64 * 1024]).unwrap();

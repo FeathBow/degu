@@ -92,7 +92,8 @@ pub(super) const RELOCATE_REPORT_KEYS: &[&str] = &["exports", "not_relocatable",
 pub(super) const RELOCATE_INIT_REPORT_KEYS: &[&str] =
     &["exports", "initialization", "not_relocatable", "target"];
 pub(super) const RELOCATE_INITIALIZATION_KEYS: &[&str] = &["already_initialized", "initialized"];
-pub(super) const TRASH_LIST_REPORT_KEYS: &[&str] = &["entries", "omitted"];
+pub(super) const TRASH_LIST_REPORT_KEYS: &[&str] =
+    &["activated_store_reachable", "entries", "omitted"];
 pub(super) const TRASH_LIST_ROW_KEYS: &[&str] = &[
     "age_days",
     "ambiguous",

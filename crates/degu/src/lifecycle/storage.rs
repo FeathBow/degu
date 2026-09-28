@@ -334,6 +334,76 @@ fn encode_trash_root(root: &Path) -> Result<String> {
     serde_json::to_string(encoded).map_err(Into::into)
 }
 
+/// Why a listing or purge plan may not account for everything this account staged.
+///
+/// `trash_roots` enumerates the current state directory and its registry, while an
+/// activated store is recorded against an anchor the account database names. Point
+/// the state directory elsewhere and the two part company: the listing is complete
+/// for what it enumerated and empty for what the account actually staged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreCoverage {
+    /// Either no store is activated, or the recorded one is this environment's.
+    Complete,
+    /// A store is activated somewhere this environment does not enumerate.
+    Elsewhere,
+    /// The selector could not answer. Not the same as complete, and not to be
+    /// reported as it.
+    Unknown,
+}
+
+impl StoreCoverage {
+    pub(crate) fn is_complete(self) -> bool {
+        self == Self::Complete
+    }
+}
+
+/// Asked of the anchor a mutation would open, which is the store staging reaches.
+///
+/// The comparison is against the locator the activation authenticated, not against
+/// a file's presence: a `store.activation` copied into another state directory
+/// would satisfy presence while naming a store that is not there.
+pub(crate) fn activated_store_coverage(ctx: &DetectCtx) -> StoreCoverage {
+    let readiness = match degu_core::activation::check_current_euid_mutation_readiness() {
+        Ok(readiness) => readiness,
+        // These two say no authority has been established, so there is no store
+        // this environment could be missing. Every other refusal leaves the
+        // question open, and an open question is not coverage.
+        Err(
+            degu_core::activation::StoreActivationError::NoAuthority { .. }
+            | degu_core::activation::StoreActivationError::SelfInitializationRequired,
+        ) => return StoreCoverage::Complete,
+        Err(_) => return StoreCoverage::Unknown,
+    };
+    let Some(recorded) = readiness.store() else {
+        return StoreCoverage::Complete;
+    };
+    if holds_the_recorded_store(recorded, ctx) {
+        StoreCoverage::Complete
+    } else {
+        StoreCoverage::Elsewhere
+    }
+}
+
+/// Whether this environment's state directory is the one the recorded store lives
+/// under.
+///
+/// The state directories are compared, not the store paths: a `sealed-staging`
+/// symlinked at the recorded store resolves to the same file while the trash this
+/// environment enumerates is still a different directory — and coverage is about
+/// the trash. A state directory that is itself a symlink to the recorded one does
+/// enumerate that trash, which is why the comparison resolves the directory and
+/// then rebuilds the store path lexically.
+fn holds_the_recorded_store(recorded: &Path, ctx: &DetectCtx) -> bool {
+    let Some(recorded_state) = recorded.parent().and_then(Path::parent) else {
+        return false;
+    };
+    resolved(recorded_state) == resolved(&ctx.xdg_state())
+}
+
+fn resolved(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 pub(crate) fn trash_roots(ctx: &DetectCtx) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
     let mut seen = HashSet::new();

@@ -8,9 +8,17 @@ use super::output;
 pub(super) fn run(json: bool, ui: crate::runtime::Ui) -> Result<()> {
     let ctx = DetectCtx::from_process()?;
     let rows = Lifecycle::new(&ctx).trash_entries()?;
+    let coverage = crate::lifecycle::activated_store_coverage(&ctx);
     if json {
-        output::print_json(&rows)
+        output::print_json(&rows, coverage.is_complete())
     } else {
+        if let Some(note) = output::coverage_note(coverage) {
+            crate::presentation::print_stderr_note(
+                crate::presentation::Severity::Warning,
+                note,
+                ui.colors,
+            );
+        }
         output::print_human(&rows, &ctx.home, ui)?;
         if should_print_outcomes(&rows, ui.stdout_is_terminal) {
             output::print_outcomes(&rows, ui)?;

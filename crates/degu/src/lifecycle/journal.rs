@@ -107,6 +107,25 @@ pub(super) fn purge_record(request: PurgeRecord<'_>) -> OpRecord {
     })
 }
 
+pub(super) struct VerifiedPurgeRecord<'a> {
+    pub(super) command: &'a str,
+    pub(super) entry: &'a Path,
+    pub(super) reclamation_id: &'a str,
+}
+
+/// Builds a reporting-only projection after the leased WAL has durably reached its
+/// purged state. Only the completed record is written: the pending record the legacy
+/// path writes first is that path's recovery authority, and a sealed purge draws its
+/// authority from the WAL, which would make a second claimant of it here.
+pub(super) fn verified_purge_record(request: VerifiedPurgeRecord<'_>) -> OpRecord {
+    purge_record(PurgeRecord {
+        command: request.command,
+        entry: request.entry,
+        reclamation_id: Some(request.reclamation_id),
+        outcome: OpOutcome::Ok,
+    })
+}
+
 pub(super) struct VerifiedRestoreRecord<'a> {
     pub(super) path: &'a Path,
     pub(super) trash_entry: &'a Path,

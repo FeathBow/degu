@@ -280,13 +280,19 @@ fn production_sealed_staging_cli_clean_undo_and_direct_purge() {
         "sealed direct purge did not append WAL evidence"
     );
     let purged_records = oplog_records(&state);
-    assert_eq!(purged_records.len(), 3);
+    assert_eq!(purged_records.len(), 4);
     assert_trash_projection(&purged_records, 2, &source_path);
     let second_reclamation = purged_records[2]["reclamation_id"].clone();
     assert_ne!(second_reclamation, first_reclamation);
-    // Direct sealed purge projects the completed trash association; its purge
-    // authority and terminal result remain in the durable seal WAL.
     assert_eq!(purged_records[2]["trash_entry"], first_trash);
+    // Direct sealed purge projects both halves of what it did, so the deletion is
+    // traceable through `degu ops`; the purge authority itself stays in the WAL.
+    let purge_record = &purged_records[3];
+    assert_eq!(purge_record["command"], "clean");
+    assert_eq!(purge_record["action"], "purge");
+    assert_eq!(purge_record["outcome"], "ok");
+    assert_eq!(purge_record["path"], first_trash);
+    assert_eq!(purge_record["reclamation_id"], second_reclamation);
 }
 
 fn count_directories(root: &Path) -> usize {

@@ -17,7 +17,9 @@ use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, Mode, OFlags};
 
 use super::super::identity;
-use super::super::journal::{OperationLog, TrashRecord, trash_record};
+use super::super::journal::{
+    OperationLog, TrashRecord, VerifiedPurgeRecord, trash_record, verified_purge_record,
+};
 use super::super::{mount, storage};
 use super::execution::CleanExecution;
 use super::feasibility::{OPEN_DIRECTORY, ProbeFailure};
@@ -628,10 +630,23 @@ fn execute_reserved(
     };
 
     if purged {
+        // The staging record alone would leave a deleted entry looking still
+        // staged: `degu ops` reads this log, not the WAL that holds the purge.
+        let purge_projection_failure = run
+            .log
+            .append(&verified_purge_record(VerifiedPurgeRecord {
+                command: "clean",
+                entry: &entry,
+                reclamation_id: &run.reclamation_id,
+            }))
+            .err()
+            .map(|error| error.to_string());
         let failures = [
             reservation_cleanup_failure.map(|error| format!("reservation cleanup failed: {error}")),
             jsonl_projection_failure
                 .map(|error| format!("operation-log projection failed: {error}")),
+            purge_projection_failure
+                .map(|error| format!("operation-log purge projection failed: {error}")),
         ]
         .into_iter()
         .flatten()

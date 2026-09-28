@@ -340,7 +340,7 @@ fn encode_trash_root(root: &Path) -> Result<String> {
 /// activated store is recorded against an anchor the account database names. Point
 /// the state directory elsewhere and the two part company: the listing is complete
 /// for what it enumerated and empty for what the account actually staged.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StoreCoverage {
     /// Either no store is activated, or the recorded one is this environment's.
     Complete,
@@ -354,6 +354,20 @@ pub(crate) enum StoreCoverage {
 impl StoreCoverage {
     pub(crate) fn is_complete(self) -> bool {
         self == Self::Complete
+    }
+
+    /// What an incomplete view has to say about itself. Kept beside the answer so
+    /// every surface that shows staged entries says the same thing about coverage.
+    pub(crate) fn note(self) -> Option<&'static str> {
+        match self {
+            Self::Complete => None,
+            Self::Elsewhere => Some(
+                "this account's activated sealed-staging store is not the one this state directory holds, so what follows covers only the trash this environment enumerates; run 'degu doctor' for the recorded authority, and use the state directory the store was activated against to reach its entries",
+            ),
+            Self::Unknown => Some(
+                "this account's authority could not be read, so whether what follows covers everything it staged is unknown rather than settled; run 'degu doctor' before treating an empty result as an empty account",
+            ),
+        }
     }
 }
 

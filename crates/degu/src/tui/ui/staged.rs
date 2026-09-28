@@ -93,11 +93,47 @@ fn plan_line(label: &str, plan: Plan) -> Line<'static> {
     ))
 }
 
+/// What the staged screen says about itself before any rows.
+///
+/// The coverage note comes first and appears whether or not there are rows: a view
+/// showing some entries implies it is showing all of them just as an empty one
+/// implies there are none. The empty text only stands in for rows.
+fn staged_prose(
+    coverage: crate::lifecycle::StoreCoverage,
+    empty: bool,
+) -> (Option<&'static str>, Option<&'static str>) {
+    let empty_text = empty.then_some(
+        "The staging trash is empty. A confirmed clean puts findings here, where degu undo can still reach them.",
+    );
+    (coverage.note(), empty_text)
+}
+
 fn listing(frame: &mut Frame, area: Rect, app: &App) {
     let staged = app.staged();
-    if staged.is_empty() {
+    let (note, empty_text) = staged_prose(staged.coverage(), staged.is_empty());
+    let area = match note {
+        None => area,
+        Some(note) => {
+            let lines = wrapped(note, usize::from(area.width.saturating_sub(2))).len();
+            let height = u16::try_from(lines).unwrap_or(u16::MAX).saturating_add(2);
+            let [top, rest] = Layout::vertical([
+                Constraint::Length(height.min(area.height)),
+                Constraint::Min(0),
+            ])
+            .areas(area);
+            frame.render_widget(
+                Paragraph::new(note)
+                    .style(Style::default().fg(CAUTION))
+                    .wrap(Wrap { trim: false })
+                    .block(panel("coverage")),
+                top,
+            );
+            rest
+        }
+    };
+    if let Some(empty_text) = empty_text {
         frame.render_widget(
-            Paragraph::new("The staging trash is empty. A confirmed clean puts findings here, where degu undo can still reach them.")
+            Paragraph::new(empty_text)
                 .wrap(Wrap { trim: false })
                 .block(panel("staged")),
             area,
@@ -195,5 +231,37 @@ fn days(age: u64) -> String {
         0 => "today".to_owned(),
         1 => "1 day".to_owned(),
         other => format!("{other} days"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::staged_prose;
+    use crate::lifecycle::StoreCoverage;
+
+    /// The screen has to say which of two different things an absence of rows
+    /// means, and a view that is not the whole account has to say so even when it
+    /// does have rows to show.
+    #[test]
+    fn the_staged_screen_separates_an_empty_account_from_an_incomplete_view() {
+        assert_eq!(staged_prose(StoreCoverage::Complete, false), (None, None));
+
+        let (note, empty) = staged_prose(StoreCoverage::Complete, true);
+        assert!(note.is_none());
+        assert!(
+            empty
+                .expect("empty text")
+                .contains("staging trash is empty")
+        );
+
+        for coverage in [StoreCoverage::Elsewhere, StoreCoverage::Unknown] {
+            let (note, empty) = staged_prose(coverage, true);
+            assert!(note.is_some(), "{coverage:?} empty screen said nothing");
+            assert!(empty.is_some());
+
+            let (note, empty) = staged_prose(coverage, false);
+            assert!(note.is_some(), "{coverage:?} populated screen said nothing");
+            assert!(empty.is_none());
+        }
     }
 }

@@ -25,8 +25,10 @@ impl Review {
         // a confirmed clean would expire it, so asking the expiry planner as
         // well would re-read the operation log and capture execution-grade
         // identities that this screen then discards.
-        let staged =
-            crate::tui::Staged::new(crate::lifecycle::Lifecycle::new(&ctx).trash_entries()?);
+        let staged = crate::tui::Staged::new(
+            crate::lifecycle::Lifecycle::new(&ctx).trash_entries()?,
+            crate::lifecycle::activated_store_coverage(&ctx),
+        );
         // Before the alternate screen, because this may run somebody's program:
         // its cost belongs to the scan the reader is already watching, not to a
         // review that has already drawn itself and then stops responding.

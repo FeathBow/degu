@@ -24,9 +24,7 @@ pub(super) fn run(args: TrashPurgeArgs, ui: Ui) -> Result<()> {
     }
     // Said before the plan, because a plan that reaches nothing reads like an
     // empty trash rather than a trash this environment cannot see.
-    if let Some(note) =
-        super::output::coverage_note(crate::lifecycle::activated_store_coverage(&ctx))
-    {
+    if let Some(note) = crate::lifecycle::activated_store_coverage(&ctx).note() {
         crate::presentation::print_stderr_note(
             crate::presentation::Severity::Warning,
             note,

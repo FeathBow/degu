@@ -73,10 +73,13 @@ pub struct Staged {
     entries: Vec<Entry>,
     chosen: BTreeSet<PathBuf>,
     cursor: usize,
+    /// Whether these rows are everything this account staged. An empty screen
+    /// reads as an empty account unless it says otherwise.
+    coverage: crate::lifecycle::StoreCoverage,
 }
 
 impl Staged {
-    pub fn new(rows: Vec<TrashEntry>) -> Self {
+    pub fn new(rows: Vec<TrashEntry>, coverage: crate::lifecycle::StoreCoverage) -> Self {
         let entries = rows
             .into_iter()
             .map(|row| Entry {
@@ -94,7 +97,18 @@ impl Staged {
             entries,
             chosen: BTreeSet::new(),
             cursor: 0,
+            coverage,
         }
+    }
+
+    /// A fixture constructor: coverage is not what those tests are about.
+    #[cfg(test)]
+    pub fn new_complete(rows: Vec<TrashEntry>) -> Self {
+        Self::new(rows, crate::lifecycle::StoreCoverage::Complete)
+    }
+
+    pub fn coverage(&self) -> crate::lifecycle::StoreCoverage {
+        self.coverage
     }
 
     pub fn entries(&self) -> &[Entry] {
@@ -201,7 +215,7 @@ mod tests {
     /// entry rather than its origin, and choosing again undoes it.
     #[test]
     fn choosing_names_the_exact_entry_and_is_reversible() {
-        let mut staged = Staged::new(vec![
+        let mut staged = Staged::new_complete(vec![
             row("/trash/0001", Some("/a"), 10),
             row("/trash/0002", Some("/b"), 20),
         ]);
@@ -232,7 +246,7 @@ mod tests {
     fn an_interrupted_claim_cannot_be_chosen() {
         let mut entry = row("/trash/.claims/1", None, 10);
         entry.interrupted_purge = true;
-        let mut staged = Staged::new(vec![entry]);
+        let mut staged = Staged::new_complete(vec![entry]);
         assert!(!staged.entries()[0].selectable());
         staged.toggle();
         assert!(staged.nothing_chosen());
@@ -244,7 +258,7 @@ mod tests {
     fn an_ambiguous_entry_stays_choosable_and_says_so() {
         let mut entry = row("/trash/0001", Some("/a"), 10);
         entry.ambiguous = true;
-        let mut staged = Staged::new(vec![entry]);
+        let mut staged = Staged::new_complete(vec![entry]);
         assert!(staged.entries()[0].selectable());
         staged.toggle();
         assert!(!staged.nothing_chosen());
@@ -264,7 +278,8 @@ mod tests {
         old.expiring = true;
         let mut older = row("/trash/0002", Some("/older"), 20);
         older.expiring = true;
-        let mut staged = Staged::new(vec![old, older, row("/trash/0003", Some("/new"), 40)]);
+        let mut staged =
+            Staged::new_complete(vec![old, older, row("/trash/0003", Some("/new"), 40)]);
 
         let summary = staged.summary(true);
         assert_eq!(summary.expiring.locations, 2);
@@ -284,7 +299,7 @@ mod tests {
     fn nothing_expires_when_no_clean_is_planned() {
         let mut old = row("/trash/0001", Some("/old"), 10);
         old.expiring = true;
-        let staged = Staged::new(vec![old]);
+        let staged = Staged::new_complete(vec![old]);
         let summary = staged.summary(false);
         assert_eq!(summary.expiring.locations, 0);
         assert_eq!(summary.remaining.bytes, 10);

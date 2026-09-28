@@ -12,7 +12,7 @@ pub(super) fn run(json: bool, ui: crate::runtime::Ui) -> Result<()> {
     if json {
         output::print_json(&rows, coverage.is_complete())
     } else {
-        if let Some(note) = output::coverage_note(coverage) {
+        if let Some(note) = coverage.note() {
             crate::presentation::print_stderr_note(
                 crate::presentation::Severity::Warning,
                 note,

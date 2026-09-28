@@ -44,6 +44,13 @@ pub(crate) fn undo_group(
         None => select_actionable_undo_group(&records),
     };
 
+    // Read before the engine is consumed: the reporting log is a projection, and a
+    // group the WAL can still restore may have no record in it at all.
+    let sealed_groups = engine
+        .as_deref()
+        .map(sealed_undoable_groups)
+        .unwrap_or_default();
+
     if let Some(engine) = engine
         && let Some(report) = undo_group_verified(ctx, &log, &records, engine, wanted)?
     {
@@ -52,7 +59,7 @@ pub(crate) fn undo_group(
 
     let Some(selection) = legacy_selection else {
         if let Some(id) = wanted {
-            return Err(no_such_undoable_group(&records, id));
+            return Err(no_such_undoable_group(&records, &sealed_groups, id));
         }
         return Ok(None);
     };
@@ -225,7 +232,24 @@ fn undo_group_verified(
 /// A named group that nothing can act on is worth spelling out. The reader chose
 /// an identifier, so answering "nothing to undo" would read as though that group
 /// had already been restored.
-fn no_such_undoable_group(records: &[degu_core::oplog::OpRecord], wanted: &str) -> anyhow::Error {
+/// The groups the WAL can still restore, which is authority rather than report.
+fn sealed_undoable_groups(engine: &ReadyStagingEngine) -> Vec<String> {
+    let mut groups = engine
+        .production_entries()
+        .iter()
+        .filter(|entry| sealed_undo_active(entry.state()))
+        .map(|entry| entry.reclamation_id().to_owned())
+        .collect::<Vec<_>>();
+    groups.sort_unstable();
+    groups.dedup();
+    groups
+}
+
+fn no_such_undoable_group(
+    records: &[degu_core::oplog::OpRecord],
+    sealed_groups: &[String],
+    wanted: &str,
+) -> anyhow::Error {
     let mut available = crate::lifecycle::reconcile::active_trash_state(records)
         .indices
         .into_iter()
@@ -239,16 +263,17 @@ fn no_such_undoable_group(records: &[degu_core::oplog::OpRecord], wanted: &str) 
         selection::select_actionable_undo_group_named(records, id)
             .is_some_and(|group| group.actionable)
     });
-    // Naming a group that cannot be undone is the mistake this message exists to
-    // correct, so offering one here would repeat it.
-
+    available.extend(sealed_groups.iter().cloned());
+    available.sort_unstable();
+    available.dedup();
+    // The claim stays on the identifier that was asked for. Saying nothing at all
+    // can be undone would be a claim about the WAL made from the reporting log,
+    // and a detached log leaves every staged group restorable.
     if available.is_empty() {
-        return anyhow::anyhow!(
-            "no staged clean can be undone, so reclamation {wanted} cannot be restored"
-        );
+        return anyhow::anyhow!("nothing that can be undone is recorded as reclamation {wanted}");
     }
     anyhow::anyhow!(
-        "no undoable clean is recorded as reclamation {wanted}; these can be undone: {}",
+        "nothing that can be undone is recorded as reclamation {wanted}; these can be undone: {}",
         available.join(", ")
     )
 }
@@ -341,6 +366,26 @@ fn trace_summary(report: &UndoReport, reclamation_label: &str) {
 mod tests {
     use super::*;
     use degu_core::oplog::{OpAction, OpRecord};
+
+    /// A detached reporting log leaves every staged group restorable from the WAL,
+    /// so the refusal may neither hide those groups nor deny that any exist.
+    #[test]
+    fn a_detached_log_does_not_deny_what_the_wal_still_holds() {
+        let staged = ["1790000000000-1".to_owned()];
+        let message = format!("{}", no_such_undoable_group(&[], &staged, "unknown"));
+        assert!(message.contains("unknown"), "{message}");
+        assert!(
+            message.contains("these can be undone: 1790000000000-1"),
+            "{message}"
+        );
+
+        let nothing = format!("{}", no_such_undoable_group(&[], &[], "unknown"));
+        assert!(nothing.contains("unknown"), "{nothing}");
+        assert!(
+            !nothing.contains("no staged clean can be undone"),
+            "the refusal may not answer for the WAL from the log: {nothing}"
+        );
+    }
 
     fn record(path: &str, trash: &str) -> OpRecord {
         OpRecord {

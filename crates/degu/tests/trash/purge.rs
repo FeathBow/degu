@@ -202,6 +202,53 @@ fn trash_purge_all_still_removes_ambiguous_entries() {
     assert!(!stderr.contains("ambiguous"), "stderr: {stderr}");
 }
 
+/// An origin selector names where data came from, so a mapping that cannot say
+/// where an entry came from must not satisfy it. The listing already marks such a
+/// mapping ambiguous; acting on it would let a stale mapping widen the requested
+/// scope onto a tree the selector never named.
+#[test]
+fn an_uncertain_origin_mapping_does_not_satisfy_a_purge_selector() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let (_, staged_entry, ambiguous_entry) = seed_pending_fixture(&home, &state);
+    let uncertain_origin = home.path().join(".cache/ambiguous");
+
+    let out = run(
+        &home,
+        &state,
+        &[
+            "trash",
+            "purge",
+            "--yes",
+            "--json",
+            "--path",
+            uncertain_origin.to_str().unwrap(),
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["purged"].as_array().unwrap().len(),
+        0,
+        "an uncertain mapping authorized a deletion: {report}"
+    );
+    assert!(
+        ambiguous_entry.exists(),
+        "the entry whose origin could not be confirmed was deleted"
+    );
+    assert!(staged_entry.exists(), "an unrelated entry was deleted");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("could not be confirmed"),
+        "the refusal did not say why nothing matched: {stderr}"
+    );
+}
+
 #[test]
 fn trash_purge_rejects_non_explicit_confirmation() {
     for input in ["y", "Purge", "PURGE"] {

@@ -16,6 +16,11 @@ use super::plan::{PlannedTrashEntry, PurgePlanBatch, TrashPurgePlan};
 pub(crate) struct SelectedTrashPlan {
     pub(crate) plan: TrashPurgePlan,
     pub(crate) unmatched: Vec<PathBuf>,
+    /// Entries a selector reached through a mapping that cannot say where they
+    /// came from. Left out of the plan, and named, because a selector that
+    /// silently matches nothing where the listing shows an entry reads as a
+    /// mistyped path.
+    pub(crate) uncertain: Vec<PathBuf>,
 }
 
 pub(crate) fn plan_selected_trash(
@@ -34,11 +39,20 @@ pub(crate) fn plan_selected_trash(
             .iter()
             .any(|chosen| chosen.selects(original, resolved.as_deref()))
     };
+    // An origin selector names where data came from, so a mapping that cannot say
+    // where an entry came from does not satisfy it. A stale reporting log can name
+    // one origin for an entry the current state holds from another, and acting on
+    // that would let the selector destroy a tree it never named.
     let plan = plan_matching_trash(ctx, |entry| {
         recorded
             .get(entry)
-            .is_some_and(|info| selects(&info.original))
+            .is_some_and(|info| !info.ambiguous && selects(&info.original))
     })?;
+    let uncertain = recorded
+        .iter()
+        .filter(|(_, info)| info.ambiguous && selects(&info.original))
+        .map(|(entry, _)| entry.clone())
+        .collect::<Vec<_>>();
     let planned = plan
         .entries()
         .filter_map(|entry| recorded.get(entry))
@@ -53,7 +67,11 @@ pub(crate) fn plan_selected_trash(
         })
         .map(|chosen| chosen.absolute)
         .collect();
-    Ok(SelectedTrashPlan { plan, unmatched })
+    Ok(SelectedTrashPlan {
+        plan,
+        unmatched,
+        uncertain,
+    })
 }
 
 /// Resolve as much of a path as still exists, leaving the rest lexical.

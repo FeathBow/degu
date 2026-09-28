@@ -41,6 +41,7 @@ pub(super) fn run(args: TrashPurgeArgs, ui: Ui) -> Result<()> {
         // Nothing staged from a named origin is a legitimate outcome, but it
         // reads exactly like a mistyped path unless the selector is named.
         report_unmatched(&selected.unmatched, ui);
+        report_uncertain(&selected.uncertain, ui);
         selected.plan
     } else {
         session.plan_purge_all()?
@@ -109,6 +110,21 @@ fn report_unmatched(unmatched: &[std::path::PathBuf], ui: Ui) {
             &ui.prose(&format!(
                 "no staged entry came from {}; this selector removed nothing.",
                 escape_terminal_text(&path.display().to_string())
+            )),
+            ui.colors,
+        );
+    }
+}
+
+/// Named rather than left out silently: the listing shows this entry, so a selector
+/// that reached it and removed nothing otherwise reads as a mistyped path.
+fn report_uncertain(uncertain: &[std::path::PathBuf], ui: Ui) {
+    for entry in uncertain {
+        crate::presentation::print_stderr_note(
+            crate::presentation::Severity::Warning,
+            &ui.prose(&format!(
+                "the origin of {} could not be confirmed, so an origin selector does not reach it; purge it by entry, or resolve the ambiguity 'degu trash list' reports.",
+                escape_terminal_text(&entry.display().to_string())
             )),
             ui.colors,
         );

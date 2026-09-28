@@ -8,14 +8,14 @@ use super::output;
 pub(super) fn run(json: bool, ui: crate::runtime::Ui) -> Result<()> {
     let ctx = DetectCtx::from_process()?;
     let rows = Lifecycle::new(&ctx).trash_entries()?;
-    let reachable = crate::lifecycle::activated_store_reachable(&ctx);
+    let coverage = crate::lifecycle::activated_store_coverage(&ctx);
     if json {
-        output::print_json(&rows, reachable)
+        output::print_json(&rows, coverage.is_complete())
     } else {
-        if !reachable {
+        if let Some(note) = output::coverage_note(coverage) {
             crate::presentation::print_stderr_note(
                 crate::presentation::Severity::Warning,
-                output::UNREACHABLE_ACTIVATED_STORE,
+                note,
                 ui.colors,
             );
         }

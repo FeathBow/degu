@@ -334,28 +334,64 @@ fn encode_trash_root(root: &Path) -> Result<String> {
     serde_json::to_string(encoded).map_err(Into::into)
 }
 
-/// Whether every staged entry this account has is reachable from this environment.
+/// Why a listing or purge plan may not account for everything this account staged.
 ///
 /// `trash_roots` enumerates the current state directory and its registry, while an
 /// activated store is recorded against an anchor the account database names. Point
 /// the state directory elsewhere and the two part company: the listing is complete
 /// for what it enumerated and empty for what the account actually staged.
-///
-/// Asked of the anchor a mutation would open, which is the store staging reaches,
-/// and answered best-effort: listing needs no authority, so a selector that cannot
-/// answer leaves the listing exactly as it was.
-pub(crate) fn activated_store_reachable(ctx: &DetectCtx) -> bool {
-    let Ok(readiness) = degu_core::activation::check_current_euid_mutation_readiness() else {
-        return true;
-    };
-    if !matches!(
-        readiness.activation(),
-        degu_core::activation::StoreActivationKind::Activated
-    ) {
-        return true;
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreCoverage {
+    /// Either no store is activated, or the recorded one is this environment's.
+    Complete,
+    /// A store is activated somewhere this environment does not enumerate.
+    Elsewhere,
+    /// The selector could not answer. Not the same as complete, and not to be
+    /// reported as it.
+    Unknown,
+}
+
+impl StoreCoverage {
+    pub(crate) fn is_complete(self) -> bool {
+        self == Self::Complete
     }
-    let binding = sealed_staging_store_path(ctx).join(degu_core::activation::STORE_BINDING_NAME);
-    std::fs::symlink_metadata(binding).is_ok()
+}
+
+/// Asked of the anchor a mutation would open, which is the store staging reaches.
+///
+/// The comparison is against the locator the activation authenticated, not against
+/// a file's presence: a `store.activation` copied into another state directory
+/// would satisfy presence while naming a store that is not there.
+pub(crate) fn activated_store_coverage(ctx: &DetectCtx) -> StoreCoverage {
+    let readiness = match degu_core::activation::check_current_euid_mutation_readiness() {
+        Ok(readiness) => readiness,
+        // These two say no authority has been established, so there is no store
+        // this environment could be missing. Every other refusal leaves the
+        // question open, and an open question is not coverage.
+        Err(
+            degu_core::activation::StoreActivationError::NoAuthority { .. }
+            | degu_core::activation::StoreActivationError::SelfInitializationRequired,
+        ) => return StoreCoverage::Complete,
+        Err(_) => return StoreCoverage::Unknown,
+    };
+    let Some(recorded) = readiness.store() else {
+        return StoreCoverage::Complete;
+    };
+    if same_store(recorded, &sealed_staging_store_path(ctx)) {
+        StoreCoverage::Complete
+    } else {
+        StoreCoverage::Elsewhere
+    }
+}
+
+/// Two locators name one store. Compared canonically where both resolve, because a
+/// state directory reached through a symlink is the same store; lexically otherwise,
+/// since a path that does not resolve cannot be the live one.
+fn same_store(recorded: &Path, here: &Path) -> bool {
+    match (std::fs::canonicalize(recorded), std::fs::canonicalize(here)) {
+        (Ok(recorded), Ok(here)) => recorded == here,
+        _ => recorded == here,
+    }
 }
 
 pub(crate) fn trash_roots(ctx: &DetectCtx) -> Result<Vec<PathBuf>> {

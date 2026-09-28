@@ -38,7 +38,7 @@ struct TrashJsonRow<'a> {
     lower_bound: bool,
 }
 
-pub(super) fn print_json(rows: &[TrashEntry], activated_store_reachable: bool) -> Result<()> {
+pub(super) fn print_json(rows: &[TrashEntry], covers_the_account: bool) -> Result<()> {
     let (entries, omitted) = representable_rows(rows);
     if omitted > 0 {
         tracing::warn!(
@@ -49,14 +49,24 @@ pub(super) fn print_json(rows: &[TrashEntry], activated_store_reachable: bool) -
     let document = serde_json::json!({
         "entries": entries,
         "omitted": omitted,
-        "activated_store_reachable": activated_store_reachable,
+        "activated_store_reachable": covers_the_account,
     });
     stdoutln!("{}", serde_json::to_string_pretty(&document)?)
 }
 
-/// What this listing or purge plan cannot answer for, said where the empty result
+/// What this listing or purge plan cannot answer for, said where an empty result
 /// would otherwise read as the whole account.
-pub(super) const UNREACHABLE_ACTIVATED_STORE: &str = "this account has an activated sealed-staging store that this state directory is not the one for, so what follows covers only the trash this environment enumerates; run 'degu doctor' for the recorded authority, and use the state directory the store was activated against to reach its entries";
+pub(super) fn coverage_note(coverage: crate::lifecycle::StoreCoverage) -> Option<&'static str> {
+    match coverage {
+        crate::lifecycle::StoreCoverage::Complete => None,
+        crate::lifecycle::StoreCoverage::Elsewhere => Some(
+            "this account's activated sealed-staging store is not the one this state directory holds, so what follows covers only the trash this environment enumerates; run 'degu doctor' for the recorded authority, and use the state directory the store was activated against to reach its entries",
+        ),
+        crate::lifecycle::StoreCoverage::Unknown => Some(
+            "this account's authority could not be read, so whether what follows covers everything it staged is unknown rather than settled; run 'degu doctor' before treating an empty result as an empty account",
+        ),
+    }
+}
 
 /// A non-UTF-8 entry (or original) path would fail the whole array's
 /// serialization, losing every entry. Such rows are omitted and counted so the

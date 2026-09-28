@@ -86,6 +86,7 @@ pub struct CurrentEuidAuthorityReadiness {
     path: PathBuf,
     backend: ActivationAnchorBackend,
     activation: StoreActivationKind,
+    store: Option<PathBuf>,
 }
 
 impl CurrentEuidAuthorityReadiness {
@@ -99,6 +100,13 @@ impl CurrentEuidAuthorityReadiness {
 
     pub fn backend(&self) -> CertifiedLocalBackend {
         self.backend.local_backend()
+    }
+
+    /// The store this account's authority records, once activation authenticated
+    /// it. `None` until then, so a caller cannot mistake an unauthenticated path
+    /// for the recorded one.
+    pub fn store(&self) -> Option<&Path> {
+        self.store.as_deref()
     }
 
     pub fn activation(&self) -> StoreActivationKind {
@@ -553,11 +561,16 @@ fn readiness_from(
     {
         return Err(StoreActivationError::SelfInitializationRequired);
     }
+    let store = match &selection.selected.state {
+        StoreActivationState::Activated(store) => Some(store.locator().to_path_buf()),
+        _ => None,
+    };
     Ok(CurrentEuidAuthorityReadiness {
         mode: selection.mode,
         path: selection.selected.authority.path.clone(),
         backend: selection.selected.authority.backend,
         activation: selection.selected.state.kind(),
+        store,
     })
 }
 

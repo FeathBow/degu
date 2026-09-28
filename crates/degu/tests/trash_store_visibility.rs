@@ -9,110 +9,158 @@
 mod common;
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-fn run(home: &Path, state: &Path, anchor: &Path, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(assert_cmd::cargo::cargo_bin("degu"))
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", home)
-        .env("XDG_STATE_HOME", state)
-        .env("XDG_CONFIG_HOME", common::isolated_config_home())
-        .env("LOGNAME", common::isolated_config_home())
-        .env("DEGU_INTEGRATION_TEST_ANCHOR", anchor)
-        // Intentionally omit DEGU_INTEGRATION_TEST_LEGACY_CLEAN: only a sealed
-        // clean activates the store this test is about.
-        .args(args)
-        .output()
-        .unwrap()
+/// One account with two state directories: the one its store was activated
+/// against, and another this environment could be pointed at instead.
+struct Sealed {
+    home: tempfile::TempDir,
+    state: tempfile::TempDir,
+    elsewhere: tempfile::TempDir,
+    cache: PathBuf,
+    anchor: PathBuf,
 }
 
-fn listing(home: &Path, state: &Path, anchor: &Path) -> serde_json::Value {
-    let out = run(home, state, anchor, &["trash", "list", "--json"]);
-    assert!(
-        out.status.success(),
-        "listing needs no authority: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    serde_json::from_slice(&out.stdout).expect("a trash listing is JSON")
-}
+impl Sealed {
+    /// `None` when the fixture filesystem is not a certified backend, which is the
+    /// same skip the other sealed fixtures take.
+    fn new() -> Option<Self> {
+        let home = tempfile::tempdir().unwrap();
+        common::require_sealed_fixture_backend(home.path())?;
+        // Both state directories live inside the fixture home: a sealed store
+        // refuses an ancestor that grants foreign rename authority, and a
+        // top-level temporary directory has one.
+        let state = tempfile::tempdir_in(home.path()).unwrap();
+        let elsewhere = tempfile::tempdir_in(home.path()).unwrap();
+        let cache = common::platform_cache_dir(home.path(), "pip");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("blob.bin"), vec![7u8; 64 * 1024]).unwrap();
+        common::make_tree_non_shared_writable(home.path()).unwrap();
+        let anchor = state.path().join("degu-integration-activation-anchor");
+        std::fs::create_dir_all(&anchor).unwrap();
+        std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let anchor = std::fs::canonicalize(&anchor).unwrap();
+        Some(Self {
+            home,
+            state,
+            elsewhere,
+            cache,
+            anchor,
+        })
+    }
 
-fn warned(out: &std::process::Output) -> bool {
-    String::from_utf8_lossy(&out.stderr).contains("activated sealed-staging store")
+    fn run(&self, state: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("degu"))
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", self.home.path())
+            .env("XDG_STATE_HOME", state)
+            .env("XDG_CONFIG_HOME", common::isolated_config_home())
+            .env("LOGNAME", common::isolated_config_home())
+            .env("DEGU_INTEGRATION_TEST_ANCHOR", &self.anchor)
+            // Intentionally omit DEGU_INTEGRATION_TEST_LEGACY_CLEAN: only a sealed
+            // clean activates the store this file is about.
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    /// Stage the cache and confirm the store really was activated, so a later
+    /// assertion about coverage is about coverage.
+    fn stage(&self) {
+        let out = self.run(self.state.path(), &["clean", "--yes"]);
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!self.cache.exists(), "the clean should have staged it away");
+        assert!(
+            self.binding(self.state.path()).exists(),
+            "the clean should have activated a store"
+        );
+    }
+
+    fn binding(&self, state: &Path) -> PathBuf {
+        state
+            .join("degu/sealed-staging")
+            .join(degu_core::activation::STORE_BINDING_NAME)
+    }
+
+    /// The listing's own account of itself: how many entries, and whether it claims
+    /// to cover everything this account staged.
+    fn listing(&self, state: &Path) -> (usize, bool) {
+        let out = self.run(state, &["trash", "list", "--json"]);
+        assert!(
+            out.status.success(),
+            "listing needs no authority: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("a trash listing is JSON");
+        (
+            json["entries"].as_array().expect("entries").len(),
+            json["activated_store_reachable"]
+                .as_bool()
+                .expect("a coverage answer"),
+        )
+    }
+
+    fn warns(&self, state: &Path, args: &[&str]) -> bool {
+        let out = self.run(state, args);
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stderr).contains("sealed-staging store")
+    }
+
+    fn staged_entries(&self) -> usize {
+        std::fs::read_dir(self.state.path().join("degu/trash"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name() != ".claims")
+            .count()
+    }
 }
 
 #[test]
-fn a_listing_says_when_the_activated_store_is_not_the_one_it_walked() {
-    let home = tempfile::tempdir().unwrap();
-    let Some(_backend) = common::require_sealed_fixture_backend(home.path()) else {
-        return;
-    };
+fn a_listing_says_when_the_activated_store_is_elsewhere() {
+    let Some(fixture) = Sealed::new() else { return };
+    fixture.stage();
 
-    // Both state directories live inside the fixture home, because a sealed store
-    // will not accept an ancestor that grants foreign rename authority and a
-    // top-level temporary directory has one.
-    let state = tempfile::tempdir_in(home.path()).unwrap();
-    let elsewhere = tempfile::tempdir_in(home.path()).unwrap();
-    let cache = common::platform_cache_dir(home.path(), "pip");
-    std::fs::create_dir_all(&cache).unwrap();
-    std::fs::write(cache.join("blob.bin"), vec![7u8; 64 * 1024]).unwrap();
-    common::make_tree_non_shared_writable(home.path()).unwrap();
-    let anchor = state.path().join("degu-integration-activation-anchor");
-    std::fs::create_dir_all(&anchor).unwrap();
-    std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let anchor = std::fs::canonicalize(&anchor).unwrap();
-
-    let cleaned = run(home.path(), state.path(), &anchor, &["clean", "--yes"]);
-    assert!(
-        cleaned.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&cleaned.stderr)
-    );
-    assert!(
-        !cache.exists(),
-        "the clean should have staged the cache away"
-    );
-    let binding = state.path().join("degu/sealed-staging/store.activation");
-    assert!(binding.exists(), "the clean should have activated a store");
-
-    let here = listing(home.path(), state.path(), &anchor);
-    assert_eq!(here["entries"].as_array().unwrap().len(), 1);
-    assert_eq!(here["activated_store_reachable"], serde_json::json!(true));
-
+    assert_eq!(fixture.listing(fixture.state.path()), (1, true));
     // The only change is where the state directory points.
-    let away = listing(home.path(), elsewhere.path(), &anchor);
+    assert_eq!(
+        fixture.listing(fixture.elsewhere.path()),
+        (0, false),
+        "an empty listing may not claim to answer for the account"
+    );
+    assert!(fixture.warns(fixture.elsewhere.path(), &["trash", "list"]));
     assert!(
-        away["entries"].as_array().unwrap().is_empty(),
-        "the other state directory enumerates no trash: {away}"
+        fixture.warns(fixture.elsewhere.path(), &["trash", "purge", "--yes"]),
+        "a purge plan that reaches nothing may not read as an empty trash"
     );
     assert_eq!(
-        away["activated_store_reachable"],
-        serde_json::json!(false),
-        "an empty listing may not claim to answer for the account: {away}"
+        fixture.staged_entries(),
+        1,
+        "the staged entry must survive that purge"
     );
-    assert!(warned(&run(
-        home.path(),
-        elsewhere.path(),
-        &anchor,
-        &["trash", "list"]
-    )));
+}
 
-    let purged = run(
-        home.path(),
-        elsewhere.path(),
-        &anchor,
-        &["trash", "purge", "--yes"],
+#[test]
+fn a_copied_store_binding_does_not_make_a_listing_complete() {
+    let Some(fixture) = Sealed::new() else { return };
+    fixture.stage();
+
+    // Presence of a binding file is not evidence that this environment holds the
+    // store the authority records: the copy names a store that is not here.
+    let forged = fixture.binding(fixture.elsewhere.path());
+    std::fs::create_dir_all(forged.parent().unwrap()).unwrap();
+    std::fs::copy(fixture.binding(fixture.state.path()), &forged).unwrap();
+
+    assert_eq!(
+        fixture.listing(fixture.elsewhere.path()),
+        (0, false),
+        "a copied binding may not buy coverage"
     );
-    assert!(purged.status.success());
-    assert!(
-        warned(&purged),
-        "a purge plan that reaches nothing may not read as an empty trash: {}",
-        String::from_utf8_lossy(&purged.stderr)
-    );
-    let staged = std::fs::read_dir(state.path().join("degu/trash"))
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_name() != ".claims")
-        .count();
-    assert_eq!(staged, 1, "the staged entry must survive that purge");
+    assert!(fixture.warns(fixture.elsewhere.path(), &["trash", "purge", "--yes"]));
+    assert_eq!(fixture.staged_entries(), 1);
 }

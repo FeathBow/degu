@@ -101,6 +101,8 @@ degu undo
 
 One clean is one reclamation group, and `degu undo` on its own takes the newest group that can still be restored. To reach an earlier one, name it. The identifier is on every staged entry in `degu trash list --json`, in `degu ops --json`, and in what an earlier undo reported; naming a group that cannot be restored fails and lists the groups that can.
 
+Which record authorizes that restore depends on the lifecycle that staged the entry, and the two do not share one: the operation log answers for a legacy-cleaned entry and the seal WAL for a sealed one. Each execution row of `clean --json` names its own in `restore_authority` — `operation_log`, `seal_wal`, or `none` for a row that moved nothing, whose object is already deleted, or that only manual recovery can reach. A consumer must treat an unknown spelling as `none`.
+
 ```sh
 degu undo --reclamation-id ID
 ```

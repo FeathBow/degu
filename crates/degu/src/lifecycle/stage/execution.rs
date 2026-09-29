@@ -63,6 +63,9 @@ enum CleanState {
     PurgeFailed {
         entry: PathBuf,
         reason: String,
+        /// A failed purge leaves the entry staged under either lifecycle, and the
+        /// state's name does not say which one staged it. Every other state's does.
+        restore_authority: RestoreAuthority,
     },
     PurgeUnsupported {
         entry: PathBuf,
@@ -77,6 +80,29 @@ enum CleanState {
 struct StagedFailure {
     reason: String,
     final_log_append_failed: bool,
+}
+
+/// Which record would authenticate `degu undo` restoring what a clean left behind.
+///
+/// Legacy Clean and Sealed Staging do not share one: ADR-0003 gives the operation
+/// log authority over legacy entries and the seal WAL authority over sealed ones. A
+/// row that moved nothing, whose object is already deleted, or that only a human can
+/// put back, has no such record, which is a different answer from either of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestoreAuthority {
+    OperationLog,
+    SealWal,
+    None,
+}
+
+impl RestoreAuthority {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::OperationLog => "operation_log",
+            Self::SealWal => "seal_wal",
+            Self::None => "none",
+        }
+    }
 }
 
 impl CleanExecution {
@@ -127,7 +153,14 @@ impl CleanExecution {
         entry: PathBuf,
         reason: String,
     ) -> Self {
-        Self::with_state(finding, CleanState::PurgeFailed { entry, reason })
+        Self::with_state(
+            finding,
+            CleanState::PurgeFailed {
+                entry,
+                reason,
+                restore_authority: RestoreAuthority::SealWal,
+            },
+        )
     }
 
     pub(super) fn production_purge_unsupported(
@@ -346,7 +379,12 @@ impl CleanExecution {
         }
     }
 
-    pub(crate) fn sealed_staging_has_recovery_authority(&self) -> bool {
+    /// Whether this row left an entry the seal WAL governs, which is what decides
+    /// the staged note: such an entry outlives legacy path-based cleanup and a later
+    /// sealed clean may expire it. It is not the same question as which record would
+    /// restore the entry -- an entry only a human can put back is still WAL-governed
+    /// -- so `restore_authority` answers that one separately.
+    pub(crate) fn staged_under_seal_authority(&self) -> bool {
         matches!(
             self.state,
             CleanState::ProductionStaged { .. }
@@ -355,6 +393,31 @@ impl CleanExecution {
                 | CleanState::Quarantined { .. }
                 | CleanState::RecoveryBlocked { .. }
         )
+    }
+
+    pub(crate) fn restore_authority(&self) -> RestoreAuthority {
+        match &self.state {
+            // Nothing was moved, so there is nothing to authorize.
+            CleanState::NotAttempted { .. } | CleanState::StageFailed { .. } => {
+                RestoreAuthority::None
+            }
+            // Something may have moved, but no record authorizes putting it back:
+            // these are the states `requires_manual_recovery` reports.
+            CleanState::Quarantined { .. }
+            | CleanState::RecoveryBlocked { .. }
+            | CleanState::UnverifiedDestination { .. } => RestoreAuthority::None,
+            CleanState::Staged { .. } | CleanState::StagedWithFailure { .. } => {
+                RestoreAuthority::OperationLog
+            }
+            CleanState::ProductionStaged { .. }
+            | CleanState::ProductionCommittedWithFailure { .. }
+            | CleanState::PurgeUnsupported { .. } => RestoreAuthority::SealWal,
+            CleanState::PurgeFailed {
+                restore_authority, ..
+            } => *restore_authority,
+            // The object is gone; a restore has nothing to reach.
+            CleanState::Purged { .. } => RestoreAuthority::None,
+        }
     }
 
     pub(crate) fn requires_manual_recovery(&self) -> bool {
@@ -378,7 +441,11 @@ impl CleanExecution {
         let (subject, _) = staged.into_parts();
         Self {
             subject,
-            state: CleanState::PurgeFailed { entry, reason },
+            state: CleanState::PurgeFailed {
+                entry,
+                reason,
+                restore_authority: RestoreAuthority::OperationLog,
+            },
         }
     }
 

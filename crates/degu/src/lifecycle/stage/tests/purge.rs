@@ -110,6 +110,12 @@ fn identity_capture_failure_retains_the_staged_entry() {
     assert_eq!(item.state_label(), "purge_failed");
     assert_eq!(item.trash_entry(), Some(entry.as_path()));
     assert!(!item.reported_as_cleaned(true));
+    // The same state the sealed path produces, and the entry it left staged is
+    // restorable against the other record.
+    assert_eq!(
+        item.restore_authority(),
+        crate::lifecycle::stage::execution::RestoreAuthority::OperationLog
+    );
     assert!(moved.exists());
 }
 

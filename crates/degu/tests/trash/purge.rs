@@ -61,6 +61,83 @@ fn xdg_state_parent_alias_does_not_block_trash_purge() {
     );
 }
 
+/// The same state directory under another spelling is the same state directory.
+/// Staging records where an entry went; a later run reaching that directory through
+/// a symlink still has to recognize its own records, or the entry loses the origin
+/// and the group it was staged with and no origin selector can reach it.
+#[test]
+fn a_symlinked_state_directory_keeps_the_origins_it_recorded() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = crate::common::platform_cache_dir(home.path(), "pip");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("wheel.whl"), b"cache").unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+    crate::common::make_tree_non_shared_writable(state.path()).unwrap();
+    let staged = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args(["clean", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        staged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&staged.stderr)
+    );
+
+    // The only change is how this run spells the same directory.
+    let alias = home.path().join("state-alias");
+    std::os::unix::fs::symlink(state.path(), &alias).unwrap();
+
+    let listed = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", &alias)
+        .args(["trash", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let row = &json["entries"][0];
+    assert!(
+        row["original"].is_string(),
+        "the alias lost the recorded origin: {json}"
+    );
+    assert!(
+        row["reclamation_id"].is_string(),
+        "the alias lost the recorded group: {json}"
+    );
+
+    let purged = degu()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", &alias)
+        .args([
+            "trash",
+            "purge",
+            "--yes",
+            "--json",
+            "--path",
+            row["original"].as_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        purged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&purged.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&purged.stdout).unwrap();
+    assert_eq!(
+        report["purged"].as_array().unwrap().len(),
+        1,
+        "the origin selector reached nothing through the alias: {report}"
+    );
+}
+
 #[test]
 fn trash_json_empty_entries_still_runs_observed_claim_housekeeping() {
     let home = tempfile::tempdir().unwrap();

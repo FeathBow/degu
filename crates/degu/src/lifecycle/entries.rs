@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -36,7 +35,7 @@ pub(crate) struct TrashEntry {
 struct EntryInspection<'a> {
     entry: PathBuf,
     info: Option<&'a TrashOplogInfo>,
-    recorded: &'a HashMap<PathBuf, TrashOplogInfo>,
+    recorded: &'a super::reconcile::RecordedTrash,
     now: jiff::Timestamp,
     interrupted_purge: bool,
 }
@@ -61,7 +60,7 @@ pub(crate) fn trash_entries(ctx: &DetectCtx) -> Result<Vec<TrashEntry>> {
 
 fn root_entries(
     root: &Path,
-    recorded: &HashMap<PathBuf, TrashOplogInfo>,
+    recorded: &super::reconcile::RecordedTrash,
     now: jiff::Timestamp,
 ) -> Result<Vec<TrashEntry>> {
     let trash = Trash::new(root.to_path_buf());
@@ -166,7 +165,7 @@ mod tests {
         aged_dir(&claims, "purge-interrupted");
         let staged = aged_dir(root.path(), "0001-cache");
 
-        let recorded = HashMap::new();
+        let recorded = super::super::reconcile::RecordedTrash::from_recorded([]);
         let now = jiff::Timestamp::now() + std::time::Duration::from_secs(EIGHT_DAYS);
         let rows = root_entries(root.path(), &recorded, now).unwrap();
 

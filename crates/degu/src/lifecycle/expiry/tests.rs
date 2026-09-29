@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::{TrashEntryExpiry, trash_entry_expiry};
@@ -16,7 +15,7 @@ fn oplog_info_for_test(staged_at: Option<&str>, original: &str, ambiguous: bool)
 #[test]
 fn trash_entry_expiry_routes_by_reconciled_record_state() {
     let ts = "2000-01-01T00:00:00Z";
-    let recorded = HashMap::from([
+    let recorded = super::super::reconcile::RecordedTrash::from_recorded([
         (
             PathBuf::from("/trash/staged"),
             oplog_info_for_test(Some(ts), "/original", false),

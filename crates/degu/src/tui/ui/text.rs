@@ -29,6 +29,29 @@ pub(super) fn elide(value: &str, budget: usize) -> String {
     format!("…{}", kept.into_iter().collect::<String>())
 }
 
+/// Keeps the beginning rather than the end, which is what an identifier needs:
+/// `elide` keeps the end, which is what a path needs.
+pub(super) fn clip(value: &str, budget: usize) -> String {
+    if columns(value) <= budget {
+        return value.to_owned();
+    }
+    if budget <= 1 {
+        return "…".repeat(budget);
+    }
+    let mut kept = String::new();
+    let mut used = 1; // the ellipsis itself
+    for character in value.chars() {
+        let width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + width > budget {
+            break;
+        }
+        used += width;
+        kept.push(character);
+    }
+    kept.push('…');
+    kept
+}
+
 pub(super) fn pad(value: &str, budget: usize) -> String {
     let mut out = elide(value, budget);
     for _ in columns(&out)..budget {

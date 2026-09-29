@@ -35,15 +35,20 @@ impl Entry {
         }
     }
 
-    pub fn label(&self, home: &Path) -> String {
-        let path = self.original.as_deref().unwrap_or(&self.entry);
-        let origin = crate::presentation::display_path(path, home);
-        let id = self
-            .entry
+    /// What tells two staged copies of one origin apart. Shown in a column of its
+    /// own, because eliding a row has to give up the redundant part of the origin
+    /// rather than the only part that is not redundant.
+    pub fn identifier(&self) -> String {
+        self.entry
             .file_name()
             .unwrap_or(self.entry.as_os_str())
-            .to_string_lossy();
-        let mut label = format!("{id} · {origin}");
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    pub fn origin(&self, home: &Path) -> String {
+        let path = self.original.as_deref().unwrap_or(&self.entry);
+        let mut label = crate::presentation::display_path(path, home);
         if self.original.is_none() {
             label.push_str(" (no recorded origin)");
         }
@@ -264,7 +269,7 @@ mod tests {
         assert!(!staged.nothing_chosen());
         assert!(
             staged.entries()[0]
-                .label(Path::new("/home/me"))
+                .origin(Path::new("/home/me"))
                 .contains("ambiguous")
         );
     }

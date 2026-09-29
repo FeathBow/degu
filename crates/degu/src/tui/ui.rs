@@ -52,7 +52,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             staged::draw(frame, rows[1], app);
         }
         View::Details => app.document().draw(frame, rows[1], true),
-        View::Help => help::draw(frame, rows[1]),
+        View::Help => {
+            let (page_size, last_offset) = help::scroll_extent(rows[1]);
+            app.resize_help(page_size, last_offset);
+            help::draw(frame, rows[1], app.help_offset());
+        }
     }
     help::footer(frame, rows[2], app);
 }

@@ -211,9 +211,12 @@ impl SealedAccount {
         // A sealed store refuses an ancestor that grants foreign rename
         // authority, which a top-level temporary directory has.
         let state = tempfile::tempdir_in(home.path()).unwrap();
+        // Directories only. A regular file carrying an extended attribute the
+        // held-tree policy does not certify is refused, and some filesystems attach
+        // one to every file a process writes -- which would stop these tests at the
+        // clean or the purge admission, before the branch either one is about.
         let cache = common::platform_cache_dir(home.path(), "pip");
-        std::fs::create_dir_all(&cache).unwrap();
-        std::fs::write(cache.join("blob.bin"), vec![3u8; 64 * 1024]).unwrap();
+        std::fs::create_dir_all(cache.join("child")).unwrap();
         common::make_tree_non_shared_writable(home.path()).unwrap();
         let anchor = state.path().join("degu-integration-activation-anchor");
         std::fs::create_dir_all(&anchor).unwrap();

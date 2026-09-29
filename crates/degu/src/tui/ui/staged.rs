@@ -5,12 +5,17 @@ use crate::presentation::escape_terminal_text;
 use crate::tui::decision::Plan;
 use crate::tui::staged::Entry;
 
-use super::text::{elide, wrapped};
+use super::text::{clip, columns, elide, wrapped};
 use super::theme::{CAUTION, EDGE, ROSE, SECONDARY, panel};
 use super::{App, format, window_start};
 
-/// One space between each pair of the five columns.
-const COLUMN_GAPS: usize = 4;
+/// One space between each pair of the six columns.
+const COLUMN_GAPS: usize = 5;
+/// Enough of an identifier to read its ordinal, and enough of an origin to read the
+/// leaf it came from. Below either, the row is too narrow to say anything useful and
+/// the remaining width is simply split.
+const ENTRY_MIN_WIDTH: usize = 6;
+const PATH_MIN_WIDTH: usize = 12;
 const TABLE_CHROME: usize = 3;
 const CURSOR_WIDTH: usize = 1;
 const MARK_WIDTH: usize = 1;
@@ -142,17 +147,21 @@ fn listing(frame: &mut Frame, area: Rect, app: &App) {
     }
     let inner = panel("").inner(area);
     let page_size = usize::from(area.height).saturating_sub(TABLE_CHROME);
-    let path_width = usize::from(inner.width)
-        .saturating_sub(CURSOR_WIDTH + MARK_WIDTH + AGE_WIDTH + SIZE_WIDTH + COLUMN_GAPS)
-        .max(1);
     let first = window_start(staged.cursor(), staged.entries().len(), page_size);
-    let rows = staged
+    let visible = staged
         .entries()
         .iter()
         .enumerate()
         .skip(first)
         .take(page_size)
-        .map(|(position, entry)| row((entry, position), path_width, app))
+        .collect::<Vec<_>>();
+    let (entry_width, path_width) = column_widths(
+        usize::from(inner.width),
+        visible.iter().map(|(_, entry)| entry.identifier()),
+    );
+    let rows = visible
+        .into_iter()
+        .map(|(position, entry)| row((entry, position), (entry_width, path_width), app))
         .collect::<Vec<_>>();
     let position = format!(" {}/{} ", staged.cursor() + 1, staged.entries().len());
     frame.render_widget(
@@ -161,6 +170,7 @@ fn listing(frame: &mut Frame, area: Rect, app: &App) {
             [
                 Constraint::Length(CURSOR_WIDTH as u16),
                 Constraint::Length(MARK_WIDTH as u16),
+                Constraint::Length(entry_width as u16),
                 Constraint::Min(path_width as u16),
                 Constraint::Length(AGE_WIDTH as u16),
                 Constraint::Length(SIZE_WIDTH as u16),
@@ -170,7 +180,8 @@ fn listing(frame: &mut Frame, area: Rect, app: &App) {
             Row::new(vec![
                 Cell::from(""),
                 Cell::from(""),
-                Cell::from("ENTRY · STAGED FROM"),
+                Cell::from("ENTRY"),
+                Cell::from("STAGED FROM"),
                 Cell::from(Line::from("IDLE").right_aligned()),
                 Cell::from(Line::from("ON DISK").right_aligned()),
             ])
@@ -183,7 +194,28 @@ fn listing(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn row(item: (&Entry, usize), path_width: usize, app: &App) -> Row<'static> {
+/// How much of the row each of the two text columns gets.
+///
+/// The identifier keeps its full width wherever the origin can still show its own
+/// tail, because the identifier is the whole of what distinguishes two copies of one
+/// origin while the origin repeats itself between them.
+fn column_widths(inner_width: usize, identifiers: impl Iterator<Item = String>) -> (usize, usize) {
+    let available = inner_width
+        .saturating_sub(CURSOR_WIDTH + MARK_WIDTH + AGE_WIDTH + SIZE_WIDTH + COLUMN_GAPS)
+        .max(2);
+    let widest = identifiers.map(|id| columns(&id)).max().unwrap_or(0);
+    let ceiling = available.saturating_sub(PATH_MIN_WIDTH);
+    let entry = if ceiling >= ENTRY_MIN_WIDTH {
+        widest.clamp(ENTRY_MIN_WIDTH, ceiling)
+    } else {
+        // Too narrow for both to say anything: split what there is.
+        (available / 2).max(1)
+    };
+    (entry, available.saturating_sub(entry).max(1))
+}
+
+fn row(item: (&Entry, usize), widths: (usize, usize), app: &App) -> Row<'static> {
+    let (entry_width, path_width) = widths;
     let (entry, position) = item;
     let staged = app.staged();
     let chosen = staged.is_chosen(entry);
@@ -210,8 +242,12 @@ fn row(item: (&Entry, usize), path_width: usize, app: &App) -> Row<'static> {
         })
         .style(Style::new().fg(super::theme::ACCENT)),
         Cell::from(mark),
+        Cell::from(clip(
+            &escape_terminal_text(&entry.identifier()),
+            entry_width,
+        )),
         Cell::from(elide(
-            &escape_terminal_text(&entry.label(app.home())),
+            &escape_terminal_text(&entry.origin(app.home())),
             path_width,
         )),
         Cell::from(Line::from(days(entry.age_days)).right_aligned()).style(

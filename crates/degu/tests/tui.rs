@@ -12,6 +12,8 @@ mod pip_cache;
 mod pip_fixture;
 #[path = "support/pty.rs"]
 mod pty;
+#[path = "support/screen.rs"]
+mod screen;
 
 use pty::{PtyRun, run as run_pty, run_sealed as run_pty_sealed};
 use std::os::unix::fs::PermissionsExt;
@@ -325,4 +327,137 @@ send "q"
         screen.contains("doctor"),
         "the coverage panel did not say where to look: {screen}"
     );
+}
+
+/// The last line of the field guide, which a reader has to reach to learn that
+/// nothing moves from this screen. Taken from the constant so the test cannot drift
+/// from the text it is about.
+const HELP_LAST_LINE: &str = "Nothing moves until you leave this screen";
+
+/// Drive the review at a fixed geometry and return the screen it left behind.
+fn review_at(home: &Path, config_home: &Path, rows: u16, columns: u16, keys: &str) -> String {
+    let state = tempfile::tempdir().unwrap();
+    let body = format!(
+        r#"
+spawn -noecho sh -c {{stty rows {rows} columns {columns}; exec "$DEGU_BIN" --color never tui}}
+expect -ex "\033\[?1049h"
+sleep 1
+{keys}
+send "q"
+"#
+    );
+    let out = run_pty(PtyRun {
+        body: &body,
+        home,
+        config_home,
+        state_home: state.path(),
+        extra_env: &[],
+    });
+    screen::flattened(&out.stdout, usize::from(rows), usize::from(columns))
+}
+
+/// The field guide is longer than a standard terminal, so a reader who cannot
+/// scroll it cannot read the part that says nothing moves from this screen.
+#[test]
+fn the_field_guide_can_be_read_to_its_end_on_a_standard_terminal() {
+    let home = tempfile::tempdir().unwrap();
+    fixture(home.path());
+    let config = config_home_with_roots(&[]);
+
+    let opened = review_at(home.path(), config.path(), 24, 80, "send \"?\"\nsleep 1\n");
+    assert!(
+        opened.contains("field guide"),
+        "the help never opened: {opened}"
+    );
+
+    let scrolled = review_at(
+        home.path(),
+        config.path(),
+        24,
+        80,
+        "send \"?\"\nsleep 1\nsend \"\\033\\[6~\"\nsleep 1\n",
+    );
+    assert!(
+        scrolled.contains(HELP_LAST_LINE),
+        "PgDn did not reach the end of the field guide: {scrolled}"
+    );
+
+    let to_end = review_at(
+        home.path(),
+        config.path(),
+        24,
+        80,
+        "send \"?\"\nsleep 1\nsend \"\\033\\[F\"\nsleep 1\n",
+    );
+    assert!(
+        to_end.contains(HELP_LAST_LINE),
+        "End did not reach the end of the field guide: {to_end}"
+    );
+}
+
+/// Two copies staged from one origin differ only by their entry identifier, and a
+/// reader choosing one for permanent deletion has to be able to tell them apart. A
+/// deep origin is the case that squeezes the row: the identifier is the shortest and
+/// least redundant thing in it, so it must not be the first thing given up.
+#[test]
+fn two_staged_copies_of_one_origin_are_told_apart_on_a_standard_terminal() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let config = config_home_with_roots(&[]);
+    // A project whose build artifacts sit behind a long path, so the origin alone
+    // does not fit the row at 80 columns.
+    let project = home
+        .path()
+        .join("workspaces/a-rather-long-project-directory-name");
+    let artifacts = project.join("target");
+    let root = project.display().to_string();
+    for _ in 0..2 {
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(
+            artifacts.join("CACHEDIR.TAG"),
+            format!("{CACHEDIR_TAG_SIGNATURE}\n"),
+        )
+        .unwrap();
+        std::fs::write(artifacts.join(".rustc_info.json"), "{}").unwrap();
+        std::fs::write(artifacts.join("debug.bin"), vec![0u8; ARTIFACT_BYTES]).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "[package]\n").unwrap();
+        common::make_tree_non_shared_writable(home.path()).unwrap();
+        let out = common::isolated_degu()
+            .env("HOME", home.path())
+            .env("XDG_STATE_HOME", state.path())
+            .args(["clean", "--yes", &root])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!artifacts.exists(), "the clean staged nothing");
+    }
+    let entries = entry_names(&state.path().join("degu/trash"));
+    assert_eq!(entries.len(), 2, "the fixture staged {entries:?}");
+
+    let body = r#"
+spawn -noecho sh -c {stty rows 24 columns 80; exec "$DEGU_BIN" --color never tui}
+expect -ex "\033\[?1049h"
+sleep 1
+send "t"
+sleep 1
+send "q"
+"#;
+    let out = run_pty(PtyRun {
+        body,
+        home: home.path(),
+        config_home: config.path(),
+        state_home: state.path(),
+        extra_env: &[],
+    });
+    let screen = screen::flattened(&out.stdout, 24, 80);
+    for entry in &entries {
+        assert!(
+            screen.contains(entry.as_str()),
+            "the staged screen does not name {entry}, so its two copies read alike: {screen}"
+        );
+    }
 }

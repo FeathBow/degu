@@ -64,6 +64,9 @@ pub struct App {
     page_size: usize,
     group_page_size: usize,
     staged_page_size: usize,
+    help_page_size: usize,
+    help_offset: usize,
+    help_last_offset: usize,
     document: Derived<Document, Option<(Section, usize)>>,
     metric_width: Derived<usize, (Section, SortBy, usize)>,
     allocation: Derived<Vec<Segment>, Section>,
@@ -97,6 +100,9 @@ impl App {
             page_size: 1,
             group_page_size: 1,
             staged_page_size: 1,
+            help_page_size: 1,
+            help_offset: 0,
+            help_last_offset: 0,
             document,
             metric_width,
             allocation,
@@ -160,6 +166,19 @@ impl App {
         self.staged_page_size = entries;
     }
 
+    /// Told by the draw, which is the only place that knows how much of the guide
+    /// this terminal shows. Re-clamped here so a widened terminal that needs no
+    /// scrolling does not keep an offset that would hide the first lines.
+    pub fn resize_help(&mut self, page_size: usize, last_offset: usize) {
+        self.help_page_size = page_size;
+        self.help_last_offset = last_offset;
+        self.help_offset = self.help_offset.min(last_offset);
+    }
+
+    pub fn help_offset(&self) -> usize {
+        self.help_offset
+    }
+
     pub fn handle(&mut self, key: KeyEvent) -> Option<Outcome> {
         let control_quit = key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c' | 'd'));
@@ -199,7 +218,7 @@ impl App {
                     }
                 }
                 View::Details => self.scroll(code),
-                View::Help => {}
+                View::Help => self.scroll_help(code),
             },
         }
         self.refresh();
@@ -294,6 +313,21 @@ impl App {
     /// Whether `c` would reach a command that can do anything.
     pub fn can_run(&self) -> bool {
         !self.blocked && self.has_work()
+    }
+
+    fn scroll_help(&mut self, code: KeyCode) {
+        if let Some(delta) = movement(code, self.help_page_size) {
+            self.help_offset = self
+                .help_offset
+                .saturating_add_signed(delta)
+                .min(self.help_last_offset);
+            return;
+        }
+        match code {
+            KeyCode::Home => self.help_offset = 0,
+            KeyCode::End => self.help_offset = self.help_last_offset,
+            _ => {}
+        }
     }
 
     fn scroll(&mut self, code: KeyCode) {

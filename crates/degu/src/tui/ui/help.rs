@@ -14,7 +14,7 @@ g             Group by ecosystem, disposition, or kind
 s             Sort by size, inodes, age, or path
 tab           Switch cache / node-runtime section
 t             Show the staging trash, and come back
-3 / enter     Open the selected record in full
+3 / enter     Open the selected finding in full
 space         Put the selected finding or staged entry in, or take it out
 p             Preview the clean these choices describe
 c             Run what you decided: the purge, the clean, or both
@@ -103,7 +103,17 @@ const DETAILS_KEYS: &[&[(&str, &str)]] = &[
     &[("q", "quit")],
 ];
 
-const HELP_KEYS: &[&[(&str, &str)]] = &[&[("Esc", "back"), ("q", "quit")], &[("q", "quit")]];
+const HELP_KEYS: &[&[(&str, &str)]] = &[
+    &[
+        ("↑↓", "scroll"),
+        ("PgUp/PgDn", "page"),
+        ("Esc", "back"),
+        ("q", "quit"),
+    ],
+    &[("↑↓", "scroll"), ("Esc", "back"), ("q", "quit")],
+    &[("Esc", "back"), ("q", "quit")],
+    &[("q", "quit")],
+];
 
 /// The key list a footer draws, `c run` included, for a view at a width.
 ///
@@ -165,9 +175,11 @@ fn footer_line(keys: &[(&'static str, &'static str)]) -> Line<'static> {
     Line::from(spans)
 }
 
-pub fn draw(frame: &mut Frame, area: Rect) {
-    const BRAND_HEIGHT: usize = 5;
-    let inner = panel("").inner(area);
+const BRAND_HEIGHT: usize = 5;
+
+/// The guide's own lines, with the wordmark only where it does not cost the reader
+/// any of the text. Built in one place so what is measured is what is drawn.
+fn lines(inner: Rect) -> Vec<Line<'static>> {
     let text_height = KEY_HELP
         .lines()
         .map(|line| wrapped(line, usize::from(inner.width)).len())
@@ -182,13 +194,44 @@ pub fn draw(frame: &mut Frame, area: Rect) {
         );
     }
     lines.extend(KEY_HELP.lines().map(Line::from));
+    lines
+}
+
+/// How far the guide can be scrolled here, and by how much a page moves.
+///
+/// The guide is longer than a standard terminal and its last lines are the ones
+/// that say nothing moves from this screen, so a reader who cannot reach them
+/// cannot learn the one thing the screen most has to tell them.
+pub fn scroll_extent(area: Rect) -> (usize, usize) {
+    let inner = panel("").inner(area);
+    let visible = usize::from(inner.height);
+    let height = lines(inner)
+        .iter()
+        .map(|line| wrapped(&line.to_string(), usize::from(inner.width)).len())
+        .sum::<usize>();
+    (visible, height.saturating_sub(visible))
+}
+
+pub fn draw(frame: &mut Frame, area: Rect, offset: usize) {
+    let inner = panel("").inner(area);
+    let title = if scroll_extent(area).1 == 0 {
+        "degu / field guide · ? or Esc to close".to_owned()
+    } else {
+        format!(
+            "degu / field guide · {} to scroll · ? or Esc to close",
+            SCROLL_KEYS
+        )
+    };
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(lines(inner))
             .wrap(Wrap { trim: false })
-            .block(panel("degu / field guide · ? or Esc to close")),
+            .scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0))
+            .block(panel(&title)),
         area,
     );
 }
+
+const SCROLL_KEYS: &str = "↑↓ PgUp/PgDn";
 
 pub fn footer(frame: &mut Frame, area: Rect, app: &App) {
     let run = app.can_run() && app.view().runs_cleanup();

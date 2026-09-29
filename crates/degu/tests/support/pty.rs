@@ -49,7 +49,25 @@ exit [lindex $result {EXPECT_WAIT_EXIT_STATUS_INDEX}]
     )
 }
 
+/// Drive the TUI against a sealed store rather than the legacy seam.
+///
+/// The ordinary harness derives the anchor from the state directory and forces
+/// legacy clean, which is right for tests that only need a trash to look at. A test
+/// about an activated store needs the anchor the store was activated against, and
+/// needs the sealed path, so it passes the anchor and this omits the seam.
+#[allow(
+    dead_code,
+    reason = "shared support is compiled into integration-test crates that use different helpers"
+)]
+pub(crate) fn run_sealed(request: PtyRun<'_>, anchor: &Path) -> Output {
+    run_with(request, Some(anchor))
+}
+
 pub(crate) fn run(request: PtyRun<'_>) -> Output {
+    run_with(request, None)
+}
+
+fn run_with(request: PtyRun<'_>, sealed_anchor: Option<&Path>) -> Output {
     // The gate serializes; it guards no data, so a panic under it leaves nothing
     // to be poisoned by. Recovering lets each test reach and report its own
     // failure instead of the first one's poison.
@@ -61,13 +79,18 @@ pub(crate) fn run(request: PtyRun<'_>) -> Output {
         .expect("failed to harden PTY HOME fixture");
     crate::common::make_tree_non_shared_writable(request.state_home)
         .expect("failed to harden PTY state fixture");
-    let anchor = request
-        .state_home
-        .join("degu-integration-activation-anchor");
-    std::fs::create_dir_all(&anchor).expect("failed to create PTY activation anchor");
-    std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o700))
-        .expect("failed to harden PTY activation anchor");
-    let anchor = std::fs::canonicalize(anchor).expect("failed to canonicalize PTY anchor");
+    let anchor = match sealed_anchor {
+        Some(anchor) => anchor.to_path_buf(),
+        None => {
+            let anchor = request
+                .state_home
+                .join("degu-integration-activation-anchor");
+            std::fs::create_dir_all(&anchor).expect("failed to create PTY activation anchor");
+            std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o700))
+                .expect("failed to harden PTY activation anchor");
+            std::fs::canonicalize(anchor).expect("failed to canonicalize PTY anchor")
+        }
+    };
     let mut command = Command::new("expect");
     command
         .arg("-c")
@@ -79,8 +102,10 @@ pub(crate) fn run(request: PtyRun<'_>) -> Output {
         .env("LOGNAME", request.home)
         .env("XDG_CONFIG_HOME", request.config_home)
         .env("XDG_STATE_HOME", request.state_home)
-        .env("DEGU_INTEGRATION_TEST_ANCHOR", anchor)
-        .env("DEGU_INTEGRATION_TEST_LEGACY_CLEAN", "1");
+        .env("DEGU_INTEGRATION_TEST_ANCHOR", anchor);
+    if sealed_anchor.is_none() {
+        command.env("DEGU_INTEGRATION_TEST_LEGACY_CLEAN", "1");
+    }
     for &(name, value) in request.extra_env {
         command.env(name, value);
     }

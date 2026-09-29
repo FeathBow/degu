@@ -13,7 +13,8 @@ mod pip_fixture;
 #[path = "support/pty.rs"]
 mod pty;
 
-use pty::{PtyRun, run as run_pty};
+use pty::{PtyRun, run as run_pty, run_sealed as run_pty_sealed};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 const CACHEDIR_TAG_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
@@ -251,4 +252,77 @@ fn entry_names(trash: &Path) -> Vec<String> {
         .collect::<Vec<_>>();
     names.sort();
     names
+}
+
+/// A sealed clean against one state directory, so the store the TUI is later asked
+/// about is really activated. The ordinary clean helper enables the legacy seam,
+/// which activates nothing.
+fn sealed_clean(home: &Path, state: &Path, anchor: &Path) {
+    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("degu"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", home)
+        .env("LOGNAME", home)
+        .env("XDG_STATE_HOME", state)
+        .env("DEGU_INTEGRATION_TEST_ANCHOR", anchor)
+        .args(["clean", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        state.join("degu/sealed-staging/store.activation").exists(),
+        "the clean activated no store, so the TUI has nothing to be wrong about"
+    );
+}
+
+/// The CLI listing says when it is not looking at the account's activated store.
+/// The staged screen is the same view through another door and has to say it too.
+#[test]
+fn the_staged_screen_says_when_it_is_not_the_account_it_looks_like() {
+    let home = tempfile::tempdir().unwrap();
+    let Some(_backend) = common::require_sealed_fixture_backend(home.path()) else {
+        return;
+    };
+    let state = tempfile::tempdir_in(home.path()).unwrap();
+    let elsewhere = tempfile::tempdir_in(home.path()).unwrap();
+    pip_cache::seed(home.path());
+    let anchor = state.path().join("degu-integration-activation-anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o700)).unwrap();
+    common::make_tree_non_shared_writable(home.path()).unwrap();
+    let anchor = std::fs::canonicalize(&anchor).unwrap();
+    sealed_clean(home.path(), state.path(), &anchor);
+
+    let config = config_home_with_roots(&[]);
+    let out = run_pty_sealed(
+        PtyRun {
+            body: r#"
+spawn -noecho sh -c {stty rows 40 columns 120; exec "$DEGU_BIN" --color never tui}
+expect -ex "\[?1049h"
+sleep 1
+send "t"
+sleep 1
+send "q"
+"#,
+            home: home.path(),
+            config_home: config.path(),
+            state_home: elsewhere.path(),
+            extra_env: &[],
+        },
+        &anchor,
+    );
+
+    let screen = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        screen.contains("coverage"),
+        "the staged screen claimed to be the whole account: {screen}"
+    );
+    assert!(
+        screen.contains("doctor"),
+        "the coverage panel did not say where to look: {screen}"
+    );
 }

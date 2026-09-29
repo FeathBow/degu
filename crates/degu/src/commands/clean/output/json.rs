@@ -145,6 +145,7 @@ fn execution_json(item: &CleanExecution) -> Result<serde_json::Value> {
         "path": path,
         "trash_entry": trash_entry,
         "state": item.state_label(),
+        "restore_authority": item.restore_authority().label(),
         "outcome": outcome_json(item),
         "purged": item.purged(),
     }))

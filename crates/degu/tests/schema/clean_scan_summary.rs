@@ -41,6 +41,7 @@ fn clean_json_schema_is_frozen() {
     for execution in assert_non_empty_array(&json["executed"], "clean executions") {
         assert_keys(execution, CLEAN_EXECUTION_KEYS);
         assert_clean_outcome(&execution["outcome"]);
+        assert_restore_authority(&execution["restore_authority"]);
     }
 }
 

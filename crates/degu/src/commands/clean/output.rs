@@ -42,7 +42,7 @@ pub(super) fn print_mutation_scope(
 /// closing line that invited undo anyway would leave the reader holding two
 /// instructions with no way to tell which one applies.
 fn staged_note(
-    sealed_authority: bool,
+    staged_under_seal: bool,
     manual_recovery: bool,
     purge_unsupported: bool,
 ) -> Option<String> {
@@ -51,7 +51,7 @@ fn staged_note(
     } else {
         "Still counts against quota while staged; restore with 'degu undo'."
     };
-    if sealed_authority {
+    if staged_under_seal {
         let expiry = if purge_unsupported {
             " Internal-hardlink entries are retained because permanent purge is unsupported; unrelated purge-supported entries may be purged after seven days."
         } else {
@@ -254,7 +254,7 @@ pub(super) fn print_execution(
         if let Some(note) = staged_note(
             executed
                 .iter()
-                .any(CleanExecution::sealed_staging_has_recovery_authority),
+                .any(CleanExecution::staged_under_seal_authority),
             executed
                 .iter()
                 .any(CleanExecution::requires_manual_recovery),

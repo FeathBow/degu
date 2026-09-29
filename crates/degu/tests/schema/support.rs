@@ -42,8 +42,14 @@ pub(super) const FINDING_KEYS_WITH_HAZARD: &[&str] = &[
 ];
 pub(super) const SCAN_REPORT_KEYS: &[&str] = &["completeness", "findings", "runtime"];
 pub(super) const SCAN_COMPLETENESS_KEYS: &[&str] = &["findings", "runtime"];
-pub(super) const CLEAN_EXECUTION_KEYS: &[&str] =
-    &["outcome", "path", "purged", "state", "trash_entry"];
+pub(super) const CLEAN_EXECUTION_KEYS: &[&str] = &[
+    "outcome",
+    "path",
+    "purged",
+    "restore_authority",
+    "state",
+    "trash_entry",
+];
 pub(super) const CLEAN_REPORT_KEYS: &[&str] = &[
     "completeness",
     "excluded",
@@ -251,6 +257,10 @@ pub(super) fn assert_clean_outcome(value: &Value) {
         assert_keys(&value["failed"], &["reason"]);
         assert!(value["failed"]["reason"].is_string());
     }
+}
+
+pub(super) fn assert_restore_authority(value: &Value) {
+    assert_string_enum(value, &["operation_log", "seal_wal", "none"]);
 }
 
 pub(super) fn assert_op_record(value: &Value, require_reclamation_id: bool) {

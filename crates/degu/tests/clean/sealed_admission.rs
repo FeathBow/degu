@@ -1013,39 +1013,6 @@ fn assert_rejected(output: &std::process::Output, expected: &str) {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn set_ordinary_xattr(path: &Path, value: &[u8]) {
-    use std::os::fd::AsRawFd;
-    let file = std::fs::File::open(path).unwrap();
-    #[cfg(target_os = "linux")]
-    let result = unsafe {
-        libc::fsetxattr(
-            file.as_raw_fd(),
-            c"user.degu-proof-v3".as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-        )
-    };
-    #[cfg(target_os = "macos")]
-    let result = unsafe {
-        libc::fsetxattr(
-            file.as_raw_fd(),
-            c"com.apple.quarantine".as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-            0,
-        )
-    };
-    assert_eq!(
-        result,
-        0,
-        "failed to set ordinary xattr: {}",
-        std::io::Error::last_os_error()
-    );
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_ordinary_xattr(path: &Path) -> Vec<u8> {
     use std::os::fd::AsRawFd;
     let file = std::fs::File::open(path).unwrap();

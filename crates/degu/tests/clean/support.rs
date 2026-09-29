@@ -274,7 +274,9 @@ pub(super) fn assert_activation_and_wal(anchor: &std::path::Path, state: &std::p
     assert!(store.join("seal.wal").is_file());
 }
 
-pub(super) use crate::common::{certify_backend, require_sealed_fixture_backend};
+pub(super) use crate::common::{
+    certify_backend, require_sealed_fixture_backend, set_ordinary_xattr, strip_extended_attributes,
+};
 
 pub(super) fn assert_output_success(output: &std::process::Output) {
     assert!(

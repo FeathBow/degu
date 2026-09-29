@@ -318,8 +318,12 @@ impl MutationSession {
                         reclamation_id: &reclamation_id,
                     });
                     if let Err(error) = log.append(&projection) {
+                        // Keyed by the path the plan named, not the one the record
+                        // names. The report pairs this against `purged`, which the
+                        // plan fills, and a deletion paired by the other spelling
+                        // reads as a purge to retry rather than a gap to inspect.
                         outcome.unrecorded.push((
-                            entry,
+                            path.clone(),
                             format!(
                                 "the entry was permanently deleted, but the non-authoritative operation log append failed, so 'degu ops' will not show it: {error}"
                             ),

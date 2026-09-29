@@ -243,6 +243,21 @@ impl SealedAccount {
             .unwrap()
     }
 
+    /// The same account reached through another spelling of its state directory.
+    fn run_at(&self, state: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("degu"))
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", self.home.path())
+            .env("XDG_STATE_HOME", state)
+            .env("XDG_CONFIG_HOME", common::isolated_config_home())
+            .env("LOGNAME", common::isolated_config_home())
+            .env("DEGU_INTEGRATION_TEST_ANCHOR", &self.anchor)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
     fn history(&self) -> Vec<serde_json::Value> {
         let out = self.run(&["ops", "--json"]);
         assert!(
@@ -302,4 +317,52 @@ fn ops_records_a_sealed_purge_that_deleted() {
     assert_eq!(purge["command"], "trash purge");
     assert_eq!(purge["outcome"], "ok");
     assert_eq!(purge["path"], trash_entry);
+}
+
+/// A deletion that happened is not a deletion to retry. When the reporting log
+/// cannot be appended, the entry belongs in `purged` and in `unrecorded` — a gap to
+/// inspect. Pairing the two halves of that answer by different spellings of the same
+/// path loses the pairing and reports a completed deletion as a failure.
+#[test]
+fn a_sealed_purge_the_log_cannot_record_is_still_a_purge() {
+    let Some(account) = SealedAccount::new() else {
+        return;
+    };
+    let staged = account.run(&["clean", "--yes", "--json"]);
+    assert!(
+        staged.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&staged.stderr)
+    );
+    assert!(!account.cache.exists());
+
+    // The only change is how this run spells the same state directory.
+    let alias = account.home.path().join("state-alias");
+    std::os::unix::fs::symlink(account.state.path(), &alias).unwrap();
+    // Readable so planning still works, unwritable so only the append fails.
+    let log = account.state.path().join("degu/ops.jsonl");
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+    let purged = account.run_at(&alias, &["trash", "purge", "--yes", "--json"]);
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&purged.stdout).unwrap();
+    assert!(
+        purged.status.success(),
+        "a completed deletion exited nonzero: {report} stderr: {}",
+        String::from_utf8_lossy(&purged.stderr)
+    );
+    assert_eq!(
+        report["purged"].as_array().unwrap().len(),
+        1,
+        "report: {report}"
+    );
+    assert_eq!(
+        report["unrecorded"].as_array().unwrap().len(),
+        1,
+        "the unrecordable purge was not reported as a gap: {report}"
+    );
+    assert!(
+        report["failed"].as_array().unwrap().is_empty(),
+        "a completed deletion was reported as a purge to retry: {report}"
+    );
 }

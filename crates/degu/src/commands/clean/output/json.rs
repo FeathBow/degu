@@ -1,6 +1,6 @@
 use super::super::execution::{CleanQuotaObservations, ExpiryExecution};
 use super::super::preparation::PreparedClean;
-use crate::lifecycle::{CleanExecution, ExpiryPlan, Lifecycle, TRASH_RETENTION_DAYS};
+use crate::lifecycle::{CleanExecution, ExpiryPlan, Lifecycle, PurgeReport, TRASH_RETENTION_DAYS};
 use crate::output::stdoutln;
 use anyhow::Result;
 use std::path::PathBuf;
@@ -107,14 +107,10 @@ fn expiry_json(expiry: &ExpiryExecution) -> Result<serde_json::Value> {
     let planned = expiry_plan_json(&expiry.plan)?;
     let report = expiry.report.as_ref();
     let purged = report.map_or(&[][..], |report| report.purged.as_slice());
-    let failed = match report {
-        Some(report) => report
-            .failed
-            .iter()
-            .map(expiry_failure_json)
-            .collect::<Result<Vec<_>>>()?,
-        None => Vec::new(),
-    };
+    // Read the way an explicit purge reads it: a reason recorded against an entry
+    // that was deleted anyway is a gap to inspect, not a deletion to repeat.
+    let failed = expiry_failure_rows(report.map(PurgeReport::unpurged))?;
+    let unrecorded = expiry_failure_rows(report.map(PurgeReport::gaps))?;
     let purged = serde_json::to_value(purged)?;
     Ok(serde_json::json!({
         "retention_days": TRASH_RETENTION_DAYS,
@@ -122,12 +118,23 @@ fn expiry_json(expiry: &ExpiryExecution) -> Result<serde_json::Value> {
         "planned": planned,
         "purged": purged,
         "failed": failed,
+        "unrecorded": unrecorded,
     }))
 }
 
 fn expiry_plan_json(plan: &ExpiryPlan) -> Result<serde_json::Value> {
     let entries = plan.entries().collect::<Vec<_>>();
     Ok(serde_json::to_value(entries)?)
+}
+
+fn expiry_failure_rows<'a>(
+    reasons: Option<impl Iterator<Item = &'a (PathBuf, String)>>,
+) -> Result<Vec<serde_json::Value>> {
+    reasons
+        .into_iter()
+        .flatten()
+        .map(expiry_failure_json)
+        .collect()
 }
 
 fn expiry_failure_json(failure: &(PathBuf, String)) -> Result<serde_json::Value> {

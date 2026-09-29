@@ -60,8 +60,14 @@ pub(super) const CLEAN_REPORT_KEYS: &[&str] = &[
     "planned",
     "quota_observations",
 ];
-pub(super) const CLEAN_EXPIRY_KEYS: &[&str] =
-    &["attempted", "failed", "planned", "purged", "retention_days"];
+pub(super) const CLEAN_EXPIRY_KEYS: &[&str] = &[
+    "attempted",
+    "failed",
+    "planned",
+    "purged",
+    "retention_days",
+    "unrecorded",
+];
 pub(super) const CLEAN_EXPIRY_FAILURE_KEYS: &[&str] = &["path", "reason"];
 pub(super) const OP_RECORD_KEYS: &[&str] = &[
     "action",

@@ -151,7 +151,14 @@ pub(crate) struct MutationSession {
 #[derive(Debug)]
 enum SealedPurgeOutcome {
     Legacy,
-    Purged,
+    /// Deleted under WAL authority, with the entry as the sealed engine
+    /// authenticated it and the reclamation id naming its group. The reporting
+    /// projection files both, so it names the entry the staging record named
+    /// rather than the spelling this walk happened to reach it by.
+    Purged {
+        entry: PathBuf,
+        reclamation_id: String,
+    },
     RetainedUnsupported(String),
     Blocked(String),
 }
@@ -160,6 +167,10 @@ enum SealedPurgeOutcome {
 struct SealedPurgeBatchOutcome {
     retained: std::collections::HashMap<PathBuf, String>,
     blocked: Option<String>,
+    /// Entries this batch deleted and could not tell the operation log about.
+    /// Reported beside the deletion rather than instead of it: calling a
+    /// completed deletion a failure would only invite a retry of nothing.
+    unrecorded: Vec<(PathBuf, String)>,
 }
 
 impl MutationSession {
@@ -209,30 +220,32 @@ impl MutationSession {
     /// work. A recovery blocker still stops the batch before any later legacy
     /// claim, deletion, or housekeeping.
     pub(crate) fn execute_explicit_purge_all(&mut self, mut plan: TrashPurgePlan) -> PurgeReport {
-        let sealed = self.execute_sealed_purge_batch(plan.entries());
+        let SealedPurgeBatchOutcome {
+            retained,
+            blocked,
+            unrecorded,
+        } = self.execute_sealed_purge_batch("trash purge", plan.entries());
         let purged = plan.take_already_purged(&self.authority_purged);
-        if let Some(reason) = sealed.blocked {
-            return PurgeReport {
-                purged,
-                failed: plan
-                    .entries()
-                    .map(|path| {
-                        let reason = sealed.retained.get(path).unwrap_or(&reason).clone();
-                        (path.to_path_buf(), reason)
-                    })
-                    .collect(),
-            };
+        if let Some(reason) = blocked {
+            let mut failed = plan
+                .entries()
+                .map(|path| {
+                    let reason = retained.get(path).unwrap_or(&reason).clone();
+                    (path.to_path_buf(), reason)
+                })
+                .collect::<Vec<_>>();
+            failed.extend(unrecorded);
+            return PurgeReport { purged, failed };
         }
         let blocker = |path: &Path| {
-            sealed
-                .retained
+            retained
                 .get(path)
                 .cloned()
                 .or_else(|| self.sealed_entry_block(path))
         };
         let mut report = PurgeReport {
             purged,
-            failed: Vec::new(),
+            failed: unrecorded,
         };
         let legacy = purge::execute_purge_plan(&self.lifecycle.ctx, "trash purge", plan, &blocker);
         report.purged.extend(legacy.purged);
@@ -250,42 +263,72 @@ impl MutationSession {
     }
 
     pub(crate) fn execute_expiry(&mut self, plan: &ExpiryPlan) -> PurgeReport {
-        let sealed = self.execute_sealed_purge_batch(plan.entries());
-        if let Some(reason) = sealed.blocked {
+        let SealedPurgeBatchOutcome {
+            retained,
+            blocked,
+            unrecorded,
+        } = self.execute_sealed_purge_batch("clean", plan.entries());
+        if let Some(reason) = blocked {
             let (purged, failed): (Vec<_>, Vec<_>) = plan
                 .entries()
                 .map(Path::to_path_buf)
                 .partition(|path| self.authority_purged.contains(path));
-            return PurgeReport {
-                purged,
-                failed: failed
-                    .into_iter()
-                    .map(|path| {
-                        let reason = sealed.retained.get(&path).unwrap_or(&reason).clone();
-                        (path, reason)
-                    })
-                    .collect(),
-            };
+            let mut failed = failed
+                .into_iter()
+                .map(|path| {
+                    let reason = retained.get(&path).unwrap_or(&reason).clone();
+                    (path, reason)
+                })
+                .collect::<Vec<_>>();
+            failed.extend(unrecorded);
+            return PurgeReport { purged, failed };
         }
         let blocker = |path: &Path| {
-            sealed
-                .retained
+            retained
                 .get(path)
                 .cloned()
                 .or_else(|| self.sealed_entry_block(path))
         };
-        purge::execute_expiry_plan(&self.lifecycle.ctx, plan, &blocker, &self.authority_purged)
+        let mut report =
+            purge::execute_expiry_plan(&self.lifecycle.ctx, plan, &blocker, &self.authority_purged);
+        report.failed.extend(unrecorded);
+        report
     }
 
     fn execute_sealed_purge_batch<'a>(
         &mut self,
+        command: &str,
         paths: impl Iterator<Item = &'a Path>,
     ) -> SealedPurgeBatchOutcome {
+        let log = journal::OperationLog::new(&self.lifecycle.ctx);
         let mut outcome = SealedPurgeBatchOutcome::default();
         for path in paths.map(Path::to_path_buf).collect::<Vec<_>>() {
             match self.execute_sealed_purge_entry(&path) {
                 SealedPurgeOutcome::Legacy => {}
-                SealedPurgeOutcome::Purged => {
+                SealedPurgeOutcome::Purged {
+                    entry,
+                    reclamation_id,
+                } => {
+                    // After the deletion, because the log is a projection of what
+                    // happened; a record written first would outlive a purge that
+                    // then failed and claim a deletion that never occurred.
+                    let projection = journal::verified_purge_record(journal::VerifiedPurgeRecord {
+                        command,
+                        entry: &entry,
+                        reclamation_id: &reclamation_id,
+                    });
+                    if let Err(error) = log.append(&projection) {
+                        // Keyed by the path the plan named, not the one the record
+                        // names. The report pairs this against `purged`, which the
+                        // plan fills, and a deletion paired by the other spelling
+                        // reads as a purge to retry rather than a gap to inspect.
+                        outcome.unrecorded.push((
+                            path.clone(),
+                            format!(
+                                "the entry was permanently deleted, but the non-authoritative operation log append failed, so 'degu ops' will not show it: {error}"
+                            ),
+                        ));
+                    }
                     self.authority_purged.insert(path);
                 }
                 SealedPurgeOutcome::RetainedUnsupported(reason) => {
@@ -427,7 +470,10 @@ impl MutationSession {
                 match engine.execute_verified_purge(authority) {
                     Ok(commit) => {
                         debug_assert_eq!(commit.transaction(), entry.transaction());
-                        SealedPurgeOutcome::Purged
+                        SealedPurgeOutcome::Purged {
+                            entry: normalized,
+                            reclamation_id: entry.reclamation_id().to_owned(),
+                        }
                     }
                     Err(error) => SealedPurgeOutcome::Blocked(format!(
                         "sealed staging explicit purge execution failed during {} ({:?}): {error}",

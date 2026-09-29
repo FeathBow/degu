@@ -329,6 +329,38 @@ send "q"
     );
 }
 
+/// The identifiers degu says are staged, which is the only authority on where its
+/// trash roots are.
+fn staged_entry_names(home: &Path, state: &Path) -> Vec<String> {
+    let out = common::isolated_degu()
+        .env("HOME", home)
+        .env("XDG_STATE_HOME", state)
+        .args(["trash", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["omitted"], 0, "report: {report}");
+    let mut names = report["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            Path::new(row["entry"].as_str().expect("entry path"))
+                .file_name()
+                .expect("entry name")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
 /// The last line of the field guide, which a reader has to reach to learn that
 /// nothing moves from this screen. Taken from the constant so the test cannot drift
 /// from the text it is about.
@@ -402,7 +434,10 @@ fn the_field_guide_can_be_read_to_its_end_on_a_standard_terminal() {
 #[test]
 fn two_staged_copies_of_one_origin_are_told_apart_on_a_standard_terminal() {
     let home = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
+    // Inside the home, as every fixture here does: trash routing puts an entry in
+    // the state trash only when the state directory is under the source mount's
+    // owner anchor, and a sibling temporary directory is not.
+    let state = tempfile::tempdir_in(home.path()).unwrap();
     let config = config_home_with_roots(&[]);
     // A project whose build artifacts sit behind a long path, so the origin alone
     // does not fit the row at 80 columns.
@@ -435,7 +470,9 @@ fn two_staged_copies_of_one_origin_are_told_apart_on_a_standard_terminal() {
         );
         assert!(!artifacts.exists(), "the clean staged nothing");
     }
-    let entries = entry_names(&state.path().join("degu/trash"));
+    // Asked of degu rather than read off a path this test guessed: the trash root
+    // is resolved per source mount, so a hardcoded one is right only by accident.
+    let entries = staged_entry_names(home.path(), state.path());
     assert_eq!(entries.len(), 2, "the fixture staged {entries:?}");
 
     let body = r#"

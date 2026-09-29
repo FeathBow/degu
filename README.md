@@ -105,13 +105,47 @@ Both `degu` and its short alias, `dg`, install into `~/.local/bin` by default. `
 
 ## Quick start
 
-Check account setup once before the first degu-managed `clean` / `undo` / `trash purge` lifecycle mutation:
+Nothing here changes anything until you say so. Start read-only — no setup, no degu state, no elevation:
+
+```sh
+degu scan            # what exists, and what is safe to clean
+```
+
+Only **Ready to clean** enters a default plan. For one **Needs review** location, the scan prints a shorter `degu clean -dn --review PATH` preview, and the `Next` command it gives back keeps that exact selection.
+
+### Decide on one screen
+
+When the decision is about one location rather than a rule, `degu tui` brings the scan, the clean, and a selective purge together: findings and the staging trash on one screen, chosen per location, handed to the same `clean` and `trash purge` implementations with their own plans and confirmations.
+
+```sh
+degu tui
+```
+
+<p align="center"><a href="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/review.svg"><img src="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/review.svg" alt="degu tui mid-decision: a 7.23 GiB Needs review model checked into the plan alongside the Ready to clean pip cache, two review locations left unchecked, the Not managed cache unselectable, and the header totalling what a clean would move" width="92%"></a></p>
+<p align="center"><sub>One Needs review location chosen; the header totals what a clean would move. Tap the image for a readable copy.</sub></p>
+
+Four keys carry the whole decision, and `?` opens a scrollable field guide to the rest:
+
+| Key | What it does |
+|---|---|
+| `Space` | Put the selected location in the plan, or take it out |
+| `t` | Show the staging trash — what an earlier clean already moved — and come back |
+| `p` | Preview the clean these choices describe, changing nothing |
+| `c` | Hand whichever plans were decided to `clean` and `trash purge`, which confirm again |
+
+The staging trash is where `t` goes: each entry names the copy it is, so two copies of one origin are told apart, and what it still costs you in quota. Choosing an entry there marks it for permanent deletion, which `c` then routes to `trash purge` rather than to `clean`. Recovery stays a command of its own — `degu undo` restores the latest clean, and nothing in the review does that for you.
+
+The review also carries an [advisory block](https://github.com/FeathBow/degu/blob/main/docs/configuration.md#advisory) on the locations degu could not classify, separating what degu measured from what degu concluded, and from what an advisor of your own thinks if you put one there. Nothing runs and nothing is sent unless you do, which is what an untouched install does on a login node.
+
+### Clean, and get it back
+
+Cleanup is the first thing that writes degu state, so check the account once before the first `clean` / `undo` / `trash purge`:
 
 ```sh
 degu doctor
 ```
 
-`ready` means continue. If it reports `missing`, initialize only the fixed authority for the current non-root account:
+`ready` means continue. `missing` means initialize the fixed authority for this non-root account:
 
 ```sh
 degu init
@@ -119,30 +153,20 @@ degu init
 
 `init` refuses when this account's store carries an activation record, which means an earlier authority was lost rather than never made. An administrator may instead provision the optional system authority. `split_authority`, `recovery_required`, `unsafe`, `unsupported`, or `uncertain` requires investigation; `init` never repairs state, chooses a UID or path, activates an empty store, or clears recovery.
 
-After setup, the daily lifecycle remains five short commands:
+After that the lifecycle is four short commands:
 
 ```sh
-degu scan            # read-only: what exists, what is safe to clean
 degu clean -n        # preview the exact plan; changes nothing
 degu clean           # stage Ready-to-clean findings into undoable trash
 degu undo            # restore the latest clean operation
 degu trash purge     # or permanently delete what you reviewed
 ```
 
-Only **Ready to clean** enters the default plan. For one **Needs review** location, the scan prints a shorter `degu clean -dn --review PATH` preview; the resulting `Next` command keeps the same exact selection.
+Staged data stays reversible and still counts against quota until it is purged, so a clean frees your attention before it frees your quota. Choose one recovery branch per clean operation. A confirmed mutating clean also permanently purges trash entries at least seven days old — that is the only deletion degu performs without being pointed at it, and `degu trash list` gives each entry's age to measure against.
 
-When the decision is about one location rather than a rule, `degu tui` brings the scan, the clean, and a selective purge onto one screen: it shows the findings and the staging trash together, you choose per location what to clean and what to permanently delete, and it hands your choices to the same `clean` and `trash purge` implementations with their own plans and confirmations. Recovery stays a command of its own — `degu undo` restores the latest clean, and nothing in the review does that for you.
+### Large shared filesystems
 
-```sh
-degu tui
-```
-
-<p align="center"><a href="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/review.svg"><img src="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/review.svg" alt="degu tui mid-decision: a 7.23 GiB Needs review model checked into the plan alongside the Ready to clean pip cache, two review locations left unchecked, the Not managed cache unselectable, and the header totalling what a clean would move" width="92%"></a></p>
-<p align="center"><sub>One Needs review location chosen; the header totals what a clean would move. Tap either image for a readable copy. Space decides a row, and <code>c</code> hands whichever plans were decided to the existing commands — here the staging trash is empty, so it would run <code>clean</code> alone.</sub></p>
-
-The review also carries an advisory block on the locations degu could not classify, which is exactly where a reader has the least to go on. It separates what degu measured from what degu concluded, and — when an executable exists at `~/.config/degu/advisor` — from what that program thinks, marked `~` on every line and headed as unverified. Setting one up is putting the file there; `degu config` says whether it was found. degu speaks no model protocol and holds no credential: it hands your program a signature on standard input under the same bounds it runs any host tool, and which model, endpoint or key that program uses is its business, not degu's. Put nothing there and nothing runs and nothing is sent, which is what an untouched install does on a login node.
-
-Staged data stays reversible and still counts against quota until purged; choose one recovery branch per clean operation. A confirmed mutating clean also permanently purges trash entries at least seven days old. On very large shared filesystems a full first scan can take minutes:
+A full first scan can take minutes:
 
 ```sh
 degu scan --budget 300s

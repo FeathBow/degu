@@ -362,7 +362,7 @@ fn ensure_expiry_success(expiry: &ExpiryExecution) -> Result<()> {
     if expiry
         .report
         .as_ref()
-        .is_some_and(|report| !report.failed.is_empty())
+        .is_some_and(|report| report.unpurged().next().is_some())
     {
         anyhow::bail!("one or more expired trash entries failed to purge");
     }

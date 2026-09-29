@@ -293,3 +293,169 @@ fn clean_empty_plan_json_without_yes_cannot_purge_expired_trash() {
     );
     assert_eq!(oplog_records(&state).len(), 1);
 }
+
+/// One account whose store is really activated, so its expiry takes the sealed path.
+/// `degu()` forces the legacy seam, whose expiry writes a `pending` record before the
+/// deletion — an unwritable log stops it there, which is a real failure, not a gap.
+struct SealedExpiry {
+    home: tempfile::TempDir,
+    state: tempfile::TempDir,
+    cache: std::path::PathBuf,
+    anchor: std::path::PathBuf,
+}
+
+impl SealedExpiry {
+    fn new() -> Option<Self> {
+        let home = tempfile::tempdir().unwrap();
+        require_sealed_fixture_backend(home.path())?;
+        // A sealed store refuses an ancestor granting foreign rename authority,
+        // which a top-level temporary directory has.
+        let state = tempfile::tempdir_in(home.path()).unwrap();
+        // Directories only: a regular file carrying an extended attribute the
+        // held-tree policy does not certify is refused, and some filesystems attach
+        // one to every file a process writes.
+        let cache = crate::common::platform_cache_dir(home.path(), "pip");
+        std::fs::create_dir_all(cache.join("child")).unwrap();
+        crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+        let anchor = state.path().join("degu-integration-activation-anchor");
+        std::fs::create_dir_all(&anchor).unwrap();
+        std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let anchor = std::fs::canonicalize(&anchor).unwrap();
+        Some(Self {
+            home,
+            state,
+            cache,
+            anchor,
+        })
+    }
+
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("degu"))
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", self.home.path())
+            .env("XDG_STATE_HOME", self.state.path())
+            .env("XDG_CONFIG_HOME", test_config_home())
+            .env("LOGNAME", test_config_home())
+            .env("DEGU_INTEGRATION_TEST_ANCHOR", &self.anchor)
+            // Intentionally omit DEGU_INTEGRATION_TEST_LEGACY_CLEAN.
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    fn log(&self) -> std::path::PathBuf {
+        self.state.path().join("degu/ops.jsonl")
+    }
+
+    /// Age the completed staging record so the next clean plans its expiry. Only the
+    /// reporting timestamp moves; the WAL and the staged tree are untouched.
+    fn age_the_staging_record(&self) {
+        let log = self.log();
+        let aged = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+                if row["action"] == "trash" && row["outcome"] == "ok" {
+                    row["ts"] = serde_json::json!("2000-01-01T00:00:00Z");
+                }
+                format!("{row}\n")
+            })
+            .collect::<String>();
+        std::fs::write(&log, aged).unwrap();
+    }
+}
+
+/// Expiry deletes under the same authority an explicit purge does and has to read its
+/// result the same way. A completed deletion the log could not record is a gap to
+/// inspect, not a purge to retry: calling it a failure tells the caller to repeat a
+/// deletion that already happened, and exits nonzero for a clean that did its job.
+#[test]
+fn an_unrecordable_expiry_purge_is_not_a_purge_to_retry() {
+    let Some(fixture) = SealedExpiry::new() else {
+        return;
+    };
+    let staged = fixture.run(&["clean", "--yes", "--json"]);
+    assert_output_success(&staged);
+    assert!(!fixture.cache.exists());
+    let entry = {
+        let report: serde_json::Value = serde_json::from_slice(&staged.stdout).unwrap();
+        report["executed"][0]["trash_entry"]
+            .as_str()
+            .expect("the clean staged nothing")
+            .to_owned()
+    };
+    fixture.age_the_staging_record();
+
+    // Readable so the expiry planner still reads the log, unwritable so only the
+    // completed purge's own record cannot be appended.
+    std::fs::set_permissions(fixture.log(), std::fs::Permissions::from_mode(0o400)).unwrap();
+    let expired = fixture.run(&["clean", "--yes", "--json"]);
+    std::fs::set_permissions(fixture.log(), std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let report: serde_json::Value = serde_json::from_slice(&expired.stdout).unwrap();
+    assert!(
+        !std::path::Path::new(&entry).exists(),
+        "expiry did not delete the expired entry, so this says nothing about reporting"
+    );
+    assert!(
+        expired.status.success(),
+        "a completed expiry exited nonzero: {report} stderr: {}",
+        String::from_utf8_lossy(&expired.stderr)
+    );
+    assert_eq!(
+        report["expiry"]["purged"].as_array().unwrap().len(),
+        1,
+        "report: {report}"
+    );
+    assert!(
+        report["expiry"]["failed"].as_array().unwrap().is_empty(),
+        "a completed deletion was reported as a purge to retry: {report}"
+    );
+    assert_eq!(
+        report["expiry"]["unrecorded"].as_array().unwrap().len(),
+        1,
+        "the unrecordable expiry purge was not reported as a gap: {report}"
+    );
+}
+
+/// The same answer in the human output, which `--json` does not exercise. A caller
+/// reading stderr has to be able to tell "this is still here, run it again" from
+/// "this is gone, the history just does not say so".
+#[test]
+fn an_unrecordable_expiry_purge_reads_as_a_gap_not_an_error() {
+    let Some(fixture) = SealedExpiry::new() else {
+        return;
+    };
+    assert_output_success(&fixture.run(&["clean", "--yes"]));
+    assert!(!fixture.cache.exists());
+    fixture.age_the_staging_record();
+
+    std::fs::set_permissions(fixture.log(), std::fs::Permissions::from_mode(0o400)).unwrap();
+    let expired = fixture.run(&["clean", "--yes"]);
+    std::fs::set_permissions(fixture.log(), std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let stdout = String::from_utf8(strip_sgr(&expired.stdout)).unwrap();
+    let stderr = String::from_utf8(strip_sgr(&expired.stderr)).unwrap();
+    assert!(
+        expired.status.success(),
+        "a completed expiry exited nonzero: {stderr}"
+    );
+    assert!(
+        stdout.contains("Purged 1 expired trash entry"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stderr.contains("failed to purge expired entry"),
+        "stderr called a completed deletion a failure: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to purge"),
+        "stderr still summarizes a completed expiry as a failure: {stderr}"
+    );
+    assert!(
+        stderr.contains("but the outcome was not fully recorded"),
+        "stderr did not report the missing record at all: {stderr}"
+    );
+}

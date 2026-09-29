@@ -305,12 +305,23 @@ pub(super) fn print_expiry(
         };
         stdoutln!("Purged {} expired trash {noun}", report.purged.len())?;
     }
-    for (entry, reason) in &report.failed {
+    for (entry, reason) in report.unpurged() {
         let entry = escape_terminal_text(&entry.display().to_string());
         let reason = escape_terminal_text(reason);
         crate::presentation::print_stderr_note(
             crate::presentation::Severity::Error,
             &format!("failed to purge expired entry {entry}: {reason}"),
+            colors,
+        );
+    }
+    for (entry, reason) in report.gaps() {
+        let entry = escape_terminal_text(&entry.display().to_string());
+        let reason = escape_terminal_text(reason);
+        crate::presentation::print_stderr_note(
+            crate::presentation::Severity::Warning,
+            &format!(
+                "purged expired entry {entry}, but the outcome was not fully recorded: {reason}"
+            ),
             colors,
         );
     }

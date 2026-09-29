@@ -124,6 +124,8 @@ To select one particular staged copy, use `--entry` with its trash path from `de
 
 A sealed purge interrupted after its durable WAL claim is different: startup marks it `RecoveryRequired`; it does not become a legacy claim that `trash purge` may guess or retry.
 
+A deletion that completed but could not be written to the operation log is reported apart from one that did not delete, because only the second is worth repeating. Both `trash purge --json` and the `expiry` section of `clean --json` list entries to retry under `failed` and completed-but-unrecorded deletions under `unrecorded`; a run whose only fault is an unrecorded deletion warns and exits 0. The `degu ops` history will not show such a deletion, so reconcile it against `degu trash list` rather than repeating it.
+
 For immediate permanent deletion, use `degu clean --purge`. Successfully purged entries cannot be restored. The [staging, undo, and purge policy](safety.md#staging-undo-and-purge) defines the confirmations and fixed-plan guarantees for both purge commands.
 
 ## Read the operation log

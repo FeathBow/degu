@@ -29,7 +29,12 @@ fn clean_json_schema_is_frozen() {
     );
     assert!(json["quota_observations"]["direct_purge"]["observation_state"].is_string());
     assert!(json["quota_observations"]["expiry_purge"]["observation_state"].is_string());
-    for failure in json["expiry"]["failed"].as_array().unwrap() {
+    for failure in json["expiry"]["failed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(json["expiry"]["unrecorded"].as_array().unwrap())
+    {
         assert_keys(failure, CLEAN_EXPIRY_FAILURE_KEYS);
     }
     for finding in assert_non_empty_array(&json["planned"], "clean planned findings") {

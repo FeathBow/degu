@@ -161,7 +161,10 @@ fn clean_purge_rejects_generic_permanent_confirmation_as_non_success() {
     assert!(transcript.contains(
         "Sealed, staged, and permanently deleted through exact object-bound authority; not restorable."
     ));
-    assert!(transcript.contains("Canceled; no clean or purge changes made."));
+    assert!(
+        transcript
+            .contains("Canceled; nothing was cleaned, and this clean deleted nothing permanently.")
+    );
 }
 
 #[test]

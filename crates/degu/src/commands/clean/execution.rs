@@ -137,9 +137,11 @@ fn run_human(prepared: PreparedClean) -> Result<()> {
     }
     let permanent = permanent_deletion_planned(&prepared, &expiry_plan);
     if !confirm_execution(&prepared, &expiry_plan)? {
-        let output_result = output::print_cancelled(prepared.settings.ui);
+        let output_result = output::print_cancelled(prepared.settings.ui, permanent);
         if permanent {
-            anyhow::bail!("permanent deletion cancelled; no clean or purge changes were made");
+            anyhow::bail!(
+                "permanent deletion cancelled; nothing was cleaned and this clean deleted nothing permanently"
+            );
         }
         return output_result;
     }

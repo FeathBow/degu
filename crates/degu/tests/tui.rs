@@ -243,6 +243,149 @@ send "no\r"
     );
 }
 
+/// A purge and a clean chosen together run in that order, and the purge is done by
+/// the time the clean asks. Declining the clean cancels the clean; it cannot also
+/// unmake the deletion the same session reported one screen earlier, so the
+/// cancellation must not say the session changed nothing.
+#[test]
+fn declining_the_clean_after_a_purge_does_not_deny_the_purge() {
+    let (home, state, _) = pip_fixture::create();
+    clean_run::run(home.path(), state.path());
+    let trash = state.path().join("degu/trash");
+    assert_eq!(
+        entry_names(&trash).len(),
+        1,
+        "the staging fixture produced no entry"
+    );
+
+    // The origin refills, so the clean half has work the reader then declines.
+    let kept = pip_cache::seed(home.path());
+    assert!(kept.exists());
+
+    let config = config_home_with_roots(&[]);
+    let out = run_pty(PtyRun {
+        body: r#"
+spawn -noecho sh -c {stty rows 40 columns 120; exec "$DEGU_BIN" --color never tui}
+expect -ex "\033\[?1049h"
+sleep 1
+send "t"
+sleep 1
+send " "
+sleep 1
+send "c"
+expect "Type 'purge'"
+send "purge\r"
+expect "Proceed?"
+send "n\r"
+"#,
+        home: home.path(),
+        config_home: config.path(),
+        state_home: state.path(),
+        extra_env: &[],
+    });
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        entry_names(&trash).is_empty(),
+        "the confirmed purge did not run, so this says nothing about its report: {stdout}"
+    );
+    assert!(kept.exists(), "the declined clean ran anyway: {stdout}");
+    assert!(
+        stdout.contains("Canceled; nothing was cleaned."),
+        "the cancellation does not say what was canceled: {stdout}"
+    );
+    assert!(
+        !stdout.contains("no clean or purge changes"),
+        "the cancellation denied a purge this session had already reported: {stdout}"
+    );
+}
+
+/// Age every completed staging record but the last, so the next clean plans an expiry
+/// that outlives whichever entry the reader purges. Only the reporting timestamp moves.
+fn age_all_but_the_newest(state: &Path) {
+    let log = state.join("degu/ops.jsonl");
+    let mut rows = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let newest = rows
+        .iter()
+        .rposition(|row| row["action"] == "trash" && row["outcome"] == "ok")
+        .expect("a completed staging record");
+    for (index, row) in rows.iter_mut().enumerate() {
+        if index != newest && row["action"] == "trash" && row["outcome"] == "ok" {
+            row["ts"] = serde_json::json!("2000-01-01T00:00:00Z");
+        }
+    }
+    std::fs::write(
+        &log,
+        rows.iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+}
+
+/// A clean that would have expired something still cannot answer for a purge that
+/// already happened. Saying nothing was permanently deleted is true of this clean and
+/// false of the session, and the session is what the reader just watched.
+#[test]
+fn declining_a_clean_with_an_expiry_plan_does_not_deny_the_purge() {
+    let (home, state, _) = pip_fixture::create();
+    for _ in 0..3 {
+        pip_cache::seed(home.path());
+        clean_run::run(home.path(), state.path());
+    }
+    let trash = state.path().join("degu/trash");
+    assert_eq!(
+        entry_names(&trash).len(),
+        3,
+        "the fixture did not stage three entries"
+    );
+    age_all_but_the_newest(state.path());
+    // The origin refills, so the clean the reader declines has work of its own.
+    let kept = pip_cache::seed(home.path());
+
+    let config = config_home_with_roots(&[]);
+    let out = run_pty(PtyRun {
+        body: r#"
+spawn -noecho sh -c {stty rows 40 columns 120; exec "$DEGU_BIN" --color never tui}
+expect -ex "\033\[?1049h"
+sleep 1
+send "t"
+sleep 1
+send " "
+sleep 1
+send "c"
+expect "Type 'purge'"
+send "purge\r"
+expect "Proceed?"
+send "n\r"
+"#,
+        home: home.path(),
+        config_home: config.path(),
+        state_home: state.path(),
+        extra_env: &[],
+    });
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        entry_names(&trash).len(),
+        2,
+        "the confirmed purge did not remove exactly one entry: {stdout}"
+    );
+    assert!(kept.exists(), "the declined clean ran anyway: {stdout}");
+    assert!(
+        stdout.contains("this clean deleted nothing permanently"),
+        "the cancellation does not scope its claim to this clean: {stdout}"
+    );
+    assert!(
+        !stdout.contains("nothing was permanently deleted"),
+        "the cancellation denied a purge this session had already reported: {stdout}"
+    );
+}
+
 fn entry_names(trash: &Path) -> Vec<String> {
     let Ok(dir) = std::fs::read_dir(trash) else {
         return Vec::new();

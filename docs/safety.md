@@ -90,7 +90,7 @@ What is staged is not in that store. `degu clean` stages into a trash directory,
 So the order is the opposite of what it looks like.
 
 1. `degu trash list` shows what is still staged. It keeps working in this state.
-2. Check whether the store the anchor records still exists — `degu doctor` names the anchor under `Authority path`, and `sealed-staging.active` names the store. A store that is still there may hold WAL state for transactions that never settled, and retiring the binding abandons that, so stop and inspect it. A store that is gone has no WAL left to abandon, and the trash is unaffected either way.
+2. Check whether the store the anchor records still exists — `degu doctor` names the anchor under `Authority path` and the store it authenticated under `Store path`, with the state directory that store belongs to under `Store state`; when this run reads a different state directory, it says which one. A store that is still there may hold WAL state for transactions that never settled, and retiring the binding abandons that, so stop and inspect it. A store that is gone has no WAL left to abandon, and the trash is unaffected either way.
 3. Copy the anchor directory aside, then remove `sealed-staging.active` and `sealed-staging.prepare` from it. Keep `sealed-staging.authority`; the durable authority claim is still valid and it is the store binding that has to go.
 4. `degu undo` now restores what was staged, through the operation log's own recovery authority. The next mutation activates a store again, so there is no reinitialization step.
 

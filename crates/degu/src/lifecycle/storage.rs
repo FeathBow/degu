@@ -398,6 +398,23 @@ pub(crate) fn activated_store_coverage(ctx: &DetectCtx) -> StoreCoverage {
     }
 }
 
+/// The state directory an activated store belongs to.
+///
+/// A store locator is `<state>/degu/sealed-staging`, so its state directory is two
+/// levels up. Named once because two answers depend on it: whether this environment
+/// holds the store, and which directory `degu doctor` should send a reader to.
+pub(crate) fn state_home_of(store: &Path) -> Option<&Path> {
+    store.parent().and_then(Path::parent)
+}
+
+/// Whether two spellings name the same directory, as far as the filesystem can say.
+///
+/// An unresolvable path compares as itself, so a directory that is gone still equals
+/// its own spelling rather than silently matching another.
+pub(crate) fn same_directory(left: &Path, right: &Path) -> bool {
+    resolved(left) == resolved(right)
+}
+
 /// Whether this environment's state directory is the one the recorded store lives
 /// under.
 ///
@@ -408,10 +425,10 @@ pub(crate) fn activated_store_coverage(ctx: &DetectCtx) -> StoreCoverage {
 /// enumerate that trash, which is why the comparison resolves the directory and
 /// then rebuilds the store path lexically.
 fn holds_the_recorded_store(recorded: &Path, ctx: &DetectCtx) -> bool {
-    let Some(recorded_state) = recorded.parent().and_then(Path::parent) else {
+    let Some(recorded_state) = state_home_of(recorded) else {
         return false;
     };
-    resolved(recorded_state) == resolved(&ctx.xdg_state())
+    same_directory(recorded_state, &ctx.xdg_state())
 }
 
 fn resolved(path: &Path) -> PathBuf {

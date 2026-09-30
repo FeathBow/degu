@@ -1,5 +1,4 @@
 use std::ffi::OsString;
-use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +15,7 @@ use degu_core::staging::{
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, Mode, OFlags};
 
+use super::super::failure::{root_cause, transaction_hex};
 use super::super::identity;
 use super::super::journal::{
     OperationLog, TrashRecord, VerifiedPurgeRecord, trash_record, verified_purge_record,
@@ -523,9 +523,10 @@ fn execute_reserved(
         Err(error) => {
             return Err((
                 format!(
-                    "sealed staging transaction {} failed during {}: {error}",
+                    "sealed staging transaction {} failed during {}: {}",
                     transaction_hex(error.transaction()),
-                    error.stage()
+                    error.stage(),
+                    root_cause(&error)
                 ),
                 error.disposition(),
             ));
@@ -588,8 +589,9 @@ fn execute_reserved(
                     .map_err(|error| {
                         (
                             format!(
-                                "explicit sealed purge execution failed during {}: {error}",
-                                error.stage()
+                                "explicit sealed purge execution failed during {}: {}",
+                                error.stage(),
+                                root_cause(&error)
                             ),
                             ForwardFailureDisposition::RecoveryBlocked,
                         )
@@ -607,8 +609,9 @@ fn execute_reserved(
             {
                 return Err((
                     format!(
-                        "explicit sealed purge admission failed during {}: {error}",
-                        error.stage()
+                        "explicit sealed purge admission failed during {}: {}",
+                        error.stage(),
+                        root_cause(&error)
                     ),
                     ForwardFailureDisposition::RecoveryBlocked,
                 ));
@@ -619,7 +622,11 @@ fn execute_reserved(
                 let unsupported_content = error.is_unsupported_internal_hard_links()
                     || error.is_unsupported_regular_xattrs();
                 purge_admission_failure = Some((
-                    format!("purge admission failed during {}: {error}", error.stage()),
+                    format!(
+                        "purge admission failed during {}: {}",
+                        error.stage(),
+                        root_cause(&error)
+                    ),
                     unsupported_content,
                 ));
                 false
@@ -740,14 +747,6 @@ fn next_sequence(destination_parent: &OwnedFd) -> io::Result<u64> {
 
 fn open_directory(path: &Path) -> io::Result<OwnedFd> {
     rustix::fs::open(path, OPEN_DIRECTORY, Mode::empty()).map_err(io::Error::from)
-}
-
-fn transaction_hex(transaction: TransactionId) -> String {
-    let mut encoded = String::with_capacity(transaction.0.len() * 2);
-    for byte in transaction.0 {
-        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    encoded
 }
 
 fn random_unused_transaction(engine: &ReadyStagingEngine) -> io::Result<TransactionId> {
@@ -997,17 +996,6 @@ mod tests {
         held.release().unwrap();
         assert!(!detached.join(".claims/0001").exists());
         assert!(trash.join(".claims/0001").is_file());
-    }
-
-    #[test]
-    fn transaction_hex_is_fixed_width_and_adapter_local() {
-        assert_eq!(
-            transaction_hex(TransactionId([
-                0x00, 0x01, 0x0f, 0x10, 0x2a, 0x7f, 0x80, 0xff, 0x55, 0xaa, 0x03, 0x30, 0x99, 0x09,
-                0xd0, 0x0d,
-            ])),
-            "00010f102a7f80ff55aa03309909d00d"
-        );
     }
 
     #[test]

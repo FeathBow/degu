@@ -166,6 +166,15 @@ fn ordinary_regular_xattr_previews_stages_and_fresh_process_undo_preserves_value
         return;
     };
     let file = fixture.cache.join("wheel.whl");
+    // The counts below are exact, so say what the tree carried before: one attribute
+    // and eleven value bytes mean this test's attribute and nothing the host added.
+    let bare = fixture.run(&["clean", "-n", "--json"]);
+    assert_output_success(&bare);
+    let bare: serde_json::Value = serde_json::from_slice(&bare.stdout).unwrap();
+    assert_eq!(
+        bare["staging_preflight"][0]["contains_ordinary_regular_xattrs"], false,
+        "{bare:#}"
+    );
     set_ordinary_xattr(&file, b"proof-bound");
 
     let preview = fixture.run(&["clean", "-n", "--json"]);
@@ -819,6 +828,11 @@ impl Fixture {
         assert_eq!(backend, degu_core::backend::CertifiedLocalBackend::Apfs);
 
         let (cache, state) = fake_pip_cache(&home, ".cache/pip");
+        // Some filesystems attach an extended attribute to every file a process
+        // writes, macOS provenance among them. These tests count attributes and
+        // assert what a purge admits, so the fixture says what it starts with rather
+        // than inheriting whatever the host put there.
+        strip_extended_attributes(home.path()).unwrap();
         assert_eq!(certify_backend(&cache).unwrap(), backend);
         assert_eq!(certify_backend(state.path()).unwrap(), backend);
         assert_eq!(

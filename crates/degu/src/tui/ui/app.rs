@@ -80,11 +80,12 @@ impl App {
         home: std::path::PathBuf,
         blocked: bool,
         advisories: crate::advisory::Advisories,
+        assess: impl Fn(&degu_core::finding::Finding) -> Option<String>,
     ) -> Self {
-        let decisions = Decisions::new(report.section(Section::Cache));
+        let decisions = Decisions::new(report.section(Section::Cache), assess);
         let browser = Browser::new(report);
         let document = Derived::new(browser.selection(), || {
-            document(&browser, &home, &advisories)
+            document(&browser, &home, &advisories, &decisions)
         });
         let metric_width = Derived::new(metric_key(&browser), || metric_width(&browser));
         let allocation = Derived::new(browser.section(), || allocation::segments(&browser));
@@ -112,8 +113,9 @@ impl App {
 
     fn refresh(&mut self) {
         let browser = &self.browser;
+        let decisions = &self.decisions;
         self.document.refresh(browser.selection(), || {
-            document(browser, &self.home, &self.advisories)
+            document(browser, &self.home, &self.advisories, decisions)
         });
         self.metric_width
             .refresh(metric_key(browser), || metric_width(browser));
@@ -348,10 +350,19 @@ fn document(
     browser: &Browser,
     home: &std::path::Path,
     advisories: &crate::advisory::Advisories,
+    decisions: &Decisions,
 ) -> Document {
     browser
         .selected_finding()
-        .map(|finding| Document::new(finding, browser.section(), home, advisories))
+        .map(|finding| {
+            Document::new(
+                finding,
+                browser.section(),
+                home,
+                advisories,
+                decisions.refusal(finding.path()),
+            )
+        })
         .unwrap_or_default()
 }
 

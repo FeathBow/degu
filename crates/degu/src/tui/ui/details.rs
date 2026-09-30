@@ -31,10 +31,11 @@ impl Document {
         section: Section,
         home: &Path,
         advisories: &crate::advisory::Advisories,
+        refusal: Option<&str>,
     ) -> Self {
         let introduction = introduction(finding, section, home);
         let source = content(finding, &introduction, advisories);
-        let preview = preview(finding, section, home, advisories);
+        let preview = preview(finding, section, home, advisories, refusal);
         Self {
             label: escape_terminal_text(finding.ecosystem()),
             summary: preview_summary(finding),
@@ -150,16 +151,27 @@ fn preview(
     section: Section,
     home: &Path,
     advisories: &crate::advisory::Advisories,
+    refusal: Option<&str>,
 ) -> Vec<Line<'static>> {
     let class = Class::of(finding, section);
+    // What the scan made of the tree, unless staging would refuse to move it: then
+    // that is what the reader needs, and repeating the disposition here beside a row
+    // that says `Blocked` would have the panel contradict the table.
+    let heading = match refusal {
+        None => Line::from(class.label()).style(class_style(class)),
+        Some(_) => Line::from("Blocked by sealed staging preflight").fg(CAUTION),
+    };
     let mut lines = vec![
-        Line::from(class.label()).style(class_style(class)),
+        heading,
         Line::from(escape_terminal_text(&crate::presentation::display_path(
             finding.path(),
             home,
         )))
         .bold(),
     ];
+    if let Some(refusal) = refusal {
+        lines.push(Line::from(escape_terminal_text(refusal)).fg(CAUTION));
+    }
     if finding.skipped() > 0 {
         lines.push(
             Line::from(format!(
@@ -698,6 +710,7 @@ mod tests {
             Section::Cache,
             Path::new("/home/account"),
             &advised(),
+            None,
         )
         .iter()
         .map(ToString::to_string)
@@ -727,6 +740,7 @@ mod tests {
                 Section::Cache,
                 Path::new("/home/account"),
                 advisories,
+                None,
             )
             .iter()
             .map(ToString::to_string)

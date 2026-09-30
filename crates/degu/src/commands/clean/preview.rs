@@ -45,6 +45,23 @@ pub(super) enum PreviewStagingStatus {
     },
 }
 
+/// Why staging admission would refuse this tree, or `None` when it would not.
+///
+/// The same assessment a dry-run preview reports, asked one finding at a time so a
+/// surface that offers a plan can say what the plan would hit before it is run. It
+/// walks the tree's metadata, so a caller asks once per finding and remembers.
+///
+/// Assessed as an explicit-path batch, because every surface that asks this builds
+/// one: that is the strictest reading, and the one the reader's own preview applies.
+pub(crate) fn staging_refusal(finding: &Finding) -> Option<String> {
+    match PreviewStagingAssessment::assess(finding, false, true).status {
+        PreviewStagingStatus::Blocked { reason, .. } => Some(reason),
+        PreviewStagingStatus::TreePolicyAssessed { .. }
+        | PreviewStagingStatus::DeferredUntilExecutionSeal { .. }
+        | PreviewStagingStatus::SealedPathUnavailable { .. } => None,
+    }
+}
+
 impl PreviewStagingAssessment {
     pub(super) fn assess(finding: &Finding, purge_requested: bool, atomic_selection: bool) -> Self {
         let path = finding.path().to_path_buf();

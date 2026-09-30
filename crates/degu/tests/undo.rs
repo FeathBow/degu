@@ -341,3 +341,100 @@ fn detach_fixture_dir(path: &Path) -> tempfile::TempDir {
     std::fs::rename(path, detached.path().join("entry")).unwrap();
     detached
 }
+
+/// One account whose store is really activated, so an undo takes the sealed path and
+/// fails the way a sealed undo fails. The legacy seam refuses an occupied original
+/// with a different error entirely.
+struct SealedUndo {
+    home: tempfile::TempDir,
+    state: tempfile::TempDir,
+    cache: PathBuf,
+    anchor: PathBuf,
+}
+
+impl SealedUndo {
+    fn new() -> Option<Self> {
+        let home = tempfile::tempdir().unwrap();
+        common::require_sealed_fixture_backend(home.path())?;
+        // Inside the home: a sealed store refuses an ancestor granting foreign rename
+        // authority, and trash routing needs the state under the source mount's anchor.
+        let state = tempfile::tempdir_in(home.path()).unwrap();
+        let cache = common::platform_cache_dir(home.path(), "pip");
+        let this = Self {
+            home,
+            state,
+            cache,
+            anchor: PathBuf::new(),
+        };
+        this.seed();
+        let anchor = this.state.path().join("degu-integration-activation-anchor");
+        std::fs::create_dir_all(&anchor).unwrap();
+        std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let anchor = std::fs::canonicalize(&anchor).unwrap();
+        Some(Self { anchor, ..this })
+    }
+
+    /// Directories only: a sealed purge refuses a tree whose regular files carry any
+    /// extended attribute, and some filesystems attach one to every file written.
+    fn seed(&self) {
+        std::fs::create_dir_all(self.cache.join("http-v2/aa")).unwrap();
+        common::make_tree_non_shared_writable(self.home.path()).unwrap();
+    }
+
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("degu"))
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", self.home.path())
+            .env("XDG_STATE_HOME", self.state.path())
+            .env("XDG_CONFIG_HOME", common::isolated_config_home())
+            .env("LOGNAME", common::isolated_config_home())
+            .env("DEGU_INTEGRATION_TEST_ANCHOR", &self.anchor)
+            // Intentionally omit DEGU_INTEGRATION_TEST_LEGACY_CLEAN.
+            .args(args)
+            .output()
+            .unwrap()
+    }
+}
+
+/// Clean a cache, let its tool refill it, then change your mind. degu refuses to
+/// overwrite what is there now, which is right — and the refusal has to say that, in
+/// words the reader can act on, rather than hand back the transaction bytes and the
+/// wrappers each layer added on the way out.
+#[test]
+fn an_undo_onto_an_occupied_original_says_what_to_do_about_it() {
+    let Some(fixture) = SealedUndo::new() else {
+        return;
+    };
+    let staged = fixture.run(&["clean", "--yes", "--json"]);
+    assert!(
+        staged.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&staged.stderr)
+    );
+    assert!(!fixture.cache.exists());
+    // The tool that owns the cache puts it back.
+    fixture.seed();
+
+    let out = fixture.run(&["undo", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        report["restored"].as_array().unwrap().is_empty(),
+        "report: {report}"
+    );
+    let failed = report["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1, "report: {report}");
+    let reason = failed[0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("already holds something") && reason.contains("undo again"),
+        "the refusal does not say what happened or what to do: {reason}"
+    );
+    assert!(
+        !reason.contains("TransactionId("),
+        "a WAL transaction's bytes reached the reader: {reason}"
+    );
+    // The staged copy is still there, which is what the message promises.
+    let listed = fixture.run(&["trash", "list", "--json"]);
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["entries"].as_array().unwrap().len(), 1);
+}

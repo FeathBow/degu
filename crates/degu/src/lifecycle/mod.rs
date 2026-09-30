@@ -1,6 +1,7 @@
 mod claims;
 mod entries;
 mod expiry;
+mod failure;
 mod identity;
 mod journal;
 mod mount;
@@ -476,9 +477,10 @@ impl MutationSession {
                         }
                     }
                     Err(error) => SealedPurgeOutcome::Blocked(format!(
-                        "sealed staging explicit purge execution failed during {} ({:?}): {error}",
+                        "sealed staging explicit purge execution failed during {} ({:?}): {}",
                         error.stage(),
-                        error.disposition()
+                        error.disposition(),
+                        failure::root_cause(&error)
                     )),
                 }
             }
@@ -489,13 +491,15 @@ impl MutationSession {
                 ) && error.is_unsupported_internal_hard_links() =>
             {
                 SealedPurgeOutcome::RetainedUnsupported(format!(
-                    "retained and remains undoable because permanent purge is unsupported: {error}"
+                    "retained and remains undoable because permanent purge is unsupported: {}",
+                    failure::root_cause(&error)
                 ))
             }
             Err(error) => SealedPurgeOutcome::Blocked(format!(
-                "sealed staging explicit purge admission failed during {} ({:?}): {error}",
+                "sealed staging explicit purge admission failed during {} ({:?}): {}",
                 error.stage(),
-                error.disposition()
+                error.disposition(),
+                failure::root_cause(&error)
             )),
         }
     }

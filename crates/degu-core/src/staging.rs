@@ -580,6 +580,21 @@ impl VerifiedUndoError {
     pub fn disposition(&self) -> VerifiedUndoFailureDisposition {
         self.disposition
     }
+
+    /// Whether the original location already holds something, so the staged copy was
+    /// left where it is. This is an ordinary outcome of cleaning a cache a tool then
+    /// refills, and a caller can say what to do about it rather than reporting a
+    /// failure the reader cannot act on.
+    pub fn is_destination_occupied(&self) -> bool {
+        self.source
+            .downcast_ref::<crate::staging::recovery::RecoveryRebindError>()
+            .is_some_and(|source| {
+                matches!(
+                    source,
+                    crate::staging::recovery::RecoveryRebindError::UndoDestinationOccupied
+                )
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

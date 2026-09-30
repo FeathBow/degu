@@ -3,18 +3,17 @@ mod restore;
 mod selection;
 
 use std::collections::HashSet;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use degu_core::authority::TransactionState;
 use degu_core::ecosystem::DetectCtx;
 use degu_core::oplog::OpOutcome;
-use degu_core::seal::wal::TransactionId;
 use degu_core::staging::{
     ProductionStagingEntry, ReadyStagingEngine, VerifiedUndoFailureDisposition, VerifiedUndoRequest,
 };
 
+use super::failure::{root_cause, transaction_hex};
 use super::journal::{OperationLog, VerifiedRestoreRecord, verified_restore_record};
 use super::mount;
 use restore::restore_selection;
@@ -215,11 +214,7 @@ fn undo_group_verified(
                     report.failed.push(UndoFailedEntry {
                         path: original,
                         trash_entry,
-                        reason: format!(
-                            "verified undo transaction {} failed during {}: {error}",
-                            transaction_hex(error.transaction()),
-                            error.stage()
-                        ),
+                        reason: undo_failure_reason(&error),
                     });
                 }
             }
@@ -341,12 +336,21 @@ fn sealed_undo_active(state: TransactionState) -> bool {
     )
 }
 
-fn transaction_hex(transaction: TransactionId) -> String {
-    let mut output = String::with_capacity(32);
-    for byte in transaction.0 {
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+/// What stopped this undo, as something the reader can act on where there is an
+/// action. An occupied original is the ordinary case -- a cache cleaned and then
+/// refilled by its own tool -- and naming a transaction for it would offer the reader
+/// the one fact they cannot use. Everything else is a real failure, where the
+/// transaction and the stage are what a report would be chased by.
+fn undo_failure_reason(error: &degu_core::staging::VerifiedUndoError) -> String {
+    if error.is_destination_occupied() {
+        return "the original location already holds something, so the staged copy was left where it is; move what is there aside and undo again, or purge the entry to accept the deletion".to_owned();
     }
-    output
+    format!(
+        "verified undo transaction {} failed during {}: {}",
+        transaction_hex(error.transaction()),
+        error.stage(),
+        root_cause(error)
+    )
 }
 
 fn trace_summary(report: &UndoReport, reclamation_label: &str) {
@@ -402,17 +406,6 @@ mod tests {
             destination_parent: None,
             outcome: OpOutcome::Ok,
         }
-    }
-
-    #[test]
-    fn transaction_hex_is_fixed_width_and_adapter_local() {
-        assert_eq!(
-            transaction_hex(TransactionId([
-                0x00, 0x01, 0x0f, 0x10, 0x2a, 0x7f, 0x80, 0xff, 0x55, 0xaa, 0x03, 0x30, 0x99, 0x09,
-                0xd0, 0x0d,
-            ])),
-            "00010f102a7f80ff55aa03309909d00d"
-        );
     }
 
     #[test]

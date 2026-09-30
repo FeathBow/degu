@@ -25,6 +25,147 @@ pub fn make_tree_non_shared_writable(root: &Path) -> std::io::Result<()> {
     strip_dir_write(root)
 }
 
+/// Plant one extended attribute of a class this platform's staging admits, which is
+/// what a filesystem that attaches provenance to every written file leaves behind.
+#[allow(
+    dead_code,
+    reason = "shared support is compiled into integration-test crates that use different helpers"
+)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn set_ordinary_xattr(path: &Path, value: &[u8]) {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).unwrap();
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            c"user.degu-proof-v3".as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            c"com.apple.quarantine".as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    assert_eq!(
+        result,
+        0,
+        "failed to set ordinary xattr: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Remove every extended attribute from each regular file under `root`.
+///
+/// A sealed purge refuses a staged tree whose regular files carry any extended
+/// attribute at all -- not only one its staging allowlist would decline -- and some
+/// filesystems attach one to every file a process writes, macOS provenance among
+/// them. A fixture that stages regular files and then purges them is otherwise
+/// measuring the host rather than degu, and fails on the machines that do.
+///
+/// Symlinks are left alone: they are not what the purge inventory classifies here.
+#[allow(
+    dead_code,
+    reason = "shared support is compiled into integration-test crates that use different helpers"
+)]
+pub fn strip_extended_attributes(root: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(root)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(root)? {
+            strip_extended_attributes(&entry?.path())?;
+        }
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        return Ok(());
+    }
+    let file = std::fs::File::open(root)?;
+    for name in extended_attribute_names(&file)? {
+        remove_extended_attribute(&file, &name)?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code, reason = "used only by strip_extended_attributes")]
+fn extended_attribute_names(file: &std::fs::File) -> std::io::Result<Vec<std::ffi::CString>> {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    // Asked for a size first, then read: the set can change between the two, and a
+    // buffer sized from a stale answer would silently truncate the list.
+    let size = unsafe {
+        #[cfg(target_os = "linux")]
+        let size = libc::flistxattr(fd, std::ptr::null_mut(), 0);
+        #[cfg(target_os = "macos")]
+        let size = libc::flistxattr(fd, std::ptr::null_mut(), 0, 0);
+        size
+    };
+    if size < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut buffer = vec![0i8; size as usize];
+    let written = unsafe {
+        #[cfg(target_os = "linux")]
+        let written = libc::flistxattr(fd, buffer.as_mut_ptr(), buffer.len());
+        #[cfg(target_os = "macos")]
+        let written = libc::flistxattr(fd, buffer.as_mut_ptr(), buffer.len(), 0);
+        written
+    };
+    if written < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let bytes = buffer[..written as usize]
+        .iter()
+        .map(|byte| *byte as u8)
+        .collect::<Vec<_>>();
+    Ok(bytes
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| std::ffi::CString::new(name).expect("a listed xattr name has no interior nul"))
+        .collect())
+}
+
+#[allow(dead_code, reason = "used only by strip_extended_attributes")]
+fn remove_extended_attribute(file: &std::fs::File, name: &std::ffi::CStr) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let result = unsafe {
+        #[cfg(target_os = "linux")]
+        let result = libc::fremovexattr(file.as_raw_fd(), name.as_ptr());
+        #[cfg(target_os = "macos")]
+        let result = libc::fremovexattr(file.as_raw_fd(), name.as_ptr(), 0);
+        result
+    };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        // A name listed a moment ago may be gone, and some are not removable by
+        // the owner at all; neither leaves an attribute this fixture put there.
+        // Linux spells the missing-attribute error `ENODATA`.
+        #[cfg(target_os = "linux")]
+        let absent = libc::ENODATA;
+        #[cfg(target_os = "macos")]
+        let absent = libc::ENOATTR;
+        if matches!(error.raw_os_error(), Some(code) if code == absent || code == libc::EPERM) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// The cache dir the adapters probe for `name` on the current platform, matching
 /// `degu_adapters::platform_cache_root`: `Library/Caches` on macOS, `.cache` else.
 /// Fixtures seed here so a scan finds them without relying on the old dual probe.

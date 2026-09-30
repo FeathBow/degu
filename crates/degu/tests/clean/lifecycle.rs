@@ -143,6 +143,15 @@ fn production_sealed_staging_cli_clean_undo_and_direct_purge() {
         TOTAL_DIRECTORIES,
         "fixture is not the exact root-inclusive production boundary"
     );
+    // A sealed purge refuses a staged tree whose regular files carry any extended
+    // attribute, and this fixture is regular files on purpose -- the undo half reads
+    // their contents back. Some filesystems attach one to every file a process
+    // writes, macOS provenance among them, which would turn the direct purge below
+    // into `purge_unsupported` there and nowhere else. So plant one and clear it:
+    // the fixture then exercises the clearing on every machine rather than trusting
+    // the ones that attach nothing.
+    set_ordinary_xattr(&cache.join("wheel.whl"), b"planted-by-the-fixture");
+    strip_extended_attributes(home.path()).unwrap();
     let source_backend = certify_backend(&cache).unwrap();
     let state_backend = certify_backend(state.path()).unwrap();
     assert_eq!(

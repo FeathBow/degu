@@ -114,7 +114,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         Table::new(rows, columns.widths())
             .header(columns.header(app))
             .block(
-                focused_panel("2 locations", app.focus() == Focus::Findings)
+                focused_panel("[2] Locations", app.focus() == Focus::Findings)
                     .title_bottom(Line::from(position).fg(SECONDARY).right_aligned()),
             ),
         area,

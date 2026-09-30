@@ -91,7 +91,7 @@ impl Document {
                 self.lines.len()
             )
         } else {
-            let prefix = "3 Selected · ";
+            let prefix = "[3] Selected · ";
             let budget = usize::from(inner.width).saturating_sub(columns(prefix));
             format!("{prefix}{}", elide(&self.label, budget))
         };

@@ -733,3 +733,140 @@ send "q"
         "the full record still calls the tree ready: {record}"
     );
 }
+
+/// One cache of each tier the screen distinguishes, plus a second Ready one: the
+/// layout has to hold rows the reader can act on and rows they cannot.
+fn caches_of_every_tier(home: &Path) {
+    for (name, kilobytes) in [("pip", 400), ("go-build", 300), ("torch", 200), ("uv", 100)] {
+        let cache = common::platform_cache_dir(home, name);
+        std::fs::create_dir_all(cache.join("aa")).unwrap();
+        std::fs::write(cache.join("aa/blob"), vec![0u8; kilobytes * 1024]).unwrap();
+    }
+    common::make_tree_non_shared_writable(home).unwrap();
+}
+
+/// The height of the findings panel, borders included, as drawn.
+fn listing_height(lines: &[String]) -> usize {
+    let top = lines
+        .iter()
+        .position(|line| line.contains("[2] Locations"))
+        .unwrap_or_else(|| panic!("the findings panel is missing: {lines:#?}"));
+    lines[top..]
+        .iter()
+        .position(|line| line.contains('╰'))
+        .map(|end| end + 1)
+        .unwrap_or_else(|| panic!("the findings panel does not close: {lines:#?}"))
+}
+
+/// A 24-row terminal is the common one, and the screen has to work there: the list is
+/// this screen's subject, the staging trash is half of what it decides, and a panel
+/// title that opens with a bare digit reads as a count of what the panel holds.
+#[test]
+fn the_findings_screen_works_on_a_standard_terminal() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir_in(home.path()).unwrap();
+    caches_of_every_tier(home.path());
+    let config = config_home_with_roots(&[]);
+
+    let out = run_pty(PtyRun {
+        body: r#"
+spawn -noecho sh -c {stty rows 24 columns 80; exec "$DEGU_BIN" --color never tui}
+expect -ex "\033\[?1049h"
+sleep 1
+send "q"
+"#,
+        home: home.path(),
+        config_home: config.path(),
+        state_home: state.path(),
+        extra_env: &[],
+    });
+    let lines = screen::render(&out.stdout, 24, 80);
+    let screen = lines.join(" ");
+
+    // The staging trash is reachable from here, and `t` is the only way in.
+    let footer = lines.last().cloned().unwrap_or_default();
+    assert!(
+        footer.contains("t trash"),
+        "the footer does not offer the staging trash: {footer}"
+    );
+
+    // A title opening with a bare digit reads as a quantity, and the header above it
+    // really does count locations, so the two must not look alike.
+    assert!(
+        screen.contains("[2] Locations"),
+        "the findings panel title still reads as a count: {screen}"
+    );
+    assert!(
+        !screen.contains("╭ 2 locations"),
+        "the ambiguous title is still drawn: {screen}"
+    );
+    assert!(
+        screen.contains("[3] Selected"),
+        "the selected panel title still reads as a count: {screen}"
+    );
+
+    // The list is the screen's subject. With the share chart drawn it got eight of
+    // twenty rows here, five of them usable; the chart's rows are most of what it was
+    // short of, so a list that still fits in eight has not been given them.
+    let height = listing_height(&lines);
+    assert!(
+        height >= 12,
+        "the findings panel is {height} rows of a 24-row terminal: {screen}"
+    );
+    // And the selected item keeps its own context.
+    assert!(
+        screen.contains("Selected"),
+        "the selected finding lost its panel: {screen}"
+    );
+}
+
+/// The same screen at the widths a reader actually has. Narrow drops what it must and
+/// keeps the way out; wide gets the chart back, because there the list can spare the
+/// rows. What no width may do is stop saying which keys reach the rest of the screen.
+#[test]
+fn the_findings_screen_gives_up_the_least_useful_thing_first() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir_in(home.path()).unwrap();
+    caches_of_every_tier(home.path());
+    let config = config_home_with_roots(&[]);
+
+    for (rows, columns, chart) in [(24u16, 60u16, false), (24, 80, false), (40, 120, true)] {
+        let body = format!(
+            r#"
+spawn -noecho sh -c {{stty rows {rows} columns {columns}; exec "$DEGU_BIN" --color never tui}}
+expect -ex "\033\[?1049h"
+sleep 1
+send "q"
+"#
+        );
+        let out = run_pty(PtyRun {
+            body: &body,
+            home: home.path(),
+            config_home: config.path(),
+            state_home: state.path(),
+            extra_env: &[],
+        });
+        let lines = screen::render(&out.stdout, usize::from(rows), usize::from(columns));
+        let screen = lines.join(" ");
+        let footer = lines.last().cloned().unwrap_or_default();
+        // Two shapes, one job: the compact bar and the wide panels are both the
+        // overview, so ask whether any of it is drawn rather than which one.
+        let overview = ["share within report", "reported allocation", "report scope"]
+            .iter()
+            .any(|title| screen.contains(title));
+        assert_eq!(
+            overview, chart,
+            "the overview at {columns}x{rows} is not where it belongs: {screen}"
+        );
+        assert!(
+            footer.contains("q quit"),
+            "the way out is gone at {columns}x{rows}: {footer}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Caches/") || line.contains(".cache/")),
+            "no finding is visible at {columns}x{rows}: {screen}"
+        );
+    }
+}

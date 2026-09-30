@@ -341,7 +341,7 @@ fn escaped_path(path: &std::path::Path, home: &std::path::Path) -> String {
 /// can answer for.
 pub(super) fn print_cancelled(ui: crate::runtime::Ui, permanent: bool) -> Result<()> {
     let text = if permanent {
-        "Canceled; nothing was cleaned and nothing was permanently deleted."
+        "Canceled; nothing was cleaned, and this clean deleted nothing permanently."
     } else {
         "Canceled; nothing was cleaned."
     };

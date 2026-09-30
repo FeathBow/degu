@@ -140,7 +140,7 @@ fn run_human(prepared: PreparedClean) -> Result<()> {
         let output_result = output::print_cancelled(prepared.settings.ui, permanent);
         if permanent {
             anyhow::bail!(
-                "permanent deletion cancelled; nothing was cleaned and nothing was permanently deleted"
+                "permanent deletion cancelled; nothing was cleaned and this clean deleted nothing permanently"
             );
         }
         return output_result;

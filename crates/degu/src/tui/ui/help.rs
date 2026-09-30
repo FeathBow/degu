@@ -39,6 +39,7 @@ const BROWSER_KEYS: &[&[(&str, &str)]] = &[
         ("↑↓", "move"),
         ("space", "toggle"),
         ("p", "preview"),
+        ("t", "trash"),
         ("1/2", "focus"),
         ("g", "group"),
         ("s", "sort"),
@@ -51,7 +52,17 @@ const BROWSER_KEYS: &[&[(&str, &str)]] = &[
         ("↑↓", "move"),
         ("space", "toggle"),
         ("p", "preview"),
+        ("t", "trash"),
         ("Enter", "details"),
+        ("?", "help"),
+        ("q", "quit"),
+    ],
+    // `t` outranks the details key here: it reaches the other half of what this
+    // screen decides, and a reader who cannot find it cannot find that half at all.
+    &[
+        ("↑↓", "move"),
+        ("space", "toggle"),
+        ("t", "trash"),
         ("?", "help"),
         ("q", "quit"),
     ],

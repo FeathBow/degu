@@ -26,6 +26,10 @@ const PANEL_GAP: u16 = 1;
 const FILTER_HEIGHT: u16 = 1;
 const FOOTER_HEIGHT: u16 = 1;
 const MIN_LIST_HEIGHT: u16 = 5;
+/// The list height worth keeping the share chart for. The chart says how the selected
+/// findings divide the report, which is context; the list is the screen's subject, and
+/// on a 24-row terminal the chart's five rows are most of what the list is short of.
+const LIST_HEIGHT_WORTH_A_CHART: u16 = 12;
 const PREVIEW_HEIGHT: u16 = 6;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -62,12 +66,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn browser(frame: &mut Frame, area: Rect, app: &mut App) {
-    let overview_height = if overview::is_wide(area) {
+    let chart_height = if overview::is_wide(area) {
         overview::WIDE_HEIGHT
     } else {
         overview::COMPACT_HEIGHT
     };
-    // The guard counts what the layout below reserves, gap included.
+    // Each guard counts what the layout below reserves, gap included. The chart goes
+    // first and the preview second: the preview is the selected item's own context,
+    // which a reader deciding row by row needs more than a division of the whole.
+    let overview_height = if area.height
+        >= chart_height + FILTER_HEIGHT + LIST_HEIGHT_WORTH_A_CHART + PANEL_GAP + PREVIEW_HEIGHT
+    {
+        chart_height
+    } else {
+        0
+    };
     let has_preview = area.height
         >= overview_height + FILTER_HEIGHT + MIN_LIST_HEIGHT + PANEL_GAP + PREVIEW_HEIGHT;
     let preview_height = if has_preview { PREVIEW_HEIGHT } else { 0 };
@@ -79,7 +92,9 @@ fn browser(frame: &mut Frame, area: Rect, app: &mut App) {
         Constraint::Length(preview_height),
     ])
     .split(area);
-    overview::draw(frame, rows[0], app);
+    if overview_height > 0 {
+        overview::draw(frame, rows[0], app);
+    }
     groups::filter_line(frame, rows[1], app);
     listing(frame, rows[2], app);
     if has_preview && app.browser().selected_finding().is_some() {

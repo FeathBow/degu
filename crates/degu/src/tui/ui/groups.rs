@@ -47,7 +47,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     };
     let block = focused_panel(
         format!(
-            "1 by {} ({})",
+            "[1] By {} ({})",
             browser.group_by().label(),
             browser.groups().len()
         ),

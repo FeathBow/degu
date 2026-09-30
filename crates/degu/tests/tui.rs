@@ -870,3 +870,49 @@ send "q"
         );
     }
 }
+
+/// A scan that could not read everything must say so at every size. The overview says
+/// it in full, and a 24-row terminal drops the overview to give the list its rows — so
+/// an empty incomplete report has to stay distinguishable from a complete one that
+/// found nothing, which is the reading a reader will otherwise take.
+#[test]
+fn an_incomplete_scan_says_so_when_the_overview_is_gone() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir_in(home.path()).unwrap();
+    let config = config_home_with_roots(&[]);
+    // A symlinked adapter root is refused, which is what leaves the scan incomplete.
+    let real = home.path().join("real-pip");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("payload"), vec![0u8; 64 * 1024]).unwrap();
+    let cache = common::platform_cache_dir(home.path(), "pip");
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real, &cache).unwrap();
+    common::make_tree_non_shared_writable(home.path()).unwrap();
+
+    for (rows, columns) in [(24u16, 80u16), (40, 120)] {
+        let body = format!(
+            r#"
+spawn -noecho sh -c {{stty rows {rows} columns {columns}; exec "$DEGU_BIN" --color never tui --only pip}}
+expect -ex "\033\[?1049h"
+sleep 1
+send "q"
+"#
+        );
+        let out = run_pty(PtyRun {
+            body: &body,
+            home: home.path(),
+            config_home: config.path(),
+            state_home: state.path(),
+            extra_env: &[],
+        });
+        let screen = screen::render(&out.stdout, usize::from(rows), usize::from(columns)).join(" ");
+        assert!(
+            screen.contains("incomplete"),
+            "the screen at {columns}x{rows} does not say the scan was incomplete: {screen}"
+        );
+        assert!(
+            !screen.contains("No findings in this section."),
+            "an incomplete search at {columns}x{rows} reads as a completed one: {screen}"
+        );
+    }
+}

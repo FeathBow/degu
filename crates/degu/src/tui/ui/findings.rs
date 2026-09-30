@@ -197,5 +197,10 @@ fn empty_message(app: &App) -> &'static str {
             Section::Cache => "Cache was not scanned in this report.",
         };
     }
+    // An empty list is the one place a reader is most likely to conclude there is
+    // nothing to find, and a search that did not finish cannot support that.
+    if browser.coverage().is_lower_bound() {
+        return "No findings from what this scan could read, and it could not read everything. Nothing here rules out findings in what it missed.";
+    }
     "No findings in this section."
 }

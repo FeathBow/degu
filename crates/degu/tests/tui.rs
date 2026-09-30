@@ -304,7 +304,7 @@ fn the_staged_screen_says_when_it_is_not_the_account_it_looks_like() {
         PtyRun {
             body: r#"
 spawn -noecho sh -c {stty rows 40 columns 120; exec "$DEGU_BIN" --color never tui}
-expect -ex "\[?1049h"
+expect -ex "\033\[?1049h"
 sleep 1
 send "t"
 sleep 1
@@ -563,5 +563,30 @@ send "q"
     assert!(
         screen.contains("hard link"),
         "the review never says why the tree was refused: {screen}"
+    );
+
+    // Enter opens the full record, which must not say less than the row it came from.
+    let out = run_pty(PtyRun {
+        body: r#"
+spawn -noecho sh -c {stty rows 24 columns 80; exec "$DEGU_BIN" --color never tui}
+expect -ex "\033\[?1049h"
+sleep 1
+send "\r"
+sleep 1
+send "q"
+"#,
+        home: home.path(),
+        config_home: config.path(),
+        state_home: state.path(),
+        extra_env: &[],
+    });
+    let record = screen::render(&out.stdout, 24, 80).join(" ");
+    assert!(
+        record.contains("Blocked by sealed staging preflight") && record.contains("hard link"),
+        "the full record dropped the refusal: {record}"
+    );
+    assert!(
+        !record.contains("Ready to clean"),
+        "the full record still calls the tree ready: {record}"
     );
 }

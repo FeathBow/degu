@@ -332,6 +332,18 @@ fn escaped_path(path: &std::path::Path, home: &std::path::Path) -> String {
     escape_terminal_text(&display_path(path, home))
 }
 
-pub(super) fn print_cancelled(ui: crate::runtime::Ui) -> Result<()> {
-    stdoutln!("{}", ui.prose("Canceled; no clean or purge changes made."))
+/// Says what this run did not do, and nothing about what it was never going to do.
+///
+/// A clean reached from the interactive review may follow a purge that already
+/// completed and reported itself; a cancellation that spoke for purges in general
+/// would deny it. `permanent` is whether this clean's own plan would have deleted
+/// anything permanently -- its `--purge` or its expiry -- which is the only purge it
+/// can answer for.
+pub(super) fn print_cancelled(ui: crate::runtime::Ui, permanent: bool) -> Result<()> {
+    let text = if permanent {
+        "Canceled; nothing was cleaned and nothing was permanently deleted."
+    } else {
+        "Canceled; nothing was cleaned."
+    };
+    stdoutln!("{}", ui.prose(text))
 }

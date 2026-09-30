@@ -41,6 +41,12 @@ impl Review {
                 ctx.home,
                 cleanup_blocked(),
                 advisories,
+                // Also before the alternate screen, and for the same reason as the
+                // advisor above: each assessment walks a tree's metadata. The review
+                // asks it only of the findings that would start in the plan, which are
+                // the cheap-to-regenerate caches, because those are what `c` acts on
+                // with no further word from the reader.
+                crate::commands::clean::staging_refusal,
             ),
             filters: collected.filters,
             limits,

@@ -31,10 +31,11 @@ impl Document {
         section: Section,
         home: &Path,
         advisories: &crate::advisory::Advisories,
+        refusal: Option<&str>,
     ) -> Self {
-        let introduction = introduction(finding, section, home);
+        let introduction = introduction(finding, section, home, refusal);
         let source = content(finding, &introduction, advisories);
-        let preview = preview(finding, section, home, advisories);
+        let preview = preview(finding, section, home, advisories, refusal);
         Self {
             label: escape_terminal_text(finding.ecosystem()),
             summary: preview_summary(finding),
@@ -150,16 +151,27 @@ fn preview(
     section: Section,
     home: &Path,
     advisories: &crate::advisory::Advisories,
+    refusal: Option<&str>,
 ) -> Vec<Line<'static>> {
     let class = Class::of(finding, section);
+    // What the scan made of the tree, unless staging would refuse to move it: then
+    // that is what the reader needs, and repeating the disposition here beside a row
+    // that says `Blocked` would have the panel contradict the table.
+    let heading = match refusal {
+        None => Line::from(class.label()).style(class_style(class)),
+        Some(_) => Line::from("Blocked by sealed staging preflight").fg(CAUTION),
+    };
     let mut lines = vec![
-        Line::from(class.label()).style(class_style(class)),
+        heading,
         Line::from(escape_terminal_text(&crate::presentation::display_path(
             finding.path(),
             home,
         )))
         .bold(),
     ];
+    if let Some(refusal) = refusal {
+        lines.push(Line::from(escape_terminal_text(refusal)).fg(CAUTION));
+    }
     if finding.skipped() > 0 {
         lines.push(
             Line::from(format!(
@@ -223,8 +235,29 @@ fn marked(body: &str, style: Style, width: u16) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn introduction(finding: &Finding, section: Section, home: &Path) -> Vec<Line<'static>> {
+fn introduction(
+    finding: &Finding,
+    section: Section,
+    home: &Path,
+    refusal: Option<&str>,
+) -> Vec<Line<'static>> {
     let class = Class::of(finding, section);
+    let path = Line::from(escape_terminal_text(&crate::presentation::display_path(
+        finding.path(),
+        home,
+    )))
+    .bold();
+    // The full record opens the same way the compact panel does. A tree staging would
+    // refuse is not ready to clean, and a reader who pressed Enter to learn more must
+    // not be told less: the disposition alone here would contradict the row they
+    // opened it from and drop the one fact that explains it.
+    if let Some(refusal) = refusal {
+        return vec![
+            path,
+            Line::from("Blocked by sealed staging preflight").fg(CAUTION),
+            Line::from(escape_terminal_text(refusal)).fg(CAUTION),
+        ];
+    }
     let reason = finding
         .disposition()
         .reason
@@ -236,14 +269,7 @@ fn introduction(finding: &Finding, section: Section, home: &Path) -> Vec<Line<'s
     } else {
         format!("{} · {reason}", class.label())
     };
-    vec![
-        Line::from(escape_terminal_text(&crate::presentation::display_path(
-            finding.path(),
-            home,
-        )))
-        .bold(),
-        Line::from(status).style(class_style(class)),
-    ]
+    vec![path, Line::from(status).style(class_style(class))]
 }
 
 fn content(
@@ -465,7 +491,7 @@ mod tests {
     }
 
     fn rendered(finding: &Finding, advisories: &Advisories) -> Vec<String> {
-        let introduction = introduction(finding, Section::Cache, Path::new("/home/account"));
+        let introduction = introduction(finding, Section::Cache, Path::new("/home/account"), None);
         content(finding, &introduction, advisories)
             .iter()
             .map(ToString::to_string)
@@ -698,6 +724,7 @@ mod tests {
             Section::Cache,
             Path::new("/home/account"),
             &advised(),
+            None,
         )
         .iter()
         .map(ToString::to_string)
@@ -727,6 +754,7 @@ mod tests {
                 Section::Cache,
                 Path::new("/home/account"),
                 advisories,
+                None,
             )
             .iter()
             .map(ToString::to_string)

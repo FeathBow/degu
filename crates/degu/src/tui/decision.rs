@@ -11,6 +11,13 @@ pub struct Decisions {
     chosen: BTreeSet<PathBuf>,
     default: BTreeSet<PathBuf>,
     sizes: BTreeMap<PathBuf, (u64, bool)>,
+    /// Why sealed staging would refuse a tree the scan found eligible, by path.
+    ///
+    /// Scan eligibility says a cache is cheap to regenerate; it says nothing about
+    /// whether this tree can be staged. Asked once, for the findings that would start
+    /// in the plan, so a screen offering to run that plan is not the last place to
+    /// learn the plan cannot run.
+    refusals: BTreeMap<PathBuf, String>,
 }
 
 /// What a plan would move, carrying the same honesty the rest of the report
@@ -39,10 +46,25 @@ impl Plan {
 }
 
 impl Decisions {
-    pub fn new(cache: &[Finding]) -> Self {
-        let default: BTreeSet<PathBuf> = cache
-            .iter()
-            .filter(|finding| Class::of(finding, Section::Cache) == Class::Ready)
+    /// `assess` says why sealed staging would refuse a tree, or `None` when it would
+    /// not. Passed in rather than called here: it walks the tree's metadata, which is
+    /// work for the caller that already waits on a scan, and only the findings that
+    /// would start in the plan are worth asking about.
+    pub fn new(cache: &[Finding], assess: impl Fn(&Finding) -> Option<String>) -> Self {
+        let eligible = || {
+            cache
+                .iter()
+                .filter(|finding| Class::of(finding, Section::Cache) == Class::Ready)
+        };
+        let refusals: BTreeMap<PathBuf, String> = eligible()
+            .filter_map(|finding| {
+                assess(finding).map(|reason| (finding.path().to_path_buf(), reason))
+            })
+            .collect();
+        // A tree staging would refuse does not start in the plan: leaving it checked
+        // offers a run that the same keystroke's preview and execution both reject.
+        let default: BTreeSet<PathBuf> = eligible()
+            .filter(|finding| !refusals.contains_key(finding.path()))
             .map(|finding| finding.path().to_path_buf())
             .collect();
         let sizes = cache
@@ -58,6 +80,7 @@ impl Decisions {
             chosen: default.clone(),
             default,
             sizes,
+            refusals,
         }
     }
 
@@ -91,6 +114,12 @@ impl Decisions {
     /// Every selectable finding outside the default set needs --include-review.
     fn includes_review(&self) -> bool {
         self.chosen.difference(&self.default).next().is_some()
+    }
+
+    /// Why sealed staging would refuse this tree, for a finding the scan found
+    /// eligible. `None` for a tree it would admit, and for one never asked about.
+    pub fn refusal(&self, path: &std::path::Path) -> Option<&str> {
+        self.refusals.get(path).map(String::as_str)
     }
 
     pub fn clean_args(
@@ -213,9 +242,31 @@ mod tests {
         assert!(plan.lower_bound);
     }
 
+    /// Scan eligibility and staging readiness are two different answers. A tree the
+    /// scan found cheap to regenerate but staging would refuse cannot start in a plan
+    /// the reader is one keystroke from running.
+    #[test]
+    fn a_refused_tree_stays_out_of_the_plan_and_says_why() {
+        let findings = [ready("/y"), ready("/refused")];
+        let decisions = Decisions::new(&findings, |finding| {
+            (finding.path() == std::path::Path::new("/refused"))
+                .then(|| "external or unenumerated hard link encountered".to_owned())
+        });
+
+        assert_eq!(decisions.plan().locations, 1);
+        assert!(decisions.is_chosen(&findings[0]));
+        assert!(!decisions.is_chosen(&findings[1]));
+        assert_eq!(decisions.refusal(std::path::Path::new("/y")), None);
+        assert!(
+            decisions
+                .refusal(std::path::Path::new("/refused"))
+                .is_some_and(|reason| reason.contains("hard link"))
+        );
+    }
+
     #[test]
     fn the_plan_starts_as_the_one_degu_would_build_alone() {
-        let decisions = Decisions::new(&[ready("/y"), review("/r"), unmanaged("/n")]);
+        let decisions = Decisions::new(&[ready("/y"), review("/r"), unmanaged("/n")], |_| None);
         assert!(decisions.is_chosen(&ready("/y")));
         assert!(!decisions.is_chosen(&review("/r")));
         assert!(!decisions.is_chosen(&unmanaged("/n")));
@@ -227,7 +278,7 @@ mod tests {
             unmanaged("/n").disposition().mode,
             DispositionMode::ReportOnly
         );
-        let mut decisions = Decisions::new(&[unmanaged("/n")]);
+        let mut decisions = Decisions::new(&[unmanaged("/n")], |_| None);
         decisions.toggle(&unmanaged("/n"), Section::Cache);
         assert!(decisions.is_empty(), "a keystroke reached a withheld tier");
     }
@@ -235,14 +286,14 @@ mod tests {
     #[test]
     fn a_runtime_finding_cannot_be_put_in_the_plan() {
         let finding = review("/r");
-        let mut decisions = Decisions::new(std::slice::from_ref(&finding));
+        let mut decisions = Decisions::new(std::slice::from_ref(&finding), |_| None);
         decisions.toggle(&finding, Section::Runtime);
         assert!(decisions.is_empty());
     }
 
     #[test]
     fn dropping_everything_leaves_nothing_to_run() {
-        let mut decisions = Decisions::new(&[ready("/y")]);
+        let mut decisions = Decisions::new(&[ready("/y")], |_| None);
         decisions.toggle(&ready("/y"), Section::Cache);
         assert!(decisions.is_empty());
         assert!(
@@ -254,7 +305,8 @@ mod tests {
 
     #[test]
     fn choosing_a_review_finding_asks_for_review_and_keeps_the_rest() {
-        let mut decisions = Decisions::new(&[ready("/y"), review("/r"), review("/other")]);
+        let mut decisions =
+            Decisions::new(&[ready("/y"), review("/r"), review("/other")], |_| None);
         decisions.toggle(&review("/other"), Section::Cache);
         decisions.toggle(&review("/other"), Section::Cache);
         decisions.toggle(&review("/r"), Section::Cache);
@@ -268,7 +320,7 @@ mod tests {
 
     #[test]
     fn a_plan_of_only_ready_findings_asks_for_no_review() {
-        let decisions = Decisions::new(&[ready("/a"), ready("/b")]);
+        let decisions = Decisions::new(&[ready("/a"), ready("/b")], |_| None);
         let args = decisions
             .clean_args(&filters(), ScanLimitArgs::default(), false)
             .expect("arguments");
@@ -281,7 +333,7 @@ mod tests {
     #[test]
     fn the_arguments_carry_the_scope_and_no_decision_of_their_own() {
         let filters = filters();
-        let args = Decisions::new(&[ready("/y")])
+        let args = Decisions::new(&[ready("/y")], |_| None)
             .clean_args(&filters, ScanLimitArgs::default(), true)
             .expect("arguments");
         assert_eq!(args.roots, filters.roots);

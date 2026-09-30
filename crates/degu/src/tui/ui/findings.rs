@@ -6,7 +6,7 @@ use crate::tui::report::{Class, Finding, Section};
 
 use super::format;
 use super::text::elide;
-use super::theme::{ACCENT, SECONDARY, SELECTION, class_style, focused_panel, panel};
+use super::theme::{ACCENT, CAUTION, SECONDARY, SELECTION, class_style, focused_panel, panel};
 use super::{App, Focus, window_start};
 
 /// One space between each pair of columns. Five columns without the
@@ -124,11 +124,17 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
 fn finding_row(item: (&Finding, usize), columns: &Columns, app: &App) -> Row<'static> {
     let (finding, position) = item;
     let class = Class::of(finding, app.browser().section());
-    let status = if columns.status == STATUS_WIDTH {
-        class.label()
-    } else {
-        symbol(class)
+    // A tree staging would refuse is not ready to clean, whatever the scan made of
+    // how cheap it is to regenerate. Saying `Ready` here is the one thing this row
+    // must not do, because `c` is a keystroke away and would be rejected.
+    let refused = app.decisions().refusal(finding.path()).is_some();
+    let status = match (refused, columns.status == STATUS_WIDTH) {
+        (true, true) => "Blocked",
+        (true, false) => "!",
+        (false, true) => class.label(),
+        (false, false) => symbol(class),
     };
+    let refused_style = Style::new().fg(CAUTION);
     let selected = position == app.browser().selected();
     let mark = match (class, app.decisions().is_chosen(finding)) {
         (Class::NotManaged, _) => " ",
@@ -137,7 +143,11 @@ fn finding_row(item: (&Finding, usize), columns: &Columns, app: &App) -> Row<'st
     };
     let mut cells = vec![
         Cell::from(if selected { "▸" } else { " " }).style(Style::new().fg(ACCENT)),
-        Cell::from(mark).style(class_style(class)),
+        Cell::from(mark).style(if refused {
+            refused_style
+        } else {
+            class_style(class)
+        }),
         Cell::from(elide(
             &escape_terminal_text(&crate::presentation::display_path(
                 finding.path(),
@@ -149,7 +159,11 @@ fn finding_row(item: (&Finding, usize), columns: &Columns, app: &App) -> Row<'st
     if columns.ecosystem {
         cells.push(Cell::from(escape_terminal_text(finding.ecosystem())));
     }
-    cells.push(Cell::from(status).style(class_style(class)));
+    cells.push(Cell::from(status).style(if refused {
+        refused_style
+    } else {
+        class_style(class)
+    }));
     let metric_style = if selected {
         Style::new().fg(ACCENT).bold()
     } else {

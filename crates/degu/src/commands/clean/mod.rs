@@ -2,6 +2,7 @@ mod execution;
 mod output;
 mod preparation;
 mod preview;
+pub(crate) use preview::staging_refusal;
 
 use crate::cli::CleanArgs;
 use crate::runtime::Ui;

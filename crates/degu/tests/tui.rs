@@ -447,7 +447,7 @@ fn the_staged_screen_says_when_it_is_not_the_account_it_looks_like() {
         PtyRun {
             body: r#"
 spawn -noecho sh -c {stty rows 40 columns 120; exec "$DEGU_BIN" --color never tui}
-expect -ex "\[?1049h"
+expect -ex "\033\[?1049h"
 sleep 1
 send "t"
 sleep 1
@@ -640,4 +640,96 @@ send "q"
             "the staged screen does not name {entry}, so its two copies read alike: {screen}"
         );
     }
+}
+
+/// Scan eligibility says a cache is cheap to regenerate. It says nothing about
+/// whether sealed staging can move the tree, and `clean -n` on the same selection
+/// refuses one with a hard link reaching outside it. The review offers `c` a keystroke
+/// away, so a row it shows as ready and checked has to be one that could run.
+#[test]
+fn a_tree_staging_would_refuse_is_not_offered_as_ready_to_clean() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir_in(home.path()).unwrap();
+    let config = config_home_with_roots(&[]);
+    let cache = common::platform_cache_dir(home.path(), "pip");
+    std::fs::create_dir_all(cache.join("http")).unwrap();
+    std::fs::write(cache.join("http/blob"), vec![0u8; 4096]).unwrap();
+    // The second link is outside the tree, which is what admission refuses.
+    std::fs::hard_link(cache.join("http/blob"), home.path().join("outside-cache")).unwrap();
+    common::make_tree_non_shared_writable(home.path()).unwrap();
+
+    let out = run_pty(PtyRun {
+        body: r#"
+spawn -noecho sh -c {stty rows 24 columns 80; exec "$DEGU_BIN" --color never tui}
+expect -ex "\033\[?1049h"
+sleep 1
+send "q"
+"#,
+        home: home.path(),
+        config_home: config.path(),
+        state_home: state.path(),
+        extra_env: &[],
+    });
+    let lines = screen::render(&out.stdout, 24, 80);
+    let row = lines
+        .iter()
+        .find(|line| line.contains("Caches/pip") || line.contains(".cache/pip"))
+        .unwrap_or_else(|| panic!("the cache is not on the screen: {lines:#?}"));
+    assert!(
+        row.contains("Blocked"),
+        "the row calls a tree staging would refuse ready: {row}"
+    );
+    assert!(
+        !row.contains("Ready to clean"),
+        "the row still claims the tree is ready: {row}"
+    );
+    assert!(
+        !row.contains('✓'),
+        "a tree staging would refuse starts in the plan: {row}"
+    );
+    let plan = lines
+        .iter()
+        .find(|line| line.contains("In the plan"))
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        plan.contains("0 locations") || plan.is_empty(),
+        "the plan total counts a tree that cannot be staged: {plan}"
+    );
+    // The panel beside the table must not contradict it, and it is where the reason
+    // fits: the table has one line per finding and no room for one.
+    let screen = lines.join(" ");
+    assert!(
+        screen.contains("Blocked by sealed staging preflight"),
+        "the details panel does not say what the row means: {screen}"
+    );
+    assert!(
+        screen.contains("hard link"),
+        "the review never says why the tree was refused: {screen}"
+    );
+
+    // Enter opens the full record, which must not say less than the row it came from.
+    let out = run_pty(PtyRun {
+        body: r#"
+spawn -noecho sh -c {stty rows 24 columns 80; exec "$DEGU_BIN" --color never tui}
+expect -ex "\033\[?1049h"
+sleep 1
+send "\r"
+sleep 1
+send "q"
+"#,
+        home: home.path(),
+        config_home: config.path(),
+        state_home: state.path(),
+        extra_env: &[],
+    });
+    let record = screen::render(&out.stdout, 24, 80).join(" ");
+    assert!(
+        record.contains("Blocked by sealed staging preflight") && record.contains("hard link"),
+        "the full record dropped the refusal: {record}"
+    );
+    assert!(
+        !record.contains("Ready to clean"),
+        "the full record still calls the tree ready: {record}"
+    );
 }

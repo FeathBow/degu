@@ -51,17 +51,20 @@ mod tests {
     #[test]
     fn the_root_cause_is_the_end_of_the_chain() {
         #[derive(Debug, thiserror::Error)]
-        #[error("outer said {0}")]
-        struct Outer(#[source] Middle, &'static str);
+        #[error("outer wraps {0}")]
+        struct Outer(#[source] Middle);
         #[derive(Debug, thiserror::Error)]
-        #[error("middle said {0}")]
-        struct Middle(#[source] Inner, &'static str);
+        #[error("middle wraps {0}")]
+        struct Middle(#[source] Inner);
         #[derive(Debug, thiserror::Error)]
         #[error("the destination is occupied")]
         struct Inner;
 
-        let error = Outer(Middle(Inner, "middle"), "outer");
-        assert_eq!(root_cause(&error), "the destination is occupied");
+        assert_eq!(
+            root_cause(&Outer(Middle(Inner))),
+            "the destination is occupied"
+        );
+        // A chain of one is the same answer, and it is the loop's other edge.
         assert_eq!(root_cause(&Inner), "the destination is occupied");
     }
 }

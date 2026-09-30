@@ -359,26 +359,24 @@ impl SealedUndo {
         // Inside the home: a sealed store refuses an ancestor granting foreign rename
         // authority, and trash routing needs the state under the source mount's anchor.
         let state = tempfile::tempdir_in(home.path()).unwrap();
-        let cache = common::platform_cache_dir(home.path(), "pip");
-        let this = Self {
-            home,
-            state,
-            cache,
-            anchor: PathBuf::new(),
-        };
-        this.seed();
-        let anchor = this.state.path().join("degu-integration-activation-anchor");
+        // The suite's own seeding, which pins the fixture modes a sealed store
+        // requires; this test never purges, so a regular file in the tree is fine.
+        let cache = seed_cache(&home, "pip", 64 * 1024);
+        let anchor = state.path().join("degu-integration-activation-anchor");
         std::fs::create_dir_all(&anchor).unwrap();
         std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o700)).unwrap();
         let anchor = std::fs::canonicalize(&anchor).unwrap();
-        Some(Self { anchor, ..this })
+        Some(Self {
+            home,
+            state,
+            cache,
+            anchor,
+        })
     }
 
-    /// Directories only: a sealed purge refuses a tree whose regular files carry any
-    /// extended attribute, and some filesystems attach one to every file written.
-    fn seed(&self) {
-        std::fs::create_dir_all(self.cache.join("http-v2/aa")).unwrap();
-        common::make_tree_non_shared_writable(self.home.path()).unwrap();
+    /// What the tool that owns the cache does after a clean.
+    fn refill(&self) {
+        seed_cache(&self.home, "pip", 64 * 1024);
     }
 
     fn run(&self, args: &[&str]) -> std::process::Output {
@@ -414,7 +412,7 @@ fn an_undo_onto_an_occupied_original_says_what_to_do_about_it() {
     );
     assert!(!fixture.cache.exists());
     // The tool that owns the cache puts it back.
-    fixture.seed();
+    fixture.refill();
 
     let out = fixture.run(&["undo", "--json"]);
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();

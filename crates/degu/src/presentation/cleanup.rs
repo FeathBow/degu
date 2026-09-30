@@ -10,6 +10,8 @@ use degu_core::safety::{
     UNTRUSTED_PARENT_REASON,
 };
 
+const READY_EXPLANATION: &str =
+    "A preview says when sealed staging cannot move one of these trees.";
 const REVIEW_EXPLANATION: &str = "Excluded by default; preview a path before including it.";
 const UNMANAGED_EXPLANATION: &str = "Reported only; degu never cleans these locations.";
 
@@ -21,11 +23,15 @@ pub(crate) fn label(mode: DispositionMode) -> &'static str {
     }
 }
 
-/// Safety-contract sentence under a group header. "Ready to clean" carries
-/// its whole contract in the label, so it takes none.
+/// Safety-contract sentence under a group header.
+///
+/// "Ready to clean" is a disposition: the tree is cheap to regenerate and in the
+/// default plan. It is not a statement that sealed staging can move the tree, which
+/// a scan has not asked and a preview has — so the label alone would promise a
+/// readiness nothing checked.
 pub(crate) fn explanation(mode: DispositionMode) -> Option<&'static str> {
     match mode {
-        DispositionMode::Eligible => None,
+        DispositionMode::Eligible => Some(READY_EXPLANATION),
         DispositionMode::OptIn => Some(REVIEW_EXPLANATION),
         DispositionMode::ReportOnly => Some(UNMANAGED_EXPLANATION),
     }

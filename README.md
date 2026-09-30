@@ -20,6 +20,7 @@ $ degu scan
 22.0 MiB detected across 3 locations - 6.0 MiB ready to clean
 
 Ready to clean - 1 location - 6.0 MiB
+A preview says when sealed staging cannot move one of these trees.
  source  on disk   idle  inodes  path
  pip     6.0 MiB  today       2  ~/.cache/pip
 

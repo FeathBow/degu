@@ -85,6 +85,21 @@ fn assert_bucket_hierarchy(stdout: &str) {
     );
     assert!(stdout.contains("Needs review - 1 location - "), "{stdout}");
     assert!(stdout.contains("Not managed - 1 location - "), "{stdout}");
+    // Every tier says what its label does not. `Ready to clean` is a disposition —
+    // cheap to regenerate, in the default plan — and not a claim that sealed staging
+    // can move the tree, which a scan has not asked and the preview has.
+    assert!(
+        stdout.contains("A preview says when sealed staging cannot move one of these trees."),
+        "the ready tier promises a readiness the scan never checked: {stdout}"
+    );
+    assert!(
+        stdout.contains("Excluded by default; preview a path before including it."),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Reported only; degu never cleans these locations."),
+        "{stdout}"
+    );
     assert!(stdout.contains("costly to regenerate"), "{stdout}");
     assert!(stdout.contains("user asset"), "{stdout}");
     assert!(!stdout.contains(" cleanup "), "{stdout}");

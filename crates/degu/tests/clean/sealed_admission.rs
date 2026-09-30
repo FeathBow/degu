@@ -159,6 +159,28 @@ fn internal_hardlink_purge_stages_full_tree_then_reports_unsupported_and_undoes(
     assert_eq!(std::fs::metadata(&original).unwrap().nlink(), 2);
 }
 
+/// What the preview says the fixture's regular files already carry, as degu counts
+/// it. Zero when it reports none, which is the whole answer on a host that attaches
+/// nothing or let the fixture clear what it did.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn xattr_totals(fixture: &Fixture) -> (i64, i64) {
+    let preview = fixture.run(&["clean", "-n", "--json"]);
+    assert_output_success(&preview);
+    let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    let preflight = &preview["staging_preflight"][0];
+    if preflight["contains_ordinary_regular_xattrs"] != true {
+        return (0, 0);
+    }
+    (
+        preflight["regular_xattrs"]["attributes"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("{preview:#}")),
+        preflight["regular_xattrs"]["value_bytes"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("{preview:#}")),
+    )
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn ordinary_regular_xattr_previews_stages_and_fresh_process_undo_preserves_value() {
@@ -166,6 +188,10 @@ fn ordinary_regular_xattr_previews_stages_and_fresh_process_undo_preserves_value
         return;
     };
     let file = fixture.cache.join("wheel.whl");
+    // Measured, not assumed: a host may attach an attribute to every file it writes
+    // and refuse to let the owner remove it, so what this test adds is one more than
+    // whatever is already there rather than the only one there is.
+    let (baseline_attributes, baseline_value_bytes) = xattr_totals(&fixture);
     set_ordinary_xattr(&file, b"proof-bound");
 
     let preview = fixture.run(&["clean", "-n", "--json"]);
@@ -175,8 +201,14 @@ fn ordinary_regular_xattr_previews_stages_and_fresh_process_undo_preserves_value
     assert_eq!(preflight["status"], "tree_policy_assessed", "{preview:#}");
     assert_eq!(preflight["contains_ordinary_regular_xattrs"], true);
     assert_eq!(preflight["regular_xattrs"]["entries"], 1);
-    assert_eq!(preflight["regular_xattrs"]["attributes"], 1);
-    assert_eq!(preflight["regular_xattrs"]["value_bytes"], 11);
+    assert_eq!(
+        preflight["regular_xattrs"]["attributes"],
+        baseline_attributes + 1
+    );
+    assert_eq!(
+        preflight["regular_xattrs"]["value_bytes"],
+        baseline_value_bytes + i64::try_from("proof-bound".len()).unwrap()
+    );
     assert_eq!(preflight["regular_xattrs"]["proof_schema"], 3);
     assert_eq!(preflight["purge_admission"]["supported"], false);
 
@@ -819,6 +851,11 @@ impl Fixture {
         assert_eq!(backend, degu_core::backend::CertifiedLocalBackend::Apfs);
 
         let (cache, state) = fake_pip_cache(&home, ".cache/pip");
+        // Some filesystems attach an extended attribute to every file a process
+        // writes, macOS provenance among them. These tests count attributes and
+        // assert what a purge admits, so the fixture says what it starts with rather
+        // than inheriting whatever the host put there.
+        strip_extended_attributes(home.path()).unwrap();
         assert_eq!(certify_backend(&cache).unwrap(), backend);
         assert_eq!(certify_backend(state.path()).unwrap(), backend);
         assert_eq!(

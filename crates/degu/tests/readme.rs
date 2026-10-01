@@ -23,7 +23,7 @@ fn readme_scan_demo_matches_real_cli_output() {
     let home = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
 
-    // Ready to clean: a pip cache under the well-known base is eligible.
+    // Eligible to clean: a pip cache under the well-known base is eligible.
     let pip = crate::common::platform_cache_dir(home.path(), "pip");
     std::fs::create_dir_all(&pip).unwrap();
     std::fs::write(pip.join("wheel-cache.bin"), vec![b'x'; 6 * MIB]).unwrap();

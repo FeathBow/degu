@@ -477,7 +477,7 @@ mod tests {
     const NOTE: &str = "Quota can change only after permanent deletion: inspect degu trash list; trash purge deletes purge-supported entries but retains sealed internal-hardlink entries.";
 
     fn sample_headline() -> Headline {
-        Headline::new("Ready to clean", HeadlineLead::Separator)
+        Headline::new("Eligible to clean", HeadlineLead::Separator)
             .stat("36 locations")
             .stat("111.6 MiB")
     }
@@ -523,9 +523,9 @@ mod tests {
     #[test]
     fn headline_layout_follows_the_terminal_width() {
         for (width, expected) in [
-            (80u16, "Ready to clean · 36 locations · 111.6 MiB"),
-            (32, "Ready to clean\n  36 locations · 111.6 MiB"),
-            (24, "Ready to clean\n  36 locations\n  111.6 MiB"),
+            (80u16, "Eligible to clean · 36 locations · 111.6 MiB"),
+            (32, "Eligible to clean\n  36 locations · 111.6 MiB"),
+            (24, "Eligible to clean\n  36 locations\n  111.6 MiB"),
         ] {
             assert_eq!(
                 Ui::test_terminal(width).headline(sample_headline()),
@@ -598,9 +598,9 @@ mod tests {
     fn headline_indent_counts_against_every_line() {
         let indented = || sample_headline().indent(2);
         for (width, expected) in [
-            (80u16, "  Ready to clean · 36 locations · 111.6 MiB"),
-            (32, "  Ready to clean\n    36 locations · 111.6 MiB"),
-            (24, "  Ready to clean\n    36 locations\n    111.6 MiB"),
+            (80u16, "  Eligible to clean · 36 locations · 111.6 MiB"),
+            (32, "  Eligible to clean\n    36 locations · 111.6 MiB"),
+            (24, "  Eligible to clean\n    36 locations\n    111.6 MiB"),
         ] {
             assert_eq!(
                 Ui::test_terminal(width).headline(indented()),
@@ -610,7 +610,7 @@ mod tests {
         }
         assert_eq!(
             Ui::test_pipe(24).headline(indented()),
-            "  Ready to clean - 36 locations - 111.6 MiB"
+            "  Eligible to clean - 36 locations - 111.6 MiB"
         );
     }
 
@@ -630,7 +630,7 @@ mod tests {
         let mut ui = Ui::test_terminal(TEST_WIDTH);
         ui.colors.stdout = true;
         let rendered = ui.headline(
-            Headline::new("Ready to clean", HeadlineLead::Separator)
+            Headline::new("Eligible to clean", HeadlineLead::Separator)
                 .stat("36 locations")
                 .stat_toned("111.6 MiB", Tone::Ready),
         );
@@ -648,7 +648,7 @@ mod tests {
         let mut ui = Ui::test_terminal(24);
         ui.colors.stdout = true;
         let rendered = ui.headline(
-            Headline::new("Ready to clean", HeadlineLead::Separator)
+            Headline::new("Eligible to clean", HeadlineLead::Separator)
                 .stat("36 locations")
                 .stat_toned("111.6 MiB", Tone::Ready),
         );
@@ -663,7 +663,7 @@ mod tests {
     fn headline_stays_single_line_when_piped() {
         assert_eq!(
             Ui::test_pipe(24).headline(sample_headline()),
-            "Ready to clean - 36 locations - 111.6 MiB"
+            "Eligible to clean - 36 locations - 111.6 MiB"
         );
     }
 

@@ -287,7 +287,7 @@ fn validate_exact_review(review: Option<&Path>, findings: &[Finding]) -> Result<
     match matches.as_slice() {
         [_] => Ok(()),
         [] => anyhow::bail!(
-            "--review {} must name exactly one Needs review finding; parent directories and Ready to clean or Not managed locations are not accepted",
+            "--review {} must name exactly one Needs review finding; parent directories and Eligible to clean or Not managed locations are not accepted",
             review.display()
         ),
         _ => anyhow::bail!(

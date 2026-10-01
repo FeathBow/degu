@@ -91,7 +91,7 @@ fn print_headline(report: &ScanReport) -> Result<()> {
     if ready.has_bytes() {
         headline = headline.stat_toned(
             format!(
-                "{} ready to clean",
+                "{} eligible to clean",
                 ready.bytes_label(report.findings_lower_bound(), report.ui.glyphs)
             ),
             Tone::Ready,

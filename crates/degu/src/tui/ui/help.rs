@@ -24,9 +24,9 @@ Esc           Back; clear a filter; otherwise quit
 ?             Show / close this help
 q, Ctrl-C/D   Quit
 
-Compact status: + Ready to clean; ? Needs review; · Not managed
+Compact status: + Eligible to clean; ? Needs review; · Not managed
 Row marks: ✓ in the plan; ○ out of it; blank degu will not act on it
-Ready to clean findings start in the plan; Needs review findings start out.
+Eligible to clean findings start in the plan; Needs review findings start out.
 Staged entries start unchosen. A confirmed clean also runs its expiry plan.
 Runtime findings are Not managed and never join cache totals.
 Nothing moves until you leave this screen and confirm the plan degu prints.";

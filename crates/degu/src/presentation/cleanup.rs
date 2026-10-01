@@ -10,22 +10,28 @@ use degu_core::safety::{
     UNTRUSTED_PARENT_REASON,
 };
 
+const ELIGIBLE_EXPLANATION: &str =
+    "Cleaned by default; a preview checks whether sealed staging can move them.";
 const REVIEW_EXPLANATION: &str = "Excluded by default; preview a path before including it.";
 const UNMANAGED_EXPLANATION: &str = "Reported only; degu never cleans these locations.";
 
 pub(crate) fn label(mode: DispositionMode) -> &'static str {
     match mode {
-        DispositionMode::Eligible => "Ready to clean",
+        DispositionMode::Eligible => "Eligible to clean",
         DispositionMode::OptIn => "Needs review",
         DispositionMode::ReportOnly => "Not managed",
     }
 }
 
-/// Safety-contract sentence under a group header. "Ready to clean" carries
-/// its whole contract in the label, so it takes none.
+/// Safety-contract sentence under a group header.
+///
+/// The eligible tier is a disposition: the tree is cheap to regenerate and in the
+/// default plan. Whether sealed staging can move it is a separate question, which a
+/// preview asks and a scan does not, so the tier is named for what every command
+/// knows and the sentence says where the rest is checked.
 pub(crate) fn explanation(mode: DispositionMode) -> Option<&'static str> {
     match mode {
-        DispositionMode::Eligible => None,
+        DispositionMode::Eligible => Some(ELIGIBLE_EXPLANATION),
         DispositionMode::OptIn => Some(REVIEW_EXPLANATION),
         DispositionMode::ReportOnly => Some(UNMANAGED_EXPLANATION),
     }
@@ -180,7 +186,7 @@ mod tests {
 
     fn ready_group() -> Group<'static> {
         Group {
-            label: "Ready to clean",
+            label: "Eligible to clean",
             mode: DispositionMode::Eligible,
             stats: FindingStats {
                 bytes: READY_BYTES,
@@ -197,7 +203,7 @@ mod tests {
     fn group_header_fits_one_line_on_a_wide_terminal() {
         assert_eq!(
             group_header(Ui::test_terminal(80), ready_group()),
-            "Ready to clean · 2 locations · 3.2 MiB"
+            "Eligible to clean · 2 locations · 3.2 MiB"
         );
     }
 
@@ -209,7 +215,7 @@ mod tests {
         };
         assert_eq!(
             group_header(Ui::test_terminal(24), group),
-            "  Ready to clean\n    2 locations\n    3.2 MiB"
+            "  Eligible to clean\n    2 locations\n    3.2 MiB"
         );
         let group = Group {
             indent: 2,
@@ -217,7 +223,7 @@ mod tests {
         };
         assert_eq!(
             group_header(Ui::test_pipe(24), group),
-            "  Ready to clean - 2 locations - 3.2 MiB"
+            "  Eligible to clean - 2 locations - 3.2 MiB"
         );
     }
 

@@ -17,9 +17,10 @@
 
 ```console
 $ degu scan
-22.0 MiB detected across 3 locations - 6.0 MiB ready to clean
+22.0 MiB detected across 3 locations - 6.0 MiB eligible to clean
 
-Ready to clean - 1 location - 6.0 MiB
+Eligible to clean - 1 location - 6.0 MiB
+Cleaned by default; a preview checks whether sealed staging can move them.
  source  on disk   idle  inodes  path
  pip     6.0 MiB  today       2  ~/.cache/pip
 
@@ -52,9 +53,9 @@ Scan build artifacts under this project, or any parent directory: degu scan .
 Deleting the wrong files is the core risk, so degu earns every deletion:
 
 - **Corroboration, not names.** A directory becomes eligible only on structural evidence that it is regenerable — a tool's own cache marker, a build manifest — never because it is *named* `cache`, `target`, or `__pycache__`. Among locations degu discovers, anything it cannot corroborate is reported, never cleaned; degu is not a whole-disk file finder.
-- **Three tiers, conservative by default.** *Ready to clean* is cheap-to-regenerate cache. *Needs review* is regenerable but costly (model downloads, compile caches) and stays excluded until you preview an exact path. *Not managed* — your data, tool-coordinated caches, checkpoints — can never enter a plan.
+- **Three tiers, conservative by default.** *Eligible to clean* is cheap-to-regenerate cache. *Needs review* is regenerable but costly (model downloads, compile caches) and stays excluded until you preview an exact path. *Not managed* — your data, tool-coordinated caches, checkpoints — can never enter a plan.
 - **Fail closed.** If any selected location cannot be fully measured or classified, degu refuses the whole plan instead of guessing. Default cleanup is staged for undo; permanent purge is separately disclosed and confirmed.
-- **Preview matches execution.** `degu clean -n` runs the same sealed-staging admission checks that execution re-verifies: a location shown as *Ready to clean* has already passed them, and anything that sealed staging cannot execute — external hard links, unsupported metadata, inventory ceilings — is disclosed with its reason up front instead of failing later.
+- **Preview matches execution.** `degu clean -n` runs the same sealed-staging admission checks that execution re-verifies: a location the preview still lists as *Eligible to clean* has already passed them, and anything that sealed staging cannot execute — external hard links, unsupported metadata, inventory ceilings — is disclosed with its reason up front instead of failing later.
 
 ## How degu compares
 
@@ -111,7 +112,7 @@ Nothing here changes anything until you say so. Start read-only — no setup, no
 degu scan            # what exists, and what is safe to clean
 ```
 
-Only **Ready to clean** enters a default plan. For one **Needs review** location, the scan prints a shorter `degu clean -dn --review PATH` preview, and the `Next` command it gives back keeps that exact selection.
+Only **Eligible to clean** enters a default plan. For one **Needs review** location, the scan prints a shorter `degu clean -dn --review PATH` preview, and the `Next` command it gives back keeps that exact selection.
 
 ### Decide on one screen
 

@@ -40,7 +40,7 @@ fn narrow_scan_splits_group_stats_and_keeps_the_next_command_whole() {
     let stdout = scan_at_width(24, "scan", home.path());
 
     let lines = trimmed_lines(&stdout);
-    let start = position(&lines, "Ready to clean", &stdout);
+    let start = position(&lines, "Eligible to clean", &stdout);
     assert_eq!(lines[start + 1], "  2 locations", "stdout: {stdout}");
     let size = lines[start + 2];
     assert!(

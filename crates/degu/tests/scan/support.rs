@@ -29,7 +29,7 @@ pub(super) fn fake_cache(
 pub(super) fn parse_summary_sizes(output: &str) -> (f64, f64, f64, f64) {
     (
         headline_size(output),
-        group_header_size(output, "Ready to clean - "),
+        group_header_size(output, "Eligible to clean - "),
         group_header_size(output, "Needs review - "),
         group_header_size(output, "Not managed - "),
     )

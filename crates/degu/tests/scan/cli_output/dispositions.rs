@@ -57,7 +57,7 @@ fn scan_color_reinforces_each_action_state_without_changing_text() {
 
     assert!(plain.status.success() && colored.status.success());
     let colored_text = String::from_utf8_lossy(&colored.stdout);
-    assert_sgr_color(&colored_text, "Ready to clean", "38;5;10");
+    assert_sgr_color(&colored_text, "Eligible to clean", "38;5;10");
     // Standard yellow (palette 3): bright yellow (palette 11) is
     // near-invisible on light terminal themes.
     assert_sgr_color(&colored_text, "Needs review", "38;5;3");
@@ -80,11 +80,27 @@ fn assert_label_has_no_color(output: &str, label: &str, color_code: &str) {
 fn assert_bucket_hierarchy(stdout: &str) {
     assert!(stdout.contains(" detected across 3 locations"), "{stdout}");
     assert!(
-        stdout.contains("Ready to clean - 1 location - "),
+        stdout.contains("Eligible to clean - 1 location - "),
         "{stdout}"
     );
     assert!(stdout.contains("Needs review - 1 location - "), "{stdout}");
     assert!(stdout.contains("Not managed - 1 location - "), "{stdout}");
+    // Every tier says what its label does not. The eligible tier is a disposition —
+    // cheap to regenerate, in the default plan — and whether sealed staging can move
+    // the tree is the separate question a preview asks and a scan does not.
+    assert!(
+        stdout
+            .contains("Cleaned by default; a preview checks whether sealed staging can move them."),
+        "the eligible tier does not say where staging admission is checked: {stdout}"
+    );
+    assert!(
+        stdout.contains("Excluded by default; preview a path before including it."),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Reported only; degu never cleans these locations."),
+        "{stdout}"
+    );
     assert!(stdout.contains("costly to regenerate"), "{stdout}");
     assert!(stdout.contains("user asset"), "{stdout}");
     assert!(!stdout.contains(" cleanup "), "{stdout}");
@@ -93,7 +109,7 @@ fn assert_bucket_hierarchy(stdout: &str) {
         "{stdout}"
     );
     let sections = [
-        "\nReady to clean - ",
+        "\nEligible to clean - ",
         "\nNeeds review - ",
         "\nNot managed - ",
     ]

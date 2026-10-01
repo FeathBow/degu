@@ -247,10 +247,10 @@ fn introduction(
         home,
     )))
     .bold();
-    // The full record opens the same way the compact panel does. A tree staging would
-    // refuse is not ready to clean, and a reader who pressed Enter to learn more must
-    // not be told less: the disposition alone here would contradict the row they
-    // opened it from and drop the one fact that explains it.
+    // The full record opens the same way the compact panel does. A reader who pressed
+    // Enter to learn more must not be told less: the disposition alone here would
+    // contradict the row they opened it from, which says the refusal, and drop the one
+    // fact that explains it.
     if let Some(refusal) = refusal {
         return vec![
             path,

@@ -680,7 +680,7 @@ send "q"
         "the row calls a tree staging would refuse ready: {row}"
     );
     assert!(
-        !row.contains("Ready to clean"),
+        !row.contains("Eligible to clean"),
         "the row still claims the tree is ready: {row}"
     );
     assert!(
@@ -729,7 +729,7 @@ send "q"
         "the full record dropped the refusal: {record}"
     );
     assert!(
-        !record.contains("Ready to clean"),
+        !record.contains("Eligible to clean"),
         "the full record still calls the tree ready: {record}"
     );
 }

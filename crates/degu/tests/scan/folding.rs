@@ -60,7 +60,7 @@ fn scan_human_folds_an_eligible_tier_past_ten_rows() {
 
     // The tier header keeps the full tally; only the rendering folds.
     assert!(
-        stdout.contains("Ready to clean - 14 locations - "),
+        stdout.contains("Eligible to clean - 14 locations - "),
         "stdout: {stdout}"
     );
     // Piped output renders the wide table: one data row per finding, each
@@ -180,7 +180,7 @@ fn lower_bound_banner_and_fold_line_agree_on_lower_bound_marks() {
         "stdout: {stdout}"
     );
     assert!(
-        stdout.contains("Ready to clean - 14 locations - >= "),
+        stdout.contains("Eligible to clean - 14 locations - >= "),
         "stdout: {stdout}"
     );
     let fold = stdout

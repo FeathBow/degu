@@ -39,6 +39,22 @@ const SHARED_WRITE_MASK: u32 = 0o022;
 const EXECUTE_MASK: u32 = 0o111;
 const MAX_XATTR_LIST_BYTES: usize = 64 * 1024;
 const MAX_EXECUTABLE_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
+/// Extended attributes whose absence from a private snapshot cannot change what it
+/// executes, so snapshotting may drop them.
+///
+/// macOS attaches `com.apple.provenance` to what it downloaded or extracted, and the
+/// official uv release carries it. It records where bytes came from and restricts
+/// nothing, so a snapshot without it runs under exactly the restrictions the selected
+/// object ran under. `com.apple.quarantine` is the opposite and stays refused with
+/// every other name: dropping it would execute bytes the selected path could not.
+///
+/// This is deliberately not the staging admission allowlist, which admits quarantine.
+/// Moving a quarantined file to the trash carries the attribute along, and running a
+/// copy that lost it does not, so one list cannot answer both questions.
+#[cfg(target_os = "macos")]
+const DROPPABLE_XATTRS: [&[u8]; 1] = [b"com.apple.provenance"];
+#[cfg(not(target_os = "macos"))]
+const DROPPABLE_XATTRS: [&[u8]; 0] = [];
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct UvVersion {
@@ -140,6 +156,10 @@ pub(crate) enum UvExecutableProbeError {
     },
     #[error("selected uv executable path is unsafe at {path}: {reason}")]
     UnsafePath { path: PathBuf, reason: &'static str },
+    #[error(
+        "extended attribute {name} at {path} would not be preserved by executable snapshotting"
+    )]
+    UnpreservedXattr { path: PathBuf, name: String },
     #[error("failed to inspect extended ACLs at {path}: {source}")]
     AclInspection {
         path: PathBuf,
@@ -745,14 +765,26 @@ fn reject_unpreserved_xattrs(fd: &impl AsFd, path: &Path) -> Result<(), UvExecut
         path: path.to_path_buf(),
         source,
     })?;
-    if names.is_empty() {
-        Ok(())
-    } else {
-        Err(unsafe_path(
-            path,
-            "extended attributes would not be preserved by executable snapshotting",
-        ))
+    match first_undroppable_xattr(&names) {
+        None => Ok(()),
+        Some(name) => Err(UvExecutableProbeError::UnpreservedXattr {
+            path: path.to_path_buf(),
+            name,
+        }),
     }
+}
+
+/// The first attribute in a `flistxattr` name list that snapshotting may not drop.
+///
+/// The list is NUL-separated and NUL-terminated, so its last split is empty. A real
+/// name never is, and counting the terminator as one would refuse every file for an
+/// attribute that does not exist.
+fn first_undroppable_xattr(names: &[u8]) -> Option<String> {
+    names
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .find(|name| !DROPPABLE_XATTRS.contains(name))
+        .map(|name| String::from_utf8_lossy(name).into_owned())
 }
 
 fn list_xattrs(fd: &impl AsFd) -> io::Result<Vec<u8>> {

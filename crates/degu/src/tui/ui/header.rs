@@ -104,46 +104,30 @@ fn sections(app: &App) -> Line<'static> {
         ]);
     }
     let browser = app.browser();
-    // The overview carries the full sentence, and a short terminal drops the overview
-    // to give the list its rows. This line is always drawn, so the marker lives here:
-    // an incomplete search must not read as a completed one that found nothing.
-    let coverage = coverage_marker(browser.coverage());
-    let mut spans = [Section::Cache, Section::Runtime]
-        .into_iter()
-        .map(|section| {
-            let suffix = if browser.coverage_of(section).is_requested() {
-                ""
-            } else {
-                " (not scanned)"
-            };
-            let style = if browser.section() == section {
-                Style::new().fg(ACCENT).bold()
-            } else {
-                Style::new().fg(SECONDARY)
-            };
-            let name = format!("{}{suffix}", section.label());
-            Span::styled(
-                if browser.section() == section {
-                    format!("[{name}]  ")
+    Line::from(
+        [Section::Cache, Section::Runtime]
+            .into_iter()
+            .map(|section| {
+                let suffix = if browser.coverage_of(section).is_requested() {
+                    ""
                 } else {
-                    format!(" {name}   ")
-                },
-                style,
-            )
-        })
-        .collect::<Vec<_>>();
-    if let Some(marker) = coverage {
-        spans.push(Span::styled(marker, Style::new().fg(CAUTION)));
-    }
-    Line::from(spans)
-}
-
-/// The shortest thing that says this report is not the whole picture.
-///
-/// `coverage_warning` spells out why for a screen with room; this fits beside the
-/// section names, which every view draws.
-fn coverage_marker(coverage: crate::tui::report::Coverage) -> Option<String> {
-    coverage
-        .is_lower_bound()
-        .then(|| format!("· {}", super::format::coverage_label(coverage)))
+                    " (not scanned)"
+                };
+                let style = if browser.section() == section {
+                    Style::new().fg(ACCENT).bold()
+                } else {
+                    Style::new().fg(SECONDARY)
+                };
+                let name = format!("{}{suffix}", section.label());
+                Span::styled(
+                    if browser.section() == section {
+                        format!("[{name}]  ")
+                    } else {
+                        format!(" {name}   ")
+                    },
+                    style,
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
 }

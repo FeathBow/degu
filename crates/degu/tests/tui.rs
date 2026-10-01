@@ -871,48 +871,71 @@ send "q"
     }
 }
 
-/// A scan that could not read everything must say so at every size. The overview says
-/// it in full, and a 24-row terminal drops the overview to give the list its rows — so
-/// an empty incomplete report has to stay distinguishable from a complete one that
-/// found nothing, which is the reading a reader will otherwise take.
+/// A scan that could not read everything must say so at every size, and with or
+/// without findings to show for it. The overview says it in full, and a 24-row
+/// terminal drops the overview to give the list its rows. The section names are
+/// already wider than a 60-column screen, so the status rides the panel border
+/// rather than the line behind them, which is where a narrow terminal cuts first.
 #[test]
 fn an_incomplete_scan_says_so_when_the_overview_is_gone() {
-    let home = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir_in(home.path()).unwrap();
-    let config = config_home_with_roots(&[]);
-    // A symlinked adapter root is refused, which is what leaves the scan incomplete.
-    let real = home.path().join("real-pip");
-    std::fs::create_dir_all(&real).unwrap();
-    std::fs::write(real.join("payload"), vec![0u8; 64 * 1024]).unwrap();
-    let cache = common::platform_cache_dir(home.path(), "pip");
-    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
-    std::os::unix::fs::symlink(&real, &cache).unwrap();
-    common::make_tree_non_shared_writable(home.path()).unwrap();
+    for with_findings in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir_in(home.path()).unwrap();
+        let config = config_home_with_roots(&[]);
+        // A symlinked adapter root is refused, which is what leaves the scan incomplete.
+        let real = home.path().join("real-pip");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("payload"), vec![0u8; 64 * 1024]).unwrap();
+        let refused = common::platform_cache_dir(home.path(), "pip");
+        std::fs::create_dir_all(refused.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &refused).unwrap();
+        // One cache a second adapter can read, because the reader who most needs the
+        // status is the one looking at rows: an empty list carries its own sentence
+        // about what it does not rule out, and a list with rows carries only the panel.
+        if with_findings {
+            let readable = common::platform_cache_dir(home.path(), "go-build");
+            std::fs::create_dir_all(readable.join("aa")).unwrap();
+            std::fs::write(readable.join("aa/blob"), vec![0u8; 400 * 1024]).unwrap();
+        }
+        common::make_tree_non_shared_writable(home.path()).unwrap();
 
-    for (rows, columns) in [(24u16, 80u16), (40, 120)] {
-        let body = format!(
-            r#"
-spawn -noecho sh -c {{stty rows {rows} columns {columns}; exec "$DEGU_BIN" --color never tui --only pip}}
+        for (rows, columns) in [(24u16, 60u16), (24, 80), (40, 120)] {
+            let body = format!(
+                r#"
+spawn -noecho sh -c {{stty rows {rows} columns {columns}; exec "$DEGU_BIN" --color never tui --only pip --only go-build}}
 expect -ex "\033\[?1049h"
 sleep 1
 send "q"
 "#
-        );
-        let out = run_pty(PtyRun {
-            body: &body,
-            home: home.path(),
-            config_home: config.path(),
-            state_home: state.path(),
-            extra_env: &[],
-        });
-        let screen = screen::render(&out.stdout, usize::from(rows), usize::from(columns)).join(" ");
-        assert!(
-            screen.contains("incomplete"),
-            "the screen at {columns}x{rows} does not say the scan was incomplete: {screen}"
-        );
-        assert!(
-            !screen.contains("No findings in this section."),
-            "an incomplete search at {columns}x{rows} reads as a completed one: {screen}"
-        );
+            );
+            let out = run_pty(PtyRun {
+                body: &body,
+                home: home.path(),
+                config_home: config.path(),
+                state_home: state.path(),
+                extra_env: &[],
+            });
+            let screen =
+                screen::render(&out.stdout, usize::from(rows), usize::from(columns)).join(" ");
+            let shape = if with_findings {
+                "a list with rows"
+            } else {
+                "an empty list"
+            };
+            assert!(
+                screen.contains("incomplete"),
+                "{shape} at {columns}x{rows} does not say the scan was incomplete: {screen}"
+            );
+            assert!(
+                !screen.contains("No findings in this section."),
+                "{shape} at {columns}x{rows} reads as a completed search: {screen}"
+            );
+            // Which shape was drawn, so neither stops being covered in silence.
+            assert_eq!(
+                screen.contains("[2] Locations"),
+                with_findings,
+                "{shape} at {columns}x{rows} drew the other shape: {screen}"
+            );
+        }
     }
 }

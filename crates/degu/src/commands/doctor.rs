@@ -11,7 +11,7 @@ use degu_core::seal::store::StoreError;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const CHECK_ID: &str = "account_readiness";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -55,6 +55,16 @@ struct DoctorReport {
     witness_path: Option<PathBuf>,
     system_path: Option<PathBuf>,
     self_managed_path: Option<PathBuf>,
+    /// The store this authority authenticated, and the state directory it belongs to.
+    ///
+    /// A trash listing that cannot see the account's store sends the reader here for
+    /// exactly this. Without it the instruction cannot be followed except by reading
+    /// activation records by hand. Both are absent when no store is activated.
+    store_path: Option<PathBuf>,
+    store_state_home: Option<PathBuf>,
+    /// The state directory this run reads, when it is not the store's own. Absent when
+    /// they are the same place, which is the ordinary case and needs no explaining.
+    other_state_home: Option<PathBuf>,
     backend: Option<&'static str>,
     reason: Option<&'static str>,
     remediation: Option<&'static str>,
@@ -68,15 +78,30 @@ impl DoctorReport {
             readiness.path(),
             readiness.backend(),
             readiness.activation(),
+            readiness.store(),
         )
     }
 
+    /// `store` is the location the authority authenticated. `readiness_from` reads it
+    /// and the activation kind from one selector state, and only `Activated` carries a
+    /// store, so the two agree by construction and the assertion below says so.
+    ///
+    /// A parameter rather than something attached afterwards: a step that can be skipped
+    /// is a step that gets skipped, and this is the one fact a reader sent here by a
+    /// trash listing came for.
     fn from_selected_authority(
         mode: ActivationAuthorityMode,
         path: &Path,
         backend: CertifiedLocalBackend,
         activation: StoreActivationKind,
+        store: Option<&Path>,
     ) -> Self {
+        debug_assert_eq!(
+            matches!(activation, StoreActivationKind::Activated),
+            store.is_some(),
+            "activation state and recorded store disagree"
+        );
+        let store_state_home = store.and_then(crate::lifecycle::state_home_of);
         let (status, reason, remediation) = match activation {
             StoreActivationKind::Lost | StoreActivationKind::CorruptOrReplaced => (
                 ReadinessStatus::RecoveryRequired,
@@ -99,6 +124,9 @@ impl DoctorReport {
             witness_path: None,
             system_path: None,
             self_managed_path: None,
+            store_path: store.map(Path::to_path_buf),
+            store_state_home: store_state_home.map(Path::to_path_buf),
+            other_state_home: other_state_home(store_state_home),
             backend: Some(backend_name(backend)),
             reason,
             remediation,
@@ -118,6 +146,9 @@ impl DoctorReport {
             witness_path: classification.witness_path,
             system_path: classification.system_path,
             self_managed_path: classification.self_managed_path,
+            store_path: None,
+            store_state_home: None,
+            other_state_home: None,
             backend: None,
             reason: Some(classification.reason),
             remediation: Some(classification.remediation),
@@ -195,6 +226,18 @@ fn render_human(report: &DoctorReport) -> String {
             escape_terminal_text(&path.display().to_string())
         ));
     }
+    if let Some(path) = &report.store_path {
+        output.push_str(&format!(
+            "\nStore path      {}",
+            escape_terminal_text(&path.display().to_string())
+        ));
+    }
+    if let Some(path) = &report.store_state_home {
+        output.push_str(&format!(
+            "\nStore state     {}",
+            escape_terminal_text(&path.display().to_string())
+        ));
+    }
     if let Some(backend) = report.backend {
         output.push_str(&format!("\nBackend         {backend}"));
     }
@@ -210,7 +253,27 @@ fn render_human(report: &DoctorReport) -> String {
             escape_terminal_text(remediation)
         ));
     }
+    // `Store state` alone reads as where the store is, not as somewhere other than
+    // here, and a listing that could not see the store is what sends a reader here.
+    if let Some(current) = &report.other_state_home {
+        output.push_str(&format!(
+            "\n\nThis run reads a different state directory\n  {}\n  Trash listings here cover only what it holds; read the store's own state directory to reach the entries it staged.",
+            escape_terminal_text(&current.display().to_string())
+        ));
+    }
     output
+}
+
+/// The state directory this run reads, when the store belongs to another one.
+///
+/// Asked for reporting only. The verdict is about the authority, which no environment
+/// variable selects, so this must not reach it.
+fn other_state_home(store_state_home: Option<&Path>) -> Option<PathBuf> {
+    let store_state_home = store_state_home?;
+    let current = degu_core::ecosystem::DetectCtx::from_process()
+        .ok()
+        .map(|ctx| ctx.xdg_state())?;
+    (!crate::lifecycle::same_directory(store_state_home, &current)).then_some(current)
 }
 
 struct FailureClassification {
@@ -502,12 +565,15 @@ mod tests {
                 "backend",
                 "check",
                 "mutated",
+                "other_state_home",
                 "path",
                 "reason",
                 "remediation",
                 "schema_version",
                 "self_managed_path",
                 "status",
+                "store_path",
+                "store_state_home",
                 "system_path",
                 "witness_path",
             ]
@@ -531,6 +597,89 @@ mod tests {
             assert_eq!(report.status, ReadinessStatus::Uncertain);
             assert_eq!(report.path, Some(path()), "{error}");
         }
+    }
+
+    /// A trash listing that cannot see the account's store sends the reader here for
+    /// the state directory it was activated against. Reporting the anchor and stopping
+    /// leaves that instruction unfollowable except by reading activation records.
+    #[test]
+    fn a_ready_report_names_the_store_and_the_directory_it_belongs_to() {
+        let store = PathBuf::from("/recorded/state/degu/sealed-staging");
+        let report = DoctorReport::from_selected_authority(
+            ActivationAuthorityMode::SelfManaged,
+            &path(),
+            CertifiedLocalBackend::Ext4,
+            StoreActivationKind::Activated,
+            Some(&store),
+        );
+
+        assert_eq!(report.store_path.as_deref(), Some(store.as_path()));
+        assert_eq!(
+            report.store_state_home.as_deref(),
+            Some(Path::new("/recorded/state")),
+            "the directory the reader was told to use is the store's own"
+        );
+    }
+
+    /// `docs/safety.md` sends an operator whose recorded store is gone to the
+    /// activation record instead, because this report names no store there. Both
+    /// directions are asserted: a renamed label would leave the absent case passing
+    /// on a report that says nothing the documentation names.
+    #[test]
+    fn only_an_authenticated_store_is_named() {
+        let authenticated = render_human(&DoctorReport::from_selected_authority(
+            ActivationAuthorityMode::SelfManaged,
+            &path(),
+            CertifiedLocalBackend::Ext4,
+            StoreActivationKind::Activated,
+            Some(Path::new("/recorded/state/degu/sealed-staging")),
+        ));
+        assert!(authenticated.contains("Store path"), "{authenticated}");
+        assert!(authenticated.contains("Store state"), "{authenticated}");
+
+        let lost = render_human(&DoctorReport::from_selected_authority(
+            ActivationAuthorityMode::SelfManaged,
+            &path(),
+            CertifiedLocalBackend::Ext4,
+            StoreActivationKind::Lost,
+            None,
+        ));
+        assert!(!lost.contains("Store path"), "{lost}");
+        assert!(!lost.contains("Store state"), "{lost}");
+    }
+
+    /// The human report has to say the directory this run reads is a different one.
+    /// `Store state` alone reads as where the store is, not as somewhere else.
+    #[test]
+    fn a_differing_state_directory_is_named_as_such() {
+        let mut report = DoctorReport::from_selected_authority(
+            ActivationAuthorityMode::SelfManaged,
+            &path(),
+            CertifiedLocalBackend::Ext4,
+            StoreActivationKind::Activated,
+            Some(Path::new("/recorded/state/degu/sealed-staging")),
+        );
+        // Set rather than derived: this process reads its own state directory, and the
+        // renderer is what this test is about.
+        report.other_state_home = Some(PathBuf::from("/somewhere/else"));
+
+        let rendered = render_human(&report);
+        assert!(
+            rendered.contains("/recorded/state/degu/sealed-staging"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("This run reads a different state directory"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("/somewhere/else"), "{rendered}");
+
+        report.other_state_home = None;
+        let same = render_human(&report);
+        assert!(
+            !same.contains("a different state directory"),
+            "the same directory was explained as a difference: {same}"
+        );
     }
 
     #[test]
@@ -641,6 +790,7 @@ mod tests {
             &path(),
             CertifiedLocalBackend::Ext4,
             StoreActivationKind::Activated,
+            Some(Path::new("/recorded/state/degu/sealed-staging")),
         );
         let value = serde_json::to_value(report).unwrap();
         assert_exact_json_keys(&value);
@@ -668,6 +818,7 @@ mod tests {
                 &path(),
                 CertifiedLocalBackend::Xfs,
                 state,
+                None,
             );
             assert_eq!(report.status, ReadinessStatus::RecoveryRequired);
             assert!(!report.status.is_ready());

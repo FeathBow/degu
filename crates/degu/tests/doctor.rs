@@ -40,12 +40,15 @@ fn assert_exact_json_keys(report: &Value) {
             "backend",
             "check",
             "mutated",
+            "other_state_home",
             "path",
             "reason",
             "remediation",
             "schema_version",
             "self_managed_path",
             "status",
+            "store_path",
+            "store_state_home",
             "system_path",
             "witness_path",
         ]
@@ -122,7 +125,7 @@ fn doctor_is_one_short_read_only_command_with_stable_json() {
     let first_json: Value = serde_json::from_slice(&first.stdout).unwrap();
     let second_json: Value = serde_json::from_slice(&second.stdout).unwrap();
 
-    assert_eq!(first_json["schema_version"], 2);
+    assert_eq!(first_json["schema_version"], 3);
     assert_eq!(first_json["check"], "account_readiness");
     assert_eq!(first_json["mutated"], false);
     assert_exact_json_keys(&first_json);

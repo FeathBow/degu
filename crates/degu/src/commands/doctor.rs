@@ -621,6 +621,33 @@ mod tests {
         );
     }
 
+    /// `docs/safety.md` sends an operator whose recorded store is gone to the
+    /// activation record instead, because this report names no store there. Both
+    /// directions are asserted: a renamed label would leave the absent case passing
+    /// on a report that says nothing the documentation names.
+    #[test]
+    fn only_an_authenticated_store_is_named() {
+        let authenticated = render_human(&DoctorReport::from_selected_authority(
+            ActivationAuthorityMode::SelfManaged,
+            &path(),
+            CertifiedLocalBackend::Ext4,
+            StoreActivationKind::Activated,
+            Some(Path::new("/recorded/state/degu/sealed-staging")),
+        ));
+        assert!(authenticated.contains("Store path"), "{authenticated}");
+        assert!(authenticated.contains("Store state"), "{authenticated}");
+
+        let lost = render_human(&DoctorReport::from_selected_authority(
+            ActivationAuthorityMode::SelfManaged,
+            &path(),
+            CertifiedLocalBackend::Ext4,
+            StoreActivationKind::Lost,
+            None,
+        ));
+        assert!(!lost.contains("Store path"), "{lost}");
+        assert!(!lost.contains("Store state"), "{lost}");
+    }
+
     /// The human report has to say the directory this run reads is a different one.
     /// `Store state` alone reads as where the store is, not as somewhere else.
     #[test]

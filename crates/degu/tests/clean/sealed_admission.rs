@@ -955,7 +955,7 @@ impl Fixture {
             "{stdout}"
         );
         assert!(stdout.contains(reason), "{stdout}");
-        assert!(!stdout.contains("Ready to clean"), "{stdout}");
+        assert!(!stdout.contains("Eligible to clean"), "{stdout}");
         assert!(!stdout.contains("Would move"), "{stdout}");
         assert!(stdout.contains("pip"), "{stdout}");
 

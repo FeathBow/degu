@@ -65,7 +65,7 @@ fn print_scan_incomplete(report: &ScanReport) -> Result<()> {
 
 /// The one end-of-report pointer at --details. A report with folded tiers
 /// needs the complete listing, and an explicitly rooted scan whose
-/// artifacts stay out of "Ready to clean" needs the full reasons; the
+/// artifacts stay out of "Eligible to clean" needs the full reasons; the
 /// details view carries both, so when the two cases coincide only the
 /// folded-locations wording prints.
 fn print_details_hint(report: &ScanReport) -> Result<()> {

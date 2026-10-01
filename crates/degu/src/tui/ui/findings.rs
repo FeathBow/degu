@@ -124,9 +124,9 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
 fn finding_row(item: (&Finding, usize), columns: &Columns, app: &App) -> Row<'static> {
     let (finding, position) = item;
     let class = Class::of(finding, app.browser().section());
-    // A tree staging would refuse is not ready to clean, whatever the scan made of
-    // how cheap it is to regenerate. Saying `Ready` here is the one thing this row
-    // must not do, because `c` is a keystroke away and would be rejected.
+    // A tree staging would refuse is still eligible by disposition, and the tier label
+    // is the one thing this row must not show for it: `c` is a keystroke away and
+    // would be rejected. What this row knows is the refusal, so it says that.
     let refused = app.decisions().refusal(finding.path()).is_some();
     let status = match (refused, columns.status == STATUS_WIDTH) {
         (true, true) => "Blocked",

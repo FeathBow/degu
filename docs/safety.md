@@ -6,7 +6,7 @@ This document defines degu's runtime discovery, cleaning, staging, and purge sem
 
 degu never deletes a finding in place. Human output starts with the action available to the user:
 
-- **Ready to clean** findings are cleaned by default. These are cheap-to-regenerate caches such as pip.
+- **Eligible to clean** findings are cleaned by default. These are cheap-to-regenerate caches such as pip.
 - **Needs review** findings are regenerable but costly or carry a declared deletion hazard. Compile caches cost rebuild time, model caches cost download transfer, and removing Conda package caches can break environments installed with softlinks. Review the reported reason, rationale, and exact path with the displayed `degu clean -dn --review PATH` command. This is shorthand for `--details --dry-run --include-review --path PATH`; it does not broaden authority.
 - **Not managed** findings are informational and are never staged or purged. They include user assets such as conda environments and training checkpoints, shared-memory segments, tool-coordinated caches, protected mixed-state directories, trees containing entries owned by another UID or group/world-writable directories, and caches known only from `CACHEDIR.TAG` when recovery and ownership are unknown.
 

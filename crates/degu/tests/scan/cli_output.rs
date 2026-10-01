@@ -75,7 +75,7 @@ spawn -noecho sh -c {stty rows 24 columns 80; exec "$DEGU_BIN" --color never sca
     let stdout = String::from_utf8(piped.stdout).unwrap();
     let headline = headline(&stdout);
     crate::elapsed::assert_no_elapsed_suffix(headline);
-    assert!(headline.contains(" ready to clean"), "{headline}");
+    assert!(headline.contains(" eligible to clean"), "{headline}");
 }
 
 fn headline(stdout: &str) -> &str {

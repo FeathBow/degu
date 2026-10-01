@@ -170,7 +170,7 @@ fn assert_size_report(fixture: &SizeFixture, report: &serde_json::Value) {
 
 fn assert_size_human_output(stdout: &str, small_path: &str) {
     assert!(
-        stdout.contains("Ready to clean - 1 location - "),
+        stdout.contains("Eligible to clean - 1 location - "),
         "{stdout}"
     );
     assert!(

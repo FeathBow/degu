@@ -260,7 +260,7 @@ fn clean_include_review_keeps_review_authority_visible_in_the_plan() {
     assert!(cache.exists() && repo.exists());
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.contains("Ready to clean - 1 location - "),
+        stdout.contains("Eligible to clean - 1 location - "),
         "{stdout}"
     );
     assert!(

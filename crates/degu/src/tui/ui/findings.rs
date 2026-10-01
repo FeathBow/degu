@@ -1,5 +1,5 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, Wrap};
 
 use crate::presentation::escape_terminal_text;
 use crate::tui::report::{Class, Finding, Section};
@@ -89,7 +89,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(
             Paragraph::new(empty_message(app))
                 .wrap(Wrap { trim: false })
-                .block(panel("Findings")),
+                .block(with_coverage(panel("Findings"), app)),
             area,
         );
         return;
@@ -114,11 +114,34 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         Table::new(rows, columns.widths())
             .header(columns.header(app))
             .block(
-                focused_panel("[2] Locations", app.focus() == Focus::Findings)
-                    .title_bottom(Line::from(position).fg(SECONDARY).right_aligned()),
+                with_coverage(
+                    focused_panel("[2] Locations", app.focus() == Focus::Findings),
+                    app,
+                )
+                .title_bottom(Line::from(position).fg(SECONDARY).right_aligned()),
             ),
         area,
     );
+}
+
+/// Says on the panel border that this report is not the whole picture.
+///
+/// The overview spells out why for a screen with room, and a short terminal drops the
+/// overview to give the list its rows. A line of running text is the first thing a
+/// narrow terminal cuts, and the section names ahead of it are already wider than a
+/// 60-column screen, so the status sits on the border instead: that row is drawn at
+/// every size and its right side is free. `empty_message` still says what an empty
+/// list does not rule out, which is the consequence rather than the status.
+fn with_coverage(block: Block<'static>, app: &App) -> Block<'static> {
+    let coverage = app.browser().coverage();
+    if !coverage.is_lower_bound() {
+        return block;
+    }
+    block.title_top(
+        Line::from(format!(" {} scan ", format::coverage_label(coverage)))
+            .fg(CAUTION)
+            .right_aligned(),
+    )
 }
 
 fn finding_row(item: (&Finding, usize), columns: &Columns, app: &App) -> Row<'static> {
@@ -196,6 +219,11 @@ fn empty_message(app: &App) -> &'static str {
             Section::Runtime => "Runtime was not scanned.\nRun degu tui --runtime to include it.",
             Section::Cache => "Cache was not scanned in this report.",
         };
+    }
+    // An empty list is the one place a reader is most likely to conclude there is
+    // nothing to find, and a search that did not finish cannot support that.
+    if browser.coverage().is_lower_bound() {
+        return "No findings from what this scan could read, and it could not read everything. Nothing here rules out findings in what it missed.";
     }
     "No findings in this section."
 }

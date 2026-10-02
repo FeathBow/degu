@@ -11,7 +11,7 @@
 //! Writers take the gate exclusively, every other fork shares it.
 
 use std::cell::Cell;
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{RwLock, RwLockReadGuard};
 
 static GATE: RwLock<()> = RwLock::new(());
 
@@ -21,8 +21,10 @@ thread_local! {
     static EXCLUSIVE: Cell<bool> = const { Cell::new(false) };
 }
 
-pub(crate) struct Exclusive(#[expect(dead_code)] RwLockWriteGuard<'static, ()>);
+#[cfg(target_os = "linux")]
+pub(crate) struct Exclusive(#[expect(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
 
+#[cfg(target_os = "linux")]
 impl Drop for Exclusive {
     fn drop(&mut self) {
         EXCLUSIVE.with(|held| held.set(false));
@@ -30,6 +32,7 @@ impl Drop for Exclusive {
 }
 
 /// Hold across writing a file this process will exec, and across that exec.
+#[cfg(target_os = "linux")]
 pub(crate) fn exec_fresh_file() -> Exclusive {
     let guard = GATE
         .write()

@@ -19,85 +19,93 @@ fn selection(path: PathBuf) -> NativeExecutableSelection {
     NativeExecutableSelection::explicit(path).unwrap()
 }
 
-fn copied_binary(directory: &Path, source: &Path) -> PathBuf {
+#[cfg(target_os = "macos")]
+const NATIVE_MAGIC: [u8; 4] = [0xcf, 0xfa, 0xed, 0xfe];
+#[cfg(not(target_os = "macos"))]
+const NATIVE_MAGIC: [u8; 4] = *b"\x7fELF";
+
+/// Native admission reads the leading magic only. A fixture therefore declares
+/// the format it claims instead of copying a system binary, which would also
+/// make it runnable — something no probe test asserts and which the host
+/// operating system is free to withdraw from copies.
+fn native_fixture(directory: &Path) -> PathBuf {
     let executable = directory.join("uv-fixture");
-    {
-        // The copy holds a write descriptor, and a fork in another thread
-        // inherits it. Whoever execs this file next would then see a writer.
-        let _exclusive = crate::fork_gate::exec_fresh_file();
-        std::fs::copy(source, &executable).unwrap();
-    }
-    #[cfg(target_os = "macos")]
-    sign_copied_fixture(&executable);
+    std::fs::write(&executable, NATIVE_MAGIC).unwrap();
     std::fs::set_permissions(&executable, Permissions::from_mode(0o700)).unwrap();
     executable
 }
 
-#[cfg(target_os = "macos")]
-fn sign_copied_fixture(executable: &Path) {
-    // A copied macOS platform binary may no longer have a trusted signature.
-    // Give only the fixture an ad-hoc signature before testing its snapshots.
-    let _shared = crate::fork_gate::forking();
-    let output = std::process::Command::new("/usr/bin/codesign")
-        .args(["--force", "--sign", "-"])
-        .arg(executable)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "fixture signing failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 fn probe_fixture(
     path: PathBuf,
-    mode: &str,
-    after_probe: &mut impl FnMut(),
+    version: UvVersion,
 ) -> Result<ProbedUvExecutable, UvExecutableProbeError> {
-    let arguments = match mode {
-        "minimum" => vec![OsString::from("uv 0.8.19")],
-        "official" => vec![OsString::from(
-            "uv 0.12.3 (507230998 2026-08-07 aarch64-apple-darwin)",
-        )],
-        "old" => vec![OsString::from("uv 0.8.18")],
-        "malformed" => vec![OsString::from("uv 0.8.19 extra")],
-        "failure" => Vec::new(),
-        "timeout" => vec![OsString::from("30")],
-        "large" => vec![OsString::from(format!(
-            "uv {}.0.0",
-            "9".repeat(VERSION_OUTPUT_LIMIT * 2)
-        ))],
-        other => panic!("unknown fixture mode: {other:?}"),
-    };
-    let _exclusive = crate::fork_gate::exec_fresh_file();
-    probe_uv_executable_with(
-        selection(path),
-        VersionProbeRequest {
-            arguments,
-            environment: NativeEnvironmentRequest::clear(),
-        },
-        after_probe,
-    )
+    probe_uv_executable_with(selection(path), &mut |_, _| Ok(version))
 }
 
 #[test]
-fn official_release_output_survives_the_snapshot_probe() {
+fn probe_outcomes_map_to_a_supported_version_or_a_closed_failure() {
+    assert_eq!(
+        parsed_probe_version(&NativeRunOutcome::Success(AUDITED_UV_PRUNE_VERSION)).unwrap(),
+        AUDITED_UV_PRUNE_VERSION
+    );
+    assert_eq!(
+        parsed_probe_version(&NativeRunOutcome::Success(MINIMUM_UV_VERSION)).unwrap(),
+        MINIMUM_UV_VERSION
+    );
+
+    let too_old = UvVersion::new(0, 8, 18);
+    let unparsable = parse_uv_version(b"uv 0.8.19 extra\n").expect_err("fixture must not parse");
+    let cases: [(NativeRunOutcome<UvVersion, UvVersionParseError>, &str); 6] = [
+        (NativeRunOutcome::Success(too_old), "too old"),
+        (
+            NativeRunOutcome::OutputParseFailure(unparsable),
+            "malformed",
+        ),
+        (NativeRunOutcome::ExitFailure { code: Some(1) }, "failed"),
+        (
+            NativeRunOutcome::Signal {
+                signal: Some(libc::SIGKILL),
+            },
+            "signalled",
+        ),
+        (NativeRunOutcome::Timeout, "timed out"),
+        (NativeRunOutcome::OutputTruncated, "truncated"),
+    ];
+    for (outcome, label) in cases {
+        let error = parsed_probe_version(&outcome).expect_err("outcome must fail");
+        let matched = match label {
+            "too old" => matches!(
+                error,
+                UvExecutableProbeError::VersionTooOld { found, minimum }
+                    if found == too_old && minimum == MINIMUM_UV_VERSION
+            ),
+            "malformed" => matches!(error, UvExecutableProbeError::InvalidOutput(_)),
+            "failed" => matches!(error, UvExecutableProbeError::ExitFailure { code: Some(1) }),
+            "signalled" => matches!(error, UvExecutableProbeError::Signal { signal: Some(_) }),
+            "timed out" => matches!(error, UvExecutableProbeError::Timeout),
+            "truncated" => matches!(error, UvExecutableProbeError::OutputTruncated),
+            _ => unreachable!(),
+        };
+        assert!(matched, "{label}: unexpected error {error:?}");
+    }
+}
+
+#[test]
+fn the_token_reports_the_version_the_probe_produced() {
     let temp = private_tempdir();
-    let executable = copied_binary(temp.path(), Path::new("/bin/echo"));
-    let probed = probe_fixture(executable, "official", &mut || {}).unwrap();
+    let probed = probe_fixture(native_fixture(temp.path()), AUDITED_UV_PRUNE_VERSION).unwrap();
     assert_eq!(probed.version(), AUDITED_UV_PRUNE_VERSION);
     probed.revalidate_path().unwrap();
 }
 
 #[test]
-fn held_native_binary_probe_accepts_minimum_and_revalidates_symlink() {
+fn a_symlink_selection_revalidates_and_its_snapshot_dies_with_the_token() {
     let temp = private_tempdir();
-    let executable = copied_binary(temp.path(), Path::new("/bin/echo"));
+    let executable = native_fixture(temp.path());
     let link = temp.path().join("selected-uv");
     symlink(&executable, &link).unwrap();
 
-    let probed = probe_fixture(link.clone(), "minimum", &mut || {}).unwrap();
+    let probed = probe_fixture(link.clone(), MINIMUM_UV_VERSION).unwrap();
     assert_eq!(probed.selection().as_path(), link);
     assert_eq!(probed.version(), MINIMUM_UV_VERSION);
     probed.revalidate_path().unwrap();
@@ -108,45 +116,19 @@ fn held_native_binary_probe_accepts_minimum_and_revalidates_symlink() {
 }
 
 #[test]
-fn old_malformed_failed_timed_out_and_large_probes_fail_closed() {
-    for (mode, source) in [
-        ("old", "/bin/echo"),
-        ("malformed", "/bin/echo"),
-        ("failure", "/usr/bin/false"),
-        ("timeout", "/bin/sleep"),
-        ("large", "/bin/echo"),
-    ] {
-        let temp = private_tempdir();
-        let executable = copied_binary(temp.path(), Path::new(source));
-        let error = probe_fixture(executable, mode, &mut || {})
-            .err()
-            .expect("probe must fail");
-        let matched = match mode {
-            "old" => matches!(error, UvExecutableProbeError::VersionTooOld { .. }),
-            "malformed" => matches!(error, UvExecutableProbeError::InvalidOutput(_)),
-            "failure" => matches!(error, UvExecutableProbeError::ExitFailure { .. }),
-            "timeout" => matches!(error, UvExecutableProbeError::Timeout),
-            "large" => matches!(error, UvExecutableProbeError::OutputTruncated),
-            _ => unreachable!(),
-        };
-        assert!(matched, "mode {mode:?}: unexpected error {error:?}");
-    }
-}
-
-#[test]
 fn unsafe_mode_and_ancestor_are_refused_before_execution() {
     let temp = private_tempdir();
-    let executable = copied_binary(temp.path(), Path::new("/bin/echo"));
+    let executable = native_fixture(temp.path());
     std::fs::set_permissions(&executable, Permissions::from_mode(0o722)).unwrap();
     assert!(matches!(
-        probe_fixture(executable.clone(), "minimum", &mut || {}),
+        probe_fixture(executable.clone(), MINIMUM_UV_VERSION),
         Err(UvExecutableProbeError::UnsafePath { reason, .. })
             if reason == "executable is group- or world-writable"
     ));
 
     std::fs::set_permissions(&executable, Permissions::from_mode(0o410)).unwrap();
     assert!(matches!(
-        probe_fixture(executable.clone(), "minimum", &mut || {}),
+        probe_fixture(executable.clone(), MINIMUM_UV_VERSION),
         Err(UvExecutableProbeError::UnsafePath { reason, .. })
             if reason == "effective user cannot execute selected file"
     ));
@@ -155,9 +137,9 @@ fn unsafe_mode_and_ancestor_are_refused_before_execution() {
     let shared = temp.path().join("shared");
     std::fs::create_dir(&shared).unwrap();
     std::fs::set_permissions(&shared, Permissions::from_mode(0o777)).unwrap();
-    let nested = copied_binary(&shared, Path::new("/bin/echo"));
+    let nested = native_fixture(&shared);
     assert!(matches!(
-        probe_fixture(nested, "minimum", &mut || {}),
+        probe_fixture(nested, MINIMUM_UV_VERSION),
         Err(UvExecutableProbeError::UnsafePath { reason, .. })
             if reason == "ancestor namespace grants foreign mutation authority"
     ));
@@ -181,7 +163,7 @@ fn snapshot_parent_chain_rejects_a_shared_writable_ancestor() {
 #[test]
 fn source_change_after_snapshot_is_refused_before_probe_execution() {
     let temp = private_tempdir();
-    let executable = copied_binary(temp.path(), Path::new("/bin/echo"));
+    let executable = native_fixture(temp.path());
     let opened = open_selected_executable(&selection(executable.clone())).unwrap();
     let snapshot = snapshot_executable(&opened).unwrap();
     std::fs::set_permissions(&executable, Permissions::from_mode(0o500)).unwrap();
@@ -195,19 +177,18 @@ fn source_change_after_snapshot_is_refused_before_probe_execution() {
 #[test]
 fn runner_refuses_snapshot_path_replacement_against_held_identity() {
     let temp = private_tempdir();
-    let executable = copied_binary(temp.path(), Path::new("/bin/echo"));
-    let probed = probe_fixture(executable, "minimum", &mut || {}).unwrap();
+    let probed = probe_fixture(native_fixture(temp.path()), MINIMUM_UV_VERSION).unwrap();
     let snapshot = probed.executable.snapshot_path().to_path_buf();
     let displaced = snapshot.with_file_name("held-original");
     let replacement_out = temp.path().join("snapshot-replacement");
     std::fs::rename(&snapshot, &displaced).unwrap();
-    std::fs::copy("/bin/echo", &snapshot).unwrap();
+    std::fs::write(&snapshot, NATIVE_MAGIC).unwrap();
     std::fs::set_permissions(&snapshot, Permissions::from_mode(0o500)).unwrap();
 
     let request = NativeActionRequest::new(
         NativeActionIdentity::new("uv", "version-probe").unwrap(),
         probed.selection().clone(),
-        [OsString::from("uv 0.8.19")],
+        [OsString::from("-V")],
         NativeEnvironmentRequest::clear(),
         NativeProcessContract::AuditedCooperativeProcessGroup,
         VERSION_PROBE_TIMEOUT,
@@ -244,18 +225,18 @@ fn scripts_are_refused_before_any_interpreter_can_run() {
 #[test]
 fn path_replacement_after_probe_cannot_mint_a_token() {
     let temp = private_tempdir();
-    let executable = copied_binary(temp.path(), Path::new("/bin/echo"));
+    let executable = native_fixture(temp.path());
     let replacement_source = temp.path().join("replacement-source");
     std::fs::copy(&executable, &replacement_source).unwrap();
     std::fs::set_permissions(&replacement_source, Permissions::from_mode(0o700)).unwrap();
     let displaced = temp.path().join("displaced");
     let selected = executable.clone();
-    let mut replace = || {
-        std::fs::rename(&executable, &displaced).unwrap();
-        std::fs::rename(&replacement_source, &executable).unwrap();
-    };
     assert!(matches!(
-        probe_fixture(selected, "minimum", &mut replace),
+        probe_uv_executable_with(selection(selected), &mut |_, _| {
+            std::fs::rename(&executable, &displaced).unwrap();
+            std::fs::rename(&replacement_source, &executable).unwrap();
+            Ok(MINIMUM_UV_VERSION)
+        }),
         Err(UvExecutableProbeError::PathChanged)
     ));
 }

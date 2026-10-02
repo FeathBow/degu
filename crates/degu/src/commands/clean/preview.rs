@@ -25,6 +25,7 @@ pub(super) enum PreviewStagingStatus {
     TreePolicyAssessed {
         regular_hard_links: HeldTreeRegularHardLinkTopology,
         regular_xattrs: HeldTreeRegularXattrTopology,
+        directories_carry_xattrs: bool,
     },
     Blocked {
         kind: &'static str,
@@ -89,16 +90,22 @@ impl PreviewStagingAssessment {
         )
     }
 
-    pub(super) fn has_ordinary_regular_xattrs(&self) -> bool {
+    /// Directory metadata is the one thing no proof covers, so it is the one extended
+    /// attribute that still refuses a permanent deletion. Ordinary regular-file xattrs
+    /// are bound into the content manifest by proof schema v3, which this purge verifies
+    /// before it unlinks anything, so they no longer block one.
+    pub(super) fn has_directory_xattrs(&self) -> bool {
         matches!(
             self.status,
-            PreviewStagingStatus::TreePolicyAssessed { regular_xattrs, .. }
-                if regular_xattrs.contains_xattrs()
+            PreviewStagingStatus::TreePolicyAssessed {
+                directories_carry_xattrs: true,
+                ..
+            }
         )
     }
 
     pub(super) fn purge_supported(&self) -> bool {
-        !self.has_internal_hard_links() && !self.has_ordinary_regular_xattrs()
+        !self.has_internal_hard_links() && !self.has_directory_xattrs()
     }
 
     pub(super) fn is_blocked(&self) -> bool {
@@ -128,18 +135,20 @@ impl PreviewStagingAssessment {
             PreviewStagingStatus::TreePolicyAssessed {
                 regular_hard_links,
                 regular_xattrs,
+                directories_carry_xattrs,
             } => {
                 let has_hardlinks = regular_hard_links.contains_multi_link_group();
                 let has_xattrs = regular_xattrs.contains_xattrs();
-                let limitation = match (has_hardlinks, has_xattrs) {
+                let has_directory_xattrs = *directories_carry_xattrs;
+                let limitation = match (has_hardlinks, has_directory_xattrs) {
                     (true, true) => Some(
-                        "multi-link regular-file groups and ordinary regular-file xattrs may be staged and undone, but sealed purge is unsupported",
+                        "multi-link regular-file groups and directory extended attributes may be staged and undone, but sealed purge is unsupported",
                     ),
                     (true, false) => Some(
                         "multi-link regular-file groups may be staged and undone, but sealed purge is unsupported",
                     ),
                     (false, true) => Some(
-                        "ordinary regular-file xattrs may be staged and undone, but sealed purge is unsupported",
+                        "directory extended attributes may be staged and undone, but sealed purge is unsupported",
                     ),
                     (false, false) => None,
                 };
@@ -149,6 +158,7 @@ impl PreviewStagingAssessment {
                     "requested_action": if self.purge_requested { "purge" } else { "stage" },
                     "contains_internal_hardlinks": has_hardlinks,
                     "contains_ordinary_regular_xattrs": has_xattrs,
+                    "contains_directory_xattrs": has_directory_xattrs,
                     "regular_hard_links": {
                         "multi_link_groups": regular_hard_links.multi_link_groups,
                         "linked_entries": regular_hard_links.linked_entries,
@@ -161,7 +171,7 @@ impl PreviewStagingAssessment {
                         "proof_schema": 3,
                     },
                     "purge_admission": {
-                        "supported": !has_hardlinks && !has_xattrs,
+                        "supported": !has_hardlinks && !has_directory_xattrs,
                         "limitation": limitation,
                     },
                     "pending_validation": {
@@ -328,6 +338,7 @@ fn assess_path(path: &Path) -> PreviewStagingStatus {
             PreviewStagingStatus::TreePolicyAssessed {
                 regular_hard_links: tree.regular_hard_links,
                 regular_xattrs: tree.regular_xattrs,
+                directories_carry_xattrs: tree.directories_carry_xattrs,
             }
         }
         Ok(HeldTreePolicyAssessmentOutcome::TreePolicyDeferredUntilSourceParentSeal { .. }) => {
@@ -491,6 +502,7 @@ mod tests {
                 PreviewStagingStatus::TreePolicyAssessed {
                     regular_hard_links: HeldTreeRegularHardLinkTopology::default(),
                     regular_xattrs: HeldTreeRegularXattrTopology::default(),
+                    directories_carry_xattrs: false,
                 },
                 "tree_policy_assessed",
             ),

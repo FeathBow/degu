@@ -620,7 +620,7 @@ fn execute_reserved(
             // failure is not a stage failure and must not skip the oplog record.
             Err(error) => {
                 let unsupported_content = error.is_unsupported_internal_hard_links()
-                    || error.is_unsupported_regular_xattrs();
+                    || error.is_unsupported_directory_xattrs();
                 purge_admission_failure = Some((
                     format!(
                         "purge admission failed during {}: {}",

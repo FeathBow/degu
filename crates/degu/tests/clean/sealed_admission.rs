@@ -210,7 +210,11 @@ fn ordinary_regular_xattr_previews_stages_and_fresh_process_undo_preserves_value
         baseline_value_bytes + i64::try_from("proof-bound".len()).unwrap()
     );
     assert_eq!(preflight["regular_xattrs"]["proof_schema"], 3);
-    assert_eq!(preflight["purge_admission"]["supported"], false);
+    // Proof schema v3 binds these names and values into the content manifest a purge
+    // verifies before it unlinks anything, so they do not refuse a permanent deletion.
+    // Directory metadata is what no proof covers, and this tree has none.
+    assert_eq!(preflight["contains_directory_xattrs"], false);
+    assert_eq!(preflight["purge_admission"]["supported"], true);
 
     let clean = fixture.run(&[
         "clean",
@@ -227,36 +231,74 @@ fn ordinary_regular_xattr_previews_stages_and_fresh_process_undo_preserves_value
         b"proof-bound"
     );
 
-    let purge = fixture.run(&["trash", "purge", "--yes", "--json"]);
-    assert!(!purge.status.success());
-    let purge_report: serde_json::Value = serde_json::from_slice(&purge.stdout).unwrap();
-    assert!(purge_report["purged"].as_array().unwrap().is_empty());
-    assert_eq!(purge_report["failed"].as_array().unwrap().len(), 1);
-    assert!(
-        purge_report["failed"][0]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("does not support a tree containing ordinary regular-file xattrs"),
-        "{purge_report:#}"
-    );
-    assert_eq!(
-        read_ordinary_xattr(&trash.join("wheel.whl")),
-        b"proof-bound"
-    );
-
     let undo = fixture.run(&["undo", "--json"]);
     assert_output_success(&undo);
     assert_eq!(read_ordinary_xattr(&file), b"proof-bound");
 }
 
+/// The capability #170 asked for: a cache whose regular files carry ordinary extended
+/// attributes is staged and then permanently deleted. Schema v3 binds those names and
+/// values into the content manifest, and this purge verifies that manifest exactly
+/// before it unlinks anything, so there is nothing about the tree it has not proven.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn ordinary_regular_xattr_purge_is_gated_after_stage_and_remains_undoable() {
+fn ordinary_regular_xattr_purge_completes_because_the_proof_binds_the_values() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
     let file = fixture.cache.join("wheel.whl");
     set_ordinary_xattr(&file, b"keep");
+
+    let clean = fixture.run(&[
+        "clean",
+        "--purge",
+        "--yes",
+        "--json",
+        "--path",
+        fixture.cache.to_str().unwrap(),
+    ]);
+    assert_output_success(&clean);
+    let report: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    let item = &report["executed"][0];
+    assert_eq!(item["state"], "purged", "{report:#}");
+    assert_eq!(item["purged"], true, "{report:#}");
+    let trash = PathBuf::from(item["trash_entry"].as_str().unwrap());
+    assert!(!trash.exists(), "the purged entry is still in the trash");
+    assert!(!file.exists(), "the source file survived a purge");
+}
+
+/// Directory metadata is the one thing no proof covers, so it is the one extended
+/// attribute that still refuses a permanent deletion. A refusal here arrives after the
+/// tree is staged and verified and before any purge authority exists, so the tree stays
+/// undoable — the same contract regular-file xattrs used to get.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn directory_xattr_purge_is_gated_after_stage_and_remains_undoable() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let file = fixture.cache.join("wheel.whl");
+    let nested = fixture.cache.join("wheels");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("inner.whl"), b"inner").unwrap();
+    set_ordinary_xattr(&nested, b"on-a-directory");
+
+    let preview = fixture.run(&["clean", "-n", "--purge", "--json"]);
+    assert_output_success(&preview);
+    let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    let preflight = &preview["staging_preflight"][0];
+    assert_eq!(preflight["contains_directory_xattrs"], true, "{preview:#}");
+    assert_eq!(
+        preflight["purge_admission"]["supported"], false,
+        "{preview:#}"
+    );
+    assert!(
+        preflight["purge_admission"]["limitation"]
+            .as_str()
+            .unwrap()
+            .contains("directory extended attributes"),
+        "{preview:#}"
+    );
 
     let clean = fixture.run(&[
         "clean",
@@ -275,68 +317,44 @@ fn ordinary_regular_xattr_purge_is_gated_after_stage_and_remains_undoable() {
         item["outcome"]["failed"]["reason"]
             .as_str()
             .unwrap()
-            .contains("does not support a tree containing ordinary regular-file xattrs"),
+            .contains("does not support a tree containing directory extended attributes"),
         "{report:#}"
     );
-    let trash = PathBuf::from(item["trash_entry"].as_str().unwrap());
-    assert_eq!(read_ordinary_xattr(&trash.join("wheel.whl")), b"keep");
 
     let undo = fixture.run(&["undo", "--json"]);
     assert_output_success(&undo);
-    assert_eq!(read_ordinary_xattr(&file), b"keep");
+    assert!(file.exists(), "the refused purge did not stay undoable");
+    assert!(nested.join("inner.whl").exists(), "the subtree was lost");
 }
 
+/// The human preview has to promise what execution will do. A tree whose only extended
+/// attributes are on regular files is now deleted, so the preview that used to say it
+/// would not be must say it will.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn xattr_only_human_purge_preview_does_not_promise_deletion() {
+fn xattr_only_human_purge_preview_promises_the_deletion_it_will_perform() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
-    let file = fixture.cache.join("wheel.whl");
-    set_ordinary_xattr(&file, b"keep");
+    set_ordinary_xattr(&fixture.cache.join("wheel.whl"), b"keep");
 
     let preview = fixture.run(&["clean", "-n", "--purge"]);
     assert_output_success(&preview);
     let preview = String::from_utf8(preview.stdout).unwrap();
-    assert!(preview.contains("Would stage"), "{preview}");
     assert!(
-        preview.contains(
-            "not permanently delete it because sealed purge does not support proof-bound ordinary regular-file xattrs"
-        ),
-        "{preview}"
+        !preview.contains("not permanently delete"),
+        "the preview still refuses a deletion execution now performs: {preview}"
     );
     assert!(!preview.contains("multi-link"), "{preview}");
+    assert!(
+        !preview.contains("ordinary regular-file xattrs"),
+        "the preview still names regular-file xattrs as a purge limitation: {preview}"
+    );
 
-    let clean = fixture.run(&[
-        "clean",
-        "--yes",
-        "--json",
-        "--path",
-        fixture.cache.to_str().unwrap(),
-    ]);
-    assert_output_success(&clean);
-    let report: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
-    let trash = PathBuf::from(report["executed"][0]["trash_entry"].as_str().unwrap());
-
-    let purge = fixture.run(&["trash", "purge", "--yes"]);
-    assert!(!purge.status.success());
-    let stdout = String::from_utf8(purge.stdout).unwrap();
-    assert!(
-        stdout.contains("Purge plan: 1 reviewed trash entry will be considered"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains(
-            "sealed entries with unsupported purge topology are retained and remain undoable"
-        ),
-        "{stdout}"
-    );
-    assert!(
-        !stdout.contains("all 1 trash entry")
-            && !stdout.contains("trash entry will be permanently deleted"),
-        "{stdout}"
-    );
-    assert_eq!(read_ordinary_xattr(&trash.join("wheel.whl")), b"keep");
+    let purge = fixture.run(&["clean", "--purge", "--yes", "--json"]);
+    assert_output_success(&purge);
+    let report: serde_json::Value = serde_json::from_slice(&purge.stdout).unwrap();
+    assert_eq!(report["executed"][0]["purged"], true, "{report:#}");
 }
 
 #[test]

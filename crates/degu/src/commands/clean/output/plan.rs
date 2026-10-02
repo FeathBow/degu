@@ -127,22 +127,22 @@ fn print_selected(prepared: &PreparedClean) -> Result<()> {
                 prepared.settings.ui.toned_prose(0, &note, Tone::Secondary)
             )?;
         }
-        let ordinary_xattr_items = assessed
+        let directory_xattr_items = assessed
             .iter()
             .filter(|finding| {
                 prepared
                     .preview_assessment(finding)
-                    .is_some_and(|assessment| assessment.has_ordinary_regular_xattrs())
+                    .is_some_and(|assessment| assessment.has_directory_xattrs())
             })
             .count();
-        if ordinary_xattr_items != 0 {
+        if directory_xattr_items != 0 {
             let note = if prepared.settings.purge {
                 format!(
-                    "{ordinary_xattr_items} location(s) contain proof-bound ordinary regular-file xattrs: execution may stage them, but permanent purge is unsupported and they will remain undoable in Degu trash."
+                    "{directory_xattr_items} location(s) contain directory extended attributes: execution may stage them, but permanent purge is unsupported and they will remain undoable in Degu trash."
                 )
             } else {
                 format!(
-                    "{ordinary_xattr_items} location(s) contain proof-bound ordinary regular-file xattrs: staging and undo are supported, but later permanent purge is unsupported."
+                    "{directory_xattr_items} location(s) contain directory extended attributes: staging and undo are supported, but later permanent purge is unsupported."
                 )
             };
             stdoutln!(
@@ -236,17 +236,15 @@ fn print_permanent_preview(
                 .preview_assessment(finding)
                 .is_some_and(|assessment| assessment.has_internal_hard_links())
         });
-        let has_xattrs = staged_only.iter().any(|finding| {
+        let has_directory_xattrs = staged_only.iter().any(|finding| {
             prepared
                 .preview_assessment(finding)
-                .is_some_and(|assessment| assessment.has_ordinary_regular_xattrs())
+                .is_some_and(|assessment| assessment.has_directory_xattrs())
         });
-        let unsupported = match (has_links, has_xattrs) {
-            (true, true) => {
-                "multi-link regular-file groups or proof-bound ordinary regular-file xattrs"
-            }
+        let unsupported = match (has_links, has_directory_xattrs) {
+            (true, true) => "multi-link regular-file groups or directory extended attributes",
             (true, false) => "multi-link regular-file groups",
-            (false, true) => "proof-bound ordinary regular-file xattrs",
+            (false, true) => "directory extended attributes",
             (false, false) => "the staged proof topology",
         };
         stdoutln!(

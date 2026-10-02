@@ -316,6 +316,8 @@ pub(crate) enum HeldTreeError {
     NonDirectoryExtendedMetadata(PathBuf),
     #[error("non-directory ACL or xattr evidence is unavailable at {0}")]
     NonDirectoryMetadataUnavailable(PathBuf),
+    #[error("directory extended-attribute evidence is unavailable at {0}")]
+    DirectoryXattrEvidenceUnavailable(PathBuf),
     #[error("non-directory content proof is unsupported at {0}")]
     UnsupportedContentProof(PathBuf),
     #[error("entry changed while its content was hashed at {0}")]
@@ -592,6 +594,10 @@ pub(crate) struct HeldTreePolicyAssessment {
     pub(crate) content_bytes: u64,
     pub(crate) regular_hard_links: RegularHardLinkTopology,
     pub(crate) regular_xattrs: RegularXattrTopology,
+    /// Whether any directory in the tree carries an extended attribute. Sealed purge
+    /// refuses such a tree, because no proof covers directory metadata, so a preview
+    /// has to be able to say so before anyone confirms a permanent deletion.
+    pub(crate) directories_carry_xattrs: bool,
     pub(crate) assessed_at: std::time::SystemTime,
 }
 
@@ -683,10 +689,116 @@ pub(crate) fn assess_tree_admission(
             content_bytes: walked.budget.content_bytes,
             regular_hard_links: walked.regular_hard_links,
             regular_xattrs: walked.regular_xattrs,
+            directories_carry_xattrs: directories_carry_xattrs(&walked.root.held, limits)?,
             assessed_at: std::time::SystemTime::now(),
         },
         source_parent_seal,
     })
+}
+
+/// Whether any directory in this tree carries an extended attribute.
+///
+/// Proof schema v3 binds ordinary regular-file xattr names and values into the content
+/// manifest, and symlink xattrs fail closed at admission, so directory xattrs are the
+/// one piece of this tree's metadata that no proof covers. Permanent deletion may not
+/// proceed on a tree whose metadata is only partly proven, and the manifest cannot
+/// answer this question: the purge rewalk accumulates its topology from manifest
+/// records rather than from live descriptors, so a fact the manifest never recorded can
+/// never reach it. The question is therefore asked of the verified root directly.
+///
+/// Only names are read, never values, so the cost is one `flistxattr` per directory.
+/// Evidence that cannot be read is a refusal rather than an absence: a tree whose
+/// directory metadata is unreadable is not a tree whose directory metadata is proven
+/// absent.
+///
+/// The pass is descriptor-bounded the way the rest of the purge path is. It keeps a
+/// worklist of relative paths and reopens each directory from the root one component at
+/// a time, dropping each parent as it descends, so it holds a fixed number of
+/// descriptors however deep the tree is. Holding one per level instead would break the
+/// bound a deep tree is tested against.
+///
+/// The caller runs this after exact verification and before any purge authority exists,
+/// so a tree this refuses stays committed and undoable.
+pub(crate) fn directories_carry_xattrs(
+    root: &HeldLocalBackendEvidence,
+    limits: HeldTreeLimits,
+) -> Result<bool, HeldTreeError> {
+    let mut pending = vec![PathBuf::new()];
+    let mut examined = 0_u64;
+    while let Some(relative) = pending.pop() {
+        let depth = u32::try_from(relative.components().count())
+            .map_err(|_| HeldTreeError::InvalidDirectoryPath(relative.clone()))?;
+        if depth > limits.max_depth {
+            return Err(HeldTreeError::Limit {
+                kind: HeldTreeLimit::Depth,
+                limit: u64::from(limits.max_depth),
+            });
+        }
+        examined = examined.saturating_add(1);
+        if examined > limits.max_directories {
+            return Err(HeldTreeError::Limit {
+                kind: HeldTreeLimit::Directories,
+                limit: limits.max_directories,
+            });
+        }
+        let opened = if relative.as_os_str().is_empty() {
+            None
+        } else {
+            Some(open_tree_directory_from_root(root, &relative)?)
+        };
+        let directory = opened.as_ref().unwrap_or(root);
+        match with_fd(directory, |fd| collect_fd_xattr_names(&fd)) {
+            CollectedXattrs::Names(names) if !names.is_empty() => return Ok(true),
+            CollectedXattrs::Names(_) => {}
+            CollectedXattrs::Unknown => {
+                return Err(HeldTreeError::DirectoryXattrEvidenceUnavailable(relative));
+            }
+        }
+        let fresh = with_fd(directory, |fd| {
+            rustix::fs::openat(fd, c".", OPEN_DIRECTORY, Mode::empty())
+        })
+        .map_err(|error| io_error(&relative, error))?;
+        let entries = Dir::new(fresh).map_err(|error| io_error(&relative, error))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| io_error(&relative, error))?;
+            if matches!(entry.file_name().to_bytes(), b"." | b"..") {
+                continue;
+            }
+            let name = OsStr::from_bytes(entry.file_name().to_bytes());
+            let child = relative.join(name);
+            let inspected = with_fd(directory, |fd| inspect_at(fd, name, &child))?;
+            if inspected.identity.kind == NodeKind::Directory {
+                pending.push(child);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// One directory of the tree, opened from the root a component at a time with
+/// no-follow semantics, holding at most the parent and the child at once.
+fn open_tree_directory_from_root(
+    root: &HeldLocalBackendEvidence,
+    relative: &Path,
+) -> Result<HeldLocalBackendEvidence, HeldTreeError> {
+    let mut current: Option<HeldLocalBackendEvidence> = None;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(HeldTreeError::InvalidDirectoryPath(relative.to_path_buf()));
+        };
+        let parent = current.as_ref().unwrap_or(root);
+        let fd = with_fd(parent, |fd| {
+            rustix::fs::openat(fd, name, OPEN_DIRECTORY, Mode::empty())
+        })
+        .map_err(|error| io_error(relative, error))?;
+        current = Some(
+            certify_held_fd(fd).map_err(|reason| HeldTreeError::Certification {
+                path: relative.to_path_buf(),
+                reason,
+            })?,
+        );
+    }
+    current.ok_or_else(|| HeldTreeError::InvalidDirectoryPath(relative.to_path_buf()))
 }
 
 /// Data-only ordering for deterministic recovery. It carries neither an

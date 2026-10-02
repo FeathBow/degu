@@ -160,8 +160,10 @@ pub(crate) enum RecoveryRebindError {
     UndoParentSync(#[source] io::Error),
     #[error("sealed purge does not support a tree containing multi-link regular-file groups")]
     PurgeUnsupportedInternalHardLinks,
-    #[error("sealed purge does not support a tree containing ordinary regular-file xattrs")]
-    PurgeUnsupportedRegularXattrs,
+    #[error("sealed purge does not support a tree containing directory extended attributes")]
+    PurgeUnsupportedDirectoryXattrs,
+    #[error("directory extended-attribute evidence could not be read before purge: {0}")]
+    PurgeDirectoryXattrEvidence(#[source] HeldTreeError),
     #[error("object-bound purge execution failed: {0}")]
     PurgeExecution(#[source] HeldTreeError),
 }
@@ -1077,9 +1079,9 @@ impl VerifiedPurgeSession<'_> {
                 *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
                 return Err(RecoveryRebindError::PurgeUnsupportedInternalHardLinks);
             }
-            if inventory.regular_xattr_topology().contains_xattrs() {
+            if verifier.tree_directories_carry_xattrs()? {
                 *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
-                return Err(RecoveryRebindError::PurgeUnsupportedRegularXattrs);
+                return Err(RecoveryRebindError::PurgeUnsupportedDirectoryXattrs);
             }
             let commitment = verifier
                 .undo
@@ -1126,9 +1128,9 @@ impl VerifiedPurgeSession<'_> {
                 *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
                 return Err(RecoveryRebindError::PurgeUnsupportedInternalHardLinks);
             }
-            if inventory.regular_xattr_topology().contains_xattrs() {
+            if verifier.tree_directories_carry_xattrs()? {
                 *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
-                return Err(RecoveryRebindError::PurgeUnsupportedRegularXattrs);
+                return Err(RecoveryRebindError::PurgeUnsupportedDirectoryXattrs);
             }
             VerifiedPurgeTree::Resident(Box::new(inventory))
         };
@@ -1500,6 +1502,20 @@ impl VerifiedUndoRecoverySession<'_> {
         }
         self.undo.root.verify_fresh_binding()?;
         Ok(inventory)
+    }
+
+    /// Whether this tree's directories carry extended attributes no proof covers.
+    ///
+    /// Asked of the verified root rather than of the manifest, because the streamed v3
+    /// rewalk accumulates its topology from manifest records and the manifest records no
+    /// directory xattrs. Regular-file xattrs need no gate of their own: schema v3 binds
+    /// their names and values into the content manifest this purge already verified.
+    fn tree_directories_carry_xattrs(&self) -> Result<bool, RecoveryRebindError> {
+        crate::backend::held::directories_carry_xattrs(
+            &self.undo.root.held,
+            HeldTreeLimits::default(),
+        )
+        .map_err(RecoveryRebindError::PurgeDirectoryXattrEvidence)
     }
 
     fn verify_purge_layout(&self) -> Result<(), RecoveryRebindError> {

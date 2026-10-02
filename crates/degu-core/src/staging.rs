@@ -481,13 +481,13 @@ impl VerifiedPurgeError {
             })
     }
 
-    pub fn is_unsupported_regular_xattrs(&self) -> bool {
+    pub fn is_unsupported_directory_xattrs(&self) -> bool {
         self.source
             .downcast_ref::<crate::staging::recovery::RecoveryRebindError>()
             .is_some_and(|source| {
                 matches!(
                     source,
-                    crate::staging::recovery::RecoveryRebindError::PurgeUnsupportedRegularXattrs
+                    crate::staging::recovery::RecoveryRebindError::PurgeUnsupportedDirectoryXattrs
                 )
             })
     }
@@ -898,7 +898,8 @@ impl ReadyStagingEngine {
             let disposition = match (&source, state) {
                 (
                     crate::staging::recovery::RecoveryRebindError::PurgeUnsupportedInternalHardLinks
-                    | crate::staging::recovery::RecoveryRebindError::PurgeUnsupportedRegularXattrs
+                    | crate::staging::recovery::RecoveryRebindError::PurgeUnsupportedDirectoryXattrs
+                    | crate::staging::recovery::RecoveryRebindError::PurgeDirectoryXattrEvidence(_)
                     | crate::staging::recovery::RecoveryRebindError::PurgePlan(_),
                     Some(TransactionState::VerifiedCommitted | TransactionState::Purgeable),
                 ) if !self.engine.startup_blocked => VerifiedPurgeFailureDisposition::NotStarted,

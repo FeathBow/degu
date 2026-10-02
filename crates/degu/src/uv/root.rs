@@ -948,20 +948,10 @@ fn reject_extended_acl(fd: &OwnedFd, path: &Path) -> Result<(), UvCacheRootSealE
             path: path.to_path_buf(),
             source,
         })?;
-    if has_posix_acl_name(&names) {
+    if crate::uv::xattr::names_a_posix_acl(&names) {
         return Err(unsafe_path(path, "extended or default ACL is present"));
     }
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn has_posix_acl_name(names: &[u8]) -> bool {
-    names.split(|byte| *byte == 0).any(|name| {
-        matches!(
-            name,
-            b"system.posix_acl_access" | b"system.posix_acl_default"
-        )
-    })
 }
 
 #[cfg(target_os = "macos")]

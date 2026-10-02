@@ -49,6 +49,22 @@ fn list(fd: &impl AsFd, buffer: &mut [u8]) -> io::Result<usize> {
     }
 }
 
+/// Whether a name list records a POSIX ACL.
+///
+/// Linux keeps the ACL that applies to an object under one name and the ACL its
+/// new children inherit under another. Either means the namespace carries ACL
+/// authority, so a walk that counted only the first would admit a directory the
+/// cache-root seal and content admission both refuse.
+#[cfg(any(target_os = "linux", test))]
+pub(in crate::uv) fn names_a_posix_acl(names: &[u8]) -> bool {
+    names.split(|byte| *byte == 0).any(|name| {
+        matches!(
+            name,
+            b"system.posix_acl_access" | b"system.posix_acl_default"
+        )
+    })
+}
+
 fn unusable(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
@@ -62,6 +78,24 @@ mod tests {
     const PLANTED: [&str; 2] = ["user.degu-one", "user.degu-two"];
     #[cfg(target_os = "macos")]
     const PLANTED: [&str; 2] = ["degu-one", "degu-two"];
+
+    #[test]
+    fn both_the_applied_and_the_inherited_acl_name_count_as_an_acl() {
+        for present in [
+            &b"system.posix_acl_access\0"[..],
+            &b"system.posix_acl_default\0"[..],
+            &b"user.comment\0system.posix_acl_default\0"[..],
+        ] {
+            assert!(names_a_posix_acl(present), "{present:?}");
+        }
+        for absent in [
+            &b""[..],
+            &b"user.comment\0"[..],
+            &b"system.posix_acl_accessory\0"[..],
+        ] {
+            assert!(!names_a_posix_acl(absent), "{absent:?}");
+        }
+    }
 
     #[test]
     fn a_descriptor_with_no_attributes_lists_nothing() {

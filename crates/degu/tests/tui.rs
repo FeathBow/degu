@@ -939,3 +939,49 @@ send "q"
         }
     }
 }
+
+/// The classification column has to hold the longest classification it can show. #166
+/// reworded one to three characters wider than the column allocated, and every terminal
+/// size then put `Eligible to cl` on the row while the record panel below it showed the
+/// whole label, so degu disagreed with itself about the same finding.
+///
+/// The label is written out here on purpose. The column derives its width from the
+/// labels, so a rewording needs no code change — and this assertion is the one place
+/// that makes someone look at the column again when the wording moves.
+#[test]
+fn the_classification_column_holds_the_longest_classification() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir_in(home.path()).unwrap();
+    let config = config_home_with_roots(&[]);
+    let cache = pip_cache::seed(home.path());
+    assert!(cache.exists());
+
+    for (rows, columns) in [(24u16, 80u16), (40, 120)] {
+        let body = format!(
+            r#"
+spawn -noecho sh -c {{stty rows {rows} columns {columns}; exec "$DEGU_BIN" --color never tui --only pip}}
+expect -ex "\033\[?1049h"
+sleep 1
+send "q"
+"#
+        );
+        let out = run_pty(PtyRun {
+            body: &body,
+            home: home.path(),
+            config_home: config.path(),
+            state_home: state.path(),
+            extra_env: &[],
+        });
+        let lines = screen::render(&out.stdout, usize::from(rows), usize::from(columns));
+        let row = lines
+            .iter()
+            .find(|line| line.contains("Caches/pip") || line.contains(".cache/pip"))
+            .unwrap_or_else(|| {
+                panic!("the cache is not on the screen at {columns}x{rows}: {lines:#?}")
+            });
+        assert!(
+            row.contains("Eligible to clean"),
+            "the row at {columns}x{rows} truncated the classification: {row}"
+        );
+    }
+}

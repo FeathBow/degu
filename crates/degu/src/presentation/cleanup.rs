@@ -15,7 +15,7 @@ const ELIGIBLE_EXPLANATION: &str =
 const REVIEW_EXPLANATION: &str = "Excluded by default; preview a path before including it.";
 const UNMANAGED_EXPLANATION: &str = "Reported only; degu never cleans these locations.";
 
-pub(crate) fn label(mode: DispositionMode) -> &'static str {
+pub(crate) const fn label(mode: DispositionMode) -> &'static str {
     match mode {
         DispositionMode::Eligible => "Eligible to clean",
         DispositionMode::OptIn => "Needs review",

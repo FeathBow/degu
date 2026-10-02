@@ -106,7 +106,7 @@ impl Progress {
 
 fn saturating_atomic_add(counter: &AtomicU64, value: u64) {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_add(value))
         })
         .expect("saturating atomic update always succeeds");

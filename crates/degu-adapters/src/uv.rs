@@ -68,6 +68,15 @@ fn require_absolute_normalized_root(path: &Path) -> Result<(), NativeCapabilityE
     Ok(())
 }
 
+/// What the finding says about itself, and the only place a reader of `scan --details`
+/// or the review's full record learns what to do about this cache.
+///
+/// It has to name the explicit command and the one uv version that command accepts,
+/// because ordinary `clean` leaving the cache alone is not the same statement as degu
+/// being unable to reclaim it. A test in the `degu` crate holds the version here to the
+/// audited one, so raising that cannot leave this text behind.
+pub const CACHE_RATIONALE: &str = "uv download/build cache; uv coordinates cache mutations with locks and documents that editing the cache directly is never safe, so degu clean leaves it alone and choosing it in the review never prunes it. The explicit action is degu reclaim uv, which drives uv's own prune and accepts uv 0.12.3 only; it deletes through uv, so nothing reaches degu's trash and degu undo cannot restore it -- see degu reclaim uv --help. Installed environments unaffected.";
+
 impl Ecosystem for Uv {
     fn id(&self) -> &'static str {
         "uv"
@@ -110,7 +119,7 @@ impl Ecosystem for Uv {
                 ecosystem: self.id(),
                 kind: FindingKind::PackageCache,
                 facts: self.stated_facts(root),
-                rationale: "uv download/build cache; uv documents that modifying the cache directly is never safe and coordinates mutations with locks, so degu does not clean it until it can participate in that protocol -- reclaim with uv cache clean or uv cache prune. Installed environments unaffected.",
+                rationale: CACHE_RATIONALE,
             },
         )
     }

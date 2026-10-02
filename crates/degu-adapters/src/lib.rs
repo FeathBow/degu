@@ -106,6 +106,7 @@ pub(crate) fn first_present(
 pub const ARTIFACT_SOURCE_ID: &str = artifacts::SOURCE_ID;
 pub const CHECKPOINT_SOURCE_ID: &str = checkpoints::SOURCE_ID;
 pub const PROJECT_SOURCE_IDS: [&str; 2] = [ARTIFACT_SOURCE_ID, CHECKPOINT_SOURCE_ID];
+pub const UV_CACHE_RATIONALE: &str = uv::CACHE_RATIONALE;
 pub use cachedir::{
     Probe as CachedirTagProbe, SIGNATURE_PROBE_LEN, has_valid_cachedir_tag, prefix_has_signature,
     probe_for_scheduling,

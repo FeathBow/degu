@@ -280,6 +280,10 @@ fn directory_xattr_purge_is_gated_after_stage_and_remains_undoable() {
     let file = fixture.cache.join("wheel.whl");
     let nested = fixture.cache.join("wheels");
     std::fs::create_dir_all(&nested).unwrap();
+    // Pin the mode instead of inheriting the ambient umask: under the umask CI
+    // runs, this directory would be group-writable and the ancestor-namespace
+    // guard would report the whole cache instead of staging it.
+    std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(nested.join("inner.whl"), b"inner").unwrap();
     set_ordinary_xattr(&nested, b"on-a-directory");
 

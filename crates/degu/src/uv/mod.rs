@@ -6,6 +6,7 @@
 mod executable;
 mod plan;
 mod root;
+mod xattr;
 
 #[cfg(target_os = "macos")]
 pub(crate) use crate::acl::grants_mutation;

@@ -1,9 +1,7 @@
 use super::error::{UvExecutableProbeError, unsafe_path};
-use rustix::fd::{AsFd, AsRawFd};
-use std::io;
+use rustix::fd::AsFd;
 use std::path::Path;
 
-const MAX_XATTR_LIST_BYTES: usize = 64 * 1024;
 /// Extended attributes whose absence from a private snapshot cannot change what it
 /// executes, so snapshotting may drop them.
 ///
@@ -26,10 +24,11 @@ pub(super) fn reject_extended_acl(
     fd: &impl AsFd,
     path: &Path,
 ) -> Result<(), UvExecutableProbeError> {
-    let names = list_xattrs(fd).map_err(|source| UvExecutableProbeError::AclInspection {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let names =
+        crate::uv::xattr::names(fd).map_err(|source| UvExecutableProbeError::AclInspection {
+            path: path.to_path_buf(),
+            source,
+        })?;
     if names
         .split(|byte| *byte == 0)
         .any(|name| name == b"system.posix_acl_access")
@@ -61,10 +60,11 @@ pub(super) fn reject_unpreserved_xattrs(
     fd: &impl AsFd,
     path: &Path,
 ) -> Result<(), UvExecutableProbeError> {
-    let names = list_xattrs(fd).map_err(|source| UvExecutableProbeError::XattrInspection {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let names =
+        crate::uv::xattr::names(fd).map_err(|source| UvExecutableProbeError::XattrInspection {
+            path: path.to_path_buf(),
+            source,
+        })?;
     match first_undroppable_xattr(&names) {
         None => Ok(()),
         Some(name) => Err(UvExecutableProbeError::UnpreservedXattr {
@@ -85,49 +85,4 @@ pub(super) fn first_undroppable_xattr(names: &[u8]) -> Option<String> {
         .filter(|name| !name.is_empty())
         .find(|name| !DROPPABLE_XATTRS.contains(name))
         .map(|name| String::from_utf8_lossy(name).into_owned())
-}
-
-fn list_xattrs(fd: &impl AsFd) -> io::Result<Vec<u8>> {
-    let raw_fd = fd.as_fd().as_raw_fd();
-    let size = flistxattr(raw_fd, std::ptr::null_mut(), 0)?;
-    if size > MAX_XATTR_LIST_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "extended attribute name list exceeds the safety bound",
-        ));
-    }
-    if size == 0 {
-        return Ok(Vec::new());
-    }
-    let mut names = vec![0_u8; size];
-    let read = flistxattr(raw_fd, names.as_mut_ptr().cast(), names.len())?;
-    if read > names.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "extended attribute name list grew beyond the allocated bound",
-        ));
-    }
-    names.truncate(read);
-    Ok(names)
-}
-
-fn flistxattr(fd: libc::c_int, buffer: *mut libc::c_char, size: usize) -> io::Result<usize> {
-    loop {
-        #[cfg(target_os = "linux")]
-        // SAFETY: buffer is null with size zero or names a writable allocation
-        // of exactly `size` bytes; the descriptor remains borrowed and live.
-        let result = unsafe { libc::flistxattr(fd, buffer, size) };
-        #[cfg(target_os = "macos")]
-        // SAFETY: same contract as Linux; options zero requests ordinary names.
-        let result = unsafe { libc::flistxattr(fd, buffer, size, 0) };
-        if result >= 0 {
-            return usize::try_from(result)
-                .map_err(|_| io::Error::other("extended attribute list size overflow"));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(error);
-    }
 }

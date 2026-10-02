@@ -1241,14 +1241,12 @@ enum XattrStep {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn collect_script(steps: &[XattrStep]) -> CollectedXattrs {
     let mut steps = steps.iter().copied();
-    let collected = collect_xattr_names(|buffer, size| match steps.next().unwrap() {
+    let collected = collect_xattr_names(|buffer| match steps.next().unwrap() {
         XattrStep::Count(count) => Ok(count),
         XattrStep::Error(errno) => Err(io::Error::from_raw_os_error(errno)),
         XattrStep::Bytes(bytes) => {
-            assert!(!buffer.is_null());
-            assert!(bytes.len() <= size);
-            // SAFETY: collect_xattr_names supplied a writable allocation of `size` bytes.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast(), bytes.len()) };
+            assert!(bytes.len() <= buffer.len());
+            buffer[..bytes.len()].copy_from_slice(bytes);
             Ok(bytes.len())
         }
     });
@@ -1384,15 +1382,14 @@ fn xattr_enumeration_retries_are_deterministic_and_fail_closed() {
         .take((MAX_XATTR_NAMES + 1) * 2)
         .collect::<Vec<_>>();
     let mut sizing = true;
-    let collected = collect_xattr_names(|buffer, size| {
+    let collected = collect_xattr_names(|buffer| {
         if sizing {
             sizing = false;
             return Ok(too_many.len());
         }
-        assert_eq!(size, too_many.len());
-        // SAFETY: collect_xattr_names supplied a writable allocation of `size` bytes.
-        unsafe { std::ptr::copy_nonoverlapping(too_many.as_ptr(), buffer.cast(), size) };
-        Ok(size)
+        assert_eq!(buffer.len(), too_many.len());
+        buffer.copy_from_slice(&too_many);
+        Ok(buffer.len())
     });
     assert_eq!(collected, CollectedXattrs::Unknown);
 }

@@ -21,8 +21,6 @@ const MAX_VERIFIED_ENTRIES: usize = 1_000_000;
 const MAX_TRAVERSAL_DEPTH: usize = 256;
 const SHARED_WRITE_MASK: u32 = 0o022;
 const REQUIRED_DIRECTORY_MODE: u32 = 0o700;
-#[cfg(target_os = "linux")]
-const MAX_ACL_XATTR_LIST_BYTES: usize = 64 * 1024;
 
 /// Exact `CacheBucket::to_str` values at uv commit
 /// `507230998c9541d67814b57463ac00e454ff6991` (tag `0.12.3`). A present
@@ -945,10 +943,11 @@ fn require_cache_tag_signature(fd: &OwnedFd, path: &Path) -> Result<(), UvCacheR
 
 #[cfg(target_os = "linux")]
 fn reject_extended_acl(fd: &OwnedFd, path: &Path) -> Result<(), UvCacheRootSealError> {
-    let names = list_xattrs(fd).map_err(|source| UvCacheRootSealError::AclInspection {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let names =
+        crate::uv::xattr::names(fd).map_err(|source| UvCacheRootSealError::AclInspection {
+            path: path.to_path_buf(),
+            source,
+        })?;
     if has_posix_acl_name(&names) {
         return Err(unsafe_path(path, "extended or default ACL is present"));
     }
@@ -977,49 +976,6 @@ fn reject_extended_acl(fd: &OwnedFd, path: &Path) -> Result<(), UvCacheRootSealE
             path: path.to_path_buf(),
             source,
         }),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn list_xattrs(fd: &OwnedFd) -> io::Result<Vec<u8>> {
-    use rustix::fd::{AsFd, AsRawFd};
-    let raw_fd = fd.as_fd().as_raw_fd();
-    let size = flistxattr(raw_fd, std::ptr::null_mut(), 0)?;
-    if size > MAX_ACL_XATTR_LIST_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "extended attribute name list exceeds the ACL safety bound",
-        ));
-    }
-    if size == 0 {
-        return Ok(Vec::new());
-    }
-    let mut names = vec![0_u8; size];
-    let read = flistxattr(raw_fd, names.as_mut_ptr().cast(), names.len())?;
-    if read > names.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "extended attribute name list grew beyond its bound",
-        ));
-    }
-    names.truncate(read);
-    Ok(names)
-}
-
-#[cfg(target_os = "linux")]
-fn flistxattr(fd: libc::c_int, buffer: *mut libc::c_char, size: usize) -> io::Result<usize> {
-    loop {
-        // SAFETY: buffer is null with size zero or identifies a writable
-        // allocation of exactly `size` bytes; the descriptor stays live.
-        let result = unsafe { libc::flistxattr(fd, buffer, size) };
-        if result >= 0 {
-            return usize::try_from(result)
-                .map_err(|_| io::Error::other("extended attribute list size overflow"));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
     }
 }
 

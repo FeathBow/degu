@@ -32,6 +32,11 @@ const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_DRAIN_BYTES_PER_TICK: usize = 64 * 1024;
 const POST_EXIT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 const KILL_REAP_GRACE: Duration = Duration::from_secs(1);
+/// The one entry a private snapshot directory may contain. Revalidation stats it
+/// and cleanup unlinks it, and both rely on the name being fixed rather than
+/// supplied, so the raw removal below can be audited against a single literal.
+/// It spells the audited tool so `ps` identifies what is running.
+pub(crate) const SNAPSHOT_FILE_NAME: &str = "uv";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InheritedEnvironment {
@@ -332,7 +337,7 @@ impl HeldNativeExecutable {
         let held = rustix::fs::fstat(&self.executable).map_err(io::Error::from)?;
         let attached = rustix::fs::statat(
             &self.cleanup.directory,
-            "uv",
+            SNAPSHOT_FILE_NAME,
             rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
         )
         .map_err(io::Error::from)?;
@@ -406,7 +411,7 @@ pub(crate) fn cleanup_executable_snapshot(
     directory: &OwnedFd,
     directory_name: &OsStr,
 ) {
-    raw_unlinkat(directory, OsStr::new("uv"), 0);
+    raw_unlinkat(directory, OsStr::new(SNAPSHOT_FILE_NAME), 0);
     raw_unlinkat(parent, directory_name, libc::AT_REMOVEDIR);
 }
 

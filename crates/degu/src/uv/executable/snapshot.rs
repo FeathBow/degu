@@ -1,7 +1,7 @@
 use super::attributes::{reject_extended_acl, reject_unpreserved_xattrs};
 use super::error::{UvExecutableProbeError, inspect, unsafe_path};
 use super::source::{OpenedExecutable, raw_mode_u32, validate_namespace_chain};
-use crate::native::{HeldNativeExecutable, cleanup_executable_snapshot};
+use crate::native::{HeldNativeExecutable, SNAPSHOT_FILE_NAME, cleanup_executable_snapshot};
 use rustix::fd::{AsRawFd, OwnedFd};
 use rustix::fs::{FileType, Mode, OFlags};
 use std::ffi::OsString;
@@ -34,10 +34,10 @@ pub(super) fn snapshot_executable(
     let temp = std::env::temp_dir();
     validate_snapshot_parent_chain(&temp)?;
     let mut guard = create_snapshot_directory(&temp)?;
-    let execution_path = guard.path.join("uv");
+    let execution_path = guard.path.join(SNAPSHOT_FILE_NAME);
     let writer = rustix::fs::openat(
         guard.directory(),
-        "uv",
+        SNAPSHOT_FILE_NAME,
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o600),
     )
@@ -51,7 +51,7 @@ pub(super) fn snapshot_executable(
 
     let executable = rustix::fs::openat(
         guard.directory(),
-        "uv",
+        SNAPSHOT_FILE_NAME,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )

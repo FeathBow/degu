@@ -1,5 +1,5 @@
 use super::*;
-use crate::native::NativeRunnerError;
+use crate::native::{NativeRunReport, NativeRunnerError};
 use std::fs::Permissions;
 use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -174,17 +174,9 @@ fn source_change_after_snapshot_is_refused_before_probe_execution() {
     drop(snapshot);
 }
 
-#[test]
-fn runner_refuses_snapshot_path_replacement_against_held_identity() {
-    let temp = private_tempdir();
-    let probed = probe_fixture(native_fixture(temp.path()), MINIMUM_UV_VERSION).unwrap();
-    let snapshot = probed.executable.snapshot_path().to_path_buf();
-    let displaced = snapshot.with_file_name("held-original");
-    let replacement_out = temp.path().join("snapshot-replacement");
-    std::fs::rename(&snapshot, &displaced).unwrap();
-    std::fs::write(&snapshot, NATIVE_MAGIC).unwrap();
-    std::fs::set_permissions(&snapshot, Permissions::from_mode(0o500)).unwrap();
-
+fn run_held_snapshot(
+    probed: &ProbedUvExecutable,
+) -> Result<NativeRunReport<UvVersion, UvVersionParseError>, NativeRunnerError> {
     let request = NativeActionRequest::new(
         NativeActionIdentity::new("uv", "version-probe").unwrap(),
         probed.selection().clone(),
@@ -197,10 +189,34 @@ fn runner_refuses_snapshot_path_replacement_against_held_identity() {
         [],
     )
     .unwrap();
-    let prepared =
-        prepare_native_action_from_held(request, probed.executable.duplicate().unwrap()).unwrap();
+    prepare_native_action_from_held(request, probed.executable.duplicate().unwrap())
+        .unwrap()
+        .execute(parse_uv_version)
+        .result()
+}
+
+#[test]
+fn the_held_binding_admits_an_untouched_snapshot_and_refuses_a_replaced_one() {
+    let temp = private_tempdir();
+    let probed = probe_fixture(native_fixture(temp.path()), MINIMUM_UV_VERSION).unwrap();
+    let snapshot = probed.executable.snapshot_path().to_path_buf();
+
+    // Whatever the fixture does once it runs, the binding must not be what
+    // refused it. Without this half, a check that could never find its
+    // attachment would be indistinguishable from one that works.
+    let untouched = run_held_snapshot(&probed);
+    assert!(
+        !matches!(untouched, Err(NativeRunnerError::ExecutableBinding(_))),
+        "an untouched snapshot must pass the held binding check: {untouched:?}"
+    );
+
+    let displaced = snapshot.with_file_name("held-original");
+    let replacement_out = temp.path().join("snapshot-replacement");
+    std::fs::rename(&snapshot, &displaced).unwrap();
+    std::fs::write(&snapshot, NATIVE_MAGIC).unwrap();
+    std::fs::set_permissions(&snapshot, Permissions::from_mode(0o500)).unwrap();
     assert!(matches!(
-        prepared.execute(parse_uv_version).result(),
+        run_held_snapshot(&probed),
         Err(NativeRunnerError::ExecutableBinding(_))
     ));
 

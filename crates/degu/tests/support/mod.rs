@@ -100,57 +100,36 @@ pub fn strip_extended_attributes(root: &Path) -> std::io::Result<()> {
 
 #[allow(dead_code, reason = "used only by strip_extended_attributes")]
 fn extended_attribute_names(file: &std::fs::File) -> std::io::Result<Vec<std::ffi::CString>> {
-    use std::os::fd::AsRawFd;
-    let fd = file.as_raw_fd();
     // Asked for a size first, then read: the set can change between the two, and a
     // buffer sized from a stale answer would silently truncate the list.
-    let size = unsafe {
-        #[cfg(target_os = "linux")]
-        let size = libc::flistxattr(fd, std::ptr::null_mut(), 0);
-        #[cfg(target_os = "macos")]
-        let size = libc::flistxattr(fd, std::ptr::null_mut(), 0, 0);
-        size
-    };
-    if size < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    let size = list_extended_attributes(file, &mut [])?;
     if size == 0 {
         return Ok(Vec::new());
     }
-    let mut buffer = vec![0i8; size as usize];
-    let written = unsafe {
-        #[cfg(target_os = "linux")]
-        let written = libc::flistxattr(fd, buffer.as_mut_ptr(), buffer.len());
-        #[cfg(target_os = "macos")]
-        let written = libc::flistxattr(fd, buffer.as_mut_ptr(), buffer.len(), 0);
-        written
-    };
-    if written < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let bytes = buffer[..written as usize]
-        .iter()
-        .map(|byte| *byte as u8)
-        .collect::<Vec<_>>();
-    Ok(bytes
+    let mut buffer = vec![0_u8; size];
+    let written = list_extended_attributes(file, &mut buffer)?;
+    buffer.truncate(written.min(buffer.len()));
+    Ok(buffer
         .split(|byte| *byte == 0)
         .filter(|name| !name.is_empty())
         .map(|name| std::ffi::CString::new(name).expect("a listed xattr name has no interior nul"))
         .collect())
 }
 
+fn list_extended_attributes(file: &std::fs::File, buffer: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match rustix::fs::flistxattr(file, &mut *buffer) {
+            Ok(size) => return Ok(size),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 #[allow(dead_code, reason = "used only by strip_extended_attributes")]
 fn remove_extended_attribute(file: &std::fs::File, name: &std::ffi::CStr) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let result = unsafe {
-        #[cfg(target_os = "linux")]
-        let result = libc::fremovexattr(file.as_raw_fd(), name.as_ptr());
-        #[cfg(target_os = "macos")]
-        let result = libc::fremovexattr(file.as_raw_fd(), name.as_ptr(), 0);
-        result
-    };
-    if result < 0 {
-        let error = std::io::Error::last_os_error();
+    if let Err(error) = rustix::fs::fremovexattr(file, name) {
+        let error = std::io::Error::from(error);
         // A name listed a moment ago may be gone, and some are not removable by
         // the owner at all; neither leaves an attribute this fixture put there.
         // Linux spells the missing-attribute error `ENODATA`.

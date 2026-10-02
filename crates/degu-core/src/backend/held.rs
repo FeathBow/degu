@@ -5208,23 +5208,10 @@ fn acl_evidence<Fd: rustix::fd::AsFd>(fd: &Fd) -> Evidence {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn collect_fd_xattr_names<Fd: rustix::fd::AsFd>(fd: &Fd) -> CollectedXattrs {
-    let raw_fd = fd.as_fd().as_raw_fd();
-    collect_xattr_names(|buffer, size| {
-        // SAFETY: fd is live for the call and buffer is either null for a size
-        // query or points to the supplied writable allocation.
-        xattr_count_result(unsafe { libc::flistxattr(raw_fd, buffer, size) })
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn collect_fd_xattr_names<Fd: rustix::fd::AsFd>(fd: &Fd) -> CollectedXattrs {
-    let raw_fd = fd.as_fd().as_raw_fd();
-    collect_xattr_names(|buffer, size| {
-        // SAFETY: fd is live for the call and buffer is either null for a size
-        // query or points to the supplied writable allocation.
-        xattr_count_result(unsafe { libc::flistxattr(raw_fd, buffer, size, 0) })
+    collect_xattr_names(|buffer| {
+        rustix::fs::flistxattr(fd.as_fd(), buffer).map_err(io::Error::from)
     })
 }
 
@@ -5234,21 +5221,10 @@ fn collect_fd_xattr_names<Fd: rustix::fd::AsFd>(_fd: &Fd) -> CollectedXattrs {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn xattr_count_result(result: libc::ssize_t) -> io::Result<usize> {
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        usize::try_from(result).map_err(|_| io::Error::other("xattr byte count does not fit usize"))
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn collect_xattr_names(
-    mut list: impl FnMut(*mut libc::c_char, usize) -> io::Result<usize>,
-) -> CollectedXattrs {
+fn collect_xattr_names(mut list: impl FnMut(&mut [u8]) -> io::Result<usize>) -> CollectedXattrs {
     let mut rejection_observed = false;
     for _ in 0..XATTR_LIST_ATTEMPTS {
-        let size = match list(std::ptr::null_mut(), 0) {
+        let size = match list(&mut []) {
             Ok(size) => size,
             Err(error) if error.raw_os_error() == Some(libc::EINTR) => {
                 rejection_observed = true;
@@ -5269,7 +5245,7 @@ fn collect_xattr_names(
         }
 
         let mut bytes = vec![0_u8; size];
-        let read = match list(bytes.as_mut_ptr().cast(), bytes.len()) {
+        let read = match list(&mut bytes) {
             Ok(read) => read,
             Err(error) if matches!(error.raw_os_error(), Some(libc::EINTR | libc::ERANGE)) => {
                 continue;
@@ -5375,7 +5351,7 @@ fn collect_regular_xattr_assessment<Fd: rustix::fd::AsFd>(
     digest.update((names.len() as u64).to_be_bytes());
     let mut value_bytes = 0_u64;
     for name in &names {
-        let value_len = size_fd_xattr_value(fd.as_fd().as_raw_fd(), name, path)?;
+        let value_len = size_fd_xattr_value(fd.as_fd(), name, path)?;
         budget.charge(value_len)?;
         value_bytes = value_bytes
             .checked_add(value_len)
@@ -5414,7 +5390,7 @@ fn collect_regular_xattr_proof<Fd: rustix::fd::AsFd>(
     let mut value_bytes = 0_u64;
     for name in &names {
         let value = read_fd_xattr_value(
-            fd.as_fd().as_raw_fd(),
+            fd.as_fd(),
             name,
             path,
             budget.remaining_bytes,
@@ -5437,30 +5413,25 @@ fn collect_regular_xattr_proof<Fd: rustix::fd::AsFd>(
     })
 }
 
-#[cfg(target_os = "linux")]
-fn size_fd_xattr_value(fd: libc::c_int, name: &[u8], path: &Path) -> Result<u64, HeldTreeError> {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn size_fd_xattr_value(
+    fd: rustix::fd::BorrowedFd<'_>,
+    name: &[u8],
+    path: &Path,
+) -> Result<u64, HeldTreeError> {
     let name = CString::new(name)
         .map_err(|_| HeldTreeError::NonDirectoryMetadataUnavailable(path.to_path_buf()))?;
     size_xattr_value(path, || {
-        // SAFETY: fd and name remain live; a null buffer requests only size.
-        xattr_count_result(unsafe { libc::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0) })
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn size_fd_xattr_value(fd: libc::c_int, name: &[u8], path: &Path) -> Result<u64, HeldTreeError> {
-    let name = CString::new(name)
-        .map_err(|_| HeldTreeError::NonDirectoryMetadataUnavailable(path.to_path_buf()))?;
-    size_xattr_value(path, || {
-        // SAFETY: fd and name remain live; a null buffer requests only size.
-        xattr_count_result(unsafe {
-            libc::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0, 0, 0)
-        })
+        rustix::fs::fgetxattr(fd, name.as_c_str(), &mut [] as &mut [u8]).map_err(io::Error::from)
     })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn size_fd_xattr_value(_fd: libc::c_int, _name: &[u8], path: &Path) -> Result<u64, HeldTreeError> {
+fn size_fd_xattr_value(
+    _fd: rustix::fd::BorrowedFd<'_>,
+    _name: &[u8],
+    path: &Path,
+) -> Result<u64, HeldTreeError> {
     Err(HeldTreeError::UnsupportedContentProof(path.to_path_buf()))
 }
 
@@ -5485,9 +5456,9 @@ fn size_xattr_value(
     ))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_fd_xattr_value(
-    fd: libc::c_int,
+    fd: rustix::fd::BorrowedFd<'_>,
     name: &[u8],
     path: &Path,
     maximum_value_bytes: u64,
@@ -5495,33 +5466,14 @@ fn read_fd_xattr_value(
 ) -> Result<Vec<u8>, HeldTreeError> {
     let name = CString::new(name)
         .map_err(|_| HeldTreeError::XattrsChangedDuringProof(path.to_path_buf()))?;
-    read_xattr_value(path, maximum_value_bytes, content_limit, |buffer, size| {
-        // SAFETY: fd and name are live; buffer is null for a size query or
-        // points to the supplied writable allocation.
-        xattr_count_result(unsafe { libc::fgetxattr(fd, name.as_ptr(), buffer.cast(), size) })
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn read_fd_xattr_value(
-    fd: libc::c_int,
-    name: &[u8],
-    path: &Path,
-    maximum_value_bytes: u64,
-    content_limit: u64,
-) -> Result<Vec<u8>, HeldTreeError> {
-    let name = CString::new(name)
-        .map_err(|_| HeldTreeError::XattrsChangedDuringProof(path.to_path_buf()))?;
-    read_xattr_value(path, maximum_value_bytes, content_limit, |buffer, size| {
-        // SAFETY: fd and name are live; buffer is null for a size query or
-        // points to the supplied writable allocation.
-        xattr_count_result(unsafe { libc::fgetxattr(fd, name.as_ptr(), buffer.cast(), size, 0, 0) })
+    read_xattr_value(path, maximum_value_bytes, content_limit, |buffer| {
+        rustix::fs::fgetxattr(fd, name.as_c_str(), buffer).map_err(io::Error::from)
     })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn read_fd_xattr_value(
-    _fd: libc::c_int,
+    _fd: rustix::fd::BorrowedFd<'_>,
     _name: &[u8],
     path: &Path,
     _maximum_value_bytes: u64,
@@ -5535,10 +5487,10 @@ fn read_xattr_value(
     path: &Path,
     maximum_value_bytes: u64,
     content_limit: u64,
-    mut get: impl FnMut(*mut libc::c_void, usize) -> io::Result<usize>,
+    mut get: impl FnMut(&mut [u8]) -> io::Result<usize>,
 ) -> Result<Vec<u8>, HeldTreeError> {
     for _ in 0..XATTR_LIST_ATTEMPTS {
-        let size = match get(std::ptr::null_mut(), 0) {
+        let size = match get(&mut []) {
             Ok(size) => size,
             Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
             Err(_) => return Err(HeldTreeError::XattrsChangedDuringProof(path.to_path_buf())),
@@ -5552,7 +5504,7 @@ fn read_xattr_value(
             });
         }
         let mut value = vec![0_u8; size];
-        let read = match get(value.as_mut_ptr().cast(), value.len()) {
+        let read = match get(&mut value) {
             Ok(read) => read,
             Err(error) if matches!(error.raw_os_error(), Some(libc::EINTR | libc::ERANGE)) => {
                 continue;
@@ -5585,10 +5537,10 @@ fn require_symlink_metadata_admitted(
         CString::new(bytes)
     })
     .map_err(|_| HeldTreeError::UnsupportedContentProof(path.to_path_buf()))?;
-    let collected = collect_xattr_names(|buffer, size| {
-        // SAFETY: proc_path is NUL-terminated and names the symlink through the
-        // held parent FD; llistxattr inspects the link itself without following.
-        xattr_count_result(unsafe { libc::llistxattr(proc_path.as_ptr(), buffer, size) })
+    let collected = collect_xattr_names(|buffer| {
+        // The proc path names the symlink through the held parent FD, and
+        // llistxattr inspects the link itself without following it.
+        rustix::fs::llistxattr(proc_path.as_c_str(), buffer).map_err(io::Error::from)
     });
     assess_symlink_xattrs(path, &collected)
 }

@@ -1,6 +1,9 @@
 use super::*;
+use crate::native::NativeRunnerError;
 use std::fs::Permissions;
 use std::os::unix::fs::{PermissionsExt, symlink};
+
+mod version_output;
 
 // The workspace CI runs under umask 002, where `tempfile` would create a
 // group-writable base directory that the ancestor-namespace guard rejects.
@@ -24,8 +27,27 @@ fn copied_binary(directory: &Path, source: &Path) -> PathBuf {
         let _exclusive = crate::fork_gate::exec_fresh_file();
         std::fs::copy(source, &executable).unwrap();
     }
+    #[cfg(target_os = "macos")]
+    sign_copied_fixture(&executable);
     std::fs::set_permissions(&executable, Permissions::from_mode(0o700)).unwrap();
     executable
+}
+
+#[cfg(target_os = "macos")]
+fn sign_copied_fixture(executable: &Path) {
+    // A copied macOS platform binary may no longer have a trusted signature.
+    // Give only the fixture an ad-hoc signature before testing its snapshots.
+    let _shared = crate::fork_gate::forking();
+    let output = std::process::Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(executable)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fixture signing failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn probe_fixture(
@@ -35,6 +57,9 @@ fn probe_fixture(
 ) -> Result<ProbedUvExecutable, UvExecutableProbeError> {
     let arguments = match mode {
         "minimum" => vec![OsString::from("uv 0.8.19")],
+        "official" => vec![OsString::from(
+            "uv 0.12.3 (507230998 2026-08-07 aarch64-apple-darwin)",
+        )],
         "old" => vec![OsString::from("uv 0.8.18")],
         "malformed" => vec![OsString::from("uv 0.8.19 extra")],
         "failure" => Vec::new(),
@@ -48,42 +73,21 @@ fn probe_fixture(
     let _exclusive = crate::fork_gate::exec_fresh_file();
     probe_uv_executable_with(
         selection(path),
-        arguments,
-        NativeEnvironmentRequest::clear(),
+        VersionProbeRequest {
+            arguments,
+            environment: NativeEnvironmentRequest::clear(),
+        },
         after_probe,
     )
 }
 
 #[test]
-fn exact_stable_versions_parse_and_minimum_is_inclusive() {
-    assert_eq!(parse_uv_version(b"uv 0.8.19\n"), Ok(MINIMUM_UV_VERSION));
-    assert_eq!(
-        parse_uv_version(b"uv 12.34.56\n"),
-        Ok(UvVersion {
-            major: 12,
-            minor: 34,
-            patch: 56
-        })
-    );
-}
-
-#[test]
-fn ambiguous_or_nonstable_version_output_fails_closed() {
-    for invalid in [
-        &b"0.8.19\n"[..],
-        b"uv 0.8.19",
-        b"uv 0.8.19\r\n",
-        b"uv 0.8.19 extra\n",
-        b"uv 0.8.19-alpha.1\n",
-        b"uv 0.8.19+local\n",
-        b"uv 00.8.19\n",
-        b"uv 0.8\n",
-        b"uv 0.8.19\nother\n",
-        b"uv 18446744073709551616.0.0\n",
-        b"\xff\n",
-    ] {
-        assert!(parse_uv_version(invalid).is_err(), "accepted {invalid:?}");
-    }
+fn official_release_output_survives_the_snapshot_probe() {
+    let temp = private_tempdir();
+    let executable = copied_binary(temp.path(), Path::new("/bin/echo"));
+    let probed = probe_fixture(executable, "official", &mut || {}).unwrap();
+    assert_eq!(probed.version(), AUDITED_UV_PRUNE_VERSION);
+    probed.revalidate_path().unwrap();
 }
 
 #[test]
@@ -156,42 +160,6 @@ fn unsafe_mode_and_ancestor_are_refused_before_execution() {
         probe_fixture(nested, "minimum", &mut || {}),
         Err(UvExecutableProbeError::UnsafePath { reason, .. })
             if reason == "ancestor namespace grants foreign mutation authority"
-    ));
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn macos_acl_and_execution_security_xattrs_fail_closed() {
-    let acl_temp = private_tempdir();
-    let acl_executable = copied_binary(acl_temp.path(), Path::new("/bin/echo"));
-    let planted = {
-        let _shared = crate::fork_gate::forking();
-        std::process::Command::new("/bin/chmod")
-            .args(["+a", "everyone allow write"])
-            .arg(&acl_executable)
-            .status()
-            .unwrap()
-    };
-    assert!(planted.success());
-    assert!(matches!(
-        open_selected_executable(&selection(acl_executable)),
-        Err(UvExecutableProbeError::UnsafePath { .. })
-    ));
-
-    let xattr_temp = private_tempdir();
-    let xattr_executable = copied_binary(xattr_temp.path(), Path::new("/bin/echo"));
-    let marked = {
-        let _shared = crate::fork_gate::forking();
-        std::process::Command::new("/usr/bin/xattr")
-            .args(["-w", "com.apple.quarantine", "0081;degu-test"])
-            .arg(&xattr_executable)
-            .status()
-            .unwrap()
-    };
-    assert!(marked.success());
-    assert!(matches!(
-        open_selected_executable(&selection(xattr_executable)),
-        Err(UvExecutableProbeError::UnsafePath { .. })
     ));
 }
 
@@ -291,3 +259,5 @@ fn path_replacement_after_probe_cannot_mint_a_token() {
         Err(UvExecutableProbeError::PathChanged)
     ));
 }
+
+mod attributes;

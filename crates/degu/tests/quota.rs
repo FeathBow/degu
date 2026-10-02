@@ -134,8 +134,7 @@ fn quota_linux_ext4_fixture_reports_configured_limits() {
     assert_eq!(json["data_source"], "linux_quotactl");
     assert_eq!(json["scope"]["filesystem"], "ext4");
     assert_eq!(json["subject"]["kind"], "user");
-    // SAFETY: geteuid has no preconditions and does not mutate process state.
-    let subject_id = unsafe { libc::geteuid() };
+    let subject_id = rustix::process::geteuid().as_raw();
     assert_eq!(json["subject"]["id"], subject_id);
     assert_eq!(json["space"]["soft_limit"], EXPECTED_SPACE_SOFT_LIMIT);
     assert_eq!(json["space"]["hard_limit"], EXPECTED_SPACE_HARD_LIMIT);
@@ -173,8 +172,7 @@ fn quota_linux_lustre_fixture_reports_the_lfs_provider() {
     assert_eq!(json["data_source"], "lfs_quota");
     assert_eq!(json["scope"]["filesystem"], "lustre");
     assert_eq!(json["subject"]["kind"], "user");
-    // SAFETY: geteuid has no preconditions and does not mutate process state.
-    let subject_id = unsafe { libc::geteuid() };
+    let subject_id = rustix::process::geteuid().as_raw();
     assert_eq!(json["subject"]["id"], subject_id);
     for dimension in ["space", "inodes"] {
         assert!(json[dimension]["used"].is_number());

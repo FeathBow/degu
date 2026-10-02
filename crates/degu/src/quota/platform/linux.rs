@@ -24,8 +24,7 @@ struct QueryResult {
 
 pub(super) fn probe(path: &Path) -> Result<QuotaSnapshot, ProbeError> {
     let mount = inspect_mount(path)?;
-    // SAFETY: geteuid has no preconditions and does not mutate process state.
-    let subject_id = unsafe { libc::geteuid() };
+    let subject_id = rustix::process::geteuid().as_raw();
     let snapshot = match mount.filesystem.as_str() {
         SUPPORTED_FILESYSTEM => probe_vfs(mount.clone(), path, subject_id),
         lustre::FILESYSTEM => lustre::probe(mount.clone(), path, subject_id),

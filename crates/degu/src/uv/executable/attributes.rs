@@ -29,11 +29,8 @@ pub(super) fn reject_extended_acl(
             path: path.to_path_buf(),
             source,
         })?;
-    if names
-        .split(|byte| *byte == 0)
-        .any(|name| name == b"system.posix_acl_access")
-    {
-        return Err(unsafe_path(path, "extended ACL is present"));
+    if crate::uv::xattr::names_a_posix_acl(&names) {
+        return Err(unsafe_path(path, "extended or default ACL is present"));
     }
     Ok(())
 }

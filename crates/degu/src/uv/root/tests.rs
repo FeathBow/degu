@@ -514,14 +514,6 @@ fn verification_entry_and_depth_bounds_fail_closed() {
     ));
 }
 
-#[cfg(target_os = "linux")]
-#[test]
-fn linux_access_and_default_acl_names_are_both_refused() {
-    assert!(has_posix_acl_name(b"system.posix_acl_access\0"));
-    assert!(has_posix_acl_name(b"user.test\0system.posix_acl_default\0"));
-    assert!(!has_posix_acl_name(b"user.test\0security.test\0"));
-}
-
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_extended_acl_on_a_traversed_directory_fails_closed() {

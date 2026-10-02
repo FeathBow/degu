@@ -102,7 +102,7 @@ degu ships no command for this. A command that could retire its own activation b
 
 The safety guard rejects the entire plan if any candidate resolves onto or around a protected path. It never downgrades that condition to skipping one item.
 
-Built-in protected locations include `.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`, keyrings, `.config`, `Documents`, `Desktop`, mixed-state AI tool directories `.claude`, `.codex`, and `.hermes`, and degu's own state directory. Credential directory names are refused wherever they appear in a path, even outside `$HOME`. The configuration `protect` field can add more locations.
+Built-in protected locations include `.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`, keyrings, `.config`, `Documents`, `Desktop`, [mixed-state AI tool directories](../crates/degu-core/src/safety.rs), and degu's own state directory. Credential directory names are refused wherever they appear in a path, even outside `$HOME`. The configuration `protect` field can add more locations.
 
 The AI tool directories above can contain caches alongside sessions, credentials, configuration, memories, plugins, and databases. An AI tool directory or any descendant is rejected as a project root, whether supplied explicitly to scan or clean, loaded from scan configuration, or reached through a symlink alias. A broader project root remains usable, but degu prunes these subtrees before classification. A precise ecosystem cache that overlaps or contains one may remain visible as **Not managed**, but it never gains cleanup authority. A protected prune is a deliberate, name-based exclusion, so it never blocks cleaning unrelated locations and never grants cleanup authority to anything it hides.
 

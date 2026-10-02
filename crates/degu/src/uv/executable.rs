@@ -93,54 +93,23 @@ impl ProbedUvExecutable {
 pub(crate) fn probe_uv_executable(
     selection: NativeExecutableSelection,
 ) -> Result<ProbedUvExecutable, UvExecutableProbeError> {
-    probe_uv_executable_with(
-        selection,
-        VersionProbeRequest {
-            arguments: vec![OsString::from("-V")],
-            environment: NativeEnvironmentRequest::clear(),
-        },
-        &mut || {},
-    )
+    probe_uv_executable_with(selection, &mut execute_version_probe)
 }
 
-struct VersionProbeRequest {
-    arguments: Vec<OsString>,
-    environment: NativeEnvironmentRequest,
-}
-
+/// The version is supplied by the caller, so path admission, snapshotting and
+/// post-probe revalidation can be exercised without executing any bytes.
+/// Production has exactly one supplier: the bounded probe of the snapshot.
 fn probe_uv_executable_with(
     selection: NativeExecutableSelection,
-    probe: VersionProbeRequest,
-    after_probe: &mut impl FnMut(),
+    probe_version: &mut impl FnMut(
+        &HeldNativeExecutable,
+        &NativeExecutableSelection,
+    ) -> Result<UvVersion, UvExecutableProbeError>,
 ) -> Result<ProbedUvExecutable, UvExecutableProbeError> {
     let opened = open_selected_executable(&selection)?;
     let executable = snapshot_executable(&opened)?;
     require_source_unchanged(&opened)?;
-    let probe_executable =
-        executable
-            .duplicate()
-            .map_err(|source| UvExecutableProbeError::Inspect {
-                path: selection.as_path().to_path_buf(),
-                source,
-            })?;
-    let request = NativeActionRequest::new(
-        NativeActionIdentity::new("uv", "version-probe")
-            .expect("static uv probe identity is valid"),
-        selection.clone(),
-        probe.arguments,
-        probe.environment,
-        NativeProcessContract::AuditedCooperativeProcessGroup,
-        VERSION_PROBE_TIMEOUT,
-        VERSION_OUTPUT_LIMIT,
-        VERSION_OUTPUT_LIMIT,
-        [],
-    )
-    .expect("static uv probe declaration is bounded");
-    let report = prepare_native_action_from_held(request, probe_executable)?
-        .execute(parse_uv_version)
-        .result()?;
-    let version = parsed_probe_version(report.outcome())?;
-    after_probe();
+    let version = probe_version(&executable, &selection)?;
     let current = open_selected_executable(&selection)?;
     if current.canonical_path != opened.canonical_path || current.identity != opened.identity {
         return Err(UvExecutableProbeError::PathChanged);
@@ -153,6 +122,36 @@ fn probe_uv_executable_with(
         executable,
         version,
     })
+}
+
+fn execute_version_probe(
+    executable: &HeldNativeExecutable,
+    selection: &NativeExecutableSelection,
+) -> Result<UvVersion, UvExecutableProbeError> {
+    let probe_executable =
+        executable
+            .duplicate()
+            .map_err(|source| UvExecutableProbeError::Inspect {
+                path: selection.as_path().to_path_buf(),
+                source,
+            })?;
+    let request = NativeActionRequest::new(
+        NativeActionIdentity::new("uv", "version-probe")
+            .expect("static uv probe identity is valid"),
+        selection.clone(),
+        [OsString::from("-V")],
+        NativeEnvironmentRequest::clear(),
+        NativeProcessContract::AuditedCooperativeProcessGroup,
+        VERSION_PROBE_TIMEOUT,
+        VERSION_OUTPUT_LIMIT,
+        VERSION_OUTPUT_LIMIT,
+        [],
+    )
+    .expect("static uv probe declaration is bounded");
+    let report = prepare_native_action_from_held(request, probe_executable)?
+        .execute(parse_uv_version)
+        .result()?;
+    parsed_probe_version(report.outcome())
 }
 
 fn require_source_unchanged(source: &OpenedExecutable) -> Result<(), UvExecutableProbeError> {

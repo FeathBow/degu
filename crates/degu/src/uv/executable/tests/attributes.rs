@@ -4,7 +4,7 @@ use super::*;
 #[test]
 fn macos_acl_and_execution_security_xattrs_fail_closed() {
     let acl_temp = private_tempdir();
-    let acl_executable = copied_binary(acl_temp.path(), Path::new("/bin/echo"));
+    let acl_executable = native_fixture(acl_temp.path());
     let planted = {
         let _shared = crate::fork_gate::forking();
         std::process::Command::new("/bin/chmod")
@@ -20,7 +20,7 @@ fn macos_acl_and_execution_security_xattrs_fail_closed() {
     ));
 
     let xattr_temp = private_tempdir();
-    let xattr_executable = copied_binary(xattr_temp.path(), Path::new("/bin/echo"));
+    let xattr_executable = native_fixture(xattr_temp.path());
     plant_xattr(&xattr_executable, "com.apple.quarantine", "0081;degu-test");
     assert!(matches!(
         open_selected_executable(&selection(xattr_executable)),
@@ -48,7 +48,7 @@ fn plant_xattr(path: &Path, name: &str, value: &str) {
 #[test]
 fn macos_provenance_is_droppable_but_never_beside_quarantine() {
     let temp = private_tempdir();
-    let executable = copied_binary(temp.path(), Path::new("/bin/echo"));
+    let executable = native_fixture(temp.path());
     plant_xattr(&executable, "com.apple.provenance", "degu-test");
     open_selected_executable(&selection(executable.clone()))
         .expect("provenance alone leaves nothing a snapshot would have to preserve");

@@ -14,12 +14,7 @@ pub(super) fn create_count_fixture(root: &Path) {
 }
 
 pub(super) fn running_as_root() -> bool {
-    std::process::Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .is_some_and(|uid| uid.trim() == "0")
+    rustix::process::geteuid().is_root()
 }
 
 pub(super) fn restore_readable(paths: &[PathBuf]) {

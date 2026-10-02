@@ -178,7 +178,7 @@ fn finding_row(item: (&Finding, usize), columns: &Columns, app: &App) -> Row<'st
     let refused = app.decisions().refusal(finding.path()).is_some();
     let status = match (refused, columns.status == STATUS_WIDTH) {
         (true, true) => BLOCKED_STATUS,
-        (true, false) => "!",
+        (true, false) => BLOCKED_SYMBOL,
         (false, true) => class.label(),
         (false, false) => symbol(class),
     };
@@ -229,13 +229,17 @@ fn finding_row(item: (&Finding, usize), columns: &Columns, app: &App) -> Row<'st
     Row::new(cells).style(style)
 }
 
-fn symbol(class: Class) -> &'static str {
+pub(super) const fn symbol(class: Class) -> &'static str {
     match class {
         Class::Ready => "+",
         Class::NeedsReview => "?",
         Class::NotManaged => "·",
     }
 }
+
+/// What the compact column shows for a tree sealed staging would refuse. The wide
+/// column says `Blocked` where this says one character.
+pub(super) const BLOCKED_SYMBOL: &str = "!";
 
 fn empty_message(app: &App) -> &'static str {
     let browser = app.browser();

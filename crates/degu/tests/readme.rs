@@ -167,3 +167,46 @@ fn documented_arg(arg: &str) -> String {
         .unwrap_or(arg)
         .to_owned()
 }
+
+/// Every `blob/main` link back into this repository names a file this commit has.
+///
+/// lychee does not ask github.com about these, because the runner's requests for them
+/// were answered with 503 and the check reported GitHub's rate limiting as a broken
+/// link. Asking the commit instead is the stronger question: github.com would answer
+/// 200 for a path that only `main` still has.
+#[test]
+fn self_referential_doc_links_point_at_files_this_commit_has() {
+    const PREFIX: &str = "https://github.com/FeathBow/degu/blob/main/";
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("the workspace root is two levels above this crate");
+    let mut checked = 0;
+    for (name, text) in [
+        ("README.md", README),
+        ("docs/usage.md", USAGE),
+        ("docs/safety.md", SAFETY),
+    ] {
+        for (index, _) in text.match_indices(PREFIX) {
+            let tail = &text[index + PREFIX.len()..];
+            let path: String = tail
+                .chars()
+                .take_while(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, '.' | '_' | '/' | '-')
+                })
+                .collect();
+            assert!(
+                root.join(&path).exists(),
+                "{name} links to {path}, which this commit does not have"
+            );
+            checked += 1;
+        }
+    }
+    // The excluded prefix would otherwise be unchecked in silence if the links moved
+    // or the extraction stopped matching them.
+    assert!(
+        checked >= 6,
+        "only {checked} self-referential links were found; the exclusion in lychee.toml \
+         covers a prefix nothing is checking"
+    );
+}

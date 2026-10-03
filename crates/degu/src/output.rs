@@ -111,8 +111,59 @@ mod tests {
     use super::consumer_gone;
     use std::os::fd::AsRawFd;
 
+    /// The exact path `--exact` has to match. A rename leaves the child running no
+    /// test at all, which the marker below then reports as a missing check rather
+    /// than a pass.
+    const SHAPES_TEST: &str =
+        "output::tests::a_hung_up_consumer_is_recognized_on_every_shape_stdout_takes";
+    const SHAPES_OWN_PROCESS: &str = "DEGU_OUTPUT_SHAPES_OWN_PROCESS";
+    const SHAPES_CHECKED: &str = "every shape stdout takes was checked";
+
+    /// Every shape runs in a process of its own.
+    ///
+    /// A socket pair whose reader this test drops is a hangup only while this process
+    /// holds the last reference to that reader. `cargo test` runs the suite as threads
+    /// in one process, and a sibling that forks between the pair and the drop leaves
+    /// the child holding a duplicate: the peer is then alive, `POLLHUP` is absent, and
+    /// the guard correctly answers that nothing hung up. The assertion fails for a
+    /// reason that has nothing to do with the guard.
+    ///
+    /// Re-execing this one test is what removes the window. It is not a retry and not
+    /// a sleep: in a process running a single test there is no sibling to fork, so the
+    /// reader this test drops is the last one. #123 recorded the same unreliability
+    /// through the reclaim integration test and closed without a located cause; #187
+    /// records it reproducing here, on Linux, only under full-suite concurrency.
     #[test]
     fn a_hung_up_consumer_is_recognized_on_every_shape_stdout_takes() {
+        if std::env::var_os(SHAPES_OWN_PROCESS).is_some() {
+            every_shape_stdout_takes();
+            return;
+        }
+        let output = {
+            let _shared = crate::fork_gate::forking();
+            std::process::Command::new(std::env::current_exe().expect("the test binary's path"))
+                .args(["--exact", SHAPES_TEST, "--nocapture"])
+                .env(SHAPES_OWN_PROCESS, "1")
+                .output()
+                .expect("failed to re-exec the test binary for one test")
+        };
+        let reported = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "the shapes failed in their own process: {reported}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A filter that matches nothing also exits zero, so the marker is what
+        // separates "every shape passed" from "no shape ran".
+        assert!(
+            reported.contains(SHAPES_CHECKED),
+            "no shape was checked; is {SHAPES_TEST} still the name of this test? {reported}"
+        );
+    }
+
+    /// Printed from here rather than from the caller, so the marker cannot be
+    /// reported by a child that skipped the shapes.
+    fn every_shape_stdout_takes() {
         let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
         drop(reader);
         assert!(
@@ -151,5 +202,7 @@ mod tests {
             !consumer_gone(sink.as_raw_fd()),
             "a writable sink is not a hangup"
         );
+
+        println!("{SHAPES_CHECKED}");
     }
 }

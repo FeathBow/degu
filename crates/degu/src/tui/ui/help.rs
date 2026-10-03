@@ -24,7 +24,7 @@ Esc           Back; clear a filter; otherwise quit
 ?             Show / close this help
 q, Ctrl-C/D   Quit
 
-Compact status: + Eligible to clean; ? Needs review; · Not managed
+Compact status: + Eligible to clean; ? Needs review; · Not managed; ! Blocked by sealed staging preflight
 Row marks: ✓ in the plan; ○ out of it; blank degu will not act on it
 Eligible to clean findings start in the plan; Needs review findings start out.
 Staged entries start unchosen. A confirmed clean also runs its expiry plan.
@@ -255,6 +255,33 @@ mod tests {
     use super::super::text::columns;
     use super::*;
     use ratatui::buffer::Buffer;
+
+    /// A reader looking at the compact column can only identify what they see from this
+    /// legend, so every status that column can show has to appear in it. The statuses
+    /// come from the table rather than being restated here, so a new one cannot be
+    /// drawn without this failing.
+    #[test]
+    fn the_legend_explains_every_compact_status_the_table_can_draw() {
+        let legend = KEY_HELP
+            .lines()
+            .find(|line| line.starts_with("Compact status:"))
+            .unwrap_or_else(|| panic!("the field guide has no compact-status legend:\n{KEY_HELP}"));
+        // Taken from the table rather than restated, so a reworded symbol cannot leave
+        // this checking something the column no longer draws.
+        use super::super::findings::{BLOCKED_SYMBOL, symbol};
+        use crate::tui::report::Class;
+        for status in [
+            symbol(Class::Ready),
+            symbol(Class::NeedsReview),
+            symbol(Class::NotManaged),
+            BLOCKED_SYMBOL,
+        ] {
+            assert!(
+                legend.contains(status),
+                "the compact column draws {status} and the legend does not explain it: {legend}"
+            );
+        }
+    }
 
     /// `c` is only offered where it acts, so the other views are never asked
     /// to make room for it. Taken from the view rather than restated, so this

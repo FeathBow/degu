@@ -178,7 +178,7 @@ fn finding_row(item: (&Finding, usize), columns: &Columns, app: &App) -> Row<'st
     let refused = app.decisions().refusal(finding.path()).is_some();
     let status = match (refused, columns.status == STATUS_WIDTH) {
         (true, true) => BLOCKED_STATUS,
-        (true, false) => "!",
+        (true, false) => BLOCKED_SYMBOL,
         (false, true) => class.label(),
         (false, false) => symbol(class),
     };
@@ -229,13 +229,17 @@ fn finding_row(item: (&Finding, usize), columns: &Columns, app: &App) -> Row<'st
     Row::new(cells).style(style)
 }
 
-fn symbol(class: Class) -> &'static str {
+pub(super) const fn symbol(class: Class) -> &'static str {
     match class {
         Class::Ready => "+",
         Class::NeedsReview => "?",
         Class::NotManaged => "·",
     }
 }
+
+/// What the compact column shows for a tree sealed staging would refuse. The wide
+/// column says `Blocked` where this says one character.
+pub(super) const BLOCKED_SYMBOL: &str = "!";
 
 fn empty_message(app: &App) -> &'static str {
     let browser = app.browser();
@@ -251,4 +255,29 @@ fn empty_message(app: &App) -> &'static str {
         return "No findings from what this scan could read, and it could not read everything. Nothing here rules out findings in what it missed.";
     }
     "No findings in this section."
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The width is derived from a list of statuses, which keeps it from being written
+    /// down and going stale — but nothing notices when a status stops being on that
+    /// list. #166 is the truncation the derivation exists to make impossible, and a
+    /// status dropped from the list reintroduces it silently at every terminal size.
+    #[test]
+    fn the_status_column_fits_every_status_it_can_draw() {
+        for status in [
+            cleanup::label(DispositionMode::Eligible),
+            cleanup::label(DispositionMode::OptIn),
+            cleanup::label(DispositionMode::ReportOnly),
+            BLOCKED_STATUS,
+        ] {
+            assert!(
+                status.len() <= STATUS_WIDTH,
+                "{status:?} needs {} columns and the status column is {STATUS_WIDTH}",
+                status.len()
+            );
+        }
+    }
 }

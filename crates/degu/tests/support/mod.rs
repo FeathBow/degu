@@ -25,6 +25,36 @@ pub fn make_tree_non_shared_writable(root: &Path) -> std::io::Result<()> {
     strip_dir_write(root)
 }
 
+/// macOS attaches this attribute on its own, including to directories, so a test that
+/// wants to observe what degu does about it has to be able to put one there.
+#[allow(
+    dead_code,
+    reason = "shared support is compiled into integration-test crates that use different helpers"
+)]
+#[cfg(target_os = "macos")]
+pub fn set_provenance_xattr(path: &Path) {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).unwrap();
+    let value = b"degu-test";
+    // SAFETY: the descriptor, name, and value buffer remain live for the syscall.
+    let result = unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            c"com.apple.provenance".as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    assert_eq!(
+        result,
+        0,
+        "failed to plant provenance: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
 /// Plant one extended attribute of a class this platform's staging admits, which is
 /// what a filesystem that attaches provenance to every written file leaves behind.
 #[allow(

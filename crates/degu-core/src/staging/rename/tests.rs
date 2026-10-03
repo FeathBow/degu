@@ -3292,18 +3292,12 @@ fn mode(path: &Path) -> u32 {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-fn verified_purge_rejects_admitted_regular_xattrs_without_leaving_committed_state() {
-    let Some(fixture) = Fixture::new() else {
-        return;
-    };
-    let data = fixture.source_root.join("child/data");
-    let data = std::ffi::CString::new(data.as_os_str().as_bytes()).unwrap();
-    let value = b"ordinary metadata";
+fn plant_xattr(path: &Path, value: &[u8]) {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
     // SAFETY: the C path, name, and value buffer remain live for the syscall.
     let result = unsafe {
         libc::setxattr(
-            data.as_ptr(),
+            path.as_ptr(),
             c"user.degu-test".as_ptr(),
             value.as_ptr().cast(),
             value.len(),
@@ -3311,12 +3305,24 @@ fn verified_purge_rejects_admitted_regular_xattrs_without_leaving_committed_stat
         )
     };
     assert_eq!(result, 0, "failed to plant ordinary xattr");
+}
+
+/// Directory metadata is the one thing no proof covers, so it is the one extended
+/// attribute that still refuses a permanent deletion. The refusal arrives before any
+/// purge authority exists, so the transaction stays committed and the tree undoable.
+#[cfg(target_os = "linux")]
+#[test]
+fn verified_purge_rejects_directory_xattrs_without_leaving_committed_state() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    plant_xattr(&fixture.source_root.join("child"), b"on a directory");
     let transaction = TransactionId([0x88; 16]);
     let mut ready = stage_production(&fixture, transaction);
     let error = ready
         .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
         .unwrap_err();
-    assert!(error.is_unsupported_regular_xattrs(), "{error}");
+    assert!(error.is_unsupported_directory_xattrs(), "{error}");
     assert_eq!(
         error.disposition(),
         VerifiedPurgeFailureDisposition::NotStarted
@@ -3326,6 +3332,29 @@ fn verified_purge_rejects_admitted_regular_xattrs_without_leaving_committed_stat
         Some(TransactionState::VerifiedCommitted)
     );
     assert!(fixture.destination_root.join("child/data").is_file());
+}
+
+/// Proof schema v3 binds ordinary regular-file xattr names and values into the content
+/// manifest this purge verifies before it unlinks anything, so they leave nothing about
+/// the tree unproven and no longer refuse a permanent deletion.
+#[cfg(target_os = "linux")]
+#[test]
+fn verified_purge_accepts_admitted_regular_xattrs() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    plant_xattr(
+        &fixture.source_root.join("child/data"),
+        b"ordinary metadata",
+    );
+    let transaction = TransactionId([0x88; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .expect("a tree whose file xattrs the proof binds is purgeable");
+    ready.execute_verified_purge(authority).unwrap();
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purged));
+    assert!(!fixture.destination_root.exists());
 }
 
 #[cfg(target_os = "linux")]

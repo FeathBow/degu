@@ -117,6 +117,26 @@ pub(crate) fn ordinary_regular_xattr_is_admitted(platform: XattrPlatform, name: 
     }
 }
 
+/// Whether a directory attribute leaves a purge with something it cannot prove.
+///
+/// No manifest records directory attributes, so a purge refuses a tree carrying
+/// one. `com.apple.provenance` is the exception: macOS attaches it on its own,
+/// it records where bytes came from and grants nothing, so a directory restored
+/// without it is restricted exactly as it was. Counting it would put permanent
+/// deletion out of reach on macOS without making anything safer.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn directory_xattr_blocks_purge(platform: XattrPlatform, name: &[u8]) -> bool {
+    !matches!(
+        classify_xattr(platform, name),
+        XattrNameClass::MacOsProvenance
+    )
+}
+
+#[cfg(not(any(target_os = "macos", test)))]
+pub(crate) fn directory_xattr_blocks_purge(_platform: XattrPlatform, _name: &[u8]) -> bool {
+    true
+}
+
 /// Apply the current, deliberately conservative content-proof policy.
 ///
 /// Directory metadata is outside this policy's scope: held-tree directory
@@ -268,6 +288,31 @@ mod tests {
             Evidence::Present => Admission::Reject(RejectReason::AclPresent),
             Evidence::Unknown => Admission::Reject(RejectReason::AclUnknown),
             Evidence::Absent => Admission::Admit,
+        }
+    }
+
+    #[test]
+    fn only_provenance_lets_a_directory_attribute_through_the_purge_gate() {
+        assert!(!directory_xattr_blocks_purge(
+            XattrPlatform::MacOs,
+            b"com.apple.provenance"
+        ));
+        for blocking in [
+            &b"com.apple.quarantine"[..],
+            &b"com.apple.FinderInfo"[..],
+            &b"com.apple.metadata:kMDItemWhereFroms"[..],
+            &b"com.apple.unknown"[..],
+        ] {
+            assert!(
+                directory_xattr_blocks_purge(XattrPlatform::MacOs, blocking),
+                "{blocking:?}"
+            );
+        }
+        for blocking in [&b"user.comment"[..], &b"system.posix_acl_access"[..]] {
+            assert!(
+                directory_xattr_blocks_purge(XattrPlatform::Linux, blocking),
+                "{blocking:?}"
+            );
         }
     }
 

@@ -184,6 +184,17 @@ pub fn current_euid_published_namespace() -> Result<PathBuf, AccountBaseError> {
     published_namespace_with(account::self_anchor_base)
 }
 
+/// The account base the namespace hangs below, from the account database.
+///
+/// Provisioning authenticates the components beneath this one and leaves the
+/// system path above it alone, which is the only workable boundary: `/var` is a
+/// symlink on one supported platform and root owns it on both, so a caller that
+/// applied the same rules all the way to `/` would decline every account.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn current_euid_account_home() -> Result<PathBuf, AccountBaseError> {
+    account::self_anchor_base()
+}
+
 /// The derivation, with the account lookup injected so a test can hold it beside
 /// the scaffold `provision_flavor` publishes and require the two to agree. They
 /// have to name the same directory: one asks for the mode the other requires.

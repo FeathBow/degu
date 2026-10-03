@@ -242,10 +242,19 @@ fn the_published_namespace_is_the_one_provisioning_publishes() {
 
     let home_for_lookup = canonical_home.clone();
     let derived = super::published_namespace_with(|| Ok(home_for_lookup.clone())).unwrap();
-    assert!(
-        created.path.starts_with(&derived),
-        "provisioning published {} outside the namespace {} this derives",
-        created.path.display(),
+    // Exact, not a prefix: the anchor sits two levels below the namespace, so a
+    // derivation that pushed one component too many is also a prefix of it and
+    // would migrate a directory whose mode provisioning never asked about.
+    let published = created
+        .path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the anchor sits below the namespace");
+    assert_eq!(
+        published,
+        derived.as_path(),
+        "provisioning published under {} and this derives {}",
+        published.display(),
         derived.display()
     );
     let mode = std::fs::metadata(&derived).unwrap().permissions().mode() & 0o7777;

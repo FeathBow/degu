@@ -119,6 +119,78 @@ fn an_existing_private_namespace_is_migrated_and_its_entries_narrowed_first() {
     }
 }
 
+/// Account setup runs before provisioning has authenticated anything, so the step it
+/// runs there creates nothing: a `create_dir_all` would build directories inside
+/// whatever a symlinked ancestor points at and only then hear provisioning refuse the
+/// chain it never authenticated.
+#[test]
+fn publishing_through_a_symlinked_ancestor_creates_and_changes_nothing() {
+    let base = tempfile::tempdir().unwrap();
+    let elsewhere = base.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let victim = elsewhere.join("state");
+    std::fs::create_dir(&victim).unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let local = base.path().join(".local");
+    std::os::unix::fs::symlink(&elsewhere, &local).unwrap();
+
+    super::validation::publish_existing_namespace(base.path(), &local.join("state").join("degu"))
+        .unwrap();
+
+    assert!(
+        !victim.join("degu").exists(),
+        "nothing may be created through a link this has not authenticated"
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&victim).unwrap().mode() & 0o777,
+        0o700,
+        "nothing through the link may be chmodded either"
+    );
+}
+
+/// An absent namespace is provisioning's to create, which it does at the published
+/// mode with private ancestors. Creating it here by pathname would publish ancestors
+/// at whatever the ambient umask allows, and provisioning refuses a group-writable
+/// ancestor — so a fresh account under `umask 002` would be blocked by directories
+/// account setup had just created for it.
+#[test]
+fn publishing_an_absent_namespace_creates_nothing() {
+    let base = tempfile::tempdir().unwrap();
+    let namespace = base.path().join(".local").join("state").join("degu");
+
+    super::validation::publish_existing_namespace(base.path(), &namespace).unwrap();
+
+    assert!(
+        !base.path().join(".local").exists(),
+        "no ancestor was created"
+    );
+}
+
+/// The case that made account setup fail: the namespace is there, owner-only, and
+/// provisioning requires it at exactly 0755.
+#[test]
+fn publishing_an_existing_private_namespace_reaches_the_published_mode() {
+    let base = tempfile::tempdir().unwrap();
+    let namespace = base.path().join("degu");
+    std::fs::create_dir(&namespace).unwrap();
+    std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let lock = namespace.join("lock");
+    std::fs::write(&lock, b"").unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    super::validation::publish_existing_namespace(base.path(), &namespace).unwrap();
+
+    assert_eq!(
+        std::fs::symlink_metadata(&namespace).unwrap().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&lock).unwrap().mode() & 0o077,
+        0,
+        "the lock relied on a private parent for its privacy"
+    );
+}
+
 /// A link where the namespace belongs is refused before anything is chmodded.
 #[test]
 fn a_symlinked_namespace_is_refused_before_its_entries_are_touched() {

@@ -108,6 +108,86 @@ fn prepare_trash_parent(root: &Path, expected_name: &str) -> Result<()> {
     validate_trash_parent(parent)
 }
 
+/// Bring one existing namespace to the published mode, creating nothing.
+///
+/// `ensure_state_parent` creates its ancestors by pathname and validates only the
+/// leaf, which is correct where it runs: a lifecycle command has already
+/// established the chain. A caller that runs before provisioning has not, and a
+/// `create_dir_all` there would build directories inside whatever a symlinked
+/// `.local` points at and only then hear provisioning refuse the chain.
+///
+/// So this creates nothing and follows nothing. It walks the chain one component
+/// at a time with no-follow, and treats an absent component, a symlink, or a
+/// foreign owner as nothing to do rather than as a problem to fix: provisioning
+/// authenticates the same chain and is the authority on refusing it. The entries
+/// are narrowed before the namespace opens, for the same reason as below.
+pub(crate) fn publish_existing_namespace(home: &Path, namespace: &Path) -> Result<()> {
+    let Some(held) = open_owned_chain(home, namespace)? else {
+        return Ok(());
+    };
+    narrow_private_entries(&held, namespace)?;
+    rustix::fs::fchmod(&held, Mode::from_raw_mode(NAMESPACE_DIR_MODE as _))
+        .with_context(|| format!("failed to set the mode of {}", namespace.display()))?;
+    Ok(())
+}
+
+/// The namespace, opened one component at a time without following a symlink
+/// anywhere along the way. `None` means there is nothing here to publish, which
+/// is not an error: provisioning authenticates the same chain and is the
+/// authority on refusing it.
+///
+/// Ownership is required of the namespace and of nothing above it. The chain runs
+/// through directories the system owns, and provisioning asks of those only that
+/// they not be writable by anyone else — so demanding this account own `/var`
+/// would decline every account rather than the unsafe ones.
+fn open_owned_chain(home: &Path, namespace: &Path) -> Result<Option<OwnedFd>> {
+    let Ok(relative) = namespace.strip_prefix(home) else {
+        anyhow::bail!(
+            "{} is not beneath the account base {}",
+            namespace.display(),
+            home.display()
+        );
+    };
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    // The base itself is opened by pathname, as provisioning opens it: the system
+    // path above an account home legitimately runs through symlinks nobody here
+    // controls, and refusing those refuses every account rather than an unsafe one.
+    let mut current = match rustix::fs::open(
+        home,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(base) => base,
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => return Ok(None),
+        Err(error) => {
+            return Err(std::io::Error::from(error))
+                .with_context(|| format!("failed to open {}", home.display()));
+        }
+    };
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        current = match rustix::fs::openat(&current, name, flags, Mode::empty()) {
+            Ok(entry) => entry,
+            // Absent, a symlink, or not a directory: nothing to publish here.
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(std::io::Error::from(error))
+                    .with_context(|| format!("failed to open {}", namespace.display()));
+            }
+        };
+    }
+    let stat = rustix::fs::fstat(&current)
+        .with_context(|| format!("failed to inspect {}", namespace.display()))?;
+    if stat.st_uid != rustix::process::geteuid().as_raw() {
+        return Ok(None);
+    }
+    Ok(Some(current))
+}
+
 pub(super) fn ensure_state_parent(parent: &Path) -> Result<()> {
     let ancestor = parent.parent().ok_or_else(|| {
         anyhow::anyhow!("state trash parent has no ancestor: {}", parent.display())

@@ -38,7 +38,10 @@ pub(crate) use stage::{
     CapturedCleanPlan, CleanExecution, CleanExecutionFailure, cleaned_resources,
 };
 pub(crate) use storage::sealed_staging_store_path;
-pub(crate) use storage::{StoreCoverage, activated_store_coverage, same_directory, state_home_of};
+pub(crate) use storage::{
+    StoreCoverage, activated_store_coverage, prepare_product_namespace, same_directory,
+    state_home_of,
+};
 pub(crate) use undo::{UndoAmbiguousEntry, UndoEntry, UndoFailedEntry, UndoLogFailure, UndoReport};
 
 pub(crate) struct Lifecycle {

@@ -167,6 +167,19 @@ where
     })
 }
 
+/// Bring one product namespace to the mode provisioning publishes it at.
+///
+/// The widening migration runs when a lifecycle command takes its mutation lock,
+/// which `init` does not do, so a legacy namespace reached provisioning at `0700`
+/// and was refused — by the command `doctor` had just recommended. The caller
+/// passes the path because the two sides disagree about which one they mean:
+/// lifecycle uses the environment's state home, provisioning uses the account
+/// database, and on an account with an `XDG_STATE_HOME` override those are
+/// different directories.
+pub(crate) fn prepare_product_namespace(namespace: &Path) -> Result<()> {
+    ensure_state_parent(namespace)
+}
+
 pub(crate) fn acquire_mutation_lock(ctx: &DetectCtx) -> Result<std::fs::File> {
     let dir = ctx.xdg_state().join("degu");
     ensure_state_parent(&dir)?;

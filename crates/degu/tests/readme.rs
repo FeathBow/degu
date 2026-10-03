@@ -167,3 +167,65 @@ fn documented_arg(arg: &str) -> String {
         .unwrap_or(arg)
         .to_owned()
 }
+
+/// Every `blob/main` link back into this repository names a file this commit has.
+///
+/// lychee does not ask github.com about these, because the runner's requests for them
+/// were answered with 503 and the check reported GitHub's rate limiting as a broken
+/// link. Asking the commit instead is the stronger question: github.com would answer
+/// 200 for a path that only `main` still has.
+#[test]
+fn self_referential_doc_links_point_at_files_this_commit_has() {
+    const PREFIX: &str = "https://github.com/FeathBow/degu/blob/main/";
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("the workspace root is two levels above this crate");
+    // lychee is pointed at every markdown file in the tree, so the check that replaces
+    // it for this prefix reads the same set. Asking git for it also keeps locally
+    // excluded working notes out, which are not part of the commit and not published.
+    let listed = std::process::Command::new("git")
+        .args(["ls-files", "-z", "*.md"])
+        .current_dir(&root)
+        .output()
+        .expect("git lists the markdown files this commit has");
+    assert!(listed.status.success(), "git ls-files failed");
+    let names: Vec<&str> = std::str::from_utf8(&listed.stdout)
+        .expect("tracked paths are UTF-8")
+        .split('\0')
+        .filter(|name| !name.is_empty())
+        .collect();
+    assert!(
+        names.len() >= 6,
+        "only {} markdown files were listed; the pathspec stopped matching",
+        names.len()
+    );
+
+    let mut checked = 0;
+    for name in &names {
+        let text = std::fs::read_to_string(root.join(name))
+            .unwrap_or_else(|error| panic!("{name} is unreadable: {error}"));
+        for (index, _) in text.match_indices(PREFIX) {
+            let tail = &text[index + PREFIX.len()..];
+            let path: String = tail
+                .chars()
+                .take_while(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, '.' | '_' | '/' | '-')
+                })
+                .collect();
+            assert!(
+                root.join(&path).exists(),
+                "{name} links to {path}, which this commit does not have"
+            );
+            checked += 1;
+        }
+    }
+    // The excluded prefix would otherwise be unchecked in silence if the links moved
+    // or the extraction stopped matching them.
+    assert!(
+        checked >= 6,
+        "only {checked} self-referential links were found across {} documents; the \
+         exclusion in lychee.toml covers a prefix nothing is checking",
+        names.len()
+    );
+}

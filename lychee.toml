@@ -3,3 +3,12 @@ max_retries = 3
 retry_wait_time = 2
 timeout = 20
 include_fragments = "anchor-only"
+
+# Links back into this repository are not asked of github.com. The runner's requests
+# for them were answered with 503 while the same version and configuration reported
+# every link OK from a developer machine, so the check was reporting GitHub's rate
+# limiting rather than a broken link. They are verified instead against the files in
+# the commit under test, which is stricter: a 200 for blob/main would also be returned
+# for a path that this commit no longer has. The test is
+# `self_referential_doc_links_point_at_files_this_commit_has` in crates/degu/tests/readme.rs.
+exclude = ["^https://github\\.com/FeathBow/degu/blob/main/"]

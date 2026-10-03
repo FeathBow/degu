@@ -156,6 +156,17 @@ pub(super) fn choose_authority(
     }
 }
 
+/// Where a system authority already claims this account, read-only.
+///
+/// `initialize_current_euid_self_authority` refuses when one exists, and it does
+/// so before it provisions anything. A caller that has its own work to do before
+/// provisioning needs the same answer first: every refusal belongs ahead of the
+/// first mutation, not between two of them.
+pub fn current_euid_system_authority() -> Result<Option<PathBuf>, StoreActivationError> {
+    let locator = ActivationAnchorLocator::for_current_euid()?;
+    Ok(open_authority_candidate(&locator)?.map(|candidate| candidate.authority.path))
+}
+
 pub(super) fn open_authority_candidate(
     locator: &ActivationAnchorLocator,
 ) -> Result<Option<AuthorityCandidate>, StoreActivationError> {

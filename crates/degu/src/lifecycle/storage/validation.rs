@@ -116,13 +116,13 @@ fn prepare_trash_parent(root: &Path, expected_name: &str) -> Result<()> {
 /// `create_dir_all` there would build directories inside whatever a symlinked
 /// `.local` points at and only then hear provisioning refuse the chain.
 ///
-/// So this creates nothing and follows nothing. It walks the chain one component
-/// at a time with no-follow, and treats an absent component, a symlink, or a
-/// foreign owner as nothing to do rather than as a problem to fix: provisioning
-/// authenticates the same chain and is the authority on refusing it. The entries
-/// are narrowed before the namespace opens, for the same reason as below.
+/// So this creates nothing, and authenticates every directory it reaches through
+/// before it changes any of them. A chain it cannot authenticate is nothing to do
+/// rather than something to repair: provisioning authenticates the same chain
+/// straight afterwards and is the authority on refusing it, with the reason. The
+/// entries are narrowed before the namespace is widened, for the reason below.
 pub(crate) fn publish_existing_namespace(home: &Path, namespace: &Path) -> Result<()> {
-    let Some(held) = open_owned_chain(home, namespace)? else {
+    let Some(held) = open_authenticated_chain(home, namespace)? else {
         return Ok(());
     };
     narrow_private_entries(&held, namespace)?;
@@ -131,16 +131,15 @@ pub(crate) fn publish_existing_namespace(home: &Path, namespace: &Path) -> Resul
     Ok(())
 }
 
-/// The namespace, opened one component at a time without following a symlink
-/// anywhere along the way. `None` means there is nothing here to publish, which
-/// is not an error: provisioning authenticates the same chain and is the
-/// authority on refusing it.
+/// The namespace, reached the way provisioning reaches it. `None` means there is
+/// nothing here this may publish.
 ///
-/// Ownership is required of the namespace and of nothing above it. The chain runs
-/// through directories the system owns, and provisioning asks of those only that
-/// they not be writable by anyone else — so demanding this account own `/var`
-/// would decline every account rather than the unsafe ones.
-fn open_owned_chain(home: &Path, namespace: &Path) -> Result<Option<OwnedFd>> {
+/// The account base and the system path above it go through the walk provisioning
+/// rebinds the base with, which authenticates each directory and admits a symlink
+/// only when the link and the chain it resolves to authenticate as well. Below the
+/// base no symlink is legitimate, so those components are opened one at a time
+/// with no-follow, and each one is authenticated before the next is reached.
+fn open_authenticated_chain(home: &Path, namespace: &Path) -> Result<Option<OwnedFd>> {
     let Ok(relative) = namespace.strip_prefix(home) else {
         anyhow::bail!(
             "{} is not beneath the account base {}",
@@ -148,26 +147,16 @@ fn open_owned_chain(home: &Path, namespace: &Path) -> Result<Option<OwnedFd>> {
             home.display()
         );
     };
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    // The base itself is opened by pathname, as provisioning opens it: the system
-    // path above an account home legitimately runs through symlinks nobody here
-    // controls, and refusing those refuses every account rather than an unsafe one.
-    let mut current = match rustix::fs::open(
-        home,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(base) => base,
-        Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => return Ok(None),
-        Err(error) => {
-            return Err(std::io::Error::from(error))
-                .with_context(|| format!("failed to open {}", home.display()));
-        }
+    let Ok(mut current) = degu_walk::resolve_trusted_directory(home, "account base") else {
+        return Ok(None);
     };
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut walked = home.to_path_buf();
     for component in relative.components() {
         let std::path::Component::Normal(name) = component else {
             continue;
         };
+        walked.push(name);
         current = match rustix::fs::openat(&current, name, flags, Mode::empty()) {
             Ok(entry) => entry,
             // Absent, a symlink, or not a directory: nothing to publish here.
@@ -176,16 +165,35 @@ fn open_owned_chain(home: &Path, namespace: &Path) -> Result<Option<OwnedFd>> {
             }
             Err(error) => {
                 return Err(std::io::Error::from(error))
-                    .with_context(|| format!("failed to open {}", namespace.display()));
+                    .with_context(|| format!("failed to open {}", walked.display()));
             }
         };
-    }
-    let stat = rustix::fs::fstat(&current)
-        .with_context(|| format!("failed to inspect {}", namespace.display()))?;
-    if stat.st_uid != rustix::process::geteuid().as_raw() {
-        return Ok(None);
+        if !authenticates_as_this_account(&current, &walked)? {
+            return Ok(None);
+        }
     }
     Ok(Some(current))
+}
+
+/// Whether provisioning would accept this directory as one of the account's own.
+///
+/// This asks what `validate_directory` asks of a self-managed component: owned by
+/// this account, and granting write to nobody else. The mode a migration exists to
+/// widen is a private one, so a directory anyone else can write to is never one to
+/// widen — doing it would take from provisioning the evidence that made it refuse.
+/// No sticky exemption, deliberately: `directory_grants_foreign_mutation` allows
+/// shared write on a sticky directory and provisioning allows none, and the sticky
+/// bit decides who may remove an entry, not who may add one.
+///
+/// An ACL can grant what the mode bits do not show, and provisioning refuses a
+/// component carrying one. A probe that cannot read one answers with uncertainty
+/// rather than absence, so it fails closed here too.
+fn authenticates_as_this_account(held: &OwnedFd, path: &Path) -> Result<bool> {
+    let stat =
+        rustix::fs::fstat(held).with_context(|| format!("failed to inspect {}", path.display()))?;
+    Ok(stat.st_uid == rustix::process::geteuid().as_raw()
+        && stat.st_mode as u32 & SHARED_WRITE_MASK == 0
+        && degu_core::backend::require_held_fd_acl_absent(held).is_ok())
 }
 
 pub(super) fn ensure_state_parent(parent: &Path) -> Result<()> {

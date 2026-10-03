@@ -273,11 +273,13 @@ pub struct HeldTreePolicySummary {
     pub content_bytes_from_metadata: u64,
     pub regular_hard_links: HeldTreeRegularHardLinkTopology,
     pub regular_xattrs: HeldTreeRegularXattrTopology,
-    /// Whether any directory in the tree carries an extended attribute. Proof schema v3
-    /// binds ordinary regular-file xattrs, and symlink xattrs fail closed at admission,
-    /// so directory metadata is the one thing no proof covers and the one thing sealed
-    /// purge still refuses.
-    pub directories_carry_xattrs: bool,
+    /// Whether any directory in the tree carries an extended attribute that sealed
+    /// purge refuses. Proof schema v3 binds ordinary regular-file xattrs, and symlink
+    /// xattrs fail closed at admission, so directory metadata is the one thing no
+    /// proof covers and the one thing sealed purge still refuses — except the
+    /// provenance record macOS attaches itself, which grants nothing. A directory
+    /// carrying only that answers false here.
+    pub directory_xattrs_block_purge: bool,
     pub assessed_at: SystemTime,
 }
 
@@ -575,7 +577,7 @@ fn map_tree_assessment(a: held::HeldTreeAdmissionAssessment) -> HeldTreePolicyAs
                     attributes: tree.regular_xattrs.attributes,
                     value_bytes: tree.regular_xattrs.value_bytes,
                 },
-                directories_carry_xattrs: tree.directories_carry_xattrs,
+                directory_xattrs_block_purge: tree.directory_xattrs_block_purge,
                 assessed_at: tree.assessed_at,
             },
             source_parent_seal: seal(source_parent_seal),

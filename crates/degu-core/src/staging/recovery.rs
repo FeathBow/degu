@@ -1079,7 +1079,7 @@ impl VerifiedPurgeSession<'_> {
                 *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
                 return Err(RecoveryRebindError::PurgeUnsupportedInternalHardLinks);
             }
-            if verifier.tree_directories_carry_xattrs()? {
+            if verifier.tree_directory_xattrs_block_purge()? {
                 *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
                 return Err(RecoveryRebindError::PurgeUnsupportedDirectoryXattrs);
             }
@@ -1128,7 +1128,7 @@ impl VerifiedPurgeSession<'_> {
                 *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
                 return Err(RecoveryRebindError::PurgeUnsupportedInternalHardLinks);
             }
-            if verifier.tree_directories_carry_xattrs()? {
+            if verifier.tree_directory_xattrs_block_purge()? {
                 *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
                 return Err(RecoveryRebindError::PurgeUnsupportedDirectoryXattrs);
             }
@@ -1510,8 +1510,8 @@ impl VerifiedUndoRecoverySession<'_> {
     /// rewalk accumulates its topology from manifest records and the manifest records no
     /// directory xattrs. Regular-file xattrs need no gate of their own: schema v3 binds
     /// their names and values into the content manifest this purge already verified.
-    fn tree_directories_carry_xattrs(&self) -> Result<bool, RecoveryRebindError> {
-        crate::backend::held::directories_carry_xattrs(
+    fn tree_directory_xattrs_block_purge(&self) -> Result<bool, RecoveryRebindError> {
+        crate::backend::held::directory_xattrs_block_purge(
             &self.undo.root.held,
             HeldTreeLimits::default(),
         )

@@ -132,7 +132,7 @@ fn print_selected(prepared: &PreparedClean) -> Result<()> {
             .filter(|finding| {
                 prepared
                     .preview_assessment(finding)
-                    .is_some_and(|assessment| assessment.has_directory_xattrs())
+                    .is_some_and(|assessment| assessment.directory_xattrs_block_purge())
             })
             .count();
         if directory_xattr_items != 0 {
@@ -236,12 +236,12 @@ fn print_permanent_preview(
                 .preview_assessment(finding)
                 .is_some_and(|assessment| assessment.has_internal_hard_links())
         });
-        let has_directory_xattrs = staged_only.iter().any(|finding| {
+        let directory_xattrs_block_purge = staged_only.iter().any(|finding| {
             prepared
                 .preview_assessment(finding)
-                .is_some_and(|assessment| assessment.has_directory_xattrs())
+                .is_some_and(|assessment| assessment.directory_xattrs_block_purge())
         });
-        let unsupported = match (has_links, has_directory_xattrs) {
+        let unsupported = match (has_links, directory_xattrs_block_purge) {
             (true, true) => "multi-link regular-file groups or directory extended attributes",
             (true, false) => "multi-link regular-file groups",
             (false, true) => "directory extended attributes",

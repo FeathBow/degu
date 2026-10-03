@@ -213,7 +213,7 @@ fn ordinary_regular_xattr_previews_stages_and_fresh_process_undo_preserves_value
     // Proof schema v3 binds these names and values into the content manifest a purge
     // verifies before it unlinks anything, so they do not refuse a permanent deletion.
     // Directory metadata is what no proof covers, and this tree has none.
-    assert_eq!(preflight["contains_directory_xattrs"], false);
+    assert_eq!(preflight["directory_xattrs_block_purge"], false);
     assert_eq!(preflight["purge_admission"]["supported"], true);
 
     let clean = fixture.run(&[
@@ -291,7 +291,10 @@ fn directory_xattr_purge_is_gated_after_stage_and_remains_undoable() {
     assert_output_success(&preview);
     let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
     let preflight = &preview["staging_preflight"][0];
-    assert_eq!(preflight["contains_directory_xattrs"], true, "{preview:#}");
+    assert_eq!(
+        preflight["directory_xattrs_block_purge"], true,
+        "{preview:#}"
+    );
     assert_eq!(
         preflight["purge_admission"]["supported"], false,
         "{preview:#}"
@@ -351,7 +354,10 @@ fn a_directory_carrying_only_provenance_stays_purgeable() {
     assert_output_success(&preview);
     let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
     let preflight = &preview["staging_preflight"][0];
-    assert_eq!(preflight["contains_directory_xattrs"], false, "{preview:#}");
+    assert_eq!(
+        preflight["directory_xattrs_block_purge"], false,
+        "{preview:#}"
+    );
     assert_eq!(
         preflight["purge_admission"]["supported"], true,
         "{preview:#}"

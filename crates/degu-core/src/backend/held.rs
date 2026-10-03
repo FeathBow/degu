@@ -594,10 +594,13 @@ pub(crate) struct HeldTreePolicyAssessment {
     pub(crate) content_bytes: u64,
     pub(crate) regular_hard_links: RegularHardLinkTopology,
     pub(crate) regular_xattrs: RegularXattrTopology,
-    /// Whether any directory in the tree carries an extended attribute. Sealed purge
-    /// refuses such a tree, because no proof covers directory metadata, so a preview
-    /// has to be able to say so before anyone confirms a permanent deletion.
-    pub(crate) directories_carry_xattrs: bool,
+    /// Whether any directory in the tree carries an extended attribute that sealed
+    /// purge refuses. No proof covers directory metadata, so one that could mean
+    /// anything refuses the deletion; the provenance record macOS attaches on its own
+    /// is the one exception, named in `admission`. A preview has to be able to say so
+    /// before anyone confirms a permanent deletion. This is not "has any attribute":
+    /// a directory carrying only the exception answers false.
+    pub(crate) directory_xattrs_block_purge: bool,
     pub(crate) assessed_at: std::time::SystemTime,
 }
 
@@ -689,14 +692,20 @@ pub(crate) fn assess_tree_admission(
             content_bytes: walked.budget.content_bytes,
             regular_hard_links: walked.regular_hard_links,
             regular_xattrs: walked.regular_xattrs,
-            directories_carry_xattrs: directories_carry_xattrs(&walked.root.held, limits)?,
+            directory_xattrs_block_purge: directory_xattrs_block_purge(&walked.root.held, limits)?,
             assessed_at: std::time::SystemTime::now(),
         },
         source_parent_seal,
     })
 }
 
-/// Whether any directory in this tree carries an extended attribute.
+/// Whether any directory in this tree carries an extended attribute a purge refuses.
+///
+/// This is deliberately not "carries any attribute". `admission` decides which names
+/// count, and the provenance record macOS attaches on its own does not: it says where
+/// bytes came from and grants nothing, so a directory restored without it is restricted
+/// exactly as it was. Counting it would have put permanent deletion out of reach on
+/// that platform without making anything safer.
 ///
 /// Proof schema v3 binds ordinary regular-file xattr names and values into the content
 /// manifest, and symlink xattrs fail closed at admission, so directory xattrs are the
@@ -719,7 +728,7 @@ pub(crate) fn assess_tree_admission(
 ///
 /// The caller runs this after exact verification and before any purge authority exists,
 /// so a tree this refuses stays committed and undoable.
-pub(crate) fn directories_carry_xattrs(
+pub(crate) fn directory_xattrs_block_purge(
     root: &HeldLocalBackendEvidence,
     limits: HeldTreeLimits,
 ) -> Result<bool, HeldTreeError> {

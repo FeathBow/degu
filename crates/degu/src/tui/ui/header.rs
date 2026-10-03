@@ -58,16 +58,10 @@ struct MastheadLayout {
     gap: usize,
 }
 
-/// Which parts of the masthead a row of this width can hold.
-///
-/// The suffix is decoration; the label beside it can be a command the reader has
-/// to type, and the row is truncated from the right, so a row too narrow for both
-/// loses exactly the part that was worth keeping. Dropping the suffix first is
-/// the only ordering that keeps the remedy whole.
-///
-/// The threshold is derived from the label it has to fit rather than written down
-/// as a width: a reworded label would otherwise be truncated at every size with
-/// nothing to notice, which is how #166 happened.
+/// Which parts of the masthead a row of this width can hold. The row truncates
+/// from the right, so the suffix goes before the label: the suffix is decoration
+/// and the label can be a command. The threshold is measured from the label
+/// rather than written down, so rewording it cannot silently truncate it.
 fn masthead_layout(plan: &str, width: usize) -> MastheadLayout {
     let compact = columns(MASTHEAD_NAME) + columns(plan) + HEADER_GAP;
     let full = compact + columns(MASTHEAD_SUFFIX);
@@ -164,46 +158,68 @@ fn sections(app: &App) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collection::{ScanCompleteness, ScanStatus};
+    use crate::lifecycle::StoreCoverage;
+    use crate::tui::report::ScanReport;
+    use crate::tui::staged::Staged;
 
-    const REMEDY: &str = "Cleanup unavailable - run 'degu doctor'";
+    /// An account whose cleanup is unavailable, which is the only state that puts a
+    /// command on this row.
+    fn blocked_app() -> App {
+        let status = ScanStatus::requested_for_test(false, false);
+        App::new(
+            ScanReport::new(
+                Vec::new(),
+                Vec::new(),
+                ScanCompleteness {
+                    findings: status,
+                    runtime: status,
+                },
+            ),
+            Staged::new(Vec::new(), StoreCoverage::Complete),
+            std::path::PathBuf::from("/home/user"),
+            true,
+            crate::advisory::Advisories::disabled_for_test(),
+            |_| None,
+        )
+    }
 
-    /// What a terminal of this many columns actually gives the header: the screen is
-    /// drawn inside a one-column margin on each side.
+    /// The screen is drawn inside a one-column margin on each side.
     fn header_width(terminal: usize) -> usize {
         terminal - 2
     }
 
-    fn drawn(plan: &str, terminal: usize) -> String {
-        masthead_line(plan.to_owned(), READY, header_width(terminal))
+    fn drawn(terminal: usize) -> String {
+        masthead(&blocked_app(), header_width(terminal))
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
     }
 
-    /// 60 columns is the narrowest terminal the findings screen is tested at, and the
-    /// remedy is the one thing on this row a reader may have to type.
+    /// 60 columns is the narrowest terminal the findings screen is tested at.
     #[test]
     fn a_narrow_masthead_keeps_the_whole_remedy() {
-        let line = drawn(REMEDY, 60);
+        let line = drawn(60);
         assert!(
             columns(&line) <= header_width(60),
             "the masthead overflows its row: {line:?}"
         );
-        assert!(line.contains(REMEDY), "the remedy was cut: {line:?}");
+        assert!(
+            line.contains("degu doctor"),
+            "the command the row exists to give was cut: {line:?}"
+        );
         assert!(
             !line.contains(MASTHEAD_SUFFIX),
             "the suffix is what should have gone: {line:?}"
         );
     }
 
-    /// A width that can hold both keeps both: the remedy is not a reason to spend every
-    /// row of every terminal without the report's name on it.
     #[test]
     fn a_wide_masthead_keeps_both() {
-        let line = drawn(REMEDY, 120);
+        let line = drawn(120);
         assert!(columns(&line) <= header_width(120), "{line:?}");
-        assert!(line.contains(REMEDY), "{line:?}");
+        assert!(line.contains("degu doctor"), "{line:?}");
         assert!(line.contains(MASTHEAD_SUFFIX), "{line:?}");
     }
 }

@@ -97,17 +97,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_descriptor_with_no_attributes_lists_nothing() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("bare");
-        std::fs::write(&path, b"bytes").unwrap();
-        let file = std::fs::File::open(&path).unwrap();
-        assert_eq!(names(&file).unwrap(), Vec::<u8>::new());
+    fn listed(file: &std::fs::File) -> Vec<String> {
+        names(file)
+            .unwrap()
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect()
     }
 
+    /// Measured, not assumed: a host may attach an attribute to everything it writes,
+    /// so the baseline is read rather than taken to be empty. What the listing has to
+    /// report is exactly what the descriptor carries, whatever that already was.
     #[test]
-    fn every_planted_name_survives_the_size_then_read_sequence() {
+    fn the_listing_reports_exactly_what_the_descriptor_carries() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("decorated");
         std::fs::write(&path, b"bytes").unwrap();
@@ -116,22 +119,34 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap();
+
+        let baseline = listed(&file);
         for name in PLANTED {
             rustix::fs::fsetxattr(&file, name, b"value", XattrFlags::empty())
                 .unwrap_or_else(|error| panic!("failed to plant {name}: {error}"));
         }
 
-        let listed = names(&file).unwrap();
-        let listed: Vec<_> = listed
-            .split(|byte| *byte == 0)
-            .filter(|name| !name.is_empty())
-            .map(|name| String::from_utf8_lossy(name).into_owned())
-            .collect();
+        let decorated = listed(&file);
         for name in PLANTED {
             assert!(
-                listed.contains(&name.to_owned()),
-                "{name} missing: {listed:?}"
+                decorated.contains(&name.to_owned()),
+                "{name} missing: {decorated:?}"
             );
         }
+        assert_eq!(
+            decorated.len(),
+            baseline.len() + PLANTED.len(),
+            "the listing gained something the test did not plant: {baseline:?} -> {decorated:?}"
+        );
+
+        for name in PLANTED {
+            rustix::fs::fremovexattr(&file, name)
+                .unwrap_or_else(|error| panic!("failed to remove {name}: {error}"));
+        }
+        assert_eq!(
+            listed(&file),
+            baseline,
+            "removing what the test planted must return the listing to what the host had"
+        );
     }
 }

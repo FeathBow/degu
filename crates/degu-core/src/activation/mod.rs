@@ -79,7 +79,7 @@ pub use selection::{
     SelfAuthorityInitializationError, SelfAuthorityInitializationOutcome,
     SelfAuthorityInitializationPostProvisionError, activate_current_euid_store,
     check_current_euid_authority_readiness, check_current_euid_mutation_readiness,
-    initialize_current_euid_self_authority,
+    current_euid_system_authority, initialize_current_euid_self_authority,
 };
 #[cfg(test)]
 use selection::{

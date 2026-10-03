@@ -59,7 +59,8 @@ fn refuse_activated_store_in(ctx: &DetectCtx) -> Result<()> {
 /// is evidence and not proof: it catches the case degu itself creates by
 /// default, which is the one people land in.
 pub(crate) fn run(json: bool) -> Result<()> {
-    refuse_if_a_store_is_already_activated()?;
+    let cleared = every_refusal_made_first()?;
+    publish_the_namespace_provisioning_requires(&cleared)?;
     let outcome = match initialize_current_euid_self_authority() {
         Ok(outcome) => outcome,
         Err(error @ SelfAuthorityInitializationError::PostProvision(_)) => {
@@ -88,6 +89,81 @@ pub(crate) fn run(json: bool) -> Result<()> {
         mutated,
         json,
     )
+}
+
+/// The refusals, and the evidence that they ran, in a namespace of their own.
+///
+/// `RefusalsCleared` is unforgeable outside this module: its field is private, so
+/// nothing in the command body can produce one without calling the function that
+/// makes every refusal. The only mutation this command performs ahead of
+/// provisioning takes one, so the two cannot be reordered without failing to
+/// compile. The fault that buys is not hypothetical — an earlier draft published
+/// the namespace and only then asked whether a system authority already claimed
+/// the account, so an account that was always going to be refused had its
+/// directories changed on the way to hearing so.
+mod refusal {
+    use super::{
+        refuse_if_a_store_is_already_activated, refuse_if_a_system_authority_claims_this_account,
+        refuse_if_root_cannot_self_provision,
+    };
+    use anyhow::Result;
+
+    pub(super) struct RefusalsCleared(());
+
+    pub(super) fn every_refusal_made_first() -> Result<RefusalsCleared> {
+        refuse_if_a_store_is_already_activated()?;
+        refuse_if_root_cannot_self_provision()?;
+        refuse_if_a_system_authority_claims_this_account()?;
+        Ok(RefusalsCleared(()))
+    }
+}
+
+use refusal::{RefusalsCleared, every_refusal_made_first};
+
+/// Root cannot provision a self-managed authority, and provisioning says so — after
+/// this command has already published a namespace on the way there.
+fn refuse_if_root_cannot_self_provision() -> Result<()> {
+    if rustix::process::geteuid().is_root() {
+        anyhow::bail!("refused create-only self-managed account setup: root cannot self-provision");
+    }
+    Ok(())
+}
+
+/// Every refusal this command can make, made before it changes anything.
+///
+/// Provisioning refuses an account a system authority already claims, and it does
+/// that before it provisions. A step that runs ahead of provisioning has to ask
+/// the same question first, or an account that was always going to be refused
+/// gets its directories changed on the way to hearing so.
+fn refuse_if_a_system_authority_claims_this_account() -> Result<()> {
+    let present = degu_core::activation::current_euid_system_authority()
+        .context("failed to read this account's activation authority")?;
+    match present {
+        None => Ok(()),
+        Some(path) => anyhow::bail!(
+            "refused create-only self-managed account setup: a system authority already claims this account at {}",
+            path.display()
+        ),
+    }
+}
+
+/// Bring the namespace provisioning publishes to the mode it requires.
+///
+/// An account an earlier version set up has it owner-only, and provisioning wants
+/// exactly `0755`. This creates nothing: an absent namespace is provisioning's to
+/// create, at the published mode with private ancestors, and a chain that is not
+/// already a plain owned directory chain is provisioning's to refuse.
+fn publish_the_namespace_provisioning_requires(_cleared: &RefusalsCleared) -> Result<()> {
+    let home = degu_core::provision::current_euid_account_home()
+        .context("failed to resolve this account's base directory")?;
+    let namespace = degu_core::provision::current_euid_published_namespace()
+        .context("failed to resolve this account's degu state namespace")?;
+    crate::lifecycle::publish_existing_namespace(&home, &namespace).with_context(|| {
+        format!(
+            "failed to prepare {} for account setup",
+            namespace.display()
+        )
+    })
 }
 
 fn finish_failed_initialization(

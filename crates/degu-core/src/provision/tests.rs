@@ -229,6 +229,43 @@ fn provision_self_test(
     )
 }
 
+/// One directory, asked for by two sides that must not drift: provisioning requires
+/// this component at exactly 0755 and refuses anything else, and a caller that has to
+/// bring a legacy namespace up to that mode needs to know which directory it is. A
+/// derivation that answered a different path would migrate the wrong one and leave the
+/// refusal in place.
+#[test]
+fn the_published_namespace_is_the_one_provisioning_publishes() {
+    let home = crate::secure_test_tempdir().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
+    let created = provision_self_test(&canonical_home).unwrap();
+
+    let home_for_lookup = canonical_home.clone();
+    let derived = super::published_namespace_with(|| Ok(home_for_lookup.clone())).unwrap();
+    // Exact, not a prefix: the anchor sits two levels below the namespace, so a
+    // derivation that pushed one component too many is also a prefix of it and
+    // would migrate a directory whose mode provisioning never asked about.
+    let published = created
+        .path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the anchor sits below the namespace");
+    assert_eq!(
+        published,
+        derived.as_path(),
+        "provisioning published under {} and this derives {}",
+        published.display(),
+        derived.display()
+    );
+    let mode = std::fs::metadata(&derived).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(
+        mode,
+        PUBLIC_MODE,
+        "{} is the component provisioning requires at 0755",
+        derived.display()
+    );
+}
+
 #[test]
 fn self_flavor_uses_trusted_account_base_and_real_backend_certification() {
     let home = crate::secure_test_tempdir().unwrap();

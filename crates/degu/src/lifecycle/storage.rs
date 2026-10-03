@@ -21,6 +21,7 @@ mod validation;
 pub(crate) use validation::ensure_managed_trash_root;
 #[cfg(test)]
 use validation::ensure_managed_trash_root_with_sync;
+pub(crate) use validation::publish_existing_namespace;
 use validation::{ensure_state_parent, validate_existing_trash_root};
 
 use super::journal::isolate_partial_tail;

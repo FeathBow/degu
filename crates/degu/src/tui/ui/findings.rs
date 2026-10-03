@@ -256,3 +256,28 @@ fn empty_message(app: &App) -> &'static str {
     }
     "No findings in this section."
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The width is derived from a list of statuses, which keeps it from being written
+    /// down and going stale — but nothing notices when a status stops being on that
+    /// list. #166 is the truncation the derivation exists to make impossible, and a
+    /// status dropped from the list reintroduces it silently at every terminal size.
+    #[test]
+    fn the_status_column_fits_every_status_it_can_draw() {
+        for status in [
+            cleanup::label(DispositionMode::Eligible),
+            cleanup::label(DispositionMode::OptIn),
+            cleanup::label(DispositionMode::ReportOnly),
+            BLOCKED_STATUS,
+        ] {
+            assert!(
+                status.len() <= STATUS_WIDTH,
+                "{status:?} needs {} columns and the status column is {STATUS_WIDTH}",
+                status.len()
+            );
+        }
+    }
+}

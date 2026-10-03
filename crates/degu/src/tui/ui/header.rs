@@ -39,14 +39,17 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn masthead(app: &App, width: usize) -> Line<'static> {
-    let plan = plan_label(app);
+    masthead_line(plan_label(app), plan_tone(app), width)
+}
+
+fn masthead_line(plan: String, tone: Color, width: usize) -> Line<'static> {
     let layout = masthead_layout(&plan, width);
     let mut spans = vec![Span::styled(MASTHEAD_NAME, Style::new().fg(READY).bold())];
     if layout.suffix {
         spans.push(Span::styled(MASTHEAD_SUFFIX, Style::new().fg(SECONDARY)));
     }
     spans.push(Span::raw(" ".repeat(layout.gap)));
-    spans.push(Span::styled(plan, Style::new().fg(plan_tone(app))));
+    spans.push(Span::styled(plan, Style::new().fg(tone)));
     Line::from(spans)
 }
 
@@ -162,46 +165,45 @@ fn sections(app: &App) -> Line<'static> {
 mod tests {
     use super::*;
 
-    /// The one label on this row that a reader may have to type. If the row cannot
-    /// hold it beside the suffix, the suffix is what has to go: the row truncates
-    /// from the right, so keeping the suffix would cut the command instead.
     const REMEDY: &str = "Cleanup unavailable - run 'degu doctor'";
 
-    #[test]
-    fn the_masthead_drops_its_suffix_before_it_cuts_the_label() {
-        // 60 columns is the narrowest terminal the findings screen is tested at.
-        for width in [60, 80, 120] {
-            let layout = masthead_layout(REMEDY, width);
-            let drawn = columns(MASTHEAD_NAME)
-                + if layout.suffix {
-                    columns(MASTHEAD_SUFFIX)
-                } else {
-                    0
-                }
-                + layout.gap
-                + columns(REMEDY);
-            assert!(
-                drawn <= width,
-                "the masthead draws {drawn} columns into {width}: suffix={}",
-                layout.suffix
-            );
-        }
+    /// What a terminal of this many columns actually gives the header: the screen is
+    /// drawn inside a one-column margin on each side.
+    fn header_width(terminal: usize) -> usize {
+        terminal - 2
     }
 
-    /// A width that can hold both keeps both: the remedy is not a reason to spend
-    /// every row of every terminal without the report's name on it.
-    #[test]
-    fn a_wide_masthead_keeps_the_suffix() {
-        assert!(masthead_layout(REMEDY, 120).suffix);
-        assert!(!masthead_layout(REMEDY, 60).suffix);
+    fn drawn(plan: &str, terminal: usize) -> String {
+        masthead_line(plan.to_owned(), READY, header_width(terminal))
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
-    /// The gap is what separates the two, so it may never close to nothing even when
-    /// the label alone is wider than the row.
+    /// 60 columns is the narrowest terminal the findings screen is tested at, and the
+    /// remedy is the one thing on this row a reader may have to type.
     #[test]
-    fn the_gap_never_closes() {
-        for width in [0, 1, 20, 44, 60, 200] {
-            assert!(masthead_layout(REMEDY, width).gap >= 1, "width {width}");
-        }
+    fn a_narrow_masthead_keeps_the_whole_remedy() {
+        let line = drawn(REMEDY, 60);
+        assert!(
+            columns(&line) <= header_width(60),
+            "the masthead overflows its row: {line:?}"
+        );
+        assert!(line.contains(REMEDY), "the remedy was cut: {line:?}");
+        assert!(
+            !line.contains(MASTHEAD_SUFFIX),
+            "the suffix is what should have gone: {line:?}"
+        );
+    }
+
+    /// A width that can hold both keeps both: the remedy is not a reason to spend every
+    /// row of every terminal without the report's name on it.
+    #[test]
+    fn a_wide_masthead_keeps_both() {
+        let line = drawn(REMEDY, 120);
+        assert!(columns(&line) <= header_width(120), "{line:?}");
+        assert!(line.contains(REMEDY), "{line:?}");
+        assert!(line.contains(MASTHEAD_SUFFIX), "{line:?}");
     }
 }

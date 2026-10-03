@@ -60,7 +60,12 @@ pub(super) fn print(report: &ScanReport) -> Result<()> {
 fn print_scan_incomplete(report: &ScanReport) -> Result<()> {
     let marked_totals = (!report.findings.is_empty() && report.findings_lower_bound())
         || (!report.runtime_findings.is_empty() && report.runtime_lower_bound());
-    print_scan_incomplete_warning(report.is_lower_bound(), marked_totals, report.ui)
+    print_scan_incomplete_warning(
+        report.is_lower_bound(),
+        marked_totals,
+        report.incomplete_regions.has_measurement_events(),
+        report.ui,
+    )
 }
 
 /// The one end-of-report pointer at --details. A report with folded tiers

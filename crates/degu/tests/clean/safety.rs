@@ -69,6 +69,43 @@ fn clean_rejects_canonical_alias_overlap_before_mutation() {
     assert!(!state.path().join("degu/ops.jsonl").exists());
 }
 
+/// A refused root contributes nothing, so saying only that the rendered totals
+/// are lower bounds leaves a reader thinking the numbers are merely
+/// conservative. The region ledger already records the root, which is how the
+/// mutation gates know to fail closed; what was missing is any surface saying
+/// so, and with no finding to mark there is not even a `>=` to notice.
+#[cfg(unix)]
+#[test]
+fn a_refused_symlink_root_is_named_as_unmeasured_not_only_as_a_lower_bound() {
+    let home = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let alias = home.path().join("pip-cache-alias");
+    std::fs::write(
+        target.path().join("CACHEDIR.TAG"),
+        format!("{CACHEDIR_TAG_SIGNATURE}\n"),
+    )
+    .unwrap();
+    std::fs::write(target.path().join("payload"), [0_u8; 4096]).unwrap();
+    std::os::unix::fs::symlink(target.path(), &alias).unwrap();
+
+    let scan = degu()
+        .env("HOME", home.path())
+        .env("PIP_CACHE_DIR", &alias)
+        .args(["scan", "--only", "pip"])
+        .output()
+        .unwrap();
+    assert!(scan.status.success());
+    let stdout = String::from_utf8(scan.stdout).unwrap();
+    assert!(
+        stdout.contains("could not be measured"),
+        "the refusal has to be visible without reading stderr: {stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&scan.stderr).contains("symlink adapter root refused"),
+        "the diagnostic stays where diagnostics go"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn final_symlink_adapter_root_is_incomplete_and_never_cleaned() {

@@ -19,6 +19,7 @@ pub(in crate::commands::clean) fn print(prepared: &PreparedClean) -> Result<()> 
     print_scan_incomplete_warning(
         prepared.scan_status.is_lower_bound(),
         marked_totals,
+        prepared.unmeasured_locations,
         prepared.settings.ui,
     )?;
     print_protected_gate_note(prepared)?;

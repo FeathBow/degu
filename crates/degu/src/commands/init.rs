@@ -58,8 +58,26 @@ fn refuse_activated_store_in(ctx: &DetectCtx) -> Result<()> {
 /// under a different `XDG_STATE_HOME` is not visible here, so a clean result
 /// is evidence and not proof: it catches the case degu itself creates by
 /// default, which is the one people land in.
+/// Bring the namespace provisioning publishes to the mode it requires.
+///
+/// Ordered after the activated-store refusal on purpose: an account that must
+/// not be initialized is not an account whose directories this should be
+/// touching. Nothing here creates an authority, and the migration it runs is the
+/// same one a lifecycle command runs under its mutation lock.
+fn migrate_legacy_namespace(namespace: &std::path::Path) -> Result<()> {
+    crate::lifecycle::prepare_product_namespace(namespace).with_context(|| {
+        format!(
+            "failed to prepare {} for account setup",
+            namespace.display()
+        )
+    })
+}
+
 pub(crate) fn run(json: bool) -> Result<()> {
     refuse_if_a_store_is_already_activated()?;
+    let namespace = degu_core::provision::current_euid_published_namespace()
+        .context("failed to resolve this account's degu state namespace")?;
+    migrate_legacy_namespace(&namespace)?;
     let outcome = match initialize_current_euid_self_authority() {
         Ok(outcome) => outcome,
         Err(error @ SelfAuthorityInitializationError::PostProvision(_)) => {
@@ -103,6 +121,53 @@ fn finish_failed_initialization(
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The layout an earlier version left behind: the namespace owner-only, and the
+    /// entries inside it relying on that for their privacy. Provisioning requires the
+    /// namespace at exactly 0755 and refuses anything else, so setup on this account
+    /// failed at the command `doctor` had just recommended.
+    #[test]
+    fn a_legacy_owner_only_namespace_reaches_the_published_mode() {
+        let state = tempfile::Builder::new().tempdir().unwrap();
+        let namespace = state.path().join("degu");
+        std::fs::create_dir(&namespace).unwrap();
+        std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let lock = namespace.join("lock");
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        migrate_legacy_namespace(&namespace).unwrap();
+
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode(&namespace),
+            0o755,
+            "provisioning requires exactly 0755"
+        );
+        // Widened last for this reason: an entry that inherited its privacy from the
+        // 0700 namespace must not become readable the moment the namespace opens.
+        assert_eq!(
+            mode(&lock) & 0o077,
+            0,
+            "the lock kept a mode that relied on a private parent"
+        );
+    }
+
+    /// A namespace that is absent is the ordinary first-use case, not an error, and it
+    /// has to arrive at the same mode as one that was migrated.
+    #[test]
+    fn an_absent_namespace_is_created_at_the_published_mode() {
+        let state = tempfile::Builder::new().tempdir().unwrap();
+        let namespace = state.path().join("degu");
+        migrate_legacy_namespace(&namespace).unwrap();
+        assert_eq!(
+            std::fs::metadata(&namespace).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+    }
+
     use super::*;
 
     fn ctx_with_state(state: &std::path::Path) -> DetectCtx {

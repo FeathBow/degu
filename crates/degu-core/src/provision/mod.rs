@@ -172,6 +172,34 @@ pub fn provision_activation_anchor(
 /// The target is derived exclusively from the account database and the fixed
 /// self-managed layout. Callers cannot select a UID or path. Root is rejected:
 /// administrators must use [`provision_activation_anchor`] instead.
+/// The namespace provisioning requires at exactly `0755`, derived from the
+/// account database like every other side of this protocol, so ambient `HOME`
+/// and `XDG_STATE_HOME` cannot redirect it.
+///
+/// A caller that wants to provision on an account an earlier version left at
+/// `0700` has to bring this component to the published mode first. Provisioning
+/// will not: it is create-only by contract, and a migration is not a create.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn current_euid_published_namespace() -> Result<PathBuf, AccountBaseError> {
+    published_namespace_with(account::self_anchor_base)
+}
+
+/// The derivation, with the account lookup injected so a test can hold it beside
+/// the scaffold `provision_flavor` publishes and require the two to agree. They
+/// have to name the same directory: one asks for the mode the other requires.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn published_namespace_with<F>(mut account_home_lookup: F) -> Result<PathBuf, AccountBaseError>
+where
+    F: FnMut() -> Result<PathBuf, AccountBaseError>,
+{
+    let mut path = account_home_lookup()?;
+    for component in account::SELF_STATE_COMPONENTS {
+        path.push(component);
+    }
+    path.push(account::PRODUCT_COMPONENTS[0]);
+    Ok(path)
+}
+
 pub fn provision_current_euid_self_activation_anchor()
 -> Result<ActivationAnchorProvisioningOutcome, ActivationAnchorProvisioningError> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]

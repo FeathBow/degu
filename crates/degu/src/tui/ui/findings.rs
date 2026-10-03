@@ -1,8 +1,9 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, Wrap};
 
-use crate::presentation::escape_terminal_text;
+use crate::presentation::{cleanup, escape_terminal_text};
 use crate::tui::report::{Class, Finding, Section};
+use degu_core::finding::DispositionMode;
 
 use super::format;
 use super::text::elide;
@@ -15,7 +16,31 @@ const COLUMN_GAPS: usize = 4;
 const TABLE_CHROME: usize = 3;
 const CURSOR_WIDTH: usize = 1;
 const MARK_WIDTH: usize = 1;
-const STATUS_WIDTH: usize = 14;
+/// What a blocked row shows where a classification would be. Named so the column it
+/// has to fit is computed from the same place it is written.
+const BLOCKED_STATUS: &str = "Blocked";
+/// Wide enough for the longest thing this column shows, derived rather than written
+/// down: #166 reworded one classification and a hardcoded width truncated it silently
+/// at every terminal size.
+const STATUS_WIDTH: usize = widest(&[
+    cleanup::label(DispositionMode::Eligible),
+    cleanup::label(DispositionMode::OptIn),
+    cleanup::label(DispositionMode::ReportOnly),
+    BLOCKED_STATUS,
+]);
+
+/// Labels are ASCII, so byte length is display width.
+const fn widest(labels: &[&str]) -> usize {
+    let mut widest = 0;
+    let mut index = 0;
+    while index < labels.len() {
+        if labels[index].len() > widest {
+            widest = labels[index].len();
+        }
+        index += 1;
+    }
+    widest
+}
 const ECOSYSTEM_WIDTH: usize = 14;
 const FULL_STATUS_MIN_WIDTH: usize = 55;
 const ECOSYSTEM_MIN_WIDTH: usize = 100;
@@ -152,7 +177,7 @@ fn finding_row(item: (&Finding, usize), columns: &Columns, app: &App) -> Row<'st
     // would be rejected. What this row knows is the refusal, so it says that.
     let refused = app.decisions().refusal(finding.path()).is_some();
     let status = match (refused, columns.status == STATUS_WIDTH) {
-        (true, true) => "Blocked",
+        (true, true) => BLOCKED_STATUS,
         (true, false) => "!",
         (false, true) => class.label(),
         (false, false) => symbol(class),

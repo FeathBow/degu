@@ -99,7 +99,7 @@ fn scan_human_report_only_table_prints_disclaimer_once() {
     assert!(stdout.contains("Not managed"));
     assert_eq!(
         stdout
-            .matches("Reported only; degu never cleans these locations.")
+            .matches("Reported only; no clean acts on these locations.")
             .count(),
         1
     );

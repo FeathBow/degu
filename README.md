@@ -30,7 +30,7 @@ Excluded by default; preview a path before including it.
  huggingface  12.0 MiB  today       3  costly to regenerate  ~/.cache/huggingface/hub/models--bert--base
 
 Not managed - 1 location - 4.0 MiB
-Reported only; degu never cleans these locations.
+Reported only; no clean acts on these locations.
  source  on disk   idle  inodes  reason         path
  uv      4.0 MiB  today       2  managed by uv  ~/.cache/uv
 

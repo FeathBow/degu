@@ -535,3 +535,27 @@ fn macos_extended_acl_on_a_traversed_directory_fails_closed() {
         Err(UvCacheRootSealError::UnsafePath { .. })
     ));
 }
+
+/// The finding's own text is where a reader of `scan --details` or the review's full
+/// record learns what to do about this cache, so it has to name the explicit command
+/// and the one uv version that command accepts. #173 found it still describing native
+/// prune as something degu could not do yet, months after it could.
+///
+/// The version is held to the audited constant rather than read for shape, because the
+/// text and the constant live in different crates and the adapter cannot see this one.
+#[test]
+fn the_cache_rationale_names_the_reclaim_command_and_the_version_it_accepts() {
+    let rationale = degu_adapters::UV_CACHE_RATIONALE;
+    assert!(
+        rationale.contains("degu reclaim uv"),
+        "the finding does not name the command that can reclaim it: {rationale}"
+    );
+    assert!(
+        rationale.contains(&AUDITED_UV_PRUNE_VERSION.to_string()),
+        "the finding names a uv version other than the audited {AUDITED_UV_PRUNE_VERSION}: {rationale}"
+    );
+    assert!(
+        rationale.contains("degu undo cannot restore it"),
+        "the finding does not say native prune leaves degu's trash and undo out: {rationale}"
+    );
+}

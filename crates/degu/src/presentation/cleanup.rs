@@ -13,7 +13,11 @@ use degu_core::safety::{
 const ELIGIBLE_EXPLANATION: &str =
     "Cleaned by default; a preview checks whether sealed staging can move them.";
 const REVIEW_EXPLANATION: &str = "Excluded by default; preview a path before including it.";
-const UNMANAGED_EXPLANATION: &str = "Reported only; degu never cleans these locations.";
+/// A clean never acts on this tier, which is not the same as degu having no way to
+/// reclaim one of them: `degu reclaim uv` is an explicit command outside clean, and a
+/// finding that has one says so in its own rationale. Claiming degu never cleans these
+/// locations put that out of reach of anyone reading the group header.
+const UNMANAGED_EXPLANATION: &str = "Reported only; no clean acts on these locations.";
 
 pub(crate) const fn label(mode: DispositionMode) -> &'static str {
     match mode {

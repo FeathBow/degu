@@ -237,7 +237,7 @@ fn clean_not_managed_path_does_not_offer_unrelated_review_authority() {
     assert!(out.status.success(), "{stdout}");
     assert!(stdout.contains("Not managed"), "{stdout}");
     assert!(
-        stdout.contains("degu never cleans these locations"),
+        stdout.contains("no clean acts on these locations"),
         "{stdout}"
     );
     assert!(!stdout.contains("models--org--name"), "{stdout}");

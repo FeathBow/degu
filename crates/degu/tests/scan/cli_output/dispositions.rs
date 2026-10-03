@@ -98,7 +98,7 @@ fn assert_bucket_hierarchy(stdout: &str) {
         "{stdout}"
     );
     assert!(
-        stdout.contains("Reported only; degu never cleans these locations."),
+        stdout.contains("Reported only; no clean acts on these locations."),
         "{stdout}"
     );
     assert!(stdout.contains("costly to regenerate"), "{stdout}");

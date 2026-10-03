@@ -181,12 +181,30 @@ fn self_referential_doc_links_point_at_files_this_commit_has() {
         .join("../..")
         .canonicalize()
         .expect("the workspace root is two levels above this crate");
+    // lychee is pointed at every markdown file in the tree, so the check that replaces
+    // it for this prefix reads the same set. Asking git for it also keeps locally
+    // excluded working notes out, which are not part of the commit and not published.
+    let listed = std::process::Command::new("git")
+        .args(["ls-files", "-z", "*.md"])
+        .current_dir(&root)
+        .output()
+        .expect("git lists the markdown files this commit has");
+    assert!(listed.status.success(), "git ls-files failed");
+    let names: Vec<&str> = std::str::from_utf8(&listed.stdout)
+        .expect("tracked paths are UTF-8")
+        .split('\0')
+        .filter(|name| !name.is_empty())
+        .collect();
+    assert!(
+        names.len() >= 6,
+        "only {} markdown files were listed; the pathspec stopped matching",
+        names.len()
+    );
+
     let mut checked = 0;
-    for (name, text) in [
-        ("README.md", README),
-        ("docs/usage.md", USAGE),
-        ("docs/safety.md", SAFETY),
-    ] {
+    for name in &names {
+        let text = std::fs::read_to_string(root.join(name))
+            .unwrap_or_else(|error| panic!("{name} is unreadable: {error}"));
         for (index, _) in text.match_indices(PREFIX) {
             let tail = &text[index + PREFIX.len()..];
             let path: String = tail
@@ -206,7 +224,8 @@ fn self_referential_doc_links_point_at_files_this_commit_has() {
     // or the extraction stopped matching them.
     assert!(
         checked >= 6,
-        "only {checked} self-referential links were found; the exclusion in lychee.toml \
-         covers a prefix nothing is checking"
+        "only {checked} self-referential links were found across {} documents; the \
+         exclusion in lychee.toml covers a prefix nothing is checking",
+        names.len()
     );
 }

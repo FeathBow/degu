@@ -274,6 +274,8 @@ pub(super) fn assert_activation_and_wal(anchor: &std::path::Path, state: &std::p
     assert!(store.join("seal.wal").is_file());
 }
 
+#[cfg(target_os = "macos")]
+pub(super) use crate::common::set_provenance_xattr;
 pub(super) use crate::common::{
     certify_backend, require_sealed_fixture_backend, set_ordinary_xattr, strip_extended_attributes,
 };

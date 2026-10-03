@@ -331,6 +331,33 @@ fn directory_xattr_purge_is_gated_after_stage_and_remains_undoable() {
     assert!(nested.join("inner.whl").exists(), "the subtree was lost");
 }
 
+/// macOS attaches `com.apple.provenance` by itself, including to directories a cache
+/// creates. It records where bytes came from and grants nothing, so a directory
+/// restored without it is restricted exactly as it was. Counting it would have put
+/// permanent deletion out of reach on this platform rather than making it safer.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_directory_carrying_only_provenance_stays_purgeable() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let nested = fixture.cache.join("wheels");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(nested.join("inner.whl"), b"inner").unwrap();
+    set_provenance_xattr(&nested);
+
+    let preview = fixture.run(&["clean", "-n", "--purge", "--json"]);
+    assert_output_success(&preview);
+    let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    let preflight = &preview["staging_preflight"][0];
+    assert_eq!(preflight["contains_directory_xattrs"], false, "{preview:#}");
+    assert_eq!(
+        preflight["purge_admission"]["supported"], true,
+        "{preview:#}"
+    );
+}
+
 /// The human preview has to promise what execution will do. A tree whose only extended
 /// attributes are on regular files is now deleted, so the preview that used to say it
 /// would not be must say it will.

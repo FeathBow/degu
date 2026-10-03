@@ -748,7 +748,13 @@ pub(crate) fn directories_carry_xattrs(
         };
         let directory = opened.as_ref().unwrap_or(root);
         match with_fd(directory, |fd| collect_fd_xattr_names(&fd)) {
-            CollectedXattrs::Names(names) if !names.is_empty() => return Ok(true),
+            CollectedXattrs::Names(names)
+                if names.iter().any(|name| {
+                    crate::admission::directory_xattr_blocks_purge(current_xattr_platform(), name)
+                }) =>
+            {
+                return Ok(true);
+            }
             CollectedXattrs::Names(_) => {}
             CollectedXattrs::Unknown => {
                 return Err(HeldTreeError::DirectoryXattrEvidenceUnavailable(relative));

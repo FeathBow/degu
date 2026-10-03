@@ -3349,10 +3349,12 @@ fn verified_purge_accepts_admitted_regular_xattrs() {
     );
     let transaction = TransactionId([0x88; 16]);
     let mut ready = stage_production(&fixture, transaction);
-    ready
+    let authority = ready
         .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
         .expect("a tree whose file xattrs the proof binds is purgeable");
-    assert!(!fixture.destination_root.join("child/data").exists());
+    ready.execute_verified_purge(authority).unwrap();
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purged));
+    assert!(!fixture.destination_root.exists());
 }
 
 #[cfg(target_os = "linux")]

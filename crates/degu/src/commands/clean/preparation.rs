@@ -43,6 +43,11 @@ pub(super) struct PreparedClean {
     /// zero when the gate never ran or the scan recorded none. Human output
     /// discloses the exclusion; JSON stays frozen.
     pub(super) protected_regions_excluded: usize,
+    /// Whether the ledger holds a location that could not be measured. Derived
+    /// here because the ledger is not carried past preparation, and asked for
+    /// by the incompleteness wording, which otherwise reports only that the
+    /// totals it did render are lower bounds.
+    pub(super) unmeasured_locations: bool,
     /// Count of planned findings dropped for a non-UTF-8 path, reported as omitted.
     pub(super) unrepresentable: usize,
     pub(super) settings: CleanSettings,
@@ -225,6 +230,7 @@ pub(super) fn prepare(args: CleanArgs, ui: Ui) -> Result<PreparedClean> {
     } else {
         0
     };
+    let unmeasured_locations = incomplete_regions.has_measurement_events();
     // Guard identity is independent of sealed-staging availability. Preview
     // must check the complete plan just like execution, including blocked,
     // deferred, and unavailable items.
@@ -238,6 +244,7 @@ pub(super) fn prepare(args: CleanArgs, ui: Ui) -> Result<PreparedClean> {
         exclusions,
         scan_status,
         protected_regions_excluded,
+        unmeasured_locations,
         unrepresentable,
         settings: request.settings,
         scope: request.scope,

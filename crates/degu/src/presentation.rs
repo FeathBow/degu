@@ -305,21 +305,40 @@ pub(crate) fn print_hardlink_summary(
 /// wording carries the meaning so the warning tone only reinforces it.
 /// `marked_totals` says whether any rendered total carries the lower-bound
 /// mark; without one the honest claim is missing results, not lower bounds.
+///
+/// `unmeasured` says whether the region ledger holds a measurement event. The
+/// two are independent and both were observed together on a host whose cache
+/// roots were symlinks: totals carried the mark because one location was
+/// truncated, while six whole roots were refused and contributed nothing. The
+/// ledger already named those roots — it is what the mutation gates read — but
+/// the lower-bound sentence described only the marked totals, so a reader
+/// concluded the numbers shown were merely conservative rather than missing
+/// whole locations.
 pub(crate) fn print_scan_incomplete_warning(
     incomplete: bool,
     marked_totals: bool,
+    unmeasured: bool,
     ui: Ui,
 ) -> anyhow::Result<()> {
     if !incomplete {
         return Ok(());
     }
-    let warning = if marked_totals {
-        format!(
+    let warning = match (marked_totals, unmeasured) {
+        (true, true) => format!(
+            "Scan incomplete: totals marked {} are lower bounds, and some locations could not be measured.",
+            ui.glyphs.lower_bound
+        ),
+        (true, false) => format!(
             "Scan incomplete: totals marked {} are lower bounds.",
             ui.glyphs.lower_bound
-        )
-    } else {
-        "Scan incomplete: results may be missing.".to_owned()
+        ),
+        // A refused root produces no finding, so there is no total to mark and
+        // nothing on screen hints that anything was skipped at all.
+        (false, true) => {
+            "Scan incomplete: some locations could not be measured, so results may be missing."
+                .to_owned()
+        }
+        (false, false) => "Scan incomplete: results may be missing.".to_owned(),
     };
     crate::output::stdoutln!("{}", ui.toned_prose(0, &warning, semantic::Tone::Review))
 }

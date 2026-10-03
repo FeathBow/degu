@@ -176,7 +176,9 @@ fn lower_bound_banner_and_fold_line_agree_on_lower_bound_marks() {
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.contains("Scan incomplete: totals marked >= are lower bounds."),
+        stdout.contains(
+            "Scan incomplete: totals marked >= are lower bounds, and some locations could not be measured."
+        ),
         "stdout: {stdout}"
     );
     assert!(

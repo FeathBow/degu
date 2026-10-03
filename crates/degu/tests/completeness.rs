@@ -308,9 +308,11 @@ fn unreadable_nested_claimed_root_reports_incomplete() {
         stdout.lines().next().unwrap().contains("detected across"),
         "stdout: {stdout}"
     );
+    // The root this scan could not read is why it is incomplete, so the banner
+    // has to say that and not only that the totals it did render are bounds.
     assert_eq!(
         stdout.lines().nth(1).unwrap(),
-        "Scan incomplete: totals marked >= are lower bounds.",
+        "Scan incomplete: totals marked >= are lower bounds, and some locations could not be measured.",
         "stdout: {stdout}"
     );
 }

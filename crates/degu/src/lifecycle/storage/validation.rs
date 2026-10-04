@@ -134,11 +134,13 @@ pub(crate) fn publish_existing_namespace(home: &Path, namespace: &Path) -> Resul
 /// The namespace, reached the way provisioning reaches it. `None` means there is
 /// nothing here this may publish.
 ///
-/// The account base and the system path above it go through the walk provisioning
-/// rebinds the base with, which authenticates each directory and admits a symlink
-/// only when the link and the chain it resolves to authenticate as well. Below the
-/// base no symlink is legitimate, so those components are opened one at a time
-/// with no-follow, and each one is authenticated before the next is reached.
+/// The base goes through `authenticated_self_managed_base`, which is the contract
+/// provisioning itself authenticates a base with — not merely the trusted walk, which
+/// admits a symlink the lexical runtime path could never consume. Below the base no
+/// symlink is legitimate, so those components are opened one at a time with no-follow,
+/// and each is put to provisioning's own question before the next is reached. Nothing
+/// here re-derives what provisioning accepts; asking it twice in two crates is how the
+/// two came apart.
 fn open_authenticated_chain(home: &Path, namespace: &Path) -> Result<Option<OwnedFd>> {
     let Ok(relative) = namespace.strip_prefix(home) else {
         anyhow::bail!(
@@ -147,9 +149,10 @@ fn open_authenticated_chain(home: &Path, namespace: &Path) -> Result<Option<Owne
             home.display()
         );
     };
-    let Ok(mut current) = degu_walk::resolve_trusted_directory(home, "account base") else {
+    let Ok(base) = degu_core::provision::authenticated_self_managed_base(home) else {
         return Ok(None);
     };
+    let mut current = base.into_directory();
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let mut walked = home.to_path_buf();
     for component in relative.components() {
@@ -168,32 +171,11 @@ fn open_authenticated_chain(home: &Path, namespace: &Path) -> Result<Option<Owne
                     .with_context(|| format!("failed to open {}", walked.display()));
             }
         };
-        if !authenticates_as_this_account(&current, &walked)? {
+        if !degu_core::provision::self_managed_component_authenticates(&current, &walked) {
             return Ok(None);
         }
     }
     Ok(Some(current))
-}
-
-/// Whether provisioning would accept this directory as one of the account's own.
-///
-/// This asks what `validate_directory` asks of a self-managed component: owned by
-/// this account, and granting write to nobody else. The mode a migration exists to
-/// widen is a private one, so a directory anyone else can write to is never one to
-/// widen — doing it would take from provisioning the evidence that made it refuse.
-/// No sticky exemption, deliberately: `directory_grants_foreign_mutation` allows
-/// shared write on a sticky directory and provisioning allows none, and the sticky
-/// bit decides who may remove an entry, not who may add one.
-///
-/// An ACL can grant what the mode bits do not show, and provisioning refuses a
-/// component carrying one. A probe that cannot read one answers with uncertainty
-/// rather than absence, so it fails closed here too.
-fn authenticates_as_this_account(held: &OwnedFd, path: &Path) -> Result<bool> {
-    let stat =
-        rustix::fs::fstat(held).with_context(|| format!("failed to inspect {}", path.display()))?;
-    Ok(stat.st_uid == rustix::process::geteuid().as_raw()
-        && stat.st_mode as u32 & SHARED_WRITE_MASK == 0
-        && degu_core::backend::require_held_fd_acl_absent(held).is_ok())
 }
 
 pub(super) fn ensure_state_parent(parent: &Path) -> Result<()> {

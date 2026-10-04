@@ -372,6 +372,72 @@ fn provision(
     )
 }
 
+/// An account base that has passed everything provisioning asks of it before it
+/// creates anything.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub struct AuthenticatedAccountBase {
+    directory: OwnedFd,
+    identity: (u64, u64),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl AuthenticatedAccountBase {
+    /// The held base, to open the chain beneath it from.
+    pub fn into_directory(self) -> OwnedFd {
+        self.directory
+    }
+
+    fn identity(&self) -> (u64, u64) {
+        self.identity
+    }
+}
+
+/// The account base, authenticated the way self-managed provisioning authenticates it
+/// before it creates anything.
+///
+/// The trusted walk alone is not that contract: it admits a symlink whose chain
+/// authenticates, and runtime consumes the lexical path, so provisioning also requires
+/// that path to resolve with no symlink in it, no ACL on any ancestor, and a certified
+/// local backend underneath. Anything that runs before provisioning and means to change
+/// a directory inside this base authenticates through here, or it changes something
+/// provisioning is about to refuse.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn authenticated_self_managed_base(
+    home: &Path,
+) -> Result<AuthenticatedAccountBase, ActivationAnchorProvisioningError> {
+    let directory = degu_walk::resolve_trusted_directory(home, "self-managed account base")
+        .map_err(|source| io_error(home, source))?;
+    let identity = directory_identity(&directory, home)?;
+    // Reject a lexical passwd-home path that runtime could never consume before
+    // creating even the shared self-managed scaffold.
+    preflight_runtime_parent(&home.join(SELF_STATE_COMPONENTS[0]), &directory)?;
+    Ok(AuthenticatedAccountBase {
+        directory,
+        identity,
+    })
+}
+
+/// Whether provisioning would accept this held directory as a component of the
+/// account's own chain, asked of everything except the published mode.
+///
+/// `DirectoryKind::System` is the question provisioning asks of `.local` and `state`,
+/// and it is the right question for the namespace itself before it is published: the
+/// exact published mode is the one thing a migration must not require, and System
+/// requires all the rest — this account owns it, nobody else may write to it, it
+/// carries no ACL, it sits on a certified local backend, and it has a strong birth
+/// identity.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn self_managed_component_authenticates(directory: &OwnedFd, path: &Path) -> bool {
+    validate_directory(
+        directory,
+        path,
+        rustix::process::geteuid().as_raw(),
+        DirectoryKind::System,
+        BackendProbe::Real,
+    )
+    .is_ok()
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn provision_flavor(
     flavor: ProvisioningFlavor<'_>,
@@ -382,24 +448,15 @@ fn provision_flavor(
 ) -> Result<ActivationAnchorProvisioningOutcome, ActivationAnchorProvisioningError> {
     let filesystem_root = flavor.base();
     let mut path = filesystem_root.to_path_buf();
-    let mut current = if flavor.uses_trusted_account_base() {
-        degu_walk::resolve_trusted_directory(filesystem_root, "self-managed account base")
-            .map_err(|source| io_error(filesystem_root, source))?
+    // The system base retains its existing checks.
+    let (mut current, trusted_base_identity) = if flavor.uses_trusted_account_base() {
+        let base = authenticated_self_managed_base(filesystem_root)?;
+        let identity = base.identity();
+        (base.into_directory(), Some(identity))
     } else {
-        rustix::fs::open(filesystem_root, OPEN_DIRECTORY, Mode::empty())
-            .map_err(|error| io_error(filesystem_root, error.into()))?
-    };
-    // The trusted resolver permits trusted symlinks. Before creating self-managed
-    // state, also require the lexical runtime path to be no-follow, ACL-free, and
-    // on a certified local backend. The system base retains its existing checks.
-    let trusted_base_identity = if flavor.uses_trusted_account_base() {
-        let identity = directory_identity(&current, filesystem_root)?;
-        // Reject a lexical passwd-home path that runtime could never consume
-        // before creating even the shared self-managed scaffold.
-        preflight_runtime_parent(&filesystem_root.join(SELF_STATE_COMPONENTS[0]), &current)?;
-        Some(identity)
-    } else {
-        None
+        let directory = rustix::fs::open(filesystem_root, OPEN_DIRECTORY, Mode::empty())
+            .map_err(|error| io_error(filesystem_root, error.into()))?;
+        (directory, None)
     };
     let root = if flavor.uses_trusted_account_base() {
         None

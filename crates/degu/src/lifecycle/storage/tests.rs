@@ -119,20 +119,42 @@ fn an_existing_private_namespace_is_migrated_and_its_entries_narrowed_first() {
     }
 }
 
+/// A base the account could plausibly own. `tempfile` creates its directory with the
+/// ambient umask, and the Linux suite runs under `umask 002`, which leaves it
+/// group-writable — a base the trusted walk refuses, so every assertion below would
+/// hold because nothing was reached rather than because nothing was published.
+fn account_home() -> tempfile::TempDir {
+    let base = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    base
+}
+
+/// Every directory in a chain made one the trusted walk accepts, so the mode a test
+/// sets after this is the only thing that can stop it. The umask leaves them
+/// group-writable, and a refusal any of them could have caused says nothing about the
+/// one under test.
+fn owner_only<P: AsRef<std::path::Path>>(directories: impl IntoIterator<Item = P>) {
+    for directory in directories {
+        std::fs::set_permissions(directory.as_ref(), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+    }
+}
+
 /// Below the account base a symlink is not a legitimate component, and following one
 /// would reach a namespace outside the chain provisioning will authenticate. The link
 /// target here holds a namespace that would otherwise be migrated, so the assertions
 /// fail if the walk ever follows it.
 #[test]
 fn publishing_through_a_symlinked_ancestor_creates_and_changes_nothing() {
-    let base = tempfile::tempdir().unwrap();
+    let base = account_home();
     let elsewhere = base.path().join("elsewhere");
-    let victim = elsewhere.join("state").join("degu");
+    let state = elsewhere.join("state");
+    let victim = state.join("degu");
     std::fs::create_dir_all(&victim).unwrap();
     let lock = victim.join("lock");
     std::fs::write(&lock, b"").unwrap();
     std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
-    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o700)).unwrap();
+    owner_only([&victim, &state, &elsewhere]);
     let local = base.path().join(".local");
     std::os::unix::fs::symlink(&elsewhere, &local).unwrap();
 
@@ -157,7 +179,7 @@ fn publishing_through_a_symlinked_ancestor_creates_and_changes_nothing() {
 /// private.
 #[test]
 fn publishing_a_shared_writable_namespace_leaves_its_mode_as_evidence() {
-    let base = tempfile::tempdir().unwrap();
+    let base = account_home();
     let namespace = base.path().join("degu");
     std::fs::create_dir(&namespace).unwrap();
     let lock = namespace.join("lock");
@@ -190,6 +212,7 @@ fn publishing_below_a_shared_writable_directory_above_the_base_changes_nothing()
     let namespace = home.join("degu");
     std::fs::create_dir_all(&namespace).unwrap();
     std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::set_permissions(outer.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
 
     super::validation::publish_existing_namespace(&home, &namespace).unwrap();
@@ -207,11 +230,12 @@ fn publishing_below_a_shared_writable_directory_above_the_base_changes_nothing()
 /// predicate would have let through.
 #[test]
 fn publishing_under_a_sticky_shared_writable_ancestor_changes_nothing() {
-    let base = tempfile::tempdir().unwrap();
+    let base = account_home();
     let local = base.path().join(".local");
-    let namespace = local.join("state").join("degu");
+    let state = local.join("state");
+    let namespace = state.join("degu");
     std::fs::create_dir_all(&namespace).unwrap();
-    std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();
+    owner_only([&namespace, &state, &local]);
     std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o1777)).unwrap();
 
     super::validation::publish_existing_namespace(base.path(), &namespace).unwrap();
@@ -229,11 +253,12 @@ fn publishing_under_a_sticky_shared_writable_ancestor_changes_nothing() {
 /// alone.
 #[test]
 fn publishing_under_a_shared_writable_ancestor_changes_nothing() {
-    let base = tempfile::tempdir().unwrap();
+    let base = account_home();
     let local = base.path().join(".local");
-    let namespace = local.join("state").join("degu");
+    let state = local.join("state");
+    let namespace = state.join("degu");
     std::fs::create_dir_all(&namespace).unwrap();
-    std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();
+    owner_only([&namespace, &state, &local]);
     std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o770)).unwrap();
 
     super::validation::publish_existing_namespace(base.path(), &namespace).unwrap();
@@ -252,7 +277,7 @@ fn publishing_under_a_shared_writable_ancestor_changes_nothing() {
 /// account setup had just created for it.
 #[test]
 fn publishing_an_absent_namespace_creates_nothing() {
-    let base = tempfile::tempdir().unwrap();
+    let base = account_home();
     let namespace = base.path().join(".local").join("state").join("degu");
 
     super::validation::publish_existing_namespace(base.path(), &namespace).unwrap();
@@ -267,7 +292,7 @@ fn publishing_an_absent_namespace_creates_nothing() {
 /// provisioning requires it at exactly 0755.
 #[test]
 fn publishing_an_existing_private_namespace_reaches_the_published_mode() {
-    let base = tempfile::tempdir().unwrap();
+    let base = account_home();
     let namespace = base.path().join("degu");
     std::fs::create_dir(&namespace).unwrap();
     std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();

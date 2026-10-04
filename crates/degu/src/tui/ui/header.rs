@@ -9,7 +9,8 @@ use super::text::columns;
 use super::theme::{ACCENT, CAUTION, READY, ROSE, SECONDARY};
 use super::{App, View};
 
-const MASTHEAD_PREFIX: &str = "degu  / storage report";
+const MASTHEAD_NAME: &str = "degu";
+const MASTHEAD_SUFFIX: &str = "  / storage report";
 const HEADER_GAP: usize = 3;
 const BROWSER_HEIGHT: u16 = 2;
 const DETAIL_HEIGHT: u16 = 4;
@@ -38,16 +39,38 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn masthead(app: &App, width: usize) -> Line<'static> {
-    let plan = plan_label(app);
-    let gap = width
-        .saturating_sub(columns(MASTHEAD_PREFIX) + columns(&plan) + HEADER_GAP)
-        .max(1);
-    Line::from(vec![
-        Span::styled("degu", Style::new().fg(READY).bold()),
-        Span::styled("  / storage report", Style::new().fg(SECONDARY)),
-        Span::raw(" ".repeat(gap)),
-        Span::styled(plan, Style::new().fg(plan_tone(app))),
-    ])
+    masthead_line(plan_label(app), plan_tone(app), width)
+}
+
+fn masthead_line(plan: String, tone: Color, width: usize) -> Line<'static> {
+    let layout = masthead_layout(&plan, width);
+    let mut spans = vec![Span::styled(MASTHEAD_NAME, Style::new().fg(READY).bold())];
+    if layout.suffix {
+        spans.push(Span::styled(MASTHEAD_SUFFIX, Style::new().fg(SECONDARY)));
+    }
+    spans.push(Span::raw(" ".repeat(layout.gap)));
+    spans.push(Span::styled(plan, Style::new().fg(tone)));
+    Line::from(spans)
+}
+
+struct MastheadLayout {
+    suffix: bool,
+    gap: usize,
+}
+
+/// Which parts of the masthead a row of this width can hold. The row truncates
+/// from the right, so the suffix goes before the label: the suffix is decoration
+/// and the label can be a command. The threshold is measured from the label
+/// rather than written down, so rewording it cannot silently truncate it.
+fn masthead_layout(plan: &str, width: usize) -> MastheadLayout {
+    let compact = columns(MASTHEAD_NAME) + columns(plan) + HEADER_GAP;
+    let full = compact + columns(MASTHEAD_SUFFIX);
+    let suffix = full <= width;
+    let used = if suffix { full } else { compact };
+    MastheadLayout {
+        suffix,
+        gap: width.saturating_sub(used).max(1),
+    }
 }
 
 fn plan_label(app: &App) -> String {
@@ -130,4 +153,73 @@ fn sections(app: &App) -> Line<'static> {
             })
             .collect::<Vec<_>>(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collection::{ScanCompleteness, ScanStatus};
+    use crate::lifecycle::StoreCoverage;
+    use crate::tui::report::ScanReport;
+    use crate::tui::staged::Staged;
+
+    /// An account whose cleanup is unavailable, which is the only state that puts a
+    /// command on this row.
+    fn blocked_app() -> App {
+        let status = ScanStatus::requested_for_test(false, false);
+        App::new(
+            ScanReport::new(
+                Vec::new(),
+                Vec::new(),
+                ScanCompleteness {
+                    findings: status,
+                    runtime: status,
+                },
+            ),
+            Staged::new(Vec::new(), StoreCoverage::Complete),
+            std::path::PathBuf::from("/home/user"),
+            true,
+            crate::advisory::Advisories::disabled_for_test(),
+            |_| None,
+        )
+    }
+
+    /// The screen is drawn inside a one-column margin on each side.
+    fn header_width(terminal: usize) -> usize {
+        terminal - 2
+    }
+
+    fn drawn(terminal: usize) -> String {
+        masthead(&blocked_app(), header_width(terminal))
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// 60 columns is the narrowest terminal the findings screen is tested at.
+    #[test]
+    fn a_narrow_masthead_keeps_the_whole_remedy() {
+        let line = drawn(60);
+        assert!(
+            columns(&line) <= header_width(60),
+            "the masthead overflows its row: {line:?}"
+        );
+        assert!(
+            line.contains("degu doctor"),
+            "the command the row exists to give was cut: {line:?}"
+        );
+        assert!(
+            !line.contains(MASTHEAD_SUFFIX),
+            "the suffix is what should have gone: {line:?}"
+        );
+    }
+
+    #[test]
+    fn a_wide_masthead_keeps_both() {
+        let line = drawn(120);
+        assert!(columns(&line) <= header_width(120), "{line:?}");
+        assert!(line.contains("degu doctor"), "{line:?}");
+        assert!(line.contains(MASTHEAD_SUFFIX), "{line:?}");
+    }
 }

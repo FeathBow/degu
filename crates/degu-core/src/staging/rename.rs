@@ -8,9 +8,11 @@
 use crate::authority::TransactionState;
 use crate::backend::held::{
     HardlinkTopologyFold, HeldTreeError, HeldTreeLimits, HeldTreeSealError, HeldTreeV3CollectError,
-    ManifestV3CodecError, PendingV3Inventory, StreamedV3Inventory, StructureEvidence,
-    decode_hardlink_scratch_record, decode_pre_seal_directory_plan_record,
-    hardlink_scratch_sentinel_record, structure_evidence_from_v3_record,
+    ManifestV3CodecError, PendingV3Inventory, PreSealDirectoryPlanRecord, PreSealV3Inventory,
+    StreamedV3Inventory, StructureEvidence, decode_hardlink_scratch_record,
+    decode_pre_seal_directory_plan_record, directory_plan_chain_holds_parent,
+    extend_directory_plan_chain, hardlink_scratch_sentinel_record,
+    structure_evidence_from_v3_record,
 };
 use crate::backend::{
     CertificationError, HeldLocalBackendEvidence, LocalModeRevalidationFailure, certify_held_fd,
@@ -416,6 +418,43 @@ impl StagedUnverifiedTree<'_> {
     }
 }
 
+/// Seals the stack's top frame and drops it.
+///
+/// The top is the deepest directory whose subtree the pass has finished, and the
+/// stack beneath it is its own root-to-directory chain, so the two arguments the
+/// seal wants are the same borrow of one vector. `seal_directory_for_staging`
+/// validates that chain against the target before it changes anything.
+fn seal_chain_top(
+    tree: &mut PreSealV3Inventory,
+    wal: &mut SealWal<RecoverySession>,
+    transaction: TransactionId,
+    source_root: &Path,
+    filesystem_id: &str,
+    mutation_id: &mut u64,
+    chain: &mut Vec<PreSealDirectoryPlanRecord>,
+) -> Result<(), StagingRenameError> {
+    let Some(target) = chain.last() else {
+        return Ok(());
+    };
+    tree.seal_directory_for_staging(
+        wal,
+        transaction,
+        source_root,
+        filesystem_id,
+        *mutation_id,
+        target,
+        chain,
+    )
+    .map_err(StagingRenameError::TreeSeal)?;
+    chain.pop();
+    *mutation_id = mutation_id
+        .checked_add(1)
+        .ok_or(StagingRenameError::TreeSeal(
+            HeldTreeSealError::MutationIdExhausted,
+        ))?;
+    Ok(())
+}
+
 pub(crate) fn execute_prepared_rename<'a>(
     wal: &'a mut SealWal<RecoverySession>,
     sidecars: &TreeSidecarStore,
@@ -703,63 +742,60 @@ pub(crate) fn execute_prepared_rename<'a>(
         .relative_path()
         .join(binding.metadata.source_basename());
     let mut mutation_id = 1_u64;
-    loop {
-        let encoded = match directory_plan.next_reverse() {
-            Ok(Some(record)) => record,
-            Ok(None) => break,
-            Err(error) => {
-                let _ = sidecars.cleanup_unpublished(wal);
-                return Err(StagingRenameError::Sidecar(error));
-            }
-        };
-        let target = match decode_pre_seal_directory_plan_record(&encoded) {
-            Ok(record) => record,
-            Err(error) => {
-                let _ = sidecars.cleanup_unpublished(wal);
-                return Err(StagingRenameError::ManifestCodec(error));
-            }
-        };
-        let mut chain = Vec::new();
-        let chain_result = directory_plan.for_each_forward(|encoded| {
-            let candidate = decode_pre_seal_directory_plan_record(encoded)
-                .map_err(HeldTreeV3CollectError::<std::convert::Infallible>::Codec)?;
-            tree.consider_directory_plan_ancestor(&target, candidate, &mut chain)
-                .map_err(HeldTreeV3CollectError::Tree)
-        });
-        if let Err(error) = chain_result {
-            let _ = sidecars.cleanup_unpublished(wal);
-            return Err(match error {
-                TreeSidecarFoldError::Sidecar(error) => StagingRenameError::Sidecar(error),
-                TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Tree(error)) => {
-                    StagingRenameError::HeldTree(error)
-                }
-                TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Codec(error)) => {
-                    StagingRenameError::ManifestCodec(error)
-                }
-                TreeSidecarFoldError::Fold(HeldTreeV3CollectError::Emit(never)) => match never {},
-            });
+    let filesystem_id = binding.metadata.filesystem_id().to_owned();
+    // One forward pass, with the root-to-current chain on a stack.
+    //
+    // The plan is emitted depth-first, so a directory is followed by its own subtree
+    // and nothing else. When a record arrives that is not a child of the stack top,
+    // every frame above its parent has had its whole subtree sealed, and is sealed
+    // now, deepest first. The stack is exactly the chain of its own top, which is
+    // what the seal asks for, and it is bounded by the tree's depth rather than by
+    // its size. The previous shape rescanned the whole plan for each of D
+    // directories to rebuild that chain.
+    //
+    // The two agreements `consider_directory_plan_ancestor` checked while scanning
+    // are checked here on the way in. Leaving them to the stack's shape would be the
+    // same arithmetic with nothing left to reject a plan whose depths or parents do
+    // not line up, so a malformed plan would seal against a chain that merely looked
+    // consistent.
+    let mut chain = Vec::new();
+    let seal_pass = directory_plan.for_each_forward(|encoded| {
+        let record = decode_pre_seal_directory_plan_record(encoded)
+            .map_err(StagingRenameError::ManifestCodec)?;
+        while !chain.is_empty() && !directory_plan_chain_holds_parent(&chain, &record) {
+            seal_chain_top(
+                &mut tree,
+                wal,
+                transaction,
+                &source_root,
+                &filesystem_id,
+                &mut mutation_id,
+                &mut chain,
+            )?;
         }
-        if let Err(error) = tree.seal_directory_for_staging(
+        extend_directory_plan_chain(&mut chain, record).map_err(StagingRenameError::HeldTree)?;
+        Ok(())
+    });
+    if let Err(error) = seal_pass {
+        let _ = sidecars.cleanup_unpublished(wal);
+        return Err(match error {
+            TreeSidecarFoldError::Sidecar(error) => StagingRenameError::Sidecar(error),
+            TreeSidecarFoldError::Fold(error) => error,
+        });
+    }
+    while !chain.is_empty() {
+        if let Err(error) = seal_chain_top(
+            &mut tree,
             wal,
             transaction,
             &source_root,
-            binding.metadata.filesystem_id(),
-            mutation_id,
-            &target,
-            &chain,
+            &filesystem_id,
+            &mut mutation_id,
+            &mut chain,
         ) {
             let _ = sidecars.cleanup_unpublished(wal);
-            return Err(StagingRenameError::TreeSeal(error));
+            return Err(error);
         }
-        mutation_id = match mutation_id.checked_add(1) {
-            Some(next) => next,
-            None => {
-                let _ = sidecars.cleanup_unpublished(wal);
-                return Err(StagingRenameError::TreeSeal(
-                    HeldTreeSealError::MutationIdExhausted,
-                ));
-            }
-        };
     }
     if let Err(error) = directory_plan.finish() {
         let _ = sidecars.cleanup_unpublished(wal);

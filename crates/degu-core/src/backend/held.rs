@@ -1459,6 +1459,17 @@ fn traverse_v2_with_sink<M: V2Traversal, E>(
     walked
         .entries
         .sort_unstable_by(|left, right| M::path(left).cmp(M::path(right)));
+    // Depth-first, so a directory is followed by its own subtree and by nothing else.
+    // The sealing pass holds one root-to-current chain on a stack and would otherwise
+    // have to rescan the whole plan for every directory. `Path` orders by component,
+    // which is what makes a subtree contiguous: compared as bytes, `a-b` falls between
+    // `a` and `a/c`. The root's relative path is empty, so it stays first, where the
+    // plan's validator requires it.
+    walked.directories.sort_unstable_by(|left, right| {
+        left.evidence
+            .relative_path
+            .cmp(&right.evidence.relative_path)
+    });
     require_parent_admission(
         &walked.parent,
         walked.backend,
@@ -2305,6 +2316,13 @@ impl CollectedPreSealV3Inventory {
         self.directories.len() as u64
     }
 
+    /// Emits the plan in the order the walk left it, which is depth-first: a
+    /// directory is followed by its own subtree and by nothing else.
+    ///
+    /// The sealing pass relies on that to hold one root-to-current chain on a stack
+    /// rather than rescanning the plan for every directory, and it does not take the
+    /// order on trust — `extend_directory_plan_chain` rejects a plan whose depths and
+    /// parents do not line up, which is what any other order produces.
     pub(crate) fn emit_directory_plan<E>(
         self,
         mut emit: impl FnMut(&[u8]) -> Result<(), E>,
@@ -2973,37 +2991,6 @@ impl PreSealV3Inventory {
         Ok(())
     }
 
-    /// Retains only the target's root-to-directory evidence while an authenticated
-    /// descriptor-only plan is scanned. The vector is bounded by max_depth, never
-    /// by the number of directories in the tree.
-    pub(crate) fn consider_directory_plan_ancestor(
-        &self,
-        target: &PreSealDirectoryPlanRecord,
-        candidate: PreSealDirectoryPlanRecord,
-        chain: &mut Vec<PreSealDirectoryPlanRecord>,
-    ) -> Result<(), HeldTreeError> {
-        let target_path = &target.evidence.relative_path;
-        let candidate_path = &candidate.evidence.relative_path;
-        let is_ancestor = candidate_path.as_os_str().is_empty()
-            || candidate_path == target_path
-            || path_is_beneath(candidate_path, target_path);
-        if !is_ancestor {
-            return Ok(());
-        }
-        if candidate.evidence.depth as usize != chain.len()
-            || candidate.evidence.depth > target.evidence.depth
-            || (candidate.evidence.depth > 0
-                && candidate_path.parent()
-                    != chain
-                        .last()
-                        .map(|record| record.evidence.relative_path.as_path()))
-        {
-            return Err(HeldTreeError::PostChanged(target_path.clone()));
-        }
-        chain.push(candidate);
-        Ok(())
-    }
-
     fn validate_directory_plan_chain(
         &self,
         target: &PreSealDirectoryPlanRecord,
@@ -3544,6 +3531,44 @@ fn encode_pre_seal_directory_plan_record(
     encoded.extend_from_slice(&evidence.group_gid.to_be_bytes());
     encoded.extend_from_slice(&evidence.observed_mode.to_be_bytes());
     debug_assert_eq!(encoded.len(), record_len);
+    Ok(())
+}
+
+/// Whether the chain's top frame is this record's parent.
+///
+/// The sealing pass pops and seals every frame for which this is false: the plan is
+/// depth-first, so a frame that is not the parent of the record arriving next has had
+/// its whole subtree emitted already.
+pub(crate) fn directory_plan_chain_holds_parent(
+    chain: &[PreSealDirectoryPlanRecord],
+    record: &PreSealDirectoryPlanRecord,
+) -> bool {
+    chain.last().is_some_and(|top| {
+        record.evidence.relative_path.parent() == Some(top.evidence.relative_path.as_path())
+    })
+}
+
+/// Extends the chain by one plan record, keeping the two agreements the previous
+/// scanning form checked as it collected ancestors: the chain holds exactly one frame
+/// per depth, and each frame's parent is the frame below it.
+///
+/// A stack keeps both by construction when the plan is well formed, which is why they
+/// are checked rather than assumed: a plan whose depths or parents do not line up would
+/// otherwise be sealed against a chain that merely looked consistent. The vector stays
+/// bounded by max_depth, never by the tree's size.
+pub(crate) fn extend_directory_plan_chain(
+    chain: &mut Vec<PreSealDirectoryPlanRecord>,
+    record: PreSealDirectoryPlanRecord,
+) -> Result<(), HeldTreeError> {
+    let evidence = &record.evidence;
+    if evidence.depth as usize != chain.len()
+        || (evidence.depth > 0
+            && evidence.relative_path.parent()
+                != chain.last().map(|top| top.evidence.relative_path.as_path()))
+    {
+        return Err(HeldTreeError::PostChanged(evidence.relative_path.clone()));
+    }
+    chain.push(record);
     Ok(())
 }
 

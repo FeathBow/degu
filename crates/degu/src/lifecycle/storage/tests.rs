@@ -119,32 +119,212 @@ fn an_existing_private_namespace_is_migrated_and_its_entries_narrowed_first() {
     }
 }
 
-/// Account setup runs before provisioning has authenticated anything, so the step it
-/// runs there creates nothing: a `create_dir_all` would build directories inside
-/// whatever a symlinked ancestor points at and only then hear provisioning refuse the
-/// chain it never authenticated.
+/// A base an account could plausibly have, satisfying the two things about a base that
+/// are not about the namespace at all.
+///
+/// It is owner-only: `tempfile` creates its directory with the ambient umask, the Linux
+/// suite runs under `umask 002`, and a group-writable base is one provisioning refuses,
+/// so every assertion below would hold because nothing was reached rather than because
+/// nothing was published. And it is named by a path with no symlink in it, because
+/// provisioning requires the lexical path to resolve without following one and the
+/// macOS temporary directory sits under `/var`, which is a link. Provisioning's own
+/// tests canonicalize for the same reason.
+struct AccountHome {
+    _guard: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+impl AccountHome {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+fn account_home() -> AccountHome {
+    use rustix::fs::{Mode, OFlags};
+
+    let guard = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(guard.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = guard.path().canonicalize().unwrap();
+    let held = rustix::fs::open(
+        &path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .unwrap();
+    // Said here rather than left to one puzzling assertion failure: provisioning takes
+    // only a certified local backend, so a temporary directory on anything else makes
+    // every test below report that nothing was published.
+    assert!(
+        degu_core::backend::certify_held_fd_backend(&held).is_ok(),
+        "these tests need the temporary directory on a certified local backend \
+         (ext4, xfs or apfs); a container's overlayfs is not one"
+    );
+    AccountHome {
+        _guard: guard,
+        path,
+    }
+}
+
+/// Every directory in a chain made one the trusted walk accepts, so the mode a test
+/// sets after this is the only thing that can stop it. The umask leaves them
+/// group-writable, and a refusal any of them could have caused says nothing about the
+/// one under test.
+fn owner_only<P: AsRef<std::path::Path>>(directories: impl IntoIterator<Item = P>) {
+    for directory in directories {
+        std::fs::set_permissions(directory.as_ref(), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+    }
+}
+
+/// Below the account base a symlink is not a legitimate component, and following one
+/// would reach a namespace outside the chain provisioning will authenticate. The link
+/// target here holds a namespace that would otherwise be migrated, so the assertions
+/// fail if the walk ever follows it.
 #[test]
 fn publishing_through_a_symlinked_ancestor_creates_and_changes_nothing() {
-    let base = tempfile::tempdir().unwrap();
+    let base = account_home();
     let elsewhere = base.path().join("elsewhere");
-    std::fs::create_dir(&elsewhere).unwrap();
-    let victim = elsewhere.join("state");
-    std::fs::create_dir(&victim).unwrap();
-    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let state = elsewhere.join("state");
+    let victim = state.join("degu");
+    std::fs::create_dir_all(&victim).unwrap();
+    let lock = victim.join("lock");
+    std::fs::write(&lock, b"").unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+    owner_only([&victim, &state, &elsewhere]);
     let local = base.path().join(".local");
     std::os::unix::fs::symlink(&elsewhere, &local).unwrap();
 
     super::validation::publish_existing_namespace(base.path(), &local.join("state").join("degu"))
         .unwrap();
 
-    assert!(
-        !victim.join("degu").exists(),
-        "nothing may be created through a link this has not authenticated"
-    );
     assert_eq!(
         std::fs::symlink_metadata(&victim).unwrap().mode() & 0o777,
         0o700,
-        "nothing through the link may be chmodded either"
+        "a namespace reachable only through the link may not be published"
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&lock).unwrap().mode() & 0o777,
+        0o644,
+        "nor may its entries be narrowed through one"
+    );
+}
+
+/// The trusted walk admits a symlink whose chain authenticates, so it hands this base
+/// back. Runtime consumes the lexical path and provisioning refuses a symlink anywhere
+/// in it, which makes the namespace underneath one the migration must leave alone.
+#[test]
+fn publishing_under_a_symlinked_account_home_changes_nothing() {
+    let outer = account_home();
+    let real = outer.path().join("real");
+    let namespace = real.join("degu");
+    std::fs::create_dir_all(&namespace).unwrap();
+    owner_only([&namespace, &real]);
+    let home = outer.path().join("home");
+    std::os::unix::fs::symlink(&real, &home).unwrap();
+
+    super::validation::publish_existing_namespace(&home, &home.join("degu")).unwrap();
+
+    assert_eq!(
+        std::fs::symlink_metadata(&namespace).unwrap().mode() & 0o777,
+        0o700,
+        "a base the lexical runtime path cannot reach is not a base to publish under"
+    );
+}
+
+/// The mode is what tells provisioning anyone could have written here, and
+/// provisioning refuses the namespace for it. Widening it would take that evidence
+/// away and leave the namespace looking like one an earlier version had merely kept
+/// private.
+#[test]
+fn publishing_a_shared_writable_namespace_leaves_its_mode_as_evidence() {
+    let base = account_home();
+    let namespace = base.path().join("degu");
+    std::fs::create_dir(&namespace).unwrap();
+    let lock = namespace.join("lock");
+    std::fs::write(&lock, b"").unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    super::validation::publish_existing_namespace(base.path(), &namespace).unwrap();
+
+    assert_eq!(
+        std::fs::symlink_metadata(&namespace).unwrap().mode() & 0o7777,
+        0o777,
+        "a namespace anyone can write to is not one to publish"
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&lock).unwrap().mode() & 0o777,
+        0o644,
+        "and its entries are not ours to narrow either"
+    );
+}
+
+/// The path above an account base is authenticated too, as part of the base contract: a
+/// directory anyone can write to up there could have the base replaced under it, so
+/// nothing below it is a namespace to publish.
+#[test]
+fn publishing_below_a_shared_writable_directory_above_the_base_changes_nothing() {
+    let outer = account_home();
+    let home = outer.path().join("home");
+    let namespace = home.join("degu");
+    std::fs::create_dir_all(&namespace).unwrap();
+    std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(outer.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    super::validation::publish_existing_namespace(&home, &namespace).unwrap();
+
+    assert_eq!(
+        std::fs::symlink_metadata(&namespace).unwrap().mode() & 0o777,
+        0o700,
+        "a base reached through a directory anyone can write to is not authenticated"
+    );
+}
+
+/// Provisioning permits no shared write at all on a component it manages, not even on
+/// a sticky one, so neither does this: the sticky bit decides who may remove an entry,
+/// not who may add one. This is the case the shared `directory_grants_foreign_mutation`
+/// predicate would have let through.
+#[test]
+fn publishing_under_a_sticky_shared_writable_ancestor_changes_nothing() {
+    let base = account_home();
+    let local = base.path().join(".local");
+    let state = local.join("state");
+    let namespace = state.join("degu");
+    std::fs::create_dir_all(&namespace).unwrap();
+    owner_only([&namespace, &state, &local]);
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o1777)).unwrap();
+
+    super::validation::publish_existing_namespace(base.path(), &namespace).unwrap();
+
+    assert_eq!(
+        std::fs::symlink_metadata(&namespace).unwrap().mode() & 0o777,
+        0o700,
+        "a sticky bit does not make an ancestor anyone can write to publishable"
+    );
+}
+
+/// Provisioning authenticates the whole chain and refuses a group-writable ancestor.
+/// The migration runs first, so it has to reach that refusal with the namespace as it
+/// found it rather than published inside a directory the account does not control
+/// alone.
+#[test]
+fn publishing_under_a_shared_writable_ancestor_changes_nothing() {
+    let base = account_home();
+    let local = base.path().join(".local");
+    let state = local.join("state");
+    let namespace = state.join("degu");
+    std::fs::create_dir_all(&namespace).unwrap();
+    owner_only([&namespace, &state, &local]);
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o770)).unwrap();
+
+    super::validation::publish_existing_namespace(base.path(), &namespace).unwrap();
+
+    assert_eq!(
+        std::fs::symlink_metadata(&namespace).unwrap().mode() & 0o777,
+        0o700,
+        "an ancestor provisioning will refuse must not have had the namespace widened under it"
     );
 }
 
@@ -155,7 +335,7 @@ fn publishing_through_a_symlinked_ancestor_creates_and_changes_nothing() {
 /// account setup had just created for it.
 #[test]
 fn publishing_an_absent_namespace_creates_nothing() {
-    let base = tempfile::tempdir().unwrap();
+    let base = account_home();
     let namespace = base.path().join(".local").join("state").join("degu");
 
     super::validation::publish_existing_namespace(base.path(), &namespace).unwrap();
@@ -170,7 +350,7 @@ fn publishing_an_absent_namespace_creates_nothing() {
 /// provisioning requires it at exactly 0755.
 #[test]
 fn publishing_an_existing_private_namespace_reaches_the_published_mode() {
-    let base = tempfile::tempdir().unwrap();
+    let base = account_home();
     let namespace = base.path().join("degu");
     std::fs::create_dir(&namespace).unwrap();
     std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();

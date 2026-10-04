@@ -119,14 +119,51 @@ fn an_existing_private_namespace_is_migrated_and_its_entries_narrowed_first() {
     }
 }
 
-/// A base the account could plausibly own. `tempfile` creates its directory with the
-/// ambient umask, and the Linux suite runs under `umask 002`, which leaves it
-/// group-writable — a base the trusted walk refuses, so every assertion below would
-/// hold because nothing was reached rather than because nothing was published.
-fn account_home() -> tempfile::TempDir {
-    let base = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    base
+/// A base an account could plausibly have, satisfying the two things about a base that
+/// are not about the namespace at all.
+///
+/// It is owner-only: `tempfile` creates its directory with the ambient umask, the Linux
+/// suite runs under `umask 002`, and a group-writable base is one provisioning refuses,
+/// so every assertion below would hold because nothing was reached rather than because
+/// nothing was published. And it is named by a path with no symlink in it, because
+/// provisioning requires the lexical path to resolve without following one and the
+/// macOS temporary directory sits under `/var`, which is a link. Provisioning's own
+/// tests canonicalize for the same reason.
+struct AccountHome {
+    _guard: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+impl AccountHome {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+fn account_home() -> AccountHome {
+    use rustix::fs::{Mode, OFlags};
+
+    let guard = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(guard.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = guard.path().canonicalize().unwrap();
+    let held = rustix::fs::open(
+        &path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .unwrap();
+    // Said here rather than left to one puzzling assertion failure: provisioning takes
+    // only a certified local backend, so a temporary directory on anything else makes
+    // every test below report that nothing was published.
+    assert!(
+        degu_core::backend::certify_held_fd_backend(&held).is_ok(),
+        "these tests need the temporary directory on a certified local backend \
+         (ext4, xfs or apfs); a container's overlayfs is not one"
+    );
+    AccountHome {
+        _guard: guard,
+        path,
+    }
 }
 
 /// Every directory in a chain made one the trusted walk accepts, so the mode a test
@@ -173,6 +210,28 @@ fn publishing_through_a_symlinked_ancestor_creates_and_changes_nothing() {
     );
 }
 
+/// The trusted walk admits a symlink whose chain authenticates, so it hands this base
+/// back. Runtime consumes the lexical path and provisioning refuses a symlink anywhere
+/// in it, which makes the namespace underneath one the migration must leave alone.
+#[test]
+fn publishing_under_a_symlinked_account_home_changes_nothing() {
+    let outer = account_home();
+    let real = outer.path().join("real");
+    let namespace = real.join("degu");
+    std::fs::create_dir_all(&namespace).unwrap();
+    owner_only([&namespace, &real]);
+    let home = outer.path().join("home");
+    std::os::unix::fs::symlink(&real, &home).unwrap();
+
+    super::validation::publish_existing_namespace(&home, &home.join("degu")).unwrap();
+
+    assert_eq!(
+        std::fs::symlink_metadata(&namespace).unwrap().mode() & 0o777,
+        0o700,
+        "a base the lexical runtime path cannot reach is not a base to publish under"
+    );
+}
+
 /// The mode is what tells provisioning anyone could have written here, and
 /// provisioning refuses the namespace for it. Widening it would take that evidence
 /// away and leave the namespace looking like one an earlier version had merely kept
@@ -201,13 +260,12 @@ fn publishing_a_shared_writable_namespace_leaves_its_mode_as_evidence() {
     );
 }
 
-/// The system path above an account base is authenticated as well, by the walk that
-/// resolves the base. A directory anyone can write to up there could have the base
-/// replaced under it, so nothing below it is a namespace to publish — and it is the
-/// only part of the chain no no-follow open would catch.
+/// The path above an account base is authenticated too, as part of the base contract: a
+/// directory anyone can write to up there could have the base replaced under it, so
+/// nothing below it is a namespace to publish.
 #[test]
 fn publishing_below_a_shared_writable_directory_above_the_base_changes_nothing() {
-    let outer = tempfile::tempdir().unwrap();
+    let outer = account_home();
     let home = outer.path().join("home");
     let namespace = home.join("degu");
     std::fs::create_dir_all(&namespace).unwrap();

@@ -2344,18 +2344,25 @@ where
             permissions: uncertain,
         };
     }
+    // The applied inverses, indexed once. Asking the whole permission list for
+    // each permission made every decision below quadratic in the number of
+    // sealed directories, and this runs on every startup.
+    let reversed: HashSet<u64> = transaction
+        .permissions
+        .iter()
+        .filter(|permission| permission.application == ApplicationStatus::Applied)
+        .filter_map(|permission| permission.reverses_mutation_id)
+        .collect();
+    let is_active = |permission: &DurablePermission| {
+        permission.application == ApplicationStatus::Applied
+            && permission.reverses_mutation_id.is_none()
+            && !reversed.contains(&permission.mutation_id)
+    };
     let active_permissions = || {
         transaction
             .permissions
             .iter()
-            .filter(|permission| {
-                permission.application == ApplicationStatus::Applied
-                    && permission.reverses_mutation_id.is_none()
-                    && !transaction.permissions.iter().any(|inverse| {
-                        inverse.application == ApplicationStatus::Applied
-                            && inverse.reverses_mutation_id == Some(permission.mutation_id)
-                    })
-            })
+            .filter(|permission| is_active(permission))
             .cloned()
             .collect::<Vec<_>>()
     };
@@ -2406,14 +2413,7 @@ where
     if transaction
         .permissions
         .iter()
-        .filter(|permission| {
-            permission.application == ApplicationStatus::Applied
-                && permission.reverses_mutation_id.is_none()
-                && !transaction.permissions.iter().any(|inverse| {
-                    inverse.application == ApplicationStatus::Applied
-                        && inverse.reverses_mutation_id == Some(permission.mutation_id)
-                })
-        })
+        .filter(|permission| is_active(permission))
         .any(|permission| identity(&permission.evidence) == RecoveryIdentity::Insufficient)
     {
         return RecoveryWork::RecoveryRequired {

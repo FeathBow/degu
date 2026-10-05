@@ -694,3 +694,137 @@ fn raw_state_transition_cannot_mint_object_bound_purge_authority() {
     }
     assert_eq!(engine.state(transaction), Some(TransactionState::Prepared));
 }
+
+/// Opening the engine actually compacts: without this, removing the call would
+/// leave every compaction test still passing and the feature unreachable.
+#[test]
+fn opening_the_engine_reclaims_terminal_transactions() {
+    use crate::seal::wal::{PermissionIntent, SealWal};
+
+    let temp = crate::secure_test_tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("wal-store");
+    let store = SealWalStore::open_or_create(&root).unwrap();
+
+    let evidence = |path: &str, mode: u32| {
+        PersistentRecoveryEvidence::new(
+            PathBuf::from(format!(
+                "registry/src/index.crates.io-1949cf8c6b5b557f/{path}"
+            )),
+            Some("fs".to_string()),
+            11,
+            22,
+            Some(33),
+            mode,
+        )
+        .unwrap()
+    };
+    let mut wal = SealWal::new(crate::MemoryWal::default()).unwrap();
+    let parent_identity = metadata().source_parent_identity();
+    // The one permission the parent-seal phase accepts is the exact
+    // metadata-bound source parent, so every transaction starts the same way.
+    let seal_the_parent = |wal: &mut SealWal<crate::MemoryWal>, transaction| {
+        wal.transition_staging_for_test(transaction, TransactionState::ParentSealIntent)
+            .unwrap();
+        wal.apply_staging_permission_mutation(
+            PermissionIntent {
+                transaction,
+                mutation_id: 0,
+                evidence: PersistentRecoveryEvidence::new(
+                    PathBuf::from("source-parent"),
+                    Some("fs".into()),
+                    parent_identity.device(),
+                    parent_identity.inode(),
+                    Some(parent_identity.incarnation().get()),
+                    0o500,
+                )
+                .unwrap(),
+                pre_mode: 0o770,
+                expected_mode: 0o500,
+                reverses_mutation_id: None,
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        wal.transition_staging_for_test(transaction, TransactionState::ParentSealed)
+            .unwrap();
+        wal.transition_staging_for_test(transaction, TransactionState::TreeSealIntent)
+            .unwrap();
+    };
+
+    let kept = TransactionId([200; 16]);
+    wal.begin_staging(kept, metadata()).unwrap();
+    seal_the_parent(&mut wal, kept);
+    // Two terminal transactions large enough to pay for the rewrite, each seal
+    // with the applied inverse a terminal restore requires.
+    for index in 0..2_u8 {
+        let dropped = TransactionId([index; 16]);
+        wal.begin_staging(dropped, metadata()).unwrap();
+        seal_the_parent(&mut wal, dropped);
+        for id in 1..=2_000 {
+            wal.apply_staging_permission_mutation(
+                PermissionIntent {
+                    transaction: dropped,
+                    mutation_id: id,
+                    evidence: evidence(&format!("gone-{index}-{id}"), 0o500),
+                    pre_mode: 0o770,
+                    expected_mode: 0o500,
+                    reverses_mutation_id: None,
+                },
+                || Ok(()),
+            )
+            .unwrap();
+        }
+        wal.transition_staging_for_test(dropped, TransactionState::RestoreIntent)
+            .unwrap();
+        for id in 1..=2_000 {
+            wal.apply_staging_permission_mutation(
+                PermissionIntent {
+                    transaction: dropped,
+                    mutation_id: 2_000 + id,
+                    evidence: evidence(&format!("gone-{index}-{id}"), 0o770),
+                    pre_mode: 0o500,
+                    expected_mode: 0o770,
+                    reverses_mutation_id: Some(id),
+                },
+                || Ok(()),
+            )
+            .unwrap();
+        }
+        // The parent seal needs its inverse for the same reason.
+        wal.apply_staging_permission_mutation(
+            PermissionIntent {
+                transaction: dropped,
+                mutation_id: 4_001,
+                evidence: PersistentRecoveryEvidence::new(
+                    PathBuf::from("source-parent"),
+                    Some("fs".into()),
+                    parent_identity.device(),
+                    parent_identity.inode(),
+                    Some(parent_identity.incarnation().get()),
+                    0o770,
+                )
+                .unwrap(),
+                pre_mode: 0o500,
+                expected_mode: 0o770,
+                reverses_mutation_id: Some(0),
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        wal.transition_staging_for_test(dropped, TransactionState::Restored)
+            .unwrap();
+    }
+    let before = crate::overwrite_test_wal(&root, &wal.into_inner().bytes);
+
+    let (engine, _report) = SealedStagingEngine::open(&store).unwrap();
+    let after = std::fs::metadata(root.join(crate::seal::store::WAL_FILE_NAME))
+        .unwrap()
+        .len();
+    assert!(
+        after < before,
+        "opening the engine must reclaim the terminal frames: {before} -> {after}"
+    );
+    assert_eq!(engine.state(kept), Some(TransactionState::TreeSealIntent));
+    assert_eq!(engine.state(TransactionId([0; 16])), None);
+    drop(engine);
+}

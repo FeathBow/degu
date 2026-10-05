@@ -1224,6 +1224,159 @@ fn quarantine_is_not_reported_as_a_committed_seal() {
     ));
 }
 
+/// The rewrite-is-worth-it rule at each of its boundaries. Expressed over
+/// numbers rather than over a 48 MiB fixture, because the pressure valve is
+/// otherwise only reachable by building one.
+#[test]
+fn compaction_pays_for_its_rewrite_only_at_the_stated_thresholds() {
+    const MIB: u64 = 1024 * 1024;
+    let cases: &[(&str, u64, u64, bool)] = &[
+        ("nothing to reclaim", 0, 8 * MIB, false),
+        ("a single stale frame", 215, 8 * MIB, false),
+        ("just under the byte floor", MIB - 1, 2 * MIB, false),
+        ("exactly the byte floor, half the file", MIB, 2 * MIB, true),
+        ("exactly a quarter of the file", 2 * MIB, 8 * MIB, true),
+        ("a hair under a quarter", 2 * MIB, 8 * MIB + 1, false),
+        ("above the floor but a thin share", 2 * MIB, 32 * MIB, false),
+        // Under pressure the share rule is dropped, so the same thin share
+        // that was refused above is taken.
+        ("a thin share under pressure", 2 * MIB, 48 * MIB, true),
+        ("one frame under pressure", 215, 48 * MIB, true),
+        ("nothing to reclaim under pressure", 0, 48 * MIB, false),
+        ("a full WAL with a thin share", MIB / 2, 64 * MIB, true),
+    ];
+    for (name, reclaimed, committed, expected) in cases {
+        assert_eq!(
+            compaction_is_worthwhile(*reclaimed, *committed),
+            *expected,
+            "{name}: reclaiming {reclaimed} of {committed}"
+        );
+    }
+    assert_eq!(
+        COMPACTION_PRESSURE_LEN,
+        48 * MIB,
+        "the pressure cases assume it"
+    );
+}
+
+/// Frame selection on its own: a dropped transaction's frames go, every other
+/// frame stays at its exact bytes, and the two counts add up to the file.
+#[test]
+fn compaction_selects_surviving_frames_byte_for_byte() {
+    let kept_transaction = tx(60);
+    let dropped_transaction = tx(61);
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    // Interleave the two so selection cannot pass by keeping a prefix.
+    for transaction in [kept_transaction, dropped_transaction] {
+        wal.begin(transaction).unwrap();
+    }
+    for transaction in [kept_transaction, dropped_transaction] {
+        wal.transition(transaction, TransactionState::ParentSealIntent)
+            .unwrap();
+        wal.apply_permission_mutation(
+            PermissionIntent {
+                transaction,
+                mutation_id: 1,
+                evidence: evidence("parent"),
+                pre_mode: 0o770,
+                expected_mode: 0o500,
+                reverses_mutation_id: None,
+            },
+            || Ok(()),
+        )
+        .unwrap();
+    }
+    // Only one of them reaches a state compaction may drop, and reaching it
+    // means restoring its seal: the state machine refuses a terminal restore
+    // whose applied seals have no applied inverse.
+    wal.transition(dropped_transaction, TransactionState::RestoreIntent)
+        .unwrap();
+    wal.apply_permission_mutation(
+        PermissionIntent {
+            transaction: dropped_transaction,
+            mutation_id: 2,
+            evidence: evidence_mode("parent", 0o770),
+            pre_mode: 0o500,
+            expected_mode: 0o770,
+            reverses_mutation_id: Some(1),
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    wal.transition(dropped_transaction, TransactionState::Restored)
+        .unwrap();
+
+    let bytes = wal.into_inner().bytes;
+    let replay = replay_bytes(&bytes);
+    let dropped = compaction_dropped_transactions(&replay);
+    assert_eq!(
+        dropped.iter().copied().collect::<Vec<_>>(),
+        vec![dropped_transaction],
+        "only the Restored transaction is dropped"
+    );
+
+    let selected = compaction_surviving_bytes(&bytes, &dropped).unwrap();
+    assert_eq!(selected.committed, bytes.len() as u64);
+    assert_eq!(
+        selected.bytes.len() as u64 + selected.reclaimed,
+        selected.committed,
+        "kept and reclaimed bytes must account for the whole file"
+    );
+    assert!(selected.reclaimed > 0);
+
+    // The survivor replays identically from the selected bytes, and the dropped
+    // transaction is simply absent.
+    let compacted = replay_bytes(&selected.bytes);
+    assert_eq!(
+        compacted.transactions.keys().copied().collect::<Vec<_>>(),
+        vec![kept_transaction]
+    );
+    assert_eq!(
+        compacted.transactions[&kept_transaction], replay.transactions[&kept_transaction],
+        "a surviving transaction must replay to exactly what it did before"
+    );
+    assert_eq!(compacted.committed_len, selected.bytes.len() as u64);
+}
+
+/// Every state the compaction predicate accepts, against the full enumeration,
+/// so a new transaction state cannot be dropped by default.
+#[test]
+fn compaction_drops_exactly_the_states_with_nothing_left_to_do() {
+    use TransactionState as S;
+    for state in [
+        S::Prepared,
+        S::ParentSealIntent,
+        S::ParentSealed,
+        S::TreeSealIntent,
+        S::TreeSealed,
+        S::RenameIntent,
+        S::StagedUnverified,
+        S::StagedSealed,
+        S::SourceParentRestoreIntent,
+        S::SourceParentRestored,
+        S::VerifiedCommitted,
+        S::UndoIntent,
+        S::UndoModesRestored,
+        S::UndoRenameIntent,
+        S::UndoConflict,
+        S::Purgeable,
+        S::PurgeIntent,
+        S::PurgeOutcome,
+        S::RollbackIntent,
+        S::RestoreIntent,
+        S::Quarantined,
+        S::RecoveryRequired,
+    ] {
+        assert!(
+            !compaction_drops_state(state),
+            "{state:?} still has something to restore, purge, undo, or report"
+        );
+    }
+    for state in [S::Purged, S::Restored, S::RolledBack] {
+        assert!(compaction_drops_state(state), "{state:?} is terminal");
+    }
+}
+
 #[test]
 fn inverse_binding_rejects_changed_stable_identity_and_cross_transaction_matches() {
     let original_evidence = evidence("source/tree");

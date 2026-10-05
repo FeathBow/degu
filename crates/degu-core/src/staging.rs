@@ -1376,9 +1376,8 @@ impl SealedStagingEngine {
     pub(crate) fn open(
         store: &SealWalStore,
     ) -> Result<(Self, StartupRecoveryReport), StagingEngineError> {
-        let sidecars = store.tree_sidecar_store()?;
         let mut recovery = store.try_lease()?;
-        let replay = recovery.replay_and_repair()?.clone();
+        let mut replay = recovery.replay_and_repair()?.clone();
         if replay
             .transactions
             .values()
@@ -1388,6 +1387,21 @@ impl SealedStagingEngine {
                 "transaction has no atomic staging metadata",
             ));
         }
+        // Reclaim the frames of transactions with nothing left to restore,
+        // purge, undo, or report. This runs after the bare-transaction gate
+        // above, so a legacy transaction still fails closed rather than being
+        // compacted out of the way. Skipped unless it pays for its rewrite;
+        // see ADR-0005.
+        if let Some(compacted) = store.compact_terminal_transactions(&recovery)? {
+            recovery = compacted;
+            replay = recovery
+                .replay()
+                .ok_or(ReplayError::InvalidHistory("leased WAL was not replayed"))?
+                .clone();
+        }
+        // Bound after compaction: the sidecar store pins the WAL's identity,
+        // and a compaction replaces that entry.
+        let sidecars = store.tree_sidecar_store()?;
         // A durable v12 reference is not usable unless its exact final sidecar
         // still satisfies the complete container commitment. Missing,
         // substituted, truncated, or tampered referenced sidecars are converted

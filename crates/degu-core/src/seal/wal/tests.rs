@@ -3105,3 +3105,312 @@ fn v11_allows_anchor_relative_parent_while_v10_rejects_empty_locator() {
         })
     ));
 }
+
+/// The index that replaced the per-directory scan, checked against the scan
+/// itself. The suite reached none of the clauses below — five mutations of the
+/// index left every test green — so each one gets a case here, and every case
+/// also asserts the two implementations agree.
+#[test]
+fn applied_tree_seal_mode_index_matches_the_scan_it_replaced() {
+    const PATH: &str = "pkg/registry";
+    const DEVICE: u64 = 0x10;
+    const INODE: u64 = 0x20;
+    const INCARNATION: u64 = 0x30;
+    const PRE_MODE: u32 = 0o775;
+    const SEALED_MODE: u32 = 0o755;
+
+    #[allow(clippy::too_many_arguments)]
+    fn permission(
+        mutation_id: u64,
+        phase: TransactionState,
+        path: &str,
+        device: u64,
+        inode: u64,
+        incarnation: Option<u64>,
+        pre_mode: u32,
+        evidence_mode: u32,
+        expected_mode: u32,
+        reverses_mutation_id: Option<u64>,
+        application: ApplicationStatus,
+    ) -> DurablePermission {
+        DurablePermission {
+            mutation_id,
+            phase,
+            evidence: PersistentRecoveryEvidence::new(
+                PathBuf::from(path),
+                Some("fs".into()),
+                device,
+                inode,
+                incarnation,
+                evidence_mode,
+            )
+            .unwrap(),
+            pre_mode,
+            expected_mode,
+            reverses_mutation_id,
+            application,
+        }
+    }
+
+    // The record a matching query must find, and the near misses each clause
+    // of the filter is responsible for rejecting.
+    let matching = || {
+        permission(
+            1,
+            TransactionState::TreeSealIntent,
+            PATH,
+            DEVICE,
+            INODE,
+            Some(INCARNATION),
+            PRE_MODE,
+            SEALED_MODE,
+            SEALED_MODE,
+            None,
+            ApplicationStatus::Applied,
+        )
+    };
+    /// A named set of durable permissions and the mode a query of the sealed
+    /// directory must answer for it.
+    type Case = (
+        &'static str,
+        Vec<(TransactionId, DurablePermission)>,
+        Option<u32>,
+    );
+
+    let cases: Vec<Case> = vec![
+        ("exact match", vec![(tx(1), matching())], Some(SEALED_MODE)),
+        ("no records at all", vec![], None),
+        (
+            "another transaction's seal",
+            vec![(tx(2), matching())],
+            None,
+        ),
+        (
+            "the parent seal, not a tree seal",
+            vec![(
+                tx(1),
+                permission(
+                    1,
+                    TransactionState::ParentSealIntent,
+                    PATH,
+                    DEVICE,
+                    INODE,
+                    Some(INCARNATION),
+                    PRE_MODE,
+                    SEALED_MODE,
+                    SEALED_MODE,
+                    None,
+                    ApplicationStatus::Applied,
+                ),
+            )],
+            None,
+        ),
+        (
+            "an intent whose application is unknown",
+            vec![(
+                tx(1),
+                DurablePermission {
+                    application: ApplicationStatus::IntentDurableApplicationUnknown,
+                    ..matching()
+                },
+            )],
+            None,
+        ),
+        (
+            "an inverse, not an original seal",
+            vec![(
+                tx(1),
+                DurablePermission {
+                    mutation_id: 2,
+                    reverses_mutation_id: Some(1),
+                    ..matching()
+                },
+            )],
+            None,
+        ),
+        (
+            "a seal of a different directory",
+            vec![(
+                tx(1),
+                permission(
+                    1,
+                    TransactionState::TreeSealIntent,
+                    "pkg/other",
+                    DEVICE,
+                    INODE,
+                    Some(INCARNATION),
+                    PRE_MODE,
+                    SEALED_MODE,
+                    SEALED_MODE,
+                    None,
+                    ApplicationStatus::Applied,
+                ),
+            )],
+            None,
+        ),
+        (
+            "the same path on another device",
+            vec![(
+                tx(1),
+                permission(
+                    1,
+                    TransactionState::TreeSealIntent,
+                    PATH,
+                    DEVICE + 1,
+                    INODE,
+                    Some(INCARNATION),
+                    PRE_MODE,
+                    SEALED_MODE,
+                    SEALED_MODE,
+                    None,
+                    ApplicationStatus::Applied,
+                ),
+            )],
+            None,
+        ),
+        (
+            "the same path at another inode",
+            vec![(
+                tx(1),
+                permission(
+                    1,
+                    TransactionState::TreeSealIntent,
+                    PATH,
+                    DEVICE,
+                    INODE + 1,
+                    Some(INCARNATION),
+                    PRE_MODE,
+                    SEALED_MODE,
+                    SEALED_MODE,
+                    None,
+                    ApplicationStatus::Applied,
+                ),
+            )],
+            None,
+        ),
+        (
+            "a recycled inode with a newer incarnation",
+            vec![(
+                tx(1),
+                permission(
+                    1,
+                    TransactionState::TreeSealIntent,
+                    PATH,
+                    DEVICE,
+                    INODE,
+                    Some(INCARNATION + 1),
+                    PRE_MODE,
+                    SEALED_MODE,
+                    SEALED_MODE,
+                    None,
+                    ApplicationStatus::Applied,
+                ),
+            )],
+            None,
+        ),
+        (
+            "evidence that carries no incarnation",
+            vec![(
+                tx(1),
+                permission(
+                    1,
+                    TransactionState::TreeSealIntent,
+                    PATH,
+                    DEVICE,
+                    INODE,
+                    None,
+                    PRE_MODE,
+                    SEALED_MODE,
+                    SEALED_MODE,
+                    None,
+                    ApplicationStatus::Applied,
+                ),
+            )],
+            None,
+        ),
+        (
+            "a seal taken from a different pre-seal mode",
+            vec![(
+                tx(1),
+                DurablePermission {
+                    pre_mode: 0o770,
+                    ..matching()
+                },
+            )],
+            None,
+        ),
+        (
+            "a record whose evidence and permission disagree on the mode",
+            vec![(
+                tx(1),
+                permission(
+                    1,
+                    TransactionState::TreeSealIntent,
+                    PATH,
+                    DEVICE,
+                    INODE,
+                    Some(INCARNATION),
+                    PRE_MODE,
+                    0o700,
+                    SEALED_MODE,
+                    None,
+                    ApplicationStatus::Applied,
+                ),
+            )],
+            None,
+        ),
+        (
+            "two applied seals matching the same query",
+            vec![
+                (tx(1), matching()),
+                (
+                    tx(1),
+                    DurablePermission {
+                        mutation_id: 2,
+                        ..matching()
+                    },
+                ),
+            ],
+            None,
+        ),
+        (
+            "a matching seal beside unrelated and reversed ones",
+            vec![
+                (tx(2), matching()),
+                (
+                    tx(1),
+                    DurablePermission {
+                        mutation_id: 7,
+                        reverses_mutation_id: Some(1),
+                        ..matching()
+                    },
+                ),
+                (tx(1), matching()),
+            ],
+            Some(SEALED_MODE),
+        ),
+    ];
+
+    for (name, permissions, expected) in cases {
+        let borrowed = || permissions.iter().map(|(owner, record)| (*owner, record));
+        let index = AppliedTreeSealModes::from_permissions(tx(1), borrowed());
+        let indexed = index.mode(Path::new(PATH), DEVICE, INODE, INCARNATION, PRE_MODE);
+        let scanned = AppliedTreeSealModes::mode_by_scan(
+            tx(1),
+            borrowed(),
+            Path::new(PATH),
+            DEVICE,
+            INODE,
+            INCARNATION,
+            PRE_MODE,
+        );
+        assert_eq!(
+            indexed, expected,
+            "index disagrees with the contract: {name}"
+        );
+        assert_eq!(
+            scanned, expected,
+            "scan disagrees with the contract: {name}"
+        );
+    }
+}

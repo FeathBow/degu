@@ -328,6 +328,89 @@ where
     Ok(())
 }
 
+/// Drops one trash root's registration, leaving the root itself and both logs alone.
+///
+/// Only a registration whose root is absent can be dropped, and absent is narrower
+/// than unreachable: `validate_existing_trash_root` answers `None` for `NotFound`
+/// alone and returns every other error, so a permission failure or an I/O error
+/// refuses here rather than being read as absence. What an absent root holds may
+/// still be there — an unmounted filesystem looks exactly like this — so this drops
+/// a pointer and claims nothing about what it pointed at.
+///
+/// Matching is lexical, because a path that is not there cannot be canonicalized and
+/// the registry records what was written.
+pub(crate) fn forget_trash_root(ctx: &DetectCtx, root: &Path) -> Result<()> {
+    // The whole read-modify-write runs under the lock every other mutation takes, so
+    // a clean registering a root cannot interleave with this rewrite.
+    let _lock = acquire_mutation_lock(ctx)?;
+    let registry = trashroots_registry(ctx);
+    let registered = read_registered_trash_roots(&registry)?;
+    if !registered.iter().any(|candidate| candidate == root) {
+        anyhow::bail!(
+            "{} is not a registered trash root; 'degu trash list' reaches the ones that are",
+            root.display()
+        );
+    }
+    if validate_existing_trash_root(root, CROSS_DEVICE_TRASH_NAME)?.is_some() {
+        anyhow::bail!(
+            "{} is still there, and its registration is how degu reaches what it holds; purge or undo its entries instead",
+            root.display()
+        );
+    }
+    let retained = registered
+        .iter()
+        .filter(|candidate| candidate.as_path() != root)
+        .map(|candidate| encode_trash_root(candidate))
+        .collect::<Result<Vec<_>>>()?;
+    rewrite_trash_registry(&registry, &retained)
+}
+
+/// Replaces the registry with exactly these lines.
+///
+/// A rewrite is new here: registration only appends, and a torn append is handled by
+/// sealing the partial tail on the next write. Removal cannot work that way, so the
+/// file is written beside itself, synced, and renamed over, and the directory is
+/// synced after so the rename survives too. A run that fails before the rename
+/// leaves the old registry untouched.
+fn rewrite_trash_registry(registry: &Path, lines: &[String]) -> Result<()> {
+    let parent = registry
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("trash registry has no parent: {}", registry.display()))?;
+    ensure_state_parent(parent)?;
+    // One fixed name is enough while the mutation lock is held, and it is created
+    // truncating, so a file left by an interrupted rewrite is overwritten rather
+    // than read.
+    let staging = parent.join("trashroots.rewriting");
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&staging)
+            .with_context(|| format!("failed to open {}", staging.display()))?;
+        for line in lines {
+            writeln!(file, "{line}")
+                .with_context(|| format!("failed to write {}", staging.display()))?;
+        }
+        file.flush()
+            .with_context(|| format!("failed to flush {}", staging.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", staging.display()))?;
+    }
+    std::fs::rename(&staging, registry).with_context(|| {
+        format!(
+            "failed to replace {} with {}",
+            registry.display(),
+            staging.display()
+        )
+    })?;
+    std::fs::File::open(parent)
+        .and_then(|parent| parent.sync_all())
+        .with_context(|| format!("failed to sync trash registry parent {}", parent.display()))?;
+    Ok(())
+}
+
 fn encode_trash_root(root: &Path) -> Result<String> {
     let encoded = root
         .to_str()
@@ -459,10 +542,13 @@ pub(crate) fn trash_roots(ctx: &DetectCtx) -> Result<Vec<PathBuf>> {
                     roots.push(validated.lexical);
                 }
             }
+            // Absent is not the same as gone: a filesystem that is not mounted
+            // looks exactly like this, and what the root holds may still be there.
+            // So the warning says what degu can see and names both ways forward.
             None => tracing::warn!(
                 target: "degu",
                 root = %root.display(),
-                "registered trash root no longer exists"
+                "registered trash root is not there; reconnect the filesystem it is on to reach what it holds, or 'degu trash forget' the registration once it is no longer needed"
             ),
         }
     }

@@ -18,7 +18,11 @@ const TOP_LEVEL_MAN_COMMANDS: &[&[&str]] = &[
     &["completions"],
     &["man"],
 ];
-const NESTED_MAN_COMMANDS: &[&[&str]] = &[&["trash", "list"], &["trash", "purge"]];
+const NESTED_MAN_COMMANDS: &[&[&str]] = &[
+    &["trash", "list"],
+    &["trash", "purge"],
+    &["trash", "forget"],
+];
 const ADMIN_MAN_COMMANDS: &[&[&str]] = &[&["admin"], &["admin", "setup"]];
 const RECLAIM_MAN_COMMANDS: &[&[&str]] = &[&["reclaim", "uv"]];
 

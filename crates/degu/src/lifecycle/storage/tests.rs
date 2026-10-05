@@ -438,6 +438,133 @@ fn registration_refuses_a_corrupt_registry_line() {
     assert_eq!(std::fs::read(&registry).unwrap(), original);
 }
 
+/// A state directory whose ancestors are owner-only, because the mutation lock and
+/// the registry both go through the namespace validation that refuses a shared-writable
+/// parent, and `tempfile` creates with the ambient umask.
+fn registry_fixture() -> (tempfile::TempDir, DetectCtx, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(state.join("degu")).unwrap();
+    for path in [dir.path(), state.as_path(), state.join("degu").as_path()] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let ctx = DetectCtx::for_test(
+        dir.path().to_path_buf(),
+        [("XDG_STATE_HOME".to_owned(), state.as_os_str().to_owned())],
+    );
+    let registry = state.join(TRASHROOTS_FILE);
+    (dir, ctx, registry)
+}
+
+/// The registration goes, and nothing else does: the other registration stays, and
+/// the operation log is not rewritten on the way past.
+#[test]
+fn forgetting_an_absent_root_drops_only_its_registration() {
+    let (dir, ctx, registry) = registry_fixture();
+    let gone = dir.path().join("gone/.degu-trash");
+    let kept = dir.path().join("kept/.degu-trash");
+    register_trash_root(&ctx.xdg_state(), &gone).unwrap();
+    register_trash_root(&ctx.xdg_state(), &kept).unwrap();
+    let ops = registry.parent().unwrap().join("ops.jsonl");
+    std::fs::write(&ops, b"{\"kept\":true}\n").unwrap();
+
+    super::forget_trash_root(&ctx, &gone).unwrap();
+
+    assert_eq!(
+        read_registered_trash_roots(&registry).unwrap(),
+        vec![kept],
+        "only the named registration may go"
+    );
+    assert_eq!(
+        std::fs::read(&ops).unwrap(),
+        b"{\"kept\":true}\n",
+        "the operation log is not this command's business"
+    );
+    assert!(
+        !registry
+            .parent()
+            .unwrap()
+            .join("trashroots.rewriting")
+            .exists(),
+        "the rewrite leaves nothing behind"
+    );
+}
+
+/// A root that is still there is reachable, and its registration is how degu reaches
+/// it. Dropping that would hide staged entries rather than a dead pointer.
+#[test]
+fn forgetting_refuses_a_root_that_is_still_there() {
+    let (dir, ctx, registry) = registry_fixture();
+    let parent = dir.path().join("present");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = parent.join(".degu-trash");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    register_trash_root(&ctx.xdg_state(), &root).unwrap();
+
+    let error = super::forget_trash_root(&ctx, &root).unwrap_err();
+
+    assert!(
+        format!("{error}").contains("is still there"),
+        "the refusal must be about the root being present: {error}"
+    );
+    assert_eq!(
+        read_registered_trash_roots(&registry).unwrap(),
+        vec![root],
+        "a refused forget changes nothing"
+    );
+}
+
+/// Absent is narrower than unreachable. A parent that cannot be searched makes the
+/// root unreadable, which is not evidence that it is gone, and the data under it may
+/// be exactly what someone is trying to recover.
+#[test]
+fn forgetting_refuses_a_root_it_cannot_inspect() {
+    let (dir, ctx, registry) = registry_fixture();
+    let parent = dir.path().join("sealed");
+    std::fs::create_dir_all(&parent).unwrap();
+    let root = parent.join(".degu-trash");
+    std::fs::create_dir(&root).unwrap();
+    register_trash_root(&ctx.xdg_state(), &root).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = super::forget_trash_root(&ctx, &root);
+
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let error = result.unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("failed to inspect"),
+        "an unreadable root must refuse as unreadable, not as absent: {message}"
+    );
+    assert_eq!(
+        read_registered_trash_roots(&registry).unwrap(),
+        vec![root],
+        "a refused forget changes nothing"
+    );
+}
+
+/// Nothing to drop, and saying so is not the same as dropping nothing: a typo should
+/// not report success.
+#[test]
+fn forgetting_refuses_a_root_that_was_never_registered() {
+    let (dir, ctx, registry) = registry_fixture();
+    let registered = dir.path().join("kept/.degu-trash");
+    register_trash_root(&ctx.xdg_state(), &registered).unwrap();
+
+    let error = super::forget_trash_root(&ctx, &dir.path().join("typo/.degu-trash")).unwrap_err();
+
+    assert!(
+        format!("{error}").contains("is not a registered trash root"),
+        "{error}"
+    );
+    assert_eq!(
+        read_registered_trash_roots(&registry).unwrap(),
+        vec![registered]
+    );
+}
+
 #[test]
 fn registration_seals_a_valid_unterminated_tail_before_appending() {
     let dir = tempfile::tempdir().unwrap();

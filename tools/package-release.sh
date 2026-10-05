@@ -76,6 +76,7 @@ write_man_page degu-undo.1 undo
 write_man_page degu-trash.1 trash
 write_man_page degu-trash-list.1 trash list
 write_man_page degu-trash-purge.1 trash purge
+write_man_page degu-trash-forget.1 trash forget
 write_man_page degu-reclaim.1 reclaim
 write_man_page degu-reclaim-uv.1 reclaim uv
 write_man_page degu-relocate.1 relocate

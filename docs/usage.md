@@ -116,6 +116,12 @@ degu trash purge
 
 `--path` narrows that plan to entries staged from at or under a path, so space can be reclaimed from one origin while the rest stay restorable by `degu undo`. It is repeatable, takes the same confirmation as a full purge, and matches the origin recorded in the operation log — the selector is resolved the same way that origin was, so a relative path, a `..`, or a symlinked ancestor all name the place they point at. The staged location itself is gone by then, so only the part of the path that still exists can be resolved; a selector that reaches no staged origin says so rather than reporting a purge of nothing:
 
+When a clean staged onto another filesystem, degu registered the trash root it created there. If that filesystem later goes away, every trash command warns about the registration it can no longer reach. Reconnect it to reach what it holds, or drop the registration once it is no longer wanted — the root and both logs are left alone, and nothing will point degu back at it:
+
+```sh
+degu trash forget /mnt/scratch/.degu-trash
+```
+
 ```sh
 degu trash purge --path ~/.cache/huggingface
 ```

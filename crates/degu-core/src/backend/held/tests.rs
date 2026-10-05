@@ -2356,8 +2356,12 @@ fn rewalk_rejects_acl_planted_after_collect() {
     ));
 }
 
+/// The streamed pre-seal plan must match the resident inventory it replaced, and it
+/// must be depth-first: the sealing pass holds one root-to-current chain on a stack
+/// instead of rescanning the plan per directory, and that only works when a directory
+/// is followed by its own subtree and nothing else.
 #[test]
-fn pre_seal_v3_stream_moves_the_historical_bfs_permission_plan_out_of_resident_state() {
+fn pre_seal_v3_stream_moves_the_permission_plan_out_of_resident_state_in_depth_first_order() {
     let (temp, root) = setup_tree();
     for path in ["z", "z/left", "a", "a/right", "z/left/deep"] {
         std::fs::create_dir_all(root.join(path)).unwrap();
@@ -2431,7 +2435,99 @@ fn pre_seal_v3_stream_moves_the_historical_bfs_permission_plan_out_of_resident_s
             .enumerate()
             .all(|(ordinal, record)| record.ordinal == ordinal as u64)
     );
+    // Depth-first: every record's parent is somewhere above it, and the record that
+    // follows is either its child or a sibling of one of its ancestors. Checking the
+    // stack discipline directly says it: walking the plan with a stack never has to
+    // look past the top for a parent.
+    let mut stack: Vec<&Path> = Vec::new();
+    for record in &decoded_plan {
+        let path = record.evidence.relative_path.as_path();
+        while stack.last().is_some_and(|top| path.parent() != Some(*top)) {
+            stack.pop();
+        }
+        assert_eq!(
+            stack.len(),
+            record.evidence.depth as usize,
+            "{} sits at stack depth {} rather than its own depth",
+            path.display(),
+            stack.len()
+        );
+        stack.push(path);
+    }
     assert_eq!(streamed_records, expected_records);
+}
+
+/// The two agreements the sealing pass checks as it pushes, and the frame it accepts
+/// when they hold. A stack keeps both by construction when the plan is well formed, so
+/// without these checks a malformed plan would be sealed against a chain that merely
+/// looked consistent.
+#[test]
+fn a_directory_plan_chain_refuses_a_frame_that_does_not_extend_it() {
+    let (temp, root) = setup_tree();
+    std::fs::create_dir_all(root.join("a/b/c")).unwrap();
+    std::fs::create_dir_all(root.join("z/left")).unwrap();
+    let tree = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
+
+    let record_for = |wanted: &str| {
+        let evidence = tree
+            .directories
+            .iter()
+            .find(|evidence| evidence.relative_path == Path::new(wanted))
+            .expect("the fixture walks this directory")
+            .clone();
+        let mut bytes = Vec::new();
+        encode_pre_seal_directory_plan_record(0, &evidence, &mut bytes).unwrap();
+        decode_pre_seal_directory_plan_record(&bytes).unwrap()
+    };
+
+    let mut chain = Vec::new();
+    extend_directory_plan_chain(&mut chain, record_for(""))
+        .expect("the root extends an empty chain");
+    extend_directory_plan_chain(&mut chain, record_for("a"))
+        .expect("a child of the top extends the chain");
+
+    let too_deep = extend_directory_plan_chain(&mut chain.clone(), record_for("a/b/c"));
+    assert!(
+        matches!(too_deep, Err(HeldTreeError::PostChanged(_))),
+        "a frame deeper than the chain must be refused: {too_deep:?}"
+    );
+
+    // A record whose depth disagrees with its path cannot reach the chain at all: the
+    // decoder refuses it, which is why the chain's own depth check is a layer behind
+    // this one rather than the one that catches it.
+    let forged = {
+        let mut evidence = tree
+            .directories
+            .iter()
+            .find(|evidence| evidence.relative_path == Path::new("a/b"))
+            .expect("the fixture walks this directory")
+            .clone();
+        evidence.depth = 5;
+        let mut bytes = Vec::new();
+        encode_pre_seal_directory_plan_record(0, &evidence, &mut bytes).unwrap();
+        decode_pre_seal_directory_plan_record(&bytes)
+    };
+    assert!(
+        matches!(forged, Err(ManifestV3CodecError::InvalidPath)),
+        "a depth that disagrees with the path must not decode: {forged:?}"
+    );
+
+    let wrong_parent = extend_directory_plan_chain(&mut chain.clone(), record_for("z/left"));
+    assert!(
+        matches!(wrong_parent, Err(HeldTreeError::PostChanged(_))),
+        "a frame whose parent is not the one below it must be refused: {wrong_parent:?}"
+    );
+
+    extend_directory_plan_chain(&mut chain, record_for("a/b"))
+        .expect("the chain still accepts the frame that does extend it");
+    assert!(directory_plan_chain_holds_parent(
+        &chain,
+        &record_for("a/b/c")
+    ));
+    assert!(!directory_plan_chain_holds_parent(
+        &chain,
+        &record_for("z/left")
+    ));
 }
 
 #[test]

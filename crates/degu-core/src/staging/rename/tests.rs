@@ -272,6 +272,14 @@ fn component_order_prefix_paths_stage_and_restart_verify() {
         std::fs::create_dir(fixture.source_root.join(name)).unwrap();
         std::fs::write(fixture.source_root.join(name).join("leaf"), name.as_bytes()).unwrap();
     }
+    // A sibling that falls between a directory and its own child when the paths are
+    // compared as bytes: `-` is 0x2D and `/` is 0x2F, so `pre-fix` sorts between `pre`
+    // and `pre/child` there, and the sealing pass would meet a child whose parent it
+    // had already sealed. Comparing by component keeps the subtree together.
+    for path in ["pre", "pre-fix", "pre/child"] {
+        std::fs::create_dir_all(fixture.source_root.join(path)).unwrap();
+        std::fs::write(fixture.source_root.join(path).join("leaf"), path.as_bytes()).unwrap();
+    }
     let transaction = TransactionId([0xdc; 16]);
     let (mut engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
     assert!(report.is_empty());

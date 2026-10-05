@@ -1224,6 +1224,46 @@ fn quarantine_is_not_reported_as_a_committed_seal() {
     ));
 }
 
+/// A seal whose restore was *confirmed not applied* is still sealed, so
+/// recovery must still restore it. The inverse index that answers "was this
+/// reversed?" therefore counts applied inverses only, and a mutation dropping
+/// that filter turns the restore below into `PreserveQuarantine`.
+#[test]
+fn only_an_applied_inverse_reverses_a_quarantined_seal() {
+    fn quarantined_with_inverse(application: ApplicationStatus) -> ReplayedTransaction {
+        let mut transaction = replayed(TransactionState::Quarantined);
+        transaction.permissions.push(DurablePermission {
+            mutation_id: 2,
+            phase: TransactionState::RestoreIntent,
+            evidence: evidence_mode("tree/dir", 0o770),
+            pre_mode: 0o500,
+            expected_mode: 0o770,
+            reverses_mutation_id: Some(1),
+            application,
+        });
+        transaction
+    }
+
+    let unapplied = quarantined_with_inverse(ApplicationStatus::ConfirmedNotApplied);
+    assert!(
+        matches!(
+            decide_recovery(&unapplied, |_| RecoveryIdentity::Reestablished),
+            RecoveryWork::RestoreQuarantinedSeals { permissions, .. }
+                if permissions.len() == 1 && permissions[0].mutation_id == 1
+        ),
+        "a confirmed-not-applied inverse left the seal in place"
+    );
+
+    let applied = quarantined_with_inverse(ApplicationStatus::Applied);
+    assert!(
+        matches!(
+            decide_recovery(&applied, |_| RecoveryIdentity::Reestablished),
+            RecoveryWork::PreserveQuarantine { .. }
+        ),
+        "an applied inverse already restored the seal"
+    );
+}
+
 #[test]
 fn inverse_binding_rejects_changed_stable_identity_and_cross_transaction_matches() {
     let original_evidence = evidence("source/tree");

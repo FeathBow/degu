@@ -17,8 +17,8 @@ use crate::backend::{
     LocalModeRevalidationFailure, certify_held_fd, certify_held_fd_backend,
 };
 use crate::seal::executor::{
-    LocalModeExecutionError, LocalModeMutationRequest, LocalModeTransform, RecoveryLocator,
-    execute_staging_local_mode_mutation,
+    LocalModeExecutionError, LocalModeMutationRequest, LocalModeMutationResult, LocalModeTransform,
+    RecoveryLocator, execute_staging_local_mode_mutation,
 };
 use crate::seal::sidecar::{
     TreePurgePlan, TreeSidecarCommitment, TreeSidecarError, TreeSidecarStore,
@@ -1187,18 +1187,27 @@ impl VerifiedUndoRecoverySession<'_> {
                     .cmp(&left.evidence.relative_path().components().count())
                     .then_with(|| left.mutation_id.cmp(&right.mutation_id))
             });
-            for plan in &self.undo.tree_seals {
-                let original = plan.permission.clone();
-                let snapshot = self
-                    .wal
-                    .recovery_snapshot(transaction)
-                    .ok_or(RecoveryRebindError::TransactionMismatch)?;
-                let restored = snapshot.permissions.iter().any(|permission| {
+            // The seals a previous interrupted run already restored. The snapshot
+            // this reads clones and sorts every permission in the transaction, so
+            // taking one per directory was quadratic in both time and allocation.
+            // Each iteration writes the inverse of its own original, so the set is
+            // extended in step rather than re-read.
+            let snapshot = self
+                .wal
+                .recovery_snapshot(transaction)
+                .ok_or(RecoveryRebindError::TransactionMismatch)?;
+            let mut restored: BTreeSet<u64> = snapshot
+                .permissions
+                .iter()
+                .filter(|permission| {
                     permission.application == ApplicationStatus::Applied
                         && permission.phase == TransactionState::UndoIntent
-                        && permission.reverses_mutation_id == Some(original.mutation_id)
-                });
-                if restored {
+                })
+                .filter_map(|permission| permission.reverses_mutation_id)
+                .collect();
+            for plan in &self.undo.tree_seals {
+                let original = plan.permission.clone();
+                if restored.contains(&original.mutation_id) {
                     continue;
                 }
                 let mut rebound = reopen_permission_plan(
@@ -1222,7 +1231,8 @@ impl VerifiedUndoRecoverySession<'_> {
                 let mutation_id = self.wal.next_recovery_mutation_id(transaction).ok_or(
                     AppendError::InvalidState("undo mutation id space exhausted"),
                 )?;
-                execute_staging_local_mode_mutation(
+                let reversed_mutation_id = original.mutation_id;
+                let outcome = execute_staging_local_mode_mutation(
                     self.wal,
                     &mut rebound.held,
                     LocalModeMutationRequest {
@@ -1235,6 +1245,9 @@ impl VerifiedUndoRecoverySession<'_> {
                         transform: LocalModeTransform::Restore { original },
                     },
                 )?;
+                if matches!(outcome, LocalModeMutationResult::Applied { .. }) {
+                    restored.insert(reversed_mutation_id);
+                }
             }
             let restored_modes = self
                 .undo
@@ -2634,6 +2647,18 @@ fn rebind_verified_undo_tree_seals(
         })
         .cloned()
         .collect::<Vec<_>>();
+    // The applied undo inverses, indexed by the seal each one reverses. Asking
+    // the whole permission list for every original made this quadratic in the
+    // number of sealed directories.
+    let mut inverses: BTreeMap<u64, Vec<&DurablePermission>> = BTreeMap::new();
+    for permission in &permissions {
+        if permission.phase == TransactionState::UndoIntent
+            && permission.application == ApplicationStatus::Applied
+            && let Some(reverses) = permission.reverses_mutation_id
+        {
+            inverses.entry(reverses).or_default().push(permission);
+        }
+    }
     let mut mutation_ids = BTreeSet::new();
     let mut plans = Vec::with_capacity(originals.len());
     for original in originals {
@@ -2648,17 +2673,19 @@ fn rebind_verified_undo_tree_seals(
             .relative_path()
             .strip_prefix(&source_root)
             .map_err(|_| RecoveryRebindError::InvalidLocator)?;
-        let inverse_applied = permissions.iter().any(|inverse| {
-            inverse.phase == TransactionState::UndoIntent
-                && inverse.application == ApplicationStatus::Applied
-                && inverse.reverses_mutation_id == Some(original.mutation_id)
-                && inverse.pre_mode == original.expected_mode
-                && inverse.expected_mode == original.pre_mode
-                && inverse.evidence.filesystem_id() == original.evidence.filesystem_id()
-                && inverse.evidence.device() == original.evidence.device()
-                && inverse.evidence.inode() == original.evidence.inode()
-                && inverse.evidence.generation_or_btime() == original.evidence.generation_or_btime()
-        });
+        let inverse_applied = inverses
+            .get(&original.mutation_id)
+            .is_some_and(|candidates| {
+                candidates.iter().any(|inverse| {
+                    inverse.pre_mode == original.expected_mode
+                        && inverse.expected_mode == original.pre_mode
+                        && inverse.evidence.filesystem_id() == original.evidence.filesystem_id()
+                        && inverse.evidence.device() == original.evidence.device()
+                        && inverse.evidence.inode() == original.evidence.inode()
+                        && inverse.evidence.generation_or_btime()
+                            == original.evidence.generation_or_btime()
+                })
+            });
         let target_path = destination_root.join(suffix);
         if inverse_applied {
             // A crash can occur after a descendant was restored but before the

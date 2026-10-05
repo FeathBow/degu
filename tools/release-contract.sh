@@ -14,6 +14,7 @@ degu-undo.1
 degu-trash.1
 degu-trash-list.1
 degu-trash-purge.1
+degu-trash-forget.1
 degu-reclaim.1
 degu-reclaim-uv.1
 degu-relocate.1

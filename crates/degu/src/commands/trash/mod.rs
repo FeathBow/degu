@@ -1,3 +1,4 @@
+mod forget;
 mod list;
 pub(crate) mod output;
 mod purge;
@@ -11,5 +12,6 @@ pub(crate) fn run(command: TrashCommand, ui: Ui) -> Result<()> {
     match command {
         TrashCommand::List { output } => list::run(output.json, ui),
         TrashCommand::Purge(args) => purge::run(args, ui),
+        TrashCommand::Forget(args) => forget::run(args, ui),
     }
 }

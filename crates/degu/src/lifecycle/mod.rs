@@ -39,8 +39,8 @@ pub(crate) use stage::{
 };
 pub(crate) use storage::sealed_staging_store_path;
 pub(crate) use storage::{
-    StoreCoverage, activated_store_coverage, publish_existing_namespace, same_directory,
-    state_home_of,
+    StoreCoverage, activated_store_coverage, forget_trash_root, publish_existing_namespace,
+    same_directory, state_home_of,
 };
 pub(crate) use undo::{UndoAmbiguousEntry, UndoEntry, UndoFailedEntry, UndoLogFailure, UndoReport};
 

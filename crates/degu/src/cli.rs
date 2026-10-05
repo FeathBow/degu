@@ -430,6 +430,17 @@ pub(crate) enum TrashCommand {
     },
     /// Permanently remove trash entries; all entries unless a selector is given
     Purge(TrashPurgeArgs),
+    /// Forget a registration whose trash root is absent; the root and both logs are untouched
+    Forget(TrashForgetArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct TrashForgetArgs {
+    /// Absolute path of the registered trash root to forget
+    pub(crate) root: PathBuf,
+    /// Proceed without prompting
+    #[arg(short = 'y', long)]
+    pub(crate) yes: bool,
 }
 
 #[derive(Args)]

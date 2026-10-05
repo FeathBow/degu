@@ -809,16 +809,18 @@ pub(crate) fn execute_prepared_rename<'a>(
     });
 
     let mut expectation_builder = tree.post_seal_expectation_builder();
+    // Indexed once, before the fold: the projection this replaces scanned every
+    // permission for every directory it was asked about.
+    let applied_modes = wal.applied_tree_seal_modes(transaction);
     let expectation_fold = sidecars.read_sorted_manifest_scratch(
         wal,
         transaction,
         pre_seal_manifest,
         &mut pre_seal_scratch,
         (),
-        |(), record, wal_view| {
+        |(), record, _wal_view| {
             expectation_builder.observe(&tree, record, |path, device, inode, incarnation| {
-                wal_view.applied_tree_seal_mode(
-                    transaction,
+                applied_modes.mode(
                     &source_root.join(path),
                     device,
                     inode,

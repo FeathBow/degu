@@ -8,10 +8,27 @@ const ACTION: &str = "self_managed_account_setup";
 
 fn refuse_if_a_store_is_already_activated() -> Result<()> {
     let ctx = DetectCtx::from_process().context("failed to read this account's environment")?;
-    refuse_activated_store_in(&ctx)
+    refuse_activated_store_in(&ctx, authenticated_store().as_deref())
 }
 
-fn refuse_activated_store_in(ctx: &DetectCtx) -> Result<()> {
+/// The store this account's authority authenticates, when it can be read.
+///
+/// The same question, and so the same selector, that `activated_store_coverage`
+/// asks to decide whether a trash listing covers the activated store. `None`
+/// covers first use, an authority that authenticates no store, and an authority
+/// this environment could not read: none of them is evidence that the store below
+/// is authenticated, and the refusal is the safe answer to all three.
+fn authenticated_store() -> Option<std::path::PathBuf> {
+    degu_core::activation::check_current_euid_mutation_readiness()
+        .ok()?
+        .store()
+        .map(std::path::Path::to_path_buf)
+}
+
+fn refuse_activated_store_in(
+    ctx: &DetectCtx,
+    authenticated: Option<&std::path::Path>,
+) -> Result<()> {
     let store = crate::lifecycle::sealed_staging_store_path(ctx);
     let binding = store.join(degu_core::activation::STORE_BINDING_NAME);
     // `exists()` answers "no" for a path it cannot stat and for a dangling
@@ -22,6 +39,13 @@ fn refuse_activated_store_in(ctx: &DetectCtx) -> Result<()> {
             return Err(error).with_context(|| format!("failed to inspect {}", binding.display()));
         }
         Ok(_) => {}
+    }
+    // An authority that authenticates this very store is the account this command
+    // is for having already been set up, which is neither of the two situations
+    // below. Saying its authority is missing would be false, and `degu init` would
+    // fail on every healthy account that has activated a store.
+    if authenticated.is_some_and(|recorded| crate::lifecycle::same_directory(recorded, &store)) {
+        return Ok(());
     }
     // Not a command to run: 'degu doctor' reports the same missing authority and
     // names this refusal as the way forward, so sending the reader there closes a
@@ -47,6 +71,11 @@ fn refuse_activated_store_in(ctx: &DetectCtx) -> Result<()> {
 /// went missing, and only the second is dangerous: a new authority does not
 /// authenticate the existing store, so everything staged in it becomes
 /// visible through `degu trash list` and unrecoverable through `degu undo`.
+///
+/// A present store binding is not by itself the dangerous case. The authority is
+/// asked as well, and when it authenticates this very store the account is simply
+/// already set up, which this reports as such: claiming the authority was missing
+/// failed `degu init` on every healthy account that had activated a store.
 ///
 /// degu used to ask the person to assert which situation this was, through a
 /// mandatory `--initial`. The assertion was unverifiable by construction and
@@ -197,19 +226,72 @@ mod tests {
     fn a_store_that_was_activated_refuses_a_fresh_authority() {
         let state = tempfile::tempdir().unwrap();
         let ctx = ctx_with_state(state.path());
-        refuse_activated_store_in(&ctx).expect("nothing staged yet");
+        refuse_activated_store_in(&ctx, None).expect("nothing staged yet");
 
         let store = crate::lifecycle::sealed_staging_store_path(&ctx);
         std::fs::create_dir_all(&store).unwrap();
         std::fs::write(store.join(degu_core::activation::STORE_BINDING_NAME), b"").unwrap();
 
-        let refusal = refuse_activated_store_in(&ctx).expect_err("an activated store refuses");
+        let refusal =
+            refuse_activated_store_in(&ctx, None).expect_err("an activated store refuses");
         let message = format!("{refusal}");
         assert!(message.contains("already activated"), "{message}");
         assert!(message.contains(&store.display().to_string()), "{message}");
         // 'degu doctor' answers this state by naming 'degu init', so a refusal
         // that sent the reader there would leave them circling.
         assert!(!message.contains("Run 'degu doctor'"), "{message}");
+    }
+
+    /// The account this command exists for, already set up: a store at this
+    /// environment's path and an authority that authenticates exactly it. Reported
+    /// as `init` exiting 1 with a claim that the authority was missing, while
+    /// `doctor` called the same account ready.
+    ///
+    /// A different store is still refused, in the same test, because a check that
+    /// accepted any authenticated store at all would pass the case above while
+    /// letting a fresh authority be published over a store this one never
+    /// authenticated — which is what the refusal is for.
+    #[test]
+    fn a_store_this_authority_authenticates_is_already_set_up() {
+        let state = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_state(state.path());
+        let store = crate::lifecycle::sealed_staging_store_path(&ctx);
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join(degu_core::activation::STORE_BINDING_NAME), b"").unwrap();
+
+        refuse_activated_store_in(&ctx, Some(&store))
+            .expect("an authority that authenticates this store means the account is set up");
+
+        let elsewhere = state.path().join("another-store");
+        let refusal = refuse_activated_store_in(&ctx, Some(&elsewhere))
+            .expect_err("an authority that authenticates some other store still refuses");
+        assert!(
+            format!("{refusal}").contains("already activated"),
+            "{refusal}"
+        );
+    }
+
+    /// The recorded store and this environment's are compared as directories, not
+    /// as strings: a state home reached through a symlink names the same store by a
+    /// different path, and refusing it would fail the healthy account again by a
+    /// different route.
+    #[test]
+    fn a_store_recorded_through_a_symlink_is_the_same_store() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real-state");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.path().join("linked-state");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let ctx = ctx_with_state(&link);
+        let store = crate::lifecycle::sealed_staging_store_path(&ctx);
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join(degu_core::activation::STORE_BINDING_NAME), b"").unwrap();
+
+        let recorded = store.canonicalize().unwrap();
+        assert_ne!(recorded, store, "the fixture must name the store two ways");
+        refuse_activated_store_in(&ctx, Some(&recorded))
+            .expect("the same store reached through a link is not a store to abandon");
     }
 
     #[test]

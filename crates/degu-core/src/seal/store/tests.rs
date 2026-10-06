@@ -594,10 +594,9 @@ fn compaction_reclaims_terminal_transactions_and_leaves_an_appendable_wal() {
     let original = lease.replay_and_repair().unwrap().clone();
     assert_eq!(original.transactions.len(), 3);
 
-    let compacted = store
-        .compact_terminal_transactions(&lease)
-        .unwrap()
-        .expect("a fixture over both thresholds must compact");
+    let Compaction::Done(compacted) = store.compact_terminal_transactions(&lease).unwrap() else {
+        panic!("a fixture over both thresholds must compact");
+    };
     drop(lease);
 
     let after = std::fs::metadata(root.join(WAL_FILE_NAME)).unwrap().len();
@@ -652,10 +651,10 @@ fn compaction_leaves_a_small_wal_untouched() {
     let mut lease = store.try_lease().unwrap();
     lease.replay_and_repair().unwrap();
     assert!(
-        store
-            .compact_terminal_transactions(&lease)
-            .unwrap()
-            .is_none(),
+        matches!(
+            store.compact_terminal_transactions(&lease).unwrap(),
+            Compaction::NotAttempted
+        ),
         "a tiny reclaim must not pay for a rewrite"
     );
     drop(lease);
@@ -687,10 +686,9 @@ fn compaction_replaces_a_leftover_entry_from_an_interrupted_run() {
 
     let mut lease = store.try_lease().unwrap();
     lease.replay_and_repair().unwrap();
-    let compacted = store
-        .compact_terminal_transactions(&lease)
-        .unwrap()
-        .expect("a leftover entry must not prevent compaction");
+    let Compaction::Done(compacted) = store.compact_terminal_transactions(&lease).unwrap() else {
+        panic!("a leftover entry must not prevent compaction");
+    };
     drop(lease);
 
     assert_eq!(
@@ -723,10 +721,10 @@ fn compaction_declines_without_the_store_directory_lock() {
     let held = crate::seal::wal::ExclusiveFileLock::try_acquire(directory).unwrap();
 
     assert!(
-        store
-            .compact_terminal_transactions(&lease)
-            .unwrap()
-            .is_none(),
+        matches!(
+            store.compact_terminal_transactions(&lease).unwrap(),
+            Compaction::NotAttempted
+        ),
         "compaction must decline rather than replace the entry unprotected"
     );
     drop(held);
@@ -750,11 +748,11 @@ fn compaction_declines_when_a_leftover_entry_cannot_be_validated() {
     let mut lease = store.try_lease().unwrap();
     lease.replay_and_repair().unwrap();
     assert!(
-        store
-            .compact_terminal_transactions(&lease)
-            .unwrap()
-            .is_none(),
-        "an unusable compaction entry must skip the rewrite, not force it"
+        matches!(
+            store.compact_terminal_transactions(&lease).unwrap(),
+            Compaction::Abandoned(_)
+        ),
+        "an unusable compaction entry is reported as abandoned, not forced"
     );
     drop(lease);
     assert_eq!(std::fs::read(root.join(WAL_FILE_NAME)).unwrap(), before);
@@ -784,8 +782,8 @@ fn compaction_refuses_an_entry_that_would_not_replay_correctly() {
         let outcome = store.compact_terminal_transactions(&lease);
         DAMAGE_COMPACTION.set(None);
         assert!(
-            matches!(outcome, Ok(None)),
-            "a damaged entry is a skipped rewrite, not a failed lease"
+            matches!(outcome, Ok(Compaction::Abandoned(_))),
+            "a damaged entry is an abandoned rewrite carrying its reason, not a failed lease"
         );
         drop(lease);
 

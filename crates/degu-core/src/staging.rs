@@ -95,11 +95,21 @@ impl StartupRecoveryCandidate {
 pub struct StartupRecoveryReport {
     candidates: Vec<StartupRecoveryCandidate>,
     generation: u64,
+    abandoned_compaction: Option<String>,
 }
 
 impl StartupRecoveryReport {
     pub fn candidates(&self) -> &[StartupRecoveryCandidate] {
         &self.candidates
+    }
+
+    /// Why this lease could not reclaim the WAL's dead frames, when it tried
+    /// and gave up. The store is usable either way -- the live WAL was never
+    /// touched -- but a store that keeps failing to shrink will eventually
+    /// refuse every clean, so the reason belongs somewhere the caller can say
+    /// it out loud.
+    pub fn abandoned_compaction(&self) -> Option<&str> {
+        self.abandoned_compaction.as_deref()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1420,12 +1430,23 @@ impl SealedStagingEngine {
         // above, so a legacy transaction still fails closed rather than being
         // compacted out of the way. Skipped unless it pays for its rewrite;
         // see ADR-0005.
-        if let Some(compacted) = store.compact_terminal_transactions(&recovery)? {
-            recovery = compacted;
-            replay = recovery
-                .replay()
-                .ok_or(ReplayError::InvalidHistory("leased WAL was not replayed"))?
-                .clone();
+        let mut abandoned_compaction = None;
+        match store.compact_terminal_transactions(&recovery)? {
+            crate::seal::store::Compaction::Done(compacted) => {
+                recovery = compacted;
+                replay = recovery
+                    .replay()
+                    .ok_or(ReplayError::InvalidHistory("leased WAL was not replayed"))?
+                    .clone();
+            }
+            // Reported rather than failed on. The live WAL is untouched, so the
+            // caller keeps a usable store; but a store whose rewrites keep
+            // failing will eventually refuse every clean, and that reason has
+            // to be sayable.
+            crate::seal::store::Compaction::Abandoned(error) => {
+                abandoned_compaction = Some(error.to_string());
+            }
+            crate::seal::store::Compaction::NotAttempted => {}
         }
         // Bound after compaction: the sidecar store pins the WAL's identity,
         // and a compaction replaces that entry.
@@ -1495,6 +1516,7 @@ impl SealedStagingEngine {
             StartupRecoveryReport {
                 candidates,
                 generation: recovery_generation,
+                abandoned_compaction,
             },
         ))
     }

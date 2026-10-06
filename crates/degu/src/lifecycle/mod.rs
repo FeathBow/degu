@@ -107,6 +107,18 @@ impl Lifecycle {
                             store_path.display()
                         )
                     })?;
+                    // The store is usable when a rewrite gives up -- the live
+                    // WAL is never touched -- but a store that keeps failing to
+                    // shrink eventually refuses every clean, and a reader who
+                    // only saw that refusal would have no way back to the cause.
+                    if let Some(reason) = report.abandoned_compaction() {
+                        tracing::warn!(
+                            target: "degu",
+                            store = %store_path.display(),
+                            reason,
+                            "the sealed-staging log could not reclaim space this time; the store is unaffected, but it cannot shrink while this persists"
+                        );
+                    }
                     // v11 transactions reopen their recorded mount-domain
                     // anchor; v10 transactions retain the canonical-HOME arm.
                     // In both cases the pathname only obtains candidate FDs for

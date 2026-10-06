@@ -980,3 +980,36 @@ fn active_permission_count_matches_the_nested_scan_it_replaced() {
         );
     }
 }
+
+/// An abandoned rewrite is reported, not just skipped. The store is usable
+/// either way, but one that keeps failing to shrink will eventually refuse
+/// every clean, and a reader who only saw that refusal would have no route
+/// back to the cause.
+#[test]
+fn an_abandoned_compaction_is_reported_on_the_startup_report() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("wal-store");
+    let store = SealWalStore::open_or_create(&root).unwrap();
+    store_with_terminal_staging_transactions(&root);
+
+    crate::seal::store::DAMAGE_COMPACTION.set(Some(crate::seal::store::CompactionDamage::Empty));
+    let (engine, report) = SealedStagingEngine::open(&store).unwrap();
+    crate::seal::store::DAMAGE_COMPACTION.set(None);
+
+    let reason = report
+        .abandoned_compaction()
+        .expect("an abandoned rewrite must say why");
+    assert!(
+        reason.contains("seal WAL") || reason.contains("compact"),
+        "the reason must name what failed, got {reason:?}"
+    );
+    drop(engine);
+
+    // A lease that had nothing to reclaim reports nothing.
+    let quiet = crate::secure_test_tempdir().unwrap();
+    let quiet_root = quiet.path().canonicalize().unwrap().join("wal-store");
+    let quiet_store = SealWalStore::open_or_create(&quiet_root).unwrap();
+    let (engine, report) = SealedStagingEngine::open(&quiet_store).unwrap();
+    assert_eq!(report.abandoned_compaction(), None);
+    drop(engine);
+}

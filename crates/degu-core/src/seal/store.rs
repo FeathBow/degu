@@ -28,6 +28,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The mandatory fixed entry managed by [`SealWalStore`]. Durable tree
 /// sidecars use transaction-derived sibling names and can never replace it.
 pub const WAL_FILE_NAME: &str = "seal.wal";
+/// What one compaction attempt did. An abandoned attempt left the live WAL
+/// untouched, so it is not an error the caller has to fail on -- but it is
+/// something the caller should be able to say out loud, because a store whose
+/// rewrites keep failing will eventually refuse every clean and the reason
+/// would otherwise be invisible.
+pub(crate) enum Compaction {
+    /// Nothing worth reclaiming, or the store directory lock was unavailable.
+    NotAttempted,
+    /// Attempted and abandoned. The live WAL is exactly as it was.
+    Abandoned(StoreError),
+    /// The WAL was replaced, and this lease covers the new one.
+    Done(RecoverySession),
+}
+
 /// Damages the bytes a compaction is about to write, so the read-back
 /// verification can be observed refusing them and leaving the live WAL alone.
 /// The checks it exercises are otherwise only reachable through a write or
@@ -372,7 +386,7 @@ impl SealWalStore {
     pub(crate) fn compact_terminal_transactions(
         &self,
         lease: &RecoverySession,
-    ) -> Result<Option<RecoverySession>, StoreError> {
+    ) -> Result<Compaction, StoreError> {
         let wal_path = self.path.join(WAL_FILE_NAME);
         let temp_path = self.path.join(WAL_COMPACTION_NAME);
         let parent_path = self.path.parent().unwrap_or_else(|| Path::new("/"));
@@ -383,7 +397,7 @@ impl SealWalStore {
             .plan_compaction()
             .map_err(|error| io_error(&wal_path, io::Error::other(error)))?
         else {
-            return Ok(None);
+            return Ok(Compaction::NotAttempted);
         };
         // The lease is a lock on the WAL's own descriptor, so replacing the
         // entry would let another participant lock the new one while this lease
@@ -393,7 +407,7 @@ impl SealWalStore {
         // acquisitions are non-blocking, so the reverse order cannot deadlock:
         // it can only fail, and failing means skipping.
         let Ok(creation_lock) = try_lock_directory(&self.directory) else {
-            return Ok(None);
+            return Ok(Compaction::NotAttempted);
         };
         validate_store_binding(
             &self.parent,
@@ -407,8 +421,9 @@ impl SealWalStore {
         validate_wal(lease.as_file(), self.backend, self.device, &wal_path)?;
         validate_entry_binding(&self.directory, lease.as_file(), &wal_path)?;
 
-        let Some(temp) = self.open_fresh_compaction_entry(&temp_path) else {
-            return Ok(None);
+        let temp = match self.open_fresh_compaction_entry(&temp_path) {
+            Ok(temp) => temp,
+            Err(error) => return Ok(Compaction::Abandoned(error)),
         };
         #[allow(unused_mut)] // only the test damage seam rewrites these bytes
         let mut bytes = plan.bytes;
@@ -431,17 +446,19 @@ impl SealWalStore {
         // entry and leave the live WAL alone. The safety property is that an
         // unverified entry never replaces the WAL, and skipping keeps it;
         // failing the lease would only take the store away from its owner.
-        if result.is_err()
-            || rustix::fs::renameat(
+        let abandoned = result.err().or_else(|| {
+            rustix::fs::renameat(
                 &self.directory,
                 WAL_COMPACTION_NAME,
                 &self.directory,
                 WAL_FILE_NAME,
             )
-            .is_err()
-        {
+            .err()
+            .map(|error| io_error(&wal_path, error.into()))
+        });
+        if let Some(error) = abandoned {
             let _ = self.remove_validated_compaction_entry(&temp, &temp_path);
-            return Ok(None);
+            return Ok(Compaction::Abandoned(error));
         }
         // Past here the live entry has changed, so a failure is no longer one
         // the caller can be spared.
@@ -458,14 +475,14 @@ impl SealWalStore {
             .replay_and_repair()
             .map_err(|error| io_error(&wal_path, io::Error::other(error)))?;
         drop(creation_lock);
-        Ok(Some(fresh))
+        Ok(Compaction::Done(fresh))
     }
 
     /// An empty compaction entry at the fixed name, replacing whatever an
     /// interrupted run left there. `None` means no clean entry could be
     /// established, which skips compaction: this is a best-effort rewrite, and
     /// an entry that will not pass the store's own checks is not one to force.
-    fn open_fresh_compaction_entry(&self, temp_path: &Path) -> Option<OwnedFd> {
+    fn open_fresh_compaction_entry(&self, temp_path: &Path) -> Result<OwnedFd, StoreError> {
         let flags = OPEN_WAL | OFlags::CREATE | OFlags::EXCL;
         let fd = match rustix::fs::openat(&self.directory, WAL_COMPACTION_NAME, flags, WAL_MODE) {
             Ok(fd) => fd,
@@ -476,25 +493,27 @@ impl SealWalStore {
                     OPEN_WAL,
                     Mode::empty(),
                 )
-                .ok()?;
-                self.remove_validated_compaction_entry(&stale, temp_path)
-                    .ok()?;
-                rustix::fs::openat(&self.directory, WAL_COMPACTION_NAME, flags, WAL_MODE).ok()?
+                .map_err(|error| io_error(temp_path, error.into()))?;
+                self.remove_validated_compaction_entry(&stale, temp_path)?;
+                rustix::fs::openat(&self.directory, WAL_COMPACTION_NAME, flags, WAL_MODE)
+                    .map_err(|error| io_error(temp_path, error.into()))?
             }
-            Err(_) => return None,
+            Err(error) => return Err(io_error(temp_path, error.into())),
         };
         // A fresh entry inherits the umask, so the mode is set rather than
         // assumed before it is held to the WAL's own contract. An entry that
         // cannot be brought up to that contract is abandoned, not forced.
-        if rustix::fs::fchmod(&fd, WAL_MODE).is_err()
-            || validate_wal(&fd, self.backend, self.device, temp_path).is_err()
-            || validate_entry_binding_named(&self.directory, &fd, WAL_COMPACTION_NAME, temp_path)
-                .is_err()
-        {
+        let established = rustix::fs::fchmod(&fd, WAL_MODE)
+            .map_err(|error| io_error(temp_path, error.into()))
+            .and_then(|()| validate_wal(&fd, self.backend, self.device, temp_path))
+            .and_then(|()| {
+                validate_entry_binding_named(&self.directory, &fd, WAL_COMPACTION_NAME, temp_path)
+            });
+        if let Err(error) = established {
             let _ = self.remove_validated_compaction_entry(&fd, temp_path);
-            return None;
+            return Err(error);
         }
-        Some(fd)
+        Ok(fd)
     }
 
     /// Removes this module's own compaction entry, and only after revalidating

@@ -967,6 +967,7 @@ fn terminal_legacy_staging_metadata_does_not_block_the_next_transaction() {
             transactions: [(old_id, legacy.clone())].into_iter().collect(),
             transaction_order: vec![old_id],
             tail_repair: None,
+            frame_bytes: BTreeMap::new(),
             committed_len: 0,
         };
         assert!(!matches!(
@@ -1259,6 +1260,47 @@ fn compaction_pays_for_its_rewrite_only_at_the_stated_thresholds() {
     );
 }
 
+/// A plan that is not worth making costs nothing but the measurement. A store
+/// with a handful of dead frames is leased often, and building the surviving
+/// copy before deciding would charge every one of those opens for a rewrite
+/// that never happens.
+#[test]
+fn compaction_decides_before_it_copies_anything() {
+    let kept = tx(70);
+    let dropped_transaction = tx(71);
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    for transaction in [kept, dropped_transaction] {
+        wal.begin(transaction).unwrap();
+        wal.transition(transaction, TransactionState::ParentSealIntent)
+            .unwrap();
+    }
+    wal.transition(dropped_transaction, TransactionState::RestoreIntent)
+        .unwrap();
+    wal.transition(dropped_transaction, TransactionState::Restored)
+        .unwrap();
+
+    let bytes = wal.into_inner().bytes;
+    let replay = replay_bytes(&bytes);
+    let dropped = compaction_dropped_transactions(&replay);
+    assert!(!dropped.is_empty(), "the fixture must have something stale");
+
+    // Far below the floor, so no plan is made at all.
+    assert!(
+        plan_compaction_from(&bytes, &replay, &dropped)
+            .unwrap()
+            .is_none()
+    );
+    // And the measurement that decided it is cheap and exact.
+    let parsed = parse_frames(&bytes).unwrap();
+    let measured = compaction_measure(&parsed, &dropped);
+    assert_eq!(measured.committed, bytes.len() as u64);
+    assert!(measured.reclaimed > 0 && measured.reclaimed < COMPACTION_MIN_RECLAIMED_BYTES);
+    assert!(!compaction_is_worthwhile(
+        measured.reclaimed,
+        measured.committed
+    ));
+}
+
 /// Frame selection on its own: a dropped transaction's frames go, every other
 /// frame stays at its exact bytes, and the two counts add up to the file.
 #[test]
@@ -1315,18 +1357,20 @@ fn compaction_selects_surviving_frames_byte_for_byte() {
         "only the Restored transaction is dropped"
     );
 
-    let selected = compaction_surviving_bytes(&bytes, &dropped).unwrap();
-    assert_eq!(selected.committed, bytes.len() as u64);
+    let parsed = parse_frames(&bytes).unwrap();
+    let measured = compaction_measure(&parsed, &dropped);
+    let kept = compaction_surviving_bytes(&bytes, &parsed, &dropped, &measured);
+    assert_eq!(measured.committed, bytes.len() as u64);
     assert_eq!(
-        selected.bytes.len() as u64 + selected.reclaimed,
-        selected.committed,
+        kept.len() as u64 + measured.reclaimed,
+        measured.committed,
         "kept and reclaimed bytes must account for the whole file"
     );
-    assert!(selected.reclaimed > 0);
+    assert!(measured.reclaimed > 0);
 
     // The survivor replays identically from the selected bytes, and the dropped
     // transaction is simply absent.
-    let compacted = replay_bytes(&selected.bytes);
+    let compacted = replay_bytes(&kept);
     assert_eq!(
         compacted.transactions.keys().copied().collect::<Vec<_>>(),
         vec![kept_transaction]
@@ -1335,7 +1379,7 @@ fn compaction_selects_surviving_frames_byte_for_byte() {
         compacted.transactions[&kept_transaction], replay.transactions[&kept_transaction],
         "a surviving transaction must replay to exactly what it did before"
     );
-    assert_eq!(compacted.committed_len, selected.bytes.len() as u64);
+    assert_eq!(compacted.committed_len, kept.len() as u64);
 }
 
 /// Every state the compaction predicate accepts, against the full enumeration,
@@ -3606,4 +3650,91 @@ fn applied_tree_seal_mode_index_matches_the_scan_it_replaced() {
             "scan disagrees with the contract: {name}"
         );
     }
+}
+
+/// A terminal transaction whose reclamation group still has something to undo
+/// is kept. Verified undo asks whether a path is sealed-managed at all, over
+/// every member of the group including the terminal ones, and refuses the
+/// whole group when an operation-log record it selected has no sealed mapping
+/// (`undo/mod.rs:276`). Dropping one member would turn that record into an
+/// unmapped one and block its siblings, so "terminal" is not sufficient on its
+/// own -- the whole group has to be done.
+#[test]
+fn compaction_keeps_a_terminal_transaction_whose_group_is_unfinished() {
+    fn replayed_group(states: &[(u8, TransactionState, Option<&str>)]) -> Replay {
+        let mut transactions = BTreeMap::new();
+        for (byte, state, group) in states {
+            let mut staging = staging_metadata();
+            if let Some(group) = group {
+                staging = staging.with_production_association(
+                    ProductionAssociation::new((*group).to_owned()).unwrap(),
+                );
+            }
+            transactions.insert(
+                tx(*byte),
+                ReplayedTransaction {
+                    id: tx(*byte),
+                    state: *state,
+                    staging_schema_version: None,
+                    permissions: Vec::new(),
+                    staging: Some(staging),
+                    tree_manifest: None,
+                    tree_sidecar: None,
+                    rename_outcome: None,
+                    undo_rename_outcome: None,
+                    purge_removed_entries: 0,
+                    purge_last_path: None,
+                },
+            );
+        }
+        Replay {
+            transactions,
+            transaction_order: Vec::new(),
+            tail_repair: None,
+            frame_bytes: BTreeMap::new(),
+            committed_len: 0,
+        }
+    }
+
+    let dropped = |states: &[(u8, TransactionState, Option<&str>)]| {
+        let mut ids = compaction_dropped_transactions(&replayed_group(states))
+            .into_iter()
+            .map(|id| id.0[0])
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    };
+
+    assert_eq!(
+        dropped(&[
+            (1, TransactionState::Restored, Some("group-a")),
+            (2, TransactionState::VerifiedCommitted, Some("group-a")),
+        ]),
+        Vec::<u8>::new(),
+        "a restored entry is the mapping its undoable sibling is checked against"
+    );
+    assert_eq!(
+        dropped(&[
+            (1, TransactionState::Restored, Some("group-a")),
+            (2, TransactionState::Purged, Some("group-a")),
+        ]),
+        vec![1, 2],
+        "a group with nothing left to undo is reclaimable whole"
+    );
+    assert_eq!(
+        dropped(&[
+            (1, TransactionState::Restored, Some("group-a")),
+            (2, TransactionState::VerifiedCommitted, Some("group-b")),
+        ]),
+        vec![1],
+        "another group's unfinished work does not hold this one back"
+    );
+    assert_eq!(
+        dropped(&[
+            (1, TransactionState::Restored, None),
+            (2, TransactionState::VerifiedCommitted, Some("group-a")),
+        ]),
+        vec![1],
+        "a transaction with no production association is in no mapping to break"
+    );
 }

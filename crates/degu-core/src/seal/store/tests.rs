@@ -762,9 +762,13 @@ fn compaction_declines_when_a_leftover_entry_cannot_be_validated() {
 }
 
 /// The compaction entry is verified before it replaces anything, so a rewrite
-/// that would not replay correctly leaves the live WAL exactly as it was. Both
-/// halves of that check get their own damage, because a wrong transaction set
-/// and a trailing partial frame are caught by different clauses.
+/// that would not replay correctly leaves the live WAL exactly as it was --
+/// and is reported as a skip, not an error. A failure here is a failure of an
+/// optimisation over an untouched WAL, and the disk being full is the
+/// condition compaction runs in, so turning it into an error would take the
+/// store away exactly when it is needed. Both halves of the check get their
+/// own damage, because a wrong transaction set and a trailing partial frame
+/// are caught by different clauses.
 #[test]
 fn compaction_refuses_an_entry_that_would_not_replay_correctly() {
     for damage in [CompactionDamage::Empty, CompactionDamage::TruncateOneByte] {
@@ -777,14 +781,14 @@ fn compaction_refuses_an_entry_that_would_not_replay_correctly() {
         let mut lease = store.try_lease().unwrap();
         lease.replay_and_repair().unwrap();
         DAMAGE_COMPACTION.set(Some(damage));
-        let error = match store.compact_terminal_transactions(&lease) {
-            Ok(_) => panic!("a damaged compaction entry must not replace the WAL"),
-            Err(error) => error,
-        };
+        let outcome = store.compact_terminal_transactions(&lease);
         DAMAGE_COMPACTION.set(None);
+        assert!(
+            matches!(outcome, Ok(None)),
+            "a damaged entry is a skipped rewrite, not a failed lease"
+        );
         drop(lease);
 
-        assert!(matches!(error, StoreError::Io { .. }), "got {error:?}");
         assert_eq!(
             std::fs::read(root.join(WAL_FILE_NAME)).unwrap(),
             before,

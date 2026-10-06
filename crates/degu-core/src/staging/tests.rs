@@ -695,15 +695,11 @@ fn raw_state_transition_cannot_mint_object_bound_purge_authority() {
     assert_eq!(engine.state(transaction), Some(TransactionState::Prepared));
 }
 
-/// Opening the engine actually compacts: without this, removing the call would
-/// leave every compaction test still passing and the feature unreachable.
-#[test]
-fn opening_the_engine_reclaims_terminal_transactions() {
+/// A store whose WAL holds two terminal staging transactions worth reclaiming
+/// and one mid-protocol transaction that must survive. Returns the live WAL
+/// length.
+fn store_with_terminal_staging_transactions(root: &std::path::Path) -> u64 {
     use crate::seal::wal::{PermissionIntent, SealWal};
-
-    let temp = crate::secure_test_tempdir().unwrap();
-    let root = temp.path().canonicalize().unwrap().join("wal-store");
-    let store = SealWalStore::open_or_create(&root).unwrap();
 
     let evidence = |path: &str, mode: u32| {
         PersistentRecoveryEvidence::new(
@@ -814,7 +810,17 @@ fn opening_the_engine_reclaims_terminal_transactions() {
         wal.transition_staging_for_test(dropped, TransactionState::Restored)
             .unwrap();
     }
-    let before = crate::overwrite_test_wal(&root, &wal.into_inner().bytes);
+    crate::overwrite_test_wal(root, &wal.into_inner().bytes)
+}
+
+/// Opening the engine actually compacts: without this, removing the call would
+/// leave every compaction test still passing and the feature unreachable.
+#[test]
+fn opening_the_engine_reclaims_terminal_transactions() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("wal-store");
+    let store = SealWalStore::open_or_create(&root).unwrap();
+    let before = store_with_terminal_staging_transactions(&root);
 
     let (engine, _report) = SealedStagingEngine::open(&store).unwrap();
     let after = std::fs::metadata(root.join(crate::seal::store::WAL_FILE_NAME))
@@ -824,9 +830,57 @@ fn opening_the_engine_reclaims_terminal_transactions() {
         after < before,
         "opening the engine must reclaim the terminal frames: {before} -> {after}"
     );
-    assert_eq!(engine.state(kept), Some(TransactionState::TreeSealIntent));
+    assert_eq!(
+        engine.state(TransactionId([200; 16])),
+        Some(TransactionState::TreeSealIntent)
+    );
     assert_eq!(engine.state(TransactionId([0; 16])), None);
     drop(engine);
+}
+
+/// A compaction that cannot complete must not cost the caller its engine. The
+/// disk filling up is the condition compaction runs in -- it writes a second
+/// copy of a large WAL -- so a rewrite failure that turned into an open
+/// failure would mean no clean could run at all, on a store that was perfectly
+/// usable before compaction existed.
+#[test]
+fn a_failed_compaction_still_opens_the_engine() {
+    for damage in [
+        crate::seal::store::CompactionDamage::Empty,
+        crate::seal::store::CompactionDamage::TruncateOneByte,
+    ] {
+        let temp = crate::secure_test_tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("wal-store");
+        let store = SealWalStore::open_or_create(&root).unwrap();
+        let before = store_with_terminal_staging_transactions(&root);
+
+        crate::seal::store::DAMAGE_COMPACTION.set(Some(damage));
+        let opened = SealedStagingEngine::open(&store);
+        crate::seal::store::DAMAGE_COMPACTION.set(None);
+
+        let (engine, _report) = match opened {
+            Ok(opened) => opened,
+            Err(error) => panic!("a failed compaction must not fail the open: {error}"),
+        };
+        assert_eq!(
+            std::fs::metadata(root.join(crate::seal::store::WAL_FILE_NAME))
+                .unwrap()
+                .len(),
+            before,
+            "the live WAL must be untouched by a failed rewrite"
+        );
+        // Every transaction is still there, including the ones compaction
+        // would have dropped had it succeeded.
+        assert_eq!(
+            engine.state(TransactionId([0; 16])),
+            Some(TransactionState::Restored)
+        );
+        assert_eq!(
+            engine.state(TransactionId([200; 16])),
+            Some(TransactionState::TreeSealIntent)
+        );
+        drop(engine);
+    }
 }
 
 /// The one-pass inverse index against the nested scan it replaced. No test in

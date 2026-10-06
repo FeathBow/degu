@@ -104,10 +104,9 @@ impl StartupRecoveryReport {
     }
 
     /// Why this lease could not reclaim the WAL's dead frames, when it tried
-    /// and gave up. The store is usable either way -- the live WAL was never
-    /// touched -- but a store that keeps failing to shrink will eventually
-    /// refuse every clean, so the reason belongs somewhere the caller can say
-    /// it out loud.
+    /// and gave up. The store is usable either way, because the live WAL was
+    /// never touched; `seal::store::Compaction` states why the reason is still
+    /// worth carrying.
     pub fn abandoned_compaction(&self) -> Option<&str> {
         self.abandoned_compaction.as_deref()
     }
@@ -1439,10 +1438,7 @@ impl SealedStagingEngine {
                     .ok_or(ReplayError::InvalidHistory("leased WAL was not replayed"))?
                     .clone();
             }
-            // Reported rather than failed on. The live WAL is untouched, so the
-            // caller keeps a usable store; but a store whose rewrites keep
-            // failing will eventually refuse every clean, and that reason has
-            // to be sayable.
+            // Reported rather than failed on; see `Compaction` for why both.
             crate::seal::store::Compaction::Abandoned(error) => {
                 abandoned_compaction = Some(error.to_string());
             }

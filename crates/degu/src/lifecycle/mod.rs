@@ -107,10 +107,9 @@ impl Lifecycle {
                             store_path.display()
                         )
                     })?;
-                    // The store is usable when a rewrite gives up -- the live
-                    // WAL is never touched -- but a store that keeps failing to
-                    // shrink eventually refuses every clean, and a reader who
-                    // only saw that refusal would have no way back to the cause.
+                    // The store is usable when a rewrite gives up; this says
+                    // why it could not shrink, so a later "WAL is full" has a
+                    // route back to its cause.
                     if let Some(reason) = report.abandoned_compaction() {
                         tracing::warn!(
                             target: "degu",

@@ -1999,7 +1999,7 @@ fn plan_compaction_from(
         return Ok(None);
     }
     Ok(Some(CompactionPlan {
-        bytes: compaction_surviving_bytes(bytes, &parsed, dropped, &measured),
+        bytes: compaction_surviving_bytes(bytes, &parsed, dropped),
         surviving: replay
             .transactions
             .iter()
@@ -2037,8 +2037,8 @@ fn compaction_surviving_bytes(
     bytes: &[u8],
     parsed: &ParsedFrames,
     dropped: &HashSet<TransactionId>,
-    measured: &MeasuredFrames,
 ) -> Vec<u8> {
+    let measured = compaction_measure(parsed, dropped);
     let mut kept =
         Vec::with_capacity(measured.committed.saturating_sub(measured.reclaimed) as usize);
     for span in &parsed.spans {
@@ -2110,9 +2110,14 @@ pub(crate) struct CompactionPlan {
     pub(crate) surviving: BTreeMap<TransactionId, TransactionState>,
 }
 
-/// The states whose frames carry no remaining authority: nothing restores,
-/// purges, undoes, or reports them, and every CLI reader of the staging
-/// entries already filters them out. ADR-0005 records the enumeration.
+/// The states whose frames carry no remaining authority of their own: nothing
+/// restores, purges, undoes, or reports them.
+///
+/// This is necessary but not sufficient for dropping a transaction. Verified
+/// undo reads the staging entries for group **membership** rather than for
+/// their state, so a terminal member's mapping is still load-bearing while its
+/// group has undo left -- see `compaction_dropped_transactions`. ADR-0005
+/// records both halves.
 fn compaction_drops_state(state: TransactionState) -> bool {
     matches!(
         state,

@@ -1260,12 +1260,13 @@ fn compaction_pays_for_its_rewrite_only_at_the_stated_thresholds() {
     );
 }
 
-/// A plan that is not worth making costs nothing but the measurement. A store
-/// with a handful of dead frames is leased often, and building the surviving
-/// copy before deciding would charge every one of those opens for a rewrite
-/// that never happens.
+/// The measurement that decides a rewrite is exact, and it says no well below
+/// the floor. That the decision also happens before any copying is held by
+/// `compaction_decides_without_reading_the_wal_again`, which can observe it;
+/// no assertion here could, because copying and discarding differs from not
+/// copying only in cost.
 #[test]
-fn compaction_decides_before_it_copies_anything() {
+fn compaction_measures_a_reclaim_that_is_below_the_floor() {
     let kept = tx(70);
     let dropped_transaction = tx(71);
     let mut wal = SealWal::new(FaultWriter::default()).unwrap();
@@ -1359,7 +1360,7 @@ fn compaction_selects_surviving_frames_byte_for_byte() {
 
     let parsed = parse_frames(&bytes).unwrap();
     let measured = compaction_measure(&parsed, &dropped);
-    let kept = compaction_surviving_bytes(&bytes, &parsed, &dropped, &measured);
+    let kept = compaction_surviving_bytes(&bytes, &parsed, &dropped);
     assert_eq!(measured.committed, bytes.len() as u64);
     assert_eq!(
         kept.len() as u64 + measured.reclaimed,

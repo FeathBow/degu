@@ -805,3 +805,77 @@ fn compaction_refuses_an_entry_that_would_not_replay_correctly() {
         );
     }
 }
+
+/// The decision is answered from the replay the lease already has, not from a
+/// fresh read of the WAL. Reading and parsing it again to answer "is this
+/// worth a rewrite?" measured at about the cost of the open itself, and on a
+/// store merely holding a few dead frames the answer is no every time.
+///
+/// Observed by making the two sources disagree: the lease replays a WAL with
+/// a sliver of reclaimable space, and the file is then replaced with one that
+/// is mostly reclaimable. A decision that re-read the file would compact; one
+/// that uses the replay declines. Production cannot diverge like this -- the
+/// lease is exclusive -- so the divergence is the instrument, not a case.
+#[test]
+fn compaction_decides_without_reading_the_wal_again() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let root = temp_path(&temp).join("wal-store");
+    let store = SealWalStore::open_or_create(&root).unwrap();
+    fill_with_terminal_transactions(&root, 1, 2);
+
+    let mut lease = store.try_lease().unwrap();
+    let replayed = lease.replay_and_repair().unwrap();
+    assert!(
+        replayed.committed_len < 1024 * 1024,
+        "the replayed WAL must be far below the reclaim floor"
+    );
+
+    // Everything the lease would see on a second read says "compact me", and
+    // says it about the one transaction the stale replay already calls
+    // terminal, so a re-read would clear both the floor and the share rule on
+    // that transaction alone.
+    let swapped = fill_with_terminal_transactions(&root, 1, 4_000);
+    assert!(
+        swapped / 3 * 2 > 1024 * 1024,
+        "a re-read must comfortably clear the floor, got {swapped} bytes"
+    );
+    let on_disk = std::fs::read(root.join(WAL_FILE_NAME)).unwrap();
+
+    assert!(
+        matches!(
+            store.compact_terminal_transactions(&lease).unwrap(),
+            Compaction::NotAttempted
+        ),
+        "the decision must come from the replay, not from the file"
+    );
+    drop(lease);
+    assert_eq!(
+        std::fs::read(root.join(WAL_FILE_NAME)).unwrap(),
+        on_disk,
+        "nothing was rewritten"
+    );
+}
+
+/// A busy directory lock and a broken one are different answers. Another
+/// participant holding it is the ordinary case; failing to even ask is
+/// something the caller should be able to say.
+#[test]
+fn a_broken_directory_lock_is_reported_and_a_busy_one_is_not() {
+    assert!(matches!(
+        compaction_without_the_directory_lock(StoreError::Lease(RecoveryLockError::Busy)),
+        Compaction::NotAttempted
+    ));
+    assert!(matches!(
+        compaction_without_the_directory_lock(StoreError::Lease(RecoveryLockError::Io(
+            io::Error::from_raw_os_error(5)
+        ))),
+        Compaction::Abandoned(_)
+    ));
+    assert!(matches!(
+        compaction_without_the_directory_lock(StoreError::UnsafeDirectory {
+            path: PathBuf::from("store"),
+            reason: "store backend or device changed",
+        }),
+        Compaction::Abandoned(_)
+    ));
+}

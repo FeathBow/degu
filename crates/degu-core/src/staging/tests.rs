@@ -828,3 +828,101 @@ fn opening_the_engine_reclaims_terminal_transactions() {
     assert_eq!(engine.state(TransactionId([0; 16])), None);
     drop(engine);
 }
+
+/// The one-pass inverse index against the nested scan it replaced. No test in
+/// the suite told the two apart, so the cases below are chosen for the clauses
+/// the index has to get right rather than for what recovery happens to produce.
+#[test]
+fn active_permission_count_matches_the_nested_scan_it_replaced() {
+    fn permission(
+        mutation_id: u64,
+        reverses_mutation_id: Option<u64>,
+        application: ApplicationStatus,
+    ) -> DurablePermission {
+        DurablePermission {
+            mutation_id,
+            phase: TransactionState::TreeSealIntent,
+            evidence: PersistentRecoveryEvidence::new(
+                PathBuf::from(format!("dir-{mutation_id}")),
+                Some("fs".into()),
+                1,
+                mutation_id + 100,
+                Some(mutation_id + 200),
+                0o755,
+            )
+            .unwrap(),
+            pre_mode: 0o775,
+            expected_mode: 0o755,
+            reverses_mutation_id,
+            application,
+        }
+    }
+    let applied = |mutation_id| permission(mutation_id, None, ApplicationStatus::Applied);
+    let inverse =
+        |mutation_id, reverses| permission(mutation_id, Some(reverses), ApplicationStatus::Applied);
+    let unknown_inverse = |mutation_id, reverses| {
+        permission(
+            mutation_id,
+            Some(reverses),
+            ApplicationStatus::IntentDurableApplicationUnknown,
+        )
+    };
+
+    let cases: Vec<(&str, Vec<DurablePermission>, usize)> = vec![
+        ("nothing recorded", vec![], 0),
+        (
+            "three seals, none undone",
+            vec![applied(1), applied(2), applied(3)],
+            3,
+        ),
+        (
+            "one seal undone by its applied inverse",
+            vec![applied(1), applied(2), inverse(3, 1)],
+            1,
+        ),
+        (
+            // The inverse's own application is unknown, so the seal it names
+            // may still stand: recovery must still count it.
+            "an inverse whose application is unknown undoes nothing yet",
+            vec![applied(1), unknown_inverse(2, 1)],
+            1,
+        ),
+        (
+            "an unresolved seal is not active either",
+            vec![permission(
+                1,
+                None,
+                ApplicationStatus::IntentDurableApplicationUnknown,
+            )],
+            0,
+        ),
+        (
+            "an inverse naming a mutation that was never applied",
+            vec![applied(1), inverse(2, 99)],
+            1,
+        ),
+        (
+            "two inverses naming the same seal",
+            vec![applied(1), applied(2), inverse(3, 1), inverse(4, 1)],
+            1,
+        ),
+        (
+            "every seal undone",
+            vec![applied(1), applied(2), inverse(3, 1), inverse(4, 2)],
+            0,
+        ),
+    ];
+
+    for (name, permissions, expected) in cases {
+        assert_eq!(
+            active_permission_count(&permissions),
+            expected,
+            "index disagrees with the contract: {name}"
+        );
+        assert_eq!(
+            active_permission_count_by_scan(&permissions),
+            expected,
+            "scan disagrees with the contract: {name}"
+        );
+    }
+}

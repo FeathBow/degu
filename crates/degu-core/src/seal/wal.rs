@@ -801,38 +801,23 @@ impl<W: DurableWrite> SealWal<W> {
         })
     }
 
-    /// Returns the exact executor-reported applied mode for one original tree
-    /// seal. This is a projection of the already-resident leased-WAL state, not
-    /// new authority; duplicate or mismatched evidence fails closed.
-    pub(crate) fn applied_tree_seal_mode(
+    /// This transaction's applied tree seals, indexed by the path each one names.
+    ///
+    /// A projection of the already-resident leased-WAL state, not new authority.
+    /// It replaces a per-directory scan of every permission: the pass that
+    /// consumes it asks once per directory, so the scan was quadratic in the
+    /// number of sealed directories. Duplicate or mismatched evidence still
+    /// fails closed, in the query rather than the build.
+    pub(crate) fn applied_tree_seal_modes(
         &self,
         transaction: TransactionId,
-        relative_path: &Path,
-        device: u64,
-        inode: u64,
-        incarnation: u64,
-        pre_mode: u32,
-    ) -> Option<u32> {
-        let mut matched = None;
-        for ((owner, _), permission) in &self.permissions {
-            if *owner != transaction
-                || permission.phase != TransactionState::TreeSealIntent
-                || permission.application != ApplicationStatus::Applied
-                || permission.reverses_mutation_id.is_some()
-                || permission.evidence.relative_path() != relative_path
-                || permission.evidence.device() != device
-                || permission.evidence.inode() != inode
-                || permission.evidence.generation_or_btime() != Some(incarnation)
-                || permission.pre_mode != pre_mode
-                || permission.evidence.expected_mode() != permission.expected_mode
-            {
-                continue;
-            }
-            if matched.replace(permission.expected_mode).is_some() {
-                return None;
-            }
-        }
-        matched
+    ) -> AppliedTreeSealModes {
+        AppliedTreeSealModes::from_permissions(
+            transaction,
+            self.permissions
+                .iter()
+                .map(|((owner, _), permission)| (*owner, permission)),
+        )
     }
 
     /// Allocates the next transaction-local mutation id for startup recovery.
@@ -1839,6 +1824,113 @@ pub enum ResolveError {
     Wal(#[source] AppendError),
 }
 
+/// One applied tree seal, as the index holds it.
+struct AppliedTreeSeal {
+    device: u64,
+    inode: u64,
+    incarnation: Option<u64>,
+    pre_mode: u32,
+    expected_mode: u32,
+}
+
+/// The applied tree seals of one transaction, answering the same question the
+/// per-directory scan answered, from one pass over the permissions.
+pub(crate) struct AppliedTreeSealModes {
+    by_path: HashMap<PathBuf, Vec<AppliedTreeSeal>>,
+}
+
+impl AppliedTreeSealModes {
+    /// Built from the permissions themselves, so the index and the scan it
+    /// replaced can be compared on the same input.
+    fn from_permissions<'a>(
+        transaction: TransactionId,
+        permissions: impl Iterator<Item = (TransactionId, &'a DurablePermission)>,
+    ) -> Self {
+        let mut by_path: HashMap<PathBuf, Vec<AppliedTreeSeal>> = HashMap::new();
+        for (owner, permission) in permissions {
+            if owner != transaction
+                || permission.phase != TransactionState::TreeSealIntent
+                || permission.application != ApplicationStatus::Applied
+                || permission.reverses_mutation_id.is_some()
+                || permission.evidence.expected_mode() != permission.expected_mode
+            {
+                continue;
+            }
+            by_path
+                .entry(permission.evidence.relative_path().to_path_buf())
+                .or_default()
+                .push(AppliedTreeSeal {
+                    device: permission.evidence.device(),
+                    inode: permission.evidence.inode(),
+                    incarnation: permission.evidence.generation_or_btime(),
+                    pre_mode: permission.pre_mode,
+                    expected_mode: permission.expected_mode,
+                });
+        }
+        AppliedTreeSealModes { by_path }
+    }
+
+    /// The scan this index replaced, kept as the oracle its tests compare
+    /// against. Five of its clauses fail closed and none of them was reachable
+    /// from the suite, so equivalence is asserted directly rather than inferred
+    /// from the tests that happened to pass.
+    #[cfg(test)]
+    fn mode_by_scan<'a>(
+        transaction: TransactionId,
+        permissions: impl Iterator<Item = (TransactionId, &'a DurablePermission)>,
+        relative_path: &Path,
+        device: u64,
+        inode: u64,
+        incarnation: u64,
+        pre_mode: u32,
+    ) -> Option<u32> {
+        let mut matched = None;
+        for (owner, permission) in permissions {
+            if owner != transaction
+                || permission.phase != TransactionState::TreeSealIntent
+                || permission.application != ApplicationStatus::Applied
+                || permission.reverses_mutation_id.is_some()
+                || permission.evidence.relative_path() != relative_path
+                || permission.evidence.device() != device
+                || permission.evidence.inode() != inode
+                || permission.evidence.generation_or_btime() != Some(incarnation)
+                || permission.pre_mode != pre_mode
+                || permission.evidence.expected_mode() != permission.expected_mode
+            {
+                continue;
+            }
+            if matched.replace(permission.expected_mode).is_some() {
+                return None;
+            }
+        }
+        matched
+    }
+
+    /// The exact executor-reported applied mode for one original tree seal.
+    /// Zero matches and more than one both answer `None`, as the scan did.
+    pub(crate) fn mode(
+        &self,
+        relative_path: &Path,
+        device: u64,
+        inode: u64,
+        incarnation: u64,
+        pre_mode: u32,
+    ) -> Option<u32> {
+        let mut matched = None;
+        for seal in self.by_path.get(relative_path)?.iter().filter(|seal| {
+            seal.device == device
+                && seal.inode == inode
+                && seal.incarnation == Some(incarnation)
+                && seal.pre_mode == pre_mode
+        }) {
+            if matched.replace(seal.expected_mode).is_some() {
+                return None;
+            }
+        }
+        matched
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurablePermission {
     pub mutation_id: u64,
@@ -2435,18 +2527,25 @@ where
             permissions: uncertain,
         };
     }
+    // The applied inverses, indexed once. Asking the whole permission list for
+    // each permission made every decision below quadratic in the number of
+    // sealed directories, and this runs on every startup.
+    let reversed: HashSet<u64> = transaction
+        .permissions
+        .iter()
+        .filter(|permission| permission.application == ApplicationStatus::Applied)
+        .filter_map(|permission| permission.reverses_mutation_id)
+        .collect();
+    let is_active = |permission: &DurablePermission| {
+        permission.application == ApplicationStatus::Applied
+            && permission.reverses_mutation_id.is_none()
+            && !reversed.contains(&permission.mutation_id)
+    };
     let active_permissions = || {
         transaction
             .permissions
             .iter()
-            .filter(|permission| {
-                permission.application == ApplicationStatus::Applied
-                    && permission.reverses_mutation_id.is_none()
-                    && !transaction.permissions.iter().any(|inverse| {
-                        inverse.application == ApplicationStatus::Applied
-                            && inverse.reverses_mutation_id == Some(permission.mutation_id)
-                    })
-            })
+            .filter(|permission| is_active(permission))
             .cloned()
             .collect::<Vec<_>>()
     };
@@ -2497,14 +2596,7 @@ where
     if transaction
         .permissions
         .iter()
-        .filter(|permission| {
-            permission.application == ApplicationStatus::Applied
-                && permission.reverses_mutation_id.is_none()
-                && !transaction.permissions.iter().any(|inverse| {
-                    inverse.application == ApplicationStatus::Applied
-                        && inverse.reverses_mutation_id == Some(permission.mutation_id)
-                })
-        })
+        .filter(|permission| is_active(permission))
         .any(|permission| identity(&permission.evidence) == RecoveryIdentity::Insufficient)
     {
         return RecoveryWork::RecoveryRequired {

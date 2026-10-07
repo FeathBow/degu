@@ -107,6 +107,17 @@ impl Lifecycle {
                             store_path.display()
                         )
                     })?;
+                    // The store is usable when a rewrite gives up; this says
+                    // why it could not shrink, so a later "WAL is full" has a
+                    // route back to its cause.
+                    if let Some(reason) = report.abandoned_compaction() {
+                        tracing::warn!(
+                            target: "degu",
+                            store = %store_path.display(),
+                            reason,
+                            "the sealed-staging log could not reclaim space this time; the store is unaffected, but it cannot shrink while this persists"
+                        );
+                    }
                     // v11 transactions reopen their recorded mount-domain
                     // anchor; v10 transactions retain the canonical-HOME arm.
                     // In both cases the pathname only obtains candidate FDs for

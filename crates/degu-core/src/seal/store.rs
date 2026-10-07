@@ -13,7 +13,7 @@ use crate::backend::{
     HeldLocalBackendEvidence, certify_held_fd, certify_held_fd_backend, require_held_fd_acl_absent,
 };
 use crate::seal::sidecar::TreeSidecarStore;
-use crate::seal::wal::{ExclusiveFileLock, RecoveryLockError, RecoverySession};
+use crate::seal::wal::{CompactionPlan, ExclusiveFileLock, RecoveryLockError, RecoverySession};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{FileType, Mode, OFlags, RenameFlags};
 use std::ffi::OsString;
@@ -28,6 +28,45 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The mandatory fixed entry managed by [`SealWalStore`]. Durable tree
 /// sidecars use transaction-derived sibling names and can never replace it.
 pub const WAL_FILE_NAME: &str = "seal.wal";
+/// What one compaction attempt did.
+///
+/// `Abandoned` left the live WAL untouched, so it is not an error the caller
+/// has to fail on -- but it carries its reason, because a store whose rewrites
+/// keep failing stays usable only until the WAL fills, and that is exactly when
+/// someone needs to know why it stopped shrinking. This is the one place that
+/// argument is written out; the callers point here.
+pub(crate) enum Compaction {
+    /// Nothing worth reclaiming, or the store directory lock was unavailable.
+    NotAttempted,
+    /// Attempted and abandoned. The live WAL is exactly as it was.
+    Abandoned(StoreError),
+    /// The WAL was replaced, and this lease covers the new one.
+    Done(RecoverySession),
+}
+
+/// Damages the bytes a compaction is about to write, so the read-back
+/// verification can be observed refusing them and leaving the live WAL alone.
+/// The checks it exercises are otherwise only reachable through a write or
+/// planning bug.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum CompactionDamage {
+    /// Replays cleanly to the wrong set of transactions.
+    Empty,
+    /// Replays to a trailing partial frame.
+    TruncateOneByte,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static DAMAGE_COMPACTION: std::cell::Cell<Option<CompactionDamage>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Where a compaction assembles the next WAL before it replaces the live one.
+/// Fixed, because the store directory lock makes the name uncontended, and a
+/// leftover from an interrupted compaction is removed rather than enumerated.
+const WAL_COMPACTION_NAME: &str = ".seal.wal.compacting";
 
 const DIRECTORY_MODE: Mode = Mode::RWXU;
 const WAL_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
@@ -325,6 +364,237 @@ impl SealWalStore {
         drop(creation_lock);
         Ok(lease)
     }
+}
+
+impl SealWalStore {
+    /// Rewrites the WAL without the frames of transactions that have nothing
+    /// left to restore, purge, undo, or report, and returns a fresh lease over
+    /// the new file. Any other answer means the live WAL was not changed and
+    /// the caller's lease still stands.
+    ///
+    /// Compaction is best-effort by design: it is attempted only when it would
+    /// reclaim enough to pay for the rewrite, and **every** failure up to and
+    /// including the rename is a skip rather than an error. Until the rename
+    /// the live WAL has not been touched, so there is nothing that refusing
+    /// the caller its lease would improve -- and refusing it would deny every
+    /// clean. Writing a second copy of a nearly full WAL can exhaust the disk,
+    /// which is the condition compaction runs in, so that is the ordinary case
+    /// rather than a remote one.
+    ///
+    /// An error is returned only for a failure that is not about the rewrite:
+    /// a live WAL that no longer parses or no longer passes the store's own
+    /// checks, and anything after the rename, where the live entry has already
+    /// changed. See ADR-0005.
+    pub(crate) fn compact_terminal_transactions(
+        &self,
+        lease: &RecoverySession,
+    ) -> Result<Compaction, StoreError> {
+        let wal_path = self.path.join(WAL_FILE_NAME);
+        let temp_path = self.path.join(WAL_COMPACTION_NAME);
+        let parent_path = self.path.parent().unwrap_or_else(|| Path::new("/"));
+        // Parsing cannot fail here: the caller already replayed this exact
+        // locked descriptor. If it does, the file changed under an exclusive
+        // lock, which is not a skippable precondition.
+        let Some(plan) = lease
+            .plan_compaction()
+            .map_err(|error| io_error(&wal_path, io::Error::other(error)))?
+        else {
+            return Ok(Compaction::NotAttempted);
+        };
+        // The lease is a lock on the WAL's own descriptor, so replacing the
+        // entry would let another participant lock the new one while this lease
+        // still holds the old, now-unlinked inode. Every participant acquires
+        // the store directory lock before it opens the WAL, so holding it here
+        // excludes them by the mechanism the lease already relies on. Both
+        // acquisitions are non-blocking, so the reverse order cannot deadlock:
+        // it can only fail, and failing means skipping.
+        let creation_lock = match try_lock_directory(&self.directory) {
+            Ok(lock) => lock,
+            Err(error) => return Ok(compaction_without_the_directory_lock(error)),
+        };
+        validate_store_binding(
+            &self.parent,
+            &self.name,
+            &self.directory,
+            self.backend,
+            self.device,
+            &self.path,
+            parent_path,
+        )?;
+        validate_wal(lease.as_file(), self.backend, self.device, &wal_path)?;
+        validate_entry_binding(&self.directory, lease.as_file(), &wal_path)?;
+
+        if let Err(error) = self.swap_in_compacted_entry(plan, &temp_path, &wal_path) {
+            return Ok(Compaction::Abandoned(error));
+        }
+        // Past here the live entry has changed, so a failure is no longer one
+        // the caller can be spared.
+        let fresh = self.lease_compacted_entry(&wal_path)?;
+        drop(creation_lock);
+        Ok(Compaction::Done(fresh))
+    }
+
+    /// Writes the compacted frames, proves they replay to what was meant to
+    /// survive, and renames them over the live entry.
+    ///
+    /// Every failure here leaves the live WAL exactly as it was, which is why
+    /// the caller reports rather than propagates them: a write that ran out of
+    /// disk and a read-back that does not replay are answered the same way.
+    /// The safety property is that an unverified entry never replaces the WAL,
+    /// and abandoning the attempt keeps it.
+    fn swap_in_compacted_entry(
+        &self,
+        plan: CompactionPlan,
+        temp_path: &Path,
+        wal_path: &Path,
+    ) -> Result<(), StoreError> {
+        let temp = self.open_fresh_compaction_entry(temp_path)?;
+        #[allow(unused_mut)] // only the test damage seam rewrites these bytes
+        let mut bytes = plan.bytes;
+        #[cfg(test)]
+        match DAMAGE_COMPACTION.with(std::cell::Cell::take) {
+            Some(CompactionDamage::Empty) => bytes.clear(),
+            Some(CompactionDamage::TruncateOneByte) => {
+                bytes.pop();
+            }
+            None => {}
+        }
+        let written = write_and_sync_compaction(&temp, &bytes, temp_path).and_then(|()| {
+            // Verify what was written rather than what was meant to be: a read
+            // back of the synced entry covers the write itself as well.
+            RecoverySession::compaction_entry_replays_to(&temp, &plan.surviving)
+                .map_err(|error| io_error(temp_path, io::Error::other(error)))
+        });
+        let failed = written.err().or_else(|| {
+            rustix::fs::renameat(
+                &self.directory,
+                WAL_COMPACTION_NAME,
+                &self.directory,
+                WAL_FILE_NAME,
+            )
+            .err()
+            .map(|error| io_error(wal_path, error.into()))
+        });
+        match failed {
+            Some(error) => {
+                let _ = self.remove_validated_compaction_entry(&temp, temp_path);
+                Err(error)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Takes the lease over the entry a compaction just put in place, under the
+    /// same checks `try_lease` applies, and replays it so the caller receives a
+    /// session it never has to read twice.
+    ///
+    /// The store directory lock must still be held: this reopens the entry by
+    /// name, and the old lease covers an inode that is no longer it.
+    fn lease_compacted_entry(&self, wal_path: &Path) -> Result<RecoverySession, StoreError> {
+        rustix::fs::fsync(&self.directory).map_err(|error| io_error(&self.path, error.into()))?;
+        let fd = rustix::fs::openat(&self.directory, WAL_FILE_NAME, OPEN_WAL, Mode::empty())
+            .map_err(|error| io_error(wal_path, error.into()))?;
+        validate_wal(&fd, self.backend, self.device, wal_path)?;
+        let mut fresh = RecoverySession::try_acquire(File::from(fd))?;
+        validate_wal(fresh.as_file(), self.backend, self.device, wal_path)?;
+        validate_entry_binding(&self.directory, fresh.as_file(), wal_path)?;
+        fresh
+            .replay_and_repair()
+            .map_err(|error| io_error(wal_path, io::Error::other(error)))?;
+        Ok(fresh)
+    }
+
+    /// An empty compaction entry at the fixed name, replacing whatever an
+    /// interrupted run left there. An error means no clean entry could be
+    /// established, which abandons the rewrite rather than forcing an entry
+    /// that will not pass the store's own checks.
+    fn open_fresh_compaction_entry(&self, temp_path: &Path) -> Result<OwnedFd, StoreError> {
+        let flags = OPEN_WAL | OFlags::CREATE | OFlags::EXCL;
+        let fd = match rustix::fs::openat(&self.directory, WAL_COMPACTION_NAME, flags, WAL_MODE) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::EXIST) => {
+                let stale = rustix::fs::openat(
+                    &self.directory,
+                    WAL_COMPACTION_NAME,
+                    OPEN_WAL,
+                    Mode::empty(),
+                )
+                .map_err(|error| io_error(temp_path, error.into()))?;
+                self.remove_validated_compaction_entry(&stale, temp_path)?;
+                rustix::fs::openat(&self.directory, WAL_COMPACTION_NAME, flags, WAL_MODE)
+                    .map_err(|error| io_error(temp_path, error.into()))?
+            }
+            Err(error) => return Err(io_error(temp_path, error.into())),
+        };
+        // A fresh entry inherits the umask, so the mode is set rather than
+        // assumed before it is held to the WAL's own contract. An entry that
+        // cannot be brought up to that contract is abandoned, not forced.
+        let established = rustix::fs::fchmod(&fd, WAL_MODE)
+            .map_err(|error| io_error(temp_path, error.into()))
+            .and_then(|()| validate_wal(&fd, self.backend, self.device, temp_path))
+            .and_then(|()| {
+                validate_entry_binding_named(&self.directory, &fd, WAL_COMPACTION_NAME, temp_path)
+            });
+        if let Err(error) = established {
+            let _ = self.remove_validated_compaction_entry(&fd, temp_path);
+            return Err(error);
+        }
+        Ok(fd)
+    }
+
+    /// Removes this module's own compaction entry, and only after revalidating
+    /// the exact open descriptor and its directory binding at the deletion
+    /// seam rather than trusting an earlier observation. This is the store
+    /// namespace's verified fd-relative deletion seam; no user-supplied path
+    /// can reach it, and it can name nothing but the compaction entry.
+    #[allow(clippy::disallowed_methods)]
+    fn remove_validated_compaction_entry<Fd: AsFd>(
+        &self,
+        fd: Fd,
+        temp_path: &Path,
+    ) -> Result<(), StoreError> {
+        validate_wal(fd.as_fd(), self.backend, self.device, temp_path)?;
+        validate_entry_binding_named(&self.directory, fd, WAL_COMPACTION_NAME, temp_path)?;
+        rustix::fs::unlinkat(
+            &self.directory,
+            WAL_COMPACTION_NAME,
+            rustix::fs::AtFlags::empty(),
+        )
+        .map_err(|error| io_error(temp_path, error.into()))
+    }
+}
+
+/// What a compaction does when it cannot take the store directory lock.
+///
+/// Another participant holding it is the ordinary case and says nothing about
+/// this store, so there is nothing to report. Failing to even ask does say
+/// something, and reporting it is the difference between a store that declined
+/// to shrink and one that could not try.
+fn compaction_without_the_directory_lock(error: StoreError) -> Compaction {
+    match error {
+        StoreError::Lease(RecoveryLockError::Busy) => Compaction::NotAttempted,
+        error => Compaction::Abandoned(error),
+    }
+}
+
+fn write_and_sync_compaction<Fd: AsFd>(
+    fd: Fd,
+    bytes: &[u8],
+    path: &Path,
+) -> Result<(), StoreError> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let written = rustix::io::write(fd.as_fd(), &bytes[offset..])
+            .map_err(|error| io_error(path, error.into()))?;
+        if written == 0 {
+            return Err(io_error(
+                path,
+                io::Error::other("compaction write made no progress"),
+            ));
+        }
+        offset += written;
+    }
+    rustix::fs::fsync(fd.as_fd()).map_err(|error| io_error(path, error.into()))
 }
 
 fn initialize_unpublished_store<F>(
@@ -752,13 +1022,21 @@ pub(super) fn validate_entry_binding<Fd: AsFd>(
     fd: Fd,
     path: &Path,
 ) -> Result<(), StoreError> {
+    validate_entry_binding_named(directory, fd, WAL_FILE_NAME, path)
+}
+
+/// The same binding check for an entry this module owns under another name,
+/// so a compaction entry is held to the WAL's own standard before it can
+/// replace the WAL.
+fn validate_entry_binding_named<Fd: AsFd>(
+    directory: &OwnedFd,
+    fd: Fd,
+    name: &str,
+    path: &Path,
+) -> Result<(), StoreError> {
     let opened = rustix::fs::fstat(fd).map_err(|error| io_error(path, error.into()))?;
-    let entry = rustix::fs::statat(
-        directory,
-        WAL_FILE_NAME,
-        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-    )
-    .map_err(|error| io_error(path, error.into()))?;
+    let entry = rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| io_error(path, error.into()))?;
     if opened.st_dev != entry.st_dev
         || opened.st_ino != entry.st_ino
         || FileType::from_raw_mode(entry.st_mode) != FileType::RegularFile

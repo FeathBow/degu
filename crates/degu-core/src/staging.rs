@@ -95,11 +95,20 @@ impl StartupRecoveryCandidate {
 pub struct StartupRecoveryReport {
     candidates: Vec<StartupRecoveryCandidate>,
     generation: u64,
+    abandoned_compaction: Option<String>,
 }
 
 impl StartupRecoveryReport {
     pub fn candidates(&self) -> &[StartupRecoveryCandidate] {
         &self.candidates
+    }
+
+    /// Why this lease could not reclaim the WAL's dead frames, when it tried
+    /// and gave up. The store is usable either way, because the live WAL was
+    /// never touched; `seal::store::Compaction` states why the reason is still
+    /// worth carrying.
+    pub fn abandoned_compaction(&self) -> Option<&str> {
+        self.abandoned_compaction.as_deref()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1404,9 +1413,8 @@ impl SealedStagingEngine {
     pub(crate) fn open(
         store: &SealWalStore,
     ) -> Result<(Self, StartupRecoveryReport), StagingEngineError> {
-        let sidecars = store.tree_sidecar_store()?;
         let mut recovery = store.try_lease()?;
-        let replay = recovery.replay_and_repair()?.clone();
+        let mut replay = recovery.replay_and_repair()?.clone();
         if replay
             .transactions
             .values()
@@ -1416,6 +1424,29 @@ impl SealedStagingEngine {
                 "transaction has no atomic staging metadata",
             ));
         }
+        // Reclaim the frames of transactions with nothing left to restore,
+        // purge, undo, or report. This runs after the bare-transaction gate
+        // above, so a legacy transaction still fails closed rather than being
+        // compacted out of the way. Skipped unless it pays for its rewrite;
+        // see ADR-0005.
+        let mut abandoned_compaction = None;
+        match store.compact_terminal_transactions(&recovery)? {
+            crate::seal::store::Compaction::Done(compacted) => {
+                recovery = compacted;
+                replay = recovery
+                    .replay()
+                    .ok_or(ReplayError::InvalidHistory("leased WAL was not replayed"))?
+                    .clone();
+            }
+            // Reported rather than failed on; see `Compaction` for why both.
+            crate::seal::store::Compaction::Abandoned(error) => {
+                abandoned_compaction = Some(error.to_string());
+            }
+            crate::seal::store::Compaction::NotAttempted => {}
+        }
+        // Bound after compaction: the sidecar store pins the WAL's identity,
+        // and a compaction replaces that entry.
+        let sidecars = store.tree_sidecar_store()?;
         // A durable v12 reference is not usable unless its exact final sidecar
         // still satisfies the complete container commitment. Missing,
         // substituted, truncated, or tampered referenced sidecars are converted
@@ -1481,6 +1512,7 @@ impl SealedStagingEngine {
             StartupRecoveryReport {
                 candidates,
                 generation: recovery_generation,
+                abandoned_compaction,
             },
         ))
     }

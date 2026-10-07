@@ -695,6 +695,194 @@ fn raw_state_transition_cannot_mint_object_bound_purge_authority() {
     assert_eq!(engine.state(transaction), Some(TransactionState::Prepared));
 }
 
+/// A store whose WAL holds two terminal staging transactions worth reclaiming
+/// and one mid-protocol transaction that must survive. Returns the live WAL
+/// length.
+fn store_with_terminal_staging_transactions(root: &std::path::Path) -> u64 {
+    use crate::seal::wal::{PermissionIntent, SealWal};
+
+    let evidence = |path: &str, mode: u32| {
+        PersistentRecoveryEvidence::new(
+            PathBuf::from(format!(
+                "registry/src/index.crates.io-1949cf8c6b5b557f/{path}"
+            )),
+            Some("fs".to_string()),
+            11,
+            22,
+            Some(33),
+            mode,
+        )
+        .unwrap()
+    };
+    let mut wal = SealWal::new(crate::MemoryWal::default()).unwrap();
+    let parent_identity = metadata().source_parent_identity();
+    // The one permission the parent-seal phase accepts is the exact
+    // metadata-bound source parent, so every transaction starts the same way.
+    let seal_the_parent = |wal: &mut SealWal<crate::MemoryWal>, transaction| {
+        wal.transition_staging_for_test(transaction, TransactionState::ParentSealIntent)
+            .unwrap();
+        wal.apply_staging_permission_mutation(
+            PermissionIntent {
+                transaction,
+                mutation_id: 0,
+                evidence: PersistentRecoveryEvidence::new(
+                    PathBuf::from("source-parent"),
+                    Some("fs".into()),
+                    parent_identity.device(),
+                    parent_identity.inode(),
+                    Some(parent_identity.incarnation().get()),
+                    0o500,
+                )
+                .unwrap(),
+                pre_mode: 0o770,
+                expected_mode: 0o500,
+                reverses_mutation_id: None,
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        wal.transition_staging_for_test(transaction, TransactionState::ParentSealed)
+            .unwrap();
+        wal.transition_staging_for_test(transaction, TransactionState::TreeSealIntent)
+            .unwrap();
+    };
+
+    let kept = TransactionId([200; 16]);
+    wal.begin_staging(kept, metadata()).unwrap();
+    seal_the_parent(&mut wal, kept);
+    // Two terminal transactions large enough to pay for the rewrite, each seal
+    // with the applied inverse a terminal restore requires.
+    for index in 0..2_u8 {
+        let dropped = TransactionId([index; 16]);
+        wal.begin_staging(dropped, metadata()).unwrap();
+        seal_the_parent(&mut wal, dropped);
+        for id in 1..=2_000 {
+            wal.apply_staging_permission_mutation(
+                PermissionIntent {
+                    transaction: dropped,
+                    mutation_id: id,
+                    evidence: evidence(&format!("gone-{index}-{id}"), 0o500),
+                    pre_mode: 0o770,
+                    expected_mode: 0o500,
+                    reverses_mutation_id: None,
+                },
+                || Ok(()),
+            )
+            .unwrap();
+        }
+        wal.transition_staging_for_test(dropped, TransactionState::RestoreIntent)
+            .unwrap();
+        for id in 1..=2_000 {
+            wal.apply_staging_permission_mutation(
+                PermissionIntent {
+                    transaction: dropped,
+                    mutation_id: 2_000 + id,
+                    evidence: evidence(&format!("gone-{index}-{id}"), 0o770),
+                    pre_mode: 0o500,
+                    expected_mode: 0o770,
+                    reverses_mutation_id: Some(id),
+                },
+                || Ok(()),
+            )
+            .unwrap();
+        }
+        // The parent seal needs its inverse for the same reason.
+        wal.apply_staging_permission_mutation(
+            PermissionIntent {
+                transaction: dropped,
+                mutation_id: 4_001,
+                evidence: PersistentRecoveryEvidence::new(
+                    PathBuf::from("source-parent"),
+                    Some("fs".into()),
+                    parent_identity.device(),
+                    parent_identity.inode(),
+                    Some(parent_identity.incarnation().get()),
+                    0o770,
+                )
+                .unwrap(),
+                pre_mode: 0o500,
+                expected_mode: 0o770,
+                reverses_mutation_id: Some(0),
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        wal.transition_staging_for_test(dropped, TransactionState::Restored)
+            .unwrap();
+    }
+    crate::overwrite_test_wal(root, &wal.into_inner().bytes)
+}
+
+/// Opening the engine actually compacts: without this, removing the call would
+/// leave every compaction test still passing and the feature unreachable.
+#[test]
+fn opening_the_engine_reclaims_terminal_transactions() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("wal-store");
+    let store = SealWalStore::open_or_create(&root).unwrap();
+    let before = store_with_terminal_staging_transactions(&root);
+
+    let (engine, _report) = SealedStagingEngine::open(&store).unwrap();
+    let after = std::fs::metadata(root.join(crate::seal::store::WAL_FILE_NAME))
+        .unwrap()
+        .len();
+    assert!(
+        after < before,
+        "opening the engine must reclaim the terminal frames: {before} -> {after}"
+    );
+    assert_eq!(
+        engine.state(TransactionId([200; 16])),
+        Some(TransactionState::TreeSealIntent)
+    );
+    assert_eq!(engine.state(TransactionId([0; 16])), None);
+    drop(engine);
+}
+
+/// A compaction that cannot complete must not cost the caller its engine. The
+/// disk filling up is the condition compaction runs in -- it writes a second
+/// copy of a large WAL -- so a rewrite failure that turned into an open
+/// failure would mean no clean could run at all, on a store that was perfectly
+/// usable before compaction existed.
+#[test]
+fn a_failed_compaction_still_opens_the_engine() {
+    for damage in [
+        crate::seal::store::CompactionDamage::Empty,
+        crate::seal::store::CompactionDamage::TruncateOneByte,
+    ] {
+        let temp = crate::secure_test_tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("wal-store");
+        let store = SealWalStore::open_or_create(&root).unwrap();
+        let before = store_with_terminal_staging_transactions(&root);
+
+        crate::seal::store::DAMAGE_COMPACTION.set(Some(damage));
+        let opened = SealedStagingEngine::open(&store);
+        crate::seal::store::DAMAGE_COMPACTION.set(None);
+
+        let (engine, _report) = match opened {
+            Ok(opened) => opened,
+            Err(error) => panic!("a failed compaction must not fail the open: {error}"),
+        };
+        assert_eq!(
+            std::fs::metadata(root.join(crate::seal::store::WAL_FILE_NAME))
+                .unwrap()
+                .len(),
+            before,
+            "the live WAL must be untouched by a failed rewrite"
+        );
+        // Every transaction is still there, including the ones compaction
+        // would have dropped had it succeeded.
+        assert_eq!(
+            engine.state(TransactionId([0; 16])),
+            Some(TransactionState::Restored)
+        );
+        assert_eq!(
+            engine.state(TransactionId([200; 16])),
+            Some(TransactionState::TreeSealIntent)
+        );
+        drop(engine);
+    }
+}
+
 /// The one-pass inverse index against the nested scan it replaced. No test in
 /// the suite told the two apart, so the cases below are chosen for the clauses
 /// the index has to get right rather than for what recovery happens to produce.
@@ -791,4 +979,37 @@ fn active_permission_count_matches_the_nested_scan_it_replaced() {
             "scan disagrees with the contract: {name}"
         );
     }
+}
+
+/// An abandoned rewrite is reported, not just skipped. The store is usable
+/// either way, but one that keeps failing to shrink will eventually refuse
+/// every clean, and a reader who only saw that refusal would have no route
+/// back to the cause.
+#[test]
+fn an_abandoned_compaction_is_reported_on_the_startup_report() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("wal-store");
+    let store = SealWalStore::open_or_create(&root).unwrap();
+    store_with_terminal_staging_transactions(&root);
+
+    crate::seal::store::DAMAGE_COMPACTION.set(Some(crate::seal::store::CompactionDamage::Empty));
+    let (engine, report) = SealedStagingEngine::open(&store).unwrap();
+    crate::seal::store::DAMAGE_COMPACTION.set(None);
+
+    let reason = report
+        .abandoned_compaction()
+        .expect("an abandoned rewrite must say why");
+    assert!(
+        reason.contains("seal WAL") || reason.contains("compact"),
+        "the reason must name what failed, got {reason:?}"
+    );
+    drop(engine);
+
+    // A lease that had nothing to reclaim reports nothing.
+    let quiet = crate::secure_test_tempdir().unwrap();
+    let quiet_root = quiet.path().canonicalize().unwrap().join("wal-store");
+    let quiet_store = SealWalStore::open_or_create(&quiet_root).unwrap();
+    let (engine, report) = SealedStagingEngine::open(&quiet_store).unwrap();
+    assert_eq!(report.abandoned_compaction(), None);
+    drop(engine);
 }

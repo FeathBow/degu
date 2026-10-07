@@ -478,3 +478,404 @@ fn replay_repair_and_resume_are_bound_to_one_locked_descriptor() {
         0
     );
 }
+
+/// A store whose WAL holds `terminal` transactions that compaction may drop
+/// and one mid-protocol transaction that it must keep.
+fn fill_with_terminal_transactions(root: &Path, terminal: u8, seals: u64) -> u64 {
+    use crate::authority::PersistentRecoveryEvidence;
+    use crate::seal::wal::{PermissionIntent, SealWal};
+
+    fn evidence(path: &str, mode: u32) -> PersistentRecoveryEvidence {
+        PersistentRecoveryEvidence::new(
+            PathBuf::from(format!(
+                "registry/src/index.crates.io-1949cf8c6b5b557f/{path}"
+            )),
+            Some("local-fs".to_string()),
+            11,
+            22,
+            Some(33),
+            mode,
+        )
+        .unwrap()
+    }
+
+    let mut wal = SealWal::new(crate::MemoryWal::default()).unwrap();
+    let seal = |wal: &mut SealWal<crate::MemoryWal>,
+                transaction,
+                mutation_id,
+                path: &str,
+                pre_mode,
+                expected_mode,
+                reverses| {
+        wal.apply_permission_mutation(
+            PermissionIntent {
+                transaction,
+                mutation_id,
+                evidence: evidence(path, expected_mode),
+                pre_mode,
+                expected_mode,
+                reverses_mutation_id: reverses,
+            },
+            || Ok(()),
+        )
+        .unwrap();
+    };
+
+    // The one transaction that must survive, left mid-protocol.
+    let kept = transaction(200);
+    wal.begin(kept).unwrap();
+    wal.transition(kept, TransactionState::ParentSealIntent)
+        .unwrap();
+    for id in 1..=seals {
+        seal(
+            &mut wal,
+            kept,
+            id,
+            &format!("kept-{id}"),
+            0o770,
+            0o500,
+            None,
+        );
+    }
+    for index in 0..terminal {
+        let dropped = transaction(index);
+        wal.begin(dropped).unwrap();
+        wal.transition(dropped, TransactionState::ParentSealIntent)
+            .unwrap();
+        for id in 1..=seals {
+            seal(
+                &mut wal,
+                dropped,
+                id,
+                &format!("gone-{index}-{id}"),
+                0o770,
+                0o500,
+                None,
+            );
+        }
+        // A terminal restore is refused unless every applied seal has an
+        // applied inverse, so reaching Restored costs a second record each.
+        wal.transition(dropped, TransactionState::RestoreIntent)
+            .unwrap();
+        for id in 1..=seals {
+            seal(
+                &mut wal,
+                dropped,
+                seals + id,
+                &format!("gone-{index}-{id}"),
+                0o500,
+                0o770,
+                Some(id),
+            );
+        }
+        wal.transition(dropped, TransactionState::Restored).unwrap();
+    }
+    crate::overwrite_test_wal(root, &wal.into_inner().bytes)
+}
+
+/// The whole replace protocol on a real store: the file shrinks, the surviving
+/// transaction replays to exactly what it did before, and the compacted WAL is
+/// still appendable at its new length.
+#[test]
+fn compaction_reclaims_terminal_transactions_and_leaves_an_appendable_wal() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let root = temp_path(&temp).join("wal-store");
+    let store = SealWalStore::open_or_create(&root).unwrap();
+    // Two terminal transactions of 2,000 seals each, every seal with its undo
+    // inverse: about four fifths of the file, which clears the byte floor and
+    // the share rule together.
+    let before = fill_with_terminal_transactions(&root, 2, 2_000);
+    assert!(
+        before / 5 * 4 > 1024 * 1024,
+        "four fifths of the fixture must clear the 1 MiB floor, got {before} bytes"
+    );
+
+    let mut lease = store.try_lease().unwrap();
+    let original = lease.replay_and_repair().unwrap().clone();
+    assert_eq!(original.transactions.len(), 3);
+
+    let Compaction::Done(compacted) = store.compact_terminal_transactions(&lease).unwrap() else {
+        panic!("a fixture over both thresholds must compact");
+    };
+    drop(lease);
+
+    let after = std::fs::metadata(root.join(WAL_FILE_NAME)).unwrap().len();
+    assert!(
+        after < before,
+        "the WAL must shrink: {before} -> {after} bytes"
+    );
+    let replay = compacted.replay().expect("a compacted lease has replayed");
+    assert_eq!(
+        replay.transactions.keys().copied().collect::<Vec<_>>(),
+        vec![transaction(200)],
+        "only the mid-protocol transaction survives"
+    );
+    assert_eq!(
+        replay.transactions[&transaction(200)],
+        original.transactions[&transaction(200)],
+        "a surviving transaction must replay to exactly what it did before"
+    );
+    assert_eq!(replay.committed_len, after);
+    assert!(replay.tail_repair.is_none());
+
+    // The new file is a WAL, not just bytes: it still accepts appends, and it
+    // accepts them at the compacted length rather than the old one.
+    let mut wal = compacted.resume().unwrap();
+    wal.transition(transaction(200), TransactionState::ParentSealed)
+        .unwrap();
+    drop(wal);
+    let grown = std::fs::metadata(root.join(WAL_FILE_NAME)).unwrap().len();
+    assert!(grown > after && grown < before);
+
+    // And the compacted state is what a fresh lease sees.
+    let mut reopened = store.try_lease().unwrap();
+    let replayed = reopened.replay_and_repair().unwrap();
+    assert_eq!(
+        replayed.transactions[&transaction(200)].state,
+        TransactionState::ParentSealed
+    );
+    assert_eq!(replayed.transactions.len(), 1);
+    assert!(!root.join(".seal.wal.compacting").exists());
+}
+
+/// Below the thresholds the live WAL is left exactly as it was, byte for byte.
+#[test]
+fn compaction_leaves_a_small_wal_untouched() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let root = temp_path(&temp).join("wal-store");
+    let store = SealWalStore::open_or_create(&root).unwrap();
+    fill_with_terminal_transactions(&root, 1, 2);
+    let before = std::fs::read(root.join(WAL_FILE_NAME)).unwrap();
+    let inode = std::fs::metadata(root.join(WAL_FILE_NAME)).unwrap().ino();
+
+    let mut lease = store.try_lease().unwrap();
+    lease.replay_and_repair().unwrap();
+    assert!(
+        matches!(
+            store.compact_terminal_transactions(&lease).unwrap(),
+            Compaction::NotAttempted
+        ),
+        "a tiny reclaim must not pay for a rewrite"
+    );
+    drop(lease);
+
+    assert_eq!(std::fs::read(root.join(WAL_FILE_NAME)).unwrap(), before);
+    assert_eq!(
+        std::fs::metadata(root.join(WAL_FILE_NAME)).unwrap().ino(),
+        inode,
+        "a skipped compaction must not replace the entry"
+    );
+}
+
+/// A leftover entry from an interrupted compaction is replaced, not trusted:
+/// it is never renamed into place without being written and verified first.
+#[test]
+fn compaction_replaces_a_leftover_entry_from_an_interrupted_run() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let root = temp_path(&temp).join("wal-store");
+    let store = SealWalStore::open_or_create(&root).unwrap();
+    fill_with_terminal_transactions(&root, 2, 2_000);
+    // Whatever an interrupted run left behind, including bytes that would
+    // replay to something else entirely.
+    std::fs::write(root.join(".seal.wal.compacting"), b"leftover from a crash").unwrap();
+    std::fs::set_permissions(
+        root.join(".seal.wal.compacting"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+
+    let mut lease = store.try_lease().unwrap();
+    lease.replay_and_repair().unwrap();
+    let Compaction::Done(compacted) = store.compact_terminal_transactions(&lease).unwrap() else {
+        panic!("a leftover entry must not prevent compaction");
+    };
+    drop(lease);
+
+    assert_eq!(
+        compacted
+            .replay()
+            .unwrap()
+            .transactions
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![transaction(200)]
+    );
+    assert!(!root.join(".seal.wal.compacting").exists());
+}
+
+/// Compaction is best-effort: without the store directory lock it cannot
+/// replace the entry safely, so it declines rather than proceeding.
+#[test]
+fn compaction_declines_without_the_store_directory_lock() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let root = temp_path(&temp).join("wal-store");
+    let store = SealWalStore::open_or_create(&root).unwrap();
+    fill_with_terminal_transactions(&root, 2, 2_000);
+    let before = std::fs::read(root.join(WAL_FILE_NAME)).unwrap();
+
+    let mut lease = store.try_lease().unwrap();
+    lease.replay_and_repair().unwrap();
+    // Another participant holds the directory lock the replace protocol needs.
+    let directory = File::open(&root).unwrap();
+    let held = crate::seal::wal::ExclusiveFileLock::try_acquire(directory).unwrap();
+
+    assert!(
+        matches!(
+            store.compact_terminal_transactions(&lease).unwrap(),
+            Compaction::NotAttempted
+        ),
+        "compaction must decline rather than replace the entry unprotected"
+    );
+    drop(held);
+    drop(lease);
+    assert_eq!(std::fs::read(root.join(WAL_FILE_NAME)).unwrap(), before);
+}
+
+/// A leftover the store's own checks reject is not forced out of the way:
+/// compaction declines instead, leaving a correct WAL behind.
+#[test]
+fn compaction_declines_when_a_leftover_entry_cannot_be_validated() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let root = temp_path(&temp).join("wal-store");
+    let store = SealWalStore::open_or_create(&root).unwrap();
+    fill_with_terminal_transactions(&root, 2, 2_000);
+    let before = std::fs::read(root.join(WAL_FILE_NAME)).unwrap();
+    // A directory at the compaction name cannot be opened as a WAL, so it can
+    // neither be written nor removed through the validated deletion seam.
+    std::fs::create_dir(root.join(".seal.wal.compacting")).unwrap();
+
+    let mut lease = store.try_lease().unwrap();
+    lease.replay_and_repair().unwrap();
+    assert!(
+        matches!(
+            store.compact_terminal_transactions(&lease).unwrap(),
+            Compaction::Abandoned(_)
+        ),
+        "an unusable compaction entry is reported as abandoned, not forced"
+    );
+    drop(lease);
+    assert_eq!(std::fs::read(root.join(WAL_FILE_NAME)).unwrap(), before);
+    assert!(root.join(".seal.wal.compacting").is_dir());
+}
+
+/// The compaction entry is verified before it replaces anything, so a rewrite
+/// that would not replay correctly leaves the live WAL exactly as it was --
+/// and is reported as a skip, not an error. A failure here is a failure of an
+/// optimisation over an untouched WAL, and the disk being full is the
+/// condition compaction runs in, so turning it into an error would take the
+/// store away exactly when it is needed. Both halves of the check get their
+/// own damage, because a wrong transaction set and a trailing partial frame
+/// are caught by different clauses.
+#[test]
+fn compaction_refuses_an_entry_that_would_not_replay_correctly() {
+    for damage in [CompactionDamage::Empty, CompactionDamage::TruncateOneByte] {
+        let temp = crate::secure_test_tempdir().unwrap();
+        let root = temp_path(&temp).join("wal-store");
+        let store = SealWalStore::open_or_create(&root).unwrap();
+        fill_with_terminal_transactions(&root, 2, 2_000);
+        let before = std::fs::read(root.join(WAL_FILE_NAME)).unwrap();
+
+        let mut lease = store.try_lease().unwrap();
+        lease.replay_and_repair().unwrap();
+        DAMAGE_COMPACTION.set(Some(damage));
+        let outcome = store.compact_terminal_transactions(&lease);
+        DAMAGE_COMPACTION.set(None);
+        assert!(
+            matches!(outcome, Ok(Compaction::Abandoned(_))),
+            "a damaged entry is an abandoned rewrite carrying its reason, not a failed lease"
+        );
+        drop(lease);
+
+        assert_eq!(
+            std::fs::read(root.join(WAL_FILE_NAME)).unwrap(),
+            before,
+            "the live WAL must be untouched"
+        );
+        assert!(
+            !root.join(".seal.wal.compacting").exists(),
+            "the rejected entry must be abandoned"
+        );
+        // And the store is still usable afterwards.
+        let mut reopened = store.try_lease().unwrap();
+        assert_eq!(
+            reopened.replay_and_repair().unwrap().transactions.len(),
+            3,
+            "a refused compaction changes nothing"
+        );
+    }
+}
+
+/// The decision is answered from the replay the lease already has, not from a
+/// fresh read of the WAL. Reading and parsing it again to answer "is this
+/// worth a rewrite?" measured at about the cost of the open itself, and on a
+/// store merely holding a few dead frames the answer is no every time.
+///
+/// Observed by making the two sources disagree: the lease replays a WAL with
+/// a sliver of reclaimable space, and the file is then replaced with one that
+/// is mostly reclaimable. A decision that re-read the file would compact; one
+/// that uses the replay declines. Production cannot diverge like this -- the
+/// lease is exclusive -- so the divergence is the instrument, not a case.
+#[test]
+fn compaction_decides_without_reading_the_wal_again() {
+    let temp = crate::secure_test_tempdir().unwrap();
+    let root = temp_path(&temp).join("wal-store");
+    let store = SealWalStore::open_or_create(&root).unwrap();
+    fill_with_terminal_transactions(&root, 1, 2);
+
+    let mut lease = store.try_lease().unwrap();
+    let replayed = lease.replay_and_repair().unwrap();
+    assert!(
+        replayed.committed_len < 1024 * 1024,
+        "the replayed WAL must be far below the reclaim floor"
+    );
+
+    // Everything the lease would see on a second read says "compact me", and
+    // says it about the one transaction the stale replay already calls
+    // terminal, so a re-read would clear both the floor and the share rule on
+    // that transaction alone.
+    let swapped = fill_with_terminal_transactions(&root, 1, 4_000);
+    assert!(
+        swapped / 3 * 2 > 1024 * 1024,
+        "a re-read must comfortably clear the floor, got {swapped} bytes"
+    );
+    let on_disk = std::fs::read(root.join(WAL_FILE_NAME)).unwrap();
+
+    assert!(
+        matches!(
+            store.compact_terminal_transactions(&lease).unwrap(),
+            Compaction::NotAttempted
+        ),
+        "the decision must come from the replay, not from the file"
+    );
+    drop(lease);
+    assert_eq!(
+        std::fs::read(root.join(WAL_FILE_NAME)).unwrap(),
+        on_disk,
+        "nothing was rewritten"
+    );
+}
+
+/// A busy directory lock and a broken one are different answers. Another
+/// participant holding it is the ordinary case; failing to even ask is
+/// something the caller should be able to say.
+#[test]
+fn a_broken_directory_lock_is_reported_and_a_busy_one_is_not() {
+    assert!(matches!(
+        compaction_without_the_directory_lock(StoreError::Lease(RecoveryLockError::Busy)),
+        Compaction::NotAttempted
+    ));
+    assert!(matches!(
+        compaction_without_the_directory_lock(StoreError::Lease(RecoveryLockError::Io(
+            io::Error::from_raw_os_error(5)
+        ))),
+        Compaction::Abandoned(_)
+    ));
+    assert!(matches!(
+        compaction_without_the_directory_lock(StoreError::UnsafeDirectory {
+            path: PathBuf::from("store"),
+            reason: "store backend or device changed",
+        }),
+        Compaction::Abandoned(_)
+    ));
+}

@@ -29,6 +29,14 @@ const CONTENT_PROOF_MANIFEST_VERSION: u16 = 3;
 const HEADER_LEN: usize = 20;
 const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 const MAX_WAL_LEN: u64 = 64 * 1024 * 1024;
+/// How much a compaction must reclaim before its rewrite pays for itself.
+const COMPACTION_MIN_RECLAIMED_BYTES: u64 = 1024 * 1024;
+/// ...and what share of the file, as a divisor, so a long-lived store is not
+/// rewritten on every lease to recover a few stale frames.
+const COMPACTION_MIN_RECLAIMED_SHARE: u64 = 4;
+/// Above this length the share rule is dropped. The file is close enough to
+/// refusing every append that any reclaimable byte is worth the rewrite.
+const COMPACTION_PRESSURE_LEN: u64 = MAX_WAL_LEN / 4 * 3;
 /// Maximum permission mutations that startup recovery may need to resolve or
 /// reverse for one transaction. Forward staging reserves one operation for the
 /// source-parent seal; every tree-directory seal consumes one more.
@@ -1962,6 +1970,159 @@ pub struct Replay {
     pub transaction_order: Vec<TransactionId>,
     pub tail_repair: Option<TailRepair>,
     pub committed_len: u64,
+    /// Committed frame bytes per transaction, from the parse the replay
+    /// already performed. One entry per transaction rather than per frame, so
+    /// it lets compaction decide whether a rewrite is worth it without reading
+    /// or parsing the WAL a second time -- which measured at roughly the cost
+    /// of the whole open.
+    pub frame_bytes: BTreeMap<TransactionId, u64>,
+}
+
+/// What a compacted WAL would hold, decided from the bytes and their replay
+/// alone. Separated from reading the file so the thresholds and the frame
+/// selection can be exercised without a store on disk.
+fn plan_compaction_from(
+    bytes: &[u8],
+    replay: &Replay,
+    dropped: &HashSet<TransactionId>,
+) -> Result<Option<CompactionPlan>, ReplayError> {
+    let parsed = parse_frames(bytes)?;
+    // The authoritative measurement, over the bytes that will actually be
+    // copied. `plan_compaction` gates on the replay's own per-transaction
+    // totals first, which is what spares a skipped rewrite the second read.
+    let measured = compaction_measure(&parsed, dropped);
+    // Decided before anything is copied. A store with a few stale frames is
+    // leased often, and building the surviving copy only to discard it would
+    // charge every one of those opens for a rewrite that never happens.
+    if measured.reclaimed == 0 || !compaction_is_worthwhile(measured.reclaimed, measured.committed)
+    {
+        return Ok(None);
+    }
+    Ok(Some(CompactionPlan {
+        bytes: compaction_surviving_bytes(bytes, &parsed, dropped),
+        surviving: replay
+            .transactions
+            .iter()
+            .filter(|(id, _)| !dropped.contains(id))
+            .map(|(id, transaction)| (*id, transaction.state))
+            .collect(),
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MeasuredFrames {
+    reclaimed: u64,
+    committed: u64,
+}
+
+/// What a compaction of this frame sequence would reclaim, without copying
+/// anything.
+fn compaction_measure(parsed: &ParsedFrames, dropped: &HashSet<TransactionId>) -> MeasuredFrames {
+    MeasuredFrames {
+        reclaimed: parsed
+            .spans
+            .iter()
+            .filter(|span| dropped.contains(&span.transaction))
+            .map(|span| (span.end - span.start) as u64)
+            .sum(),
+        committed: parsed.committed_len as u64,
+    }
+}
+
+/// The committed frames that do not belong to a dropped transaction, in file
+/// order and with their exact bytes. Keeping the bytes rather than re-encoding
+/// the records is what makes a compacted WAL incapable of differing from the
+/// original by an encoding.
+fn compaction_surviving_bytes(
+    bytes: &[u8],
+    parsed: &ParsedFrames,
+    dropped: &HashSet<TransactionId>,
+) -> Vec<u8> {
+    let measured = compaction_measure(parsed, dropped);
+    let mut kept =
+        Vec::with_capacity(measured.committed.saturating_sub(measured.reclaimed) as usize);
+    for span in &parsed.spans {
+        if !dropped.contains(&span.transaction) {
+            kept.extend_from_slice(&bytes[span.start..span.end]);
+        }
+    }
+    kept
+}
+
+/// Whether reclaiming this much of a WAL this long is worth a full rewrite.
+///
+/// Below the share rule a long-lived store would be rewritten on every lease
+/// to recover a few stale frames. Above `COMPACTION_PRESSURE_LEN` the share
+/// rule is dropped: the file is close enough to refusing every append that any
+/// reclaimable byte is worth the rewrite, and holding out for a quarter would
+/// be how a store reaches the wall with space it declined to take.
+fn compaction_is_worthwhile(reclaimed: u64, committed: u64) -> bool {
+    if committed >= COMPACTION_PRESSURE_LEN {
+        return reclaimed > 0;
+    }
+    reclaimed >= COMPACTION_MIN_RECLAIMED_BYTES
+        && reclaimed.saturating_mul(COMPACTION_MIN_RECLAIMED_SHARE) >= committed
+}
+
+/// The transactions a compaction would drop from this replay.
+///
+/// A terminal state is not enough on its own. Verified undo answers "is this
+/// path sealed-managed at all?" over **every** member of a reclamation group,
+/// terminal ones included, and refuses the whole group when an operation-log
+/// record it selected has no sealed mapping. Dropping one member of a group
+/// that still has something to undo would turn that record into an unmapped
+/// one and block the siblings. So a terminal transaction is dropped only once
+/// its whole group is terminal. A transaction with no production association
+/// never appears in that mapping, so it is droppable on its own.
+fn compaction_dropped_transactions(replay: &Replay) -> HashSet<TransactionId> {
+    let unfinished_groups = replay
+        .transactions
+        .values()
+        .filter(|transaction| !compaction_drops_state(transaction.state))
+        .filter_map(reclamation_group)
+        .collect::<HashSet<_>>();
+    replay
+        .transactions
+        .iter()
+        .filter(|(_, transaction)| compaction_drops_state(transaction.state))
+        .filter(|(_, transaction)| {
+            reclamation_group(transaction).is_none_or(|group| !unfinished_groups.contains(&group))
+        })
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// The reclamation group this transaction belongs to in the staging-entry
+/// mapping verified undo reads, if it appears there at all.
+fn reclamation_group(transaction: &ReplayedTransaction) -> Option<&str> {
+    Some(
+        transaction
+            .staging
+            .as_ref()?
+            .production_association()?
+            .reclamation_id(),
+    )
+}
+
+/// A compacted WAL's exact bytes and the transactions it must replay to.
+pub(crate) struct CompactionPlan {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) surviving: BTreeMap<TransactionId, TransactionState>,
+}
+
+/// The states whose frames carry no remaining authority of their own: nothing
+/// restores, purges, undoes, or reports them.
+///
+/// This is necessary but not sufficient for dropping a transaction. Verified
+/// undo reads the staging entries for group **membership** rather than for
+/// their state, so a terminal member's mapping is still load-bearing while its
+/// group has undo left -- see `compaction_dropped_transactions`. ADR-0005
+/// records both halves.
+fn compaction_drops_state(state: TransactionState) -> bool {
+    matches!(
+        state,
+        TransactionState::Purged | TransactionState::Restored | TransactionState::RolledBack
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2102,7 +2263,16 @@ impl RecoverySession {
             return Err(ReplayError::TooLarge { limit: MAX_WAL_LEN });
         }
         let parsed = parse_frames(&bytes)?;
+        let frame_bytes =
+            parsed
+                .spans
+                .iter()
+                .fold(BTreeMap::<TransactionId, u64>::new(), |mut totals, span| {
+                    *totals.entry(span.transaction).or_default() += (span.end - span.start) as u64;
+                    totals
+                });
         let mut replay = replay_records(parsed.records)?;
+        replay.frame_bytes = frame_bytes;
         if parsed.committed_len < bytes.len() {
             file.set_len(parsed.committed_len as u64)?;
             file.sync_all()?;
@@ -2114,6 +2284,97 @@ impl RecoverySession {
         file.seek(SeekFrom::Start(parsed.committed_len as u64))?;
         self.replay = Some(replay);
         Ok(self.replay.as_ref().unwrap())
+    }
+
+    /// The bytes a compacted WAL would hold, or `None` when there is nothing
+    /// worth reclaiming. Pure computation: it reads and parses, and changes
+    /// nothing. See ADR-0005 for why these transactions can be dropped.
+    pub(crate) fn plan_compaction(&self) -> Result<Option<CompactionPlan>, ReplayError> {
+        let Some(replay) = self.replay.as_ref() else {
+            return Ok(None);
+        };
+        let dropped = compaction_dropped_transactions(replay);
+        if dropped.is_empty() {
+            return Ok(None);
+        }
+        // Decided from the parse the replay already did. Reading and parsing
+        // the WAL again to answer "is this worth a rewrite?" measured at about
+        // the cost of the open itself, and on a store that is merely holding a
+        // few dead frames the answer is no every single time.
+        let measured = MeasuredFrames {
+            reclaimed: dropped
+                .iter()
+                .filter_map(|id| replay.frame_bytes.get(id))
+                .sum(),
+            committed: replay.committed_len,
+        };
+        if measured.reclaimed == 0
+            || !compaction_is_worthwhile(measured.reclaimed, measured.committed)
+        {
+            return Ok(None);
+        }
+        let file = self.lock.as_file();
+        let len = file.metadata()?.len();
+        if len > MAX_WAL_LEN {
+            return Err(ReplayError::TooLarge { limit: MAX_WAL_LEN });
+        }
+        let mut bytes = vec![0_u8; len as usize];
+        std::os::unix::fs::FileExt::read_exact_at(file, &mut bytes, 0)?;
+        plan_compaction_from(&bytes, replay, &dropped)
+    }
+
+    /// The replay this session already performed. A compacted session returns
+    /// from `compact_terminal_transactions` already replayed, so a caller that
+    /// compacts never reads the WAL a second time.
+    pub(crate) fn replay(&self) -> Option<&Replay> {
+        self.replay.as_ref()
+    }
+
+    /// Reads back a synced compaction entry and confirms it replays to exactly
+    /// the transactions and states that were meant to survive, with no partial
+    /// trailing frame. A compaction that cannot prove this never replaces the
+    /// live WAL.
+    pub(crate) fn compaction_entry_replays_to<Fd: rustix::fd::AsFd>(
+        fd: Fd,
+        surviving: &BTreeMap<TransactionId, TransactionState>,
+    ) -> Result<(), ReplayError> {
+        let stat = rustix::fs::fstat(fd.as_fd()).map_err(io::Error::from)?;
+        let len = u64::try_from(stat.st_size).unwrap_or(u64::MAX);
+        if len > MAX_WAL_LEN {
+            return Err(ReplayError::TooLarge { limit: MAX_WAL_LEN });
+        }
+        let mut bytes = vec![0_u8; len as usize];
+        let mut read = 0_usize;
+        while read < bytes.len() {
+            let got = rustix::io::pread(fd.as_fd(), &mut bytes[read..], read as u64)
+                .map_err(io::Error::from)?;
+            if got == 0 {
+                return Err(ReplayError::Malformed {
+                    offset: read as u64,
+                    reason: "compaction entry is shorter than its own size",
+                });
+            }
+            read += got;
+        }
+        let parsed = parse_frames(&bytes)?;
+        if parsed.committed_len != bytes.len() {
+            return Err(ReplayError::Malformed {
+                offset: parsed.committed_len as u64,
+                reason: "compaction entry ends in a partial frame",
+            });
+        }
+        let replayed = replay_records(parsed.records)?;
+        let states = replayed
+            .transactions
+            .iter()
+            .map(|(id, transaction)| (*id, transaction.state))
+            .collect::<BTreeMap<_, _>>();
+        if &states != surviving {
+            return Err(ReplayError::InvalidHistory(
+                "compaction entry does not replay to the surviving transactions",
+            ));
+        }
+        Ok(())
     }
 
     /// Test-only empty-WAL constructor. Production must replay and resume the
@@ -2526,11 +2787,23 @@ impl IntoVersionedRecord for SealRecord {
 
 struct ParsedFrames {
     records: Vec<VersionedRecord>,
+    /// Each committed frame's transaction and its exact byte range, in file
+    /// order. Compaction copies the surviving ranges verbatim, so it cannot
+    /// introduce an encoding difference the way re-encoding records would.
+    spans: Vec<FrameSpan>,
     committed_len: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FrameSpan {
+    transaction: TransactionId,
+    start: usize,
+    end: usize,
 }
 
 fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
     let mut records = Vec::new();
+    let mut spans = Vec::new();
     let mut offset = 0;
     let mut last_version = None;
     while offset < bytes.len() {
@@ -2586,11 +2859,17 @@ fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
             return Err(ReplayError::InvalidHistory("WAL frame version regressed"));
         }
         last_version = Some(version);
+        spans.push(FrameSpan {
+            transaction: record.transaction(),
+            start: offset,
+            end: offset + frame_len,
+        });
         records.push(VersionedRecord { version, record });
         offset += frame_len;
     }
     Ok(ParsedFrames {
         records,
+        spans,
         committed_len: offset,
     })
 }
@@ -3099,6 +3378,7 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
         }
     }
     Ok(Replay {
+        frame_bytes: BTreeMap::new(),
         transactions,
         transaction_order,
         tail_repair: None,

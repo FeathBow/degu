@@ -107,7 +107,7 @@ fn clean_min_size_excludes_small_findings_and_totals_only_planned_items() {
     );
     assert_eq!(
         report["staging_preflight"][0]["purge_admission"]["supported"],
-        false
+        true
     );
 
     let human = run_clean(
@@ -178,13 +178,10 @@ fn assert_size_human_output(stdout: &str, small_path: &str) {
         "{stdout}"
     );
     assert!(
-        stdout.contains("staging and undo are supported"),
+        stdout.contains("staging, undo and permanent deletion are all supported"),
         "{stdout}"
     );
-    assert!(
-        stdout.contains("later permanent purge is unsupported"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("last name for each inode"), "{stdout}");
     assert!(stdout.contains("Hidden by filters: 1 location"));
     assert!(!stdout.contains(small_path));
     assert!(stdout.contains("Would move "), "{stdout}");

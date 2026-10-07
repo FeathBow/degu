@@ -93,7 +93,10 @@ impl PreviewStagingAssessment {
     /// Directory metadata is the one thing no proof covers, so it is the one extended
     /// attribute that still refuses a permanent deletion. Ordinary regular-file xattrs
     /// are bound into the content manifest by proof schema v3, which this purge verifies
-    /// before it unlinks anything, so they no longer block one.
+    /// before it unlinks anything, so they no longer block one. Nor do complete internal
+    /// hard-link groups: the manifest binds each regular file's link count, the walk
+    /// refuses every other topology, and the purge predicts the only drift its own
+    /// unlinks cause in that count.
     pub(super) fn directory_xattrs_block_purge(&self) -> bool {
         matches!(
             self.status,
@@ -105,7 +108,7 @@ impl PreviewStagingAssessment {
     }
 
     pub(super) fn purge_supported(&self) -> bool {
-        !self.has_internal_hard_links() && !self.directory_xattrs_block_purge()
+        !self.directory_xattrs_block_purge()
     }
 
     pub(super) fn is_blocked(&self) -> bool {
@@ -140,18 +143,9 @@ impl PreviewStagingAssessment {
                 let has_hardlinks = regular_hard_links.contains_multi_link_group();
                 let has_xattrs = regular_xattrs.contains_xattrs();
                 let directory_xattrs_block_purge = *directory_xattrs_block_purge;
-                let limitation = match (has_hardlinks, directory_xattrs_block_purge) {
-                    (true, true) => Some(
-                        "multi-link regular-file groups and directory extended attributes may be staged and undone, but sealed purge is unsupported",
-                    ),
-                    (true, false) => Some(
-                        "multi-link regular-file groups may be staged and undone, but sealed purge is unsupported",
-                    ),
-                    (false, true) => Some(
-                        "directory extended attributes may be staged and undone, but sealed purge is unsupported",
-                    ),
-                    (false, false) => None,
-                };
+                let limitation = directory_xattrs_block_purge.then_some(
+                    "directory extended attributes may be staged and undone, but sealed purge is unsupported",
+                );
                 serde_json::json!({
                     "path": path,
                     "status": "tree_policy_assessed",
@@ -162,6 +156,9 @@ impl PreviewStagingAssessment {
                     "regular_hard_links": {
                         "multi_link_groups": regular_hard_links.multi_link_groups,
                         "linked_entries": regular_hard_links.linked_entries,
+                        // Every other topology was refused by the walk that
+                        // produced this assessment: a group whose in-tree link
+                        // count differs from the inode's never reaches here.
                         "topology": if has_hardlinks { "internal_complete" } else { "single_link_only" },
                     },
                     "regular_xattrs": {
@@ -171,7 +168,7 @@ impl PreviewStagingAssessment {
                         "proof_schema": 3,
                     },
                     "purge_admission": {
-                        "supported": !has_hardlinks && !directory_xattrs_block_purge,
+                        "supported": !directory_xattrs_block_purge,
                         "limitation": limitation,
                     },
                     "pending_validation": {

@@ -619,8 +619,7 @@ fn execute_reserved(
             // The object stays durably staged in trash; a non-recovery admission
             // failure is not a stage failure and must not skip the oplog record.
             Err(error) => {
-                let unsupported_content = error.is_unsupported_internal_hard_links()
-                    || error.is_unsupported_directory_xattrs();
+                let unsupported_content = error.is_unsupported_directory_xattrs();
                 purge_admission_failure = Some((
                     format!(
                         "purge admission failed during {}: {}",

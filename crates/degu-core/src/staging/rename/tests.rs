@@ -1389,7 +1389,7 @@ fn verified_purge_mints_one_use_authority_after_durable_terminal_transition() {
 }
 
 #[test]
-fn internal_hardlink_purge_is_rejected_before_authority_and_restart_undo_preserves_aliases() {
+fn internal_hardlink_purge_unlinks_every_alias_and_frees_the_inode() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -1399,59 +1399,30 @@ fn internal_hardlink_purge_is_rejected_before_authority_and_restart_undo_preserv
     let transaction = TransactionId([0xeb; 16]);
     let mut ready = stage_production(&fixture, transaction);
 
-    let error = ready
-        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
-        .unwrap_err();
-    assert!(error.is_unsupported_internal_hard_links(), "{error}");
+    let staged_data = fixture.destination_root.join("child/data");
+    let staged_alias = fixture.destination_root.join("child/data-alias");
+    let staged_inode = std::fs::metadata(&staged_data).unwrap().ino();
     assert_eq!(
-        error.disposition(),
-        VerifiedPurgeFailureDisposition::NotStarted
+        std::fs::metadata(&staged_alias).unwrap().ino(),
+        staged_inode
     );
-    assert_eq!(
-        ready.state(transaction),
-        Some(TransactionState::VerifiedCommitted)
-    );
-    for path in [
-        fixture.destination_root.join("child/data"),
-        fixture.destination_root.join("child/data-alias"),
-    ] {
-        assert!(path.is_file());
+    for path in [&staged_data, &staged_alias] {
         assert_eq!(std::fs::metadata(path).unwrap().nlink(), 2);
     }
-    drop(ready);
 
-    let mut lease = fixture.store.try_lease().unwrap();
-    let replay = lease.replay_and_repair().unwrap();
-    let staged = &replay.transactions[&transaction];
-    assert_eq!(staged.state, TransactionState::VerifiedCommitted);
-    assert_eq!(staged.purge_removed_entries, 0);
-    assert!(staged.purge_last_path.is_none());
-    drop(lease);
-
-    // A fresh engine generation must still regard the committed transaction as
-    // healthy and permit exact undo without any recovery/quarantine promotion.
-    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
-    assert!(report.is_empty());
-    let (mut ready, summary) = engine
-        .recover_startup(report, |_, _| {
-            Err(std::io::Error::other(
-                "VerifiedCommitted must not request startup recovery anchors",
-            ))
-        })
+    // The plan is path-keyed, so each alias is its own record. Unlinking the
+    // first drops the shared count and bumps the shared ctime, which is the
+    // drift `reconcile_group_alias_drift` predicts rather than ignores.
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
         .unwrap();
-    assert!(summary.recovered.is_empty());
-    let token = ready
-        .verified_undo_token(transaction, "undo-group")
-        .unwrap();
-    ready
-        .undo_verified(token, verified_undo_request(&fixture))
-        .unwrap();
-    let restored = std::fs::metadata(&original).unwrap();
-    let restored_alias = std::fs::metadata(&alias).unwrap();
-    assert_eq!(restored.ino(), restored_alias.ino());
-    assert_eq!(restored.nlink(), 2);
-    assert_eq!(restored_alias.nlink(), 2);
-    assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+    ready.execute_verified_purge(authority).unwrap();
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purged));
+    assert!(!staged_data.exists());
+    assert!(!staged_alias.exists());
+    assert!(!fixture.destination_root.exists());
+    assert!(!original.exists());
+    assert!(!alias.exists());
 }
 
 #[test]
@@ -1467,7 +1438,6 @@ fn hardlink_topology_drift_after_stage_uses_existing_recovery_required_tamper_pa
     let error = ready
         .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
         .unwrap_err();
-    assert!(!error.is_unsupported_internal_hard_links());
     assert_eq!(
         error.disposition(),
         VerifiedPurgeFailureDisposition::Terminal(TransactionState::RecoveryRequired)
@@ -3765,5 +3735,47 @@ fn staged_recovery_descendant_replacement_is_quarantined_without_chmod_replaceme
     assert_eq!(
         recovered.state(transaction),
         Some(TransactionState::Quarantined)
+    );
+}
+
+/// Interruption between the aliases of one group is the existing interrupted
+/// purge, not a new state: progress is durable, the transaction stops at
+/// `PurgeIntent`, and startup hands it to recovery rather than resuming a plan
+/// whose remaining aliases can no longer match the record they were proven by.
+#[test]
+fn interruption_between_two_aliases_of_one_group_stops_at_purge_intent() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let original = fixture.source_root.join("child/data");
+    let alias = fixture.source_root.join("child/data-alias");
+    std::fs::hard_link(&original, &alias).unwrap();
+    let transaction = TransactionId([0xed; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+
+    // Stop on the progress sync that follows the group's first unlink.
+    crate::staging::recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(Some(2)));
+    assert!(ready.execute_verified_purge(authority).is_err());
+    crate::staging::recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(None));
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::PurgeIntent)
+    );
+    drop(ready);
+
+    let mut lease = fixture.store.try_lease().unwrap();
+    let replay = lease.replay_and_repair().unwrap();
+    assert_eq!(replay.transactions[&transaction].purge_removed_entries, 1);
+    assert_eq!(
+        crate::seal::wal::decide_recovery(&replay.transactions[&transaction], |_| {
+            crate::seal::wal::RecoveryIdentity::Reestablished
+        }),
+        crate::seal::wal::RecoveryWork::RecoveryRequired {
+            transaction,
+            reason: crate::seal::wal::RecoveryRequiredReason::InterruptedPurge,
+        }
     );
 }

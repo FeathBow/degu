@@ -502,7 +502,7 @@ impl MutationSession {
                 if matches!(
                     error.disposition(),
                     degu_core::staging::VerifiedPurgeFailureDisposition::NotStarted
-                ) && error.is_unsupported_internal_hard_links() =>
+                ) && error.is_unsupported_directory_xattrs() =>
             {
                 SealedPurgeOutcome::RetainedUnsupported(format!(
                     "retained and remains undoable because permanent purge is unsupported: {}",

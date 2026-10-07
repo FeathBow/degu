@@ -114,15 +114,12 @@ fn print_selected(prepared: &PreparedClean) -> Result<()> {
             })
             .count();
         if internal_hard_link_items != 0 {
-            let note = if prepared.settings.purge {
-                format!(
-                    "{internal_hard_link_items} location(s) contain complete internal regular-file hardlink groups: execution may stage them, but permanent purge is unsupported and they will remain undoable in Degu trash."
-                )
-            } else {
-                format!(
-                    "{internal_hard_link_items} location(s) contain complete internal regular-file hardlink groups: staging and undo are supported, but later permanent purge is unsupported."
-                )
-            };
+            // Purge admits these now, so what is left to say is the one thing
+            // a reader cannot infer: the deleted amount is not the freed
+            // amount while any name outside the tree holds the same inode.
+            let note = format!(
+                "{internal_hard_link_items} location(s) contain complete internal regular-file hardlink groups: staging, undo and permanent deletion are all supported, and space returns only once the last name for each inode is gone."
+            );
             stdoutln!(
                 "{}",
                 prepared.settings.ui.toned_prose(0, &note, Tone::Secondary)
@@ -232,21 +229,15 @@ fn print_permanent_preview(
         )?;
     }
     if !staged_only.is_empty() {
-        let has_links = staged_only.iter().any(|finding| {
-            prepared
-                .preview_assessment(finding)
-                .is_some_and(|assessment| assessment.has_internal_hard_links())
-        });
         let directory_xattrs_block_purge = staged_only.iter().any(|finding| {
             prepared
                 .preview_assessment(finding)
                 .is_some_and(|assessment| assessment.directory_xattrs_block_purge())
         });
-        let unsupported = match (has_links, directory_xattrs_block_purge) {
-            (true, true) => "multi-link regular-file groups or directory extended attributes",
-            (true, false) => "multi-link regular-file groups",
-            (false, true) => "directory extended attributes",
-            (false, false) => "the staged proof topology",
+        let unsupported = if directory_xattrs_block_purge {
+            "directory extended attributes"
+        } else {
+            "the staged proof topology"
         };
         stdoutln!(
             "{}",

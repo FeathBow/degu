@@ -3523,17 +3523,16 @@ fn group_alias_drift_is_predicted_rather_than_excused() {
             },
         }
     }
-    let path = Path::new("child/data");
     let proven = alias(2, 19, 20);
 
     // The first alias of a group is compared exactly: nothing of ours has
     // touched it yet, so neither field may have moved.
     let mut first = alias(2, 19, 20);
-    assert!(reconcile_group_alias_drift(path, &proven, &mut first, 0).is_ok());
+    assert!(reconcile_group_alias_drift(&proven, &mut first, 0).is_ok());
     assert_eq!(first, proven);
     let mut first_drifted_ctime = alias(2, 25, 0);
     assert!(
-        reconcile_group_alias_drift(path, &proven, &mut first_drifted_ctime, 0).is_ok(),
+        reconcile_group_alias_drift(&proven, &mut first_drifted_ctime, 0).is_ok(),
         "the check itself passes; the caller's byte comparison is what refuses it"
     );
     assert_ne!(
@@ -3544,7 +3543,7 @@ fn group_alias_drift_is_predicted_rather_than_excused() {
     // The second alias: the count must be exactly one lower, and once that
     // holds both fields are normalised so the rest is compared as proven.
     let mut second = alias(1, 25, 0);
-    assert!(reconcile_group_alias_drift(path, &proven, &mut second, 1).is_ok());
+    assert!(reconcile_group_alias_drift(&proven, &mut second, 1).is_ok());
     assert_eq!(second, proven);
 
     // A count that is not the predicted one is refused, whichever side it
@@ -3552,24 +3551,24 @@ fn group_alias_drift_is_predicted_rather_than_excused() {
     for observed in [2, 0] {
         let mut wrong = alias(observed, 25, 0);
         assert!(
-            reconcile_group_alias_drift(path, &proven, &mut wrong, 1).is_err(),
+            reconcile_group_alias_drift(&proven, &mut wrong, 1).is_err(),
             "nlink {observed} is not the predicted 1"
         );
     }
 
     // A ctime older than the proven one did not come from our unlink.
     let mut backwards = alias(1, 18, 999);
-    assert!(reconcile_group_alias_drift(path, &proven, &mut backwards, 1).is_err());
+    assert!(reconcile_group_alias_drift(&proven, &mut backwards, 1).is_err());
 
     // More aliases removed than the record ever had is not arithmetic to wrap.
     let mut overshoot = alias(1, 25, 0);
-    assert!(reconcile_group_alias_drift(path, &proven, &mut overshoot, 3).is_err());
+    assert!(reconcile_group_alias_drift(&proven, &mut overshoot, 3).is_err());
 
     // A single-link file is never relaxed: it is returned untouched whatever
     // the caller passes, so its comparison is the one it always had.
     let single = alias(1, 19, 20);
     let mut observed_single = alias(1, 25, 0);
-    assert!(reconcile_group_alias_drift(path, &single, &mut observed_single, 0).is_ok());
+    assert!(reconcile_group_alias_drift(&single, &mut observed_single, 0).is_ok());
     assert_eq!(
         observed_single,
         alias(1, 25, 0),

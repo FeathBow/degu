@@ -386,13 +386,16 @@ fn xattr_only_human_purge_preview_promises_the_deletion_it_will_perform() {
     assert_eq!(report["executed"][0]["purged"], true, "{report:#}");
 }
 
-/// The retained-entry contract still exists, but a complete internal hardlink
-/// group is no longer what triggers it: directory metadata is. This keeps the
-/// property under test — one retained entry must not stop the others — while
-/// the hardlink group itself is now expected to be purged like anything else.
+/// The retained-entry contract still exists; directory metadata is what
+/// triggers it now that a complete internal hardlink group does not. The
+/// property under test is unchanged — one retained entry must not stop the
+/// unrelated ones — and the hardlink group here is inside the retained entry,
+/// so it stays put with it. A hardlink entry of its own is purged, which
+/// `internal_hardlink_purge_deletes_every_alias_because_the_proof_binds_the_link_count`
+/// is what shows.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn trash_purge_retains_a_directory_xattr_entry_and_continues_the_hardlink_entry() {
+fn trash_purge_retains_a_directory_xattr_entry_and_continues_the_unrelated_entry() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -460,10 +463,11 @@ fn trash_purge_retains_a_directory_xattr_entry_and_continues_the_hardlink_entry(
 
 /// Expiry's continue-past-a-retained-entry contract, re-pointed at the one
 /// topology that still refuses a permanent deletion now that a complete
-/// internal hardlink group does not.
+/// internal hardlink group does not. The others continued past are the
+/// unrelated legacy entries; the hardlink group is inside the retained entry.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn expiry_retains_a_middle_directory_xattr_entry_and_continues_the_others() {
+fn expiry_retains_a_middle_directory_xattr_entry_and_continues_the_unrelated_ones() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -1169,4 +1173,52 @@ fn count_directories(root: &Path) -> usize {
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .count()
+}
+
+/// A plan holding both a purgeable hardlink group and a retained
+/// directory-xattr entry is where the two were conflated. The surface a reader
+/// actually sees for this is the dry-run plan — the execution-path mechanism
+/// line has no preview assessment to consult, which is why its "some entries
+/// are retained" variants were unreachable and were deleted rather than
+/// reworded. So this pins the dry run: the retained thing is named by what
+/// retains it, and no surface describes the hardlink group as retained.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_mixed_plan_names_only_what_it_retains() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let original = fixture.cache.join("wheel.whl");
+    let alias = fixture.cache.join("wheel-alias.whl");
+    std::fs::hard_link(&original, &alias).unwrap();
+    let nested = fixture.cache.join("wheels");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(nested.join("inner.whl"), b"inner").unwrap();
+    set_ordinary_xattr(&nested, b"on-a-directory");
+
+    let json = fixture.run(&["clean", "-n", "--purge", "--json"]);
+    assert_output_success(&json);
+    let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let assessed = &json["staging_preflight"][0];
+    assert_eq!(assessed["contains_internal_hardlinks"], true, "{json:#}");
+    assert_eq!(assessed["directory_xattrs_block_purge"], true, "{json:#}");
+    assert_eq!(assessed["purge_admission"]["supported"], false, "{json:#}");
+    assert_eq!(
+        assessed["purge_admission"]["limitation"],
+        "directory extended attributes may be staged and undone, but sealed purge is unsupported",
+        "the limitation must name what causes it: {json:#}"
+    );
+
+    let human = fixture.run(&["clean", "-n", "--purge"]);
+    assert_output_success(&human);
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        human.contains("directory extended attributes"),
+        "the retained reason must be named: {human}"
+    );
+    assert!(
+        !human.to_lowercase().contains("hardlink") || human.contains("last name for each inode"),
+        "no surface may describe the hardlink group as retained: {human}"
+    );
 }

@@ -3738,44 +3738,74 @@ fn staged_recovery_descendant_replacement_is_quarantined_without_chmod_replaceme
     );
 }
 
-/// Interruption between the aliases of one group is the existing interrupted
-/// purge, not a new state: progress is durable, the transaction stops at
-/// `PurgeIntent`, and startup hands it to recovery rather than resuming a plan
-/// whose remaining aliases can no longer match the record they were proven by.
+/// Interruption with one alias of a group gone and the other still there is
+/// the interrupted purge that already exists: progress is durable, the
+/// transaction stops at `PurgeIntent`, and startup hands it to recovery rather
+/// than resuming a plan whose remaining alias can no longer match the record
+/// it was proven by.
+///
+/// The progress hook fires *after* an unlink, so the index alone says nothing
+/// about how many names are left. Which boundary lands between the two aliases
+/// depends on the plan's order, so the test looks for it on the filesystem
+/// instead of assuming one.
 #[test]
-fn interruption_between_two_aliases_of_one_group_stops_at_purge_intent() {
-    let Some(fixture) = Fixture::new() else {
-        return;
-    };
-    let original = fixture.source_root.join("child/data");
-    let alias = fixture.source_root.join("child/data-alias");
-    std::fs::hard_link(&original, &alias).unwrap();
-    let transaction = TransactionId([0xed; 16]);
-    let mut ready = stage_production(&fixture, transaction);
-    let authority = ready
-        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
-        .unwrap();
+fn interruption_with_one_alias_left_stops_at_purge_intent() {
+    let mut boundaries_between_aliases = 0;
+    for progress in 1..=4_u64 {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let original = fixture.source_root.join("child/data");
+        let alias = fixture.source_root.join("child/data-alias");
+        std::fs::hard_link(&original, &alias).unwrap();
+        let transaction = TransactionId([0xed; 16]);
+        let mut ready = stage_production(&fixture, transaction);
+        let staged = [
+            fixture.destination_root.join("child/data"),
+            fixture.destination_root.join("child/data-alias"),
+        ];
+        let authority = ready
+            .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+            .unwrap();
 
-    // Stop on the progress sync that follows the group's first unlink.
-    crate::staging::recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(Some(2)));
-    assert!(ready.execute_verified_purge(authority).is_err());
-    crate::staging::recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(None));
-    assert_eq!(
-        ready.state(transaction),
-        Some(TransactionState::PurgeIntent)
-    );
-    drop(ready);
+        crate::staging::recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(Some(progress)));
+        assert!(ready.execute_verified_purge(authority).is_err());
+        crate::staging::recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(None));
+        assert_eq!(
+            ready.state(transaction),
+            Some(TransactionState::PurgeIntent)
+        );
+        drop(ready);
 
-    let mut lease = fixture.store.try_lease().unwrap();
-    let replay = lease.replay_and_repair().unwrap();
-    assert_eq!(replay.transactions[&transaction].purge_removed_entries, 1);
-    assert_eq!(
-        crate::seal::wal::decide_recovery(&replay.transactions[&transaction], |_| {
-            crate::seal::wal::RecoveryIdentity::Reestablished
-        }),
-        crate::seal::wal::RecoveryWork::RecoveryRequired {
-            transaction,
-            reason: crate::seal::wal::RecoveryRequiredReason::InterruptedPurge,
+        let surviving = staged.iter().filter(|path| path.exists()).count();
+        let mut lease = fixture.store.try_lease().unwrap();
+        let replay = lease.replay_and_repair().unwrap();
+        let recorded = &replay.transactions[&transaction];
+        assert_eq!(recorded.state, TransactionState::PurgeIntent);
+        assert_eq!(
+            crate::seal::wal::decide_recovery(recorded, |_| {
+                crate::seal::wal::RecoveryIdentity::Reestablished
+            }),
+            crate::seal::wal::RecoveryWork::RecoveryRequired {
+                transaction,
+                reason: crate::seal::wal::RecoveryRequiredReason::InterruptedPurge,
+            },
+            "every boundary is the existing interrupted purge"
+        );
+        drop(lease);
+
+        if surviving == 1 {
+            boundaries_between_aliases += 1;
+            let left = staged.iter().find(|path| path.exists()).unwrap();
+            assert_eq!(
+                std::fs::metadata(left).unwrap().nlink(),
+                1,
+                "the surviving name is the group's last, so the inode is still alive"
+            );
         }
+    }
+    assert!(
+        boundaries_between_aliases > 0,
+        "no progress boundary left exactly one alias of the group in place"
     );
 }

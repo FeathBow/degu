@@ -3443,7 +3443,7 @@ impl StreamedV3Purger {
             .get(&plan.expected.identity)
             .copied()
             .unwrap_or(0);
-        reconcile_group_alias_drift(&plan.path, &plan.expected, &mut actual, already_unlinked)?;
+        reconcile_group_alias_drift(&plan.expected, &mut actual, already_unlinked)?;
         self.actual_record.clear();
         emit_manifest_entry_v3(&actual, |bytes| self.actual_record.extend_from_slice(bytes));
         if self.actual_record.as_slice() != plan.expected_raw || actual != plan.expected {
@@ -4238,7 +4238,7 @@ impl HeldTreeInventory {
             )?;
             let mut actual = before.into_manifest(expected.path.clone(), content);
             let already_unlinked = group_unlinked.get(&expected.identity).copied().unwrap_or(0);
-            reconcile_group_alias_drift(&expected.path, expected, &mut actual, already_unlinked)?;
+            reconcile_group_alias_drift(expected, &mut actual, already_unlinked)?;
             if &actual != expected {
                 return Err(HeldTreeError::IdentityChanged(expected.path.clone()).into());
             }
@@ -5861,11 +5861,11 @@ fn require_owner(path: &Path, actual: u32, expected: u32) -> Result<(), HeldTree
 /// A single-link file never enters this: its recorded count is one, nothing of
 /// ours has touched it, and it is compared as it always was.
 fn reconcile_group_alias_drift(
-    path: &Path,
     expected: &ManifestEntry,
     actual: &mut ManifestEntry,
     already_unlinked: u64,
 ) -> Result<(), HeldTreeError> {
+    let path = expected.path.as_path();
     let ContentProof::Regular {
         nlink: recorded,
         ctime_sec: recorded_ctime_sec,

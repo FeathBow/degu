@@ -41,39 +41,26 @@ pub(super) fn print_mutation_scope(
 /// reports `Do not run undo for this entry` for the ones that cannot, and a
 /// closing line that invited undo anyway would leave the reader holding two
 /// instructions with no way to tell which one applies.
-fn staged_note(
-    staged_under_seal: bool,
-    manual_recovery: bool,
-    purge_unsupported: bool,
-) -> Option<String> {
+/// There is no "some entries were retained" variant: saying that needs a
+/// preview assessment, and `staging_preflight` exists only for a dry run
+/// (`preparation.rs:205`), which never reaches this summary. The variant that
+/// used to be here printed nothing and named a topology the execution had
+/// deleted.
+fn staged_note(staged_under_seal: bool, manual_recovery: bool) -> Option<String> {
     let quota = if manual_recovery {
         "Still counts against quota while staged. Entries that need manual recovery cannot be restored with 'degu undo'; each one's reason is reported as an error."
     } else {
         "Still counts against quota while staged; restore with 'degu undo'."
     };
     if staged_under_seal {
-        let expiry = if purge_unsupported {
-            " Internal-hardlink entries are retained because permanent purge is unsupported; unrelated purge-supported entries may be purged after seven days."
-        } else {
-            " A later clean may purge it after seven days; legacy path-based cleanup cannot delete it."
-        };
-        Some(format!("{quota}{expiry}"))
+        Some(format!(
+            "{quota} A later clean may purge it after seven days; legacy path-based cleanup cannot delete it."
+        ))
     } else if manual_recovery {
         None
     } else {
         Some(quota.to_owned())
     }
-}
-
-fn plan_has_purge_unsupported(prepared: &PreparedClean) -> bool {
-    prepared
-        .preview_tree_policy_assessed()
-        .iter()
-        .any(|finding| {
-            prepared
-                .preview_assessment(finding)
-                .is_some_and(|assessment| !assessment.purge_supported())
-        })
 }
 
 fn print_mechanism(prepared: &PreparedClean, sealed_staging: bool) -> Result<()> {
@@ -97,21 +84,16 @@ fn print_mechanism(prepared: &PreparedClean, sealed_staging: bool) -> Result<()>
     for trash_dir in &trash_dirs {
         stdoutln!("  {trash_dir}")?;
     }
-    let mechanism = if prepared.settings.purge && plan_has_purge_unsupported(prepared) {
-        ui.toned_prose(
-            0,
-            "Purge-supported items are sealed, staged, and permanently deleted through exact object-bound authority. Internal-hardlink items remain staged and undoable because permanent purge is unsupported.",
-            Tone::Destructive,
-        )
-    } else if prepared.settings.purge {
+    // No "some items are unsupported" variant here: that would need a preview
+    // assessment, and `staging_preflight` is populated only for a dry run
+    // (`preparation.rs:205`), which returns before this is reached
+    // (`execution.rs:117`). A branch on it printed nothing and said something
+    // the execution did not do.
+    let mechanism = if prepared.settings.purge {
         ui.toned_prose(
             0,
             "Sealed, staged, and permanently deleted through exact object-bound authority; not restorable.",
             Tone::Destructive,
-        )
-    } else if sealed_staging && plan_has_purge_unsupported(prepared) {
-        ui.prose(
-            "Restorable with degu undo. Internal-hardlink entries remain staged because permanent purge is unsupported; unrelated purge-supported entries may be purged after seven days. Legacy path-based cleanup cannot delete sealed entries."
         )
     } else if sealed_staging {
         ui.prose(&format!(
@@ -130,20 +112,13 @@ fn print_mechanism_sentence(
     trash_dirs: &[String],
     sealed_staging: bool,
 ) -> Result<()> {
-    let mechanism = if prepared.settings.purge && plan_has_purge_unsupported(prepared) {
-        semantic::paint(
-            "purge-supported items are sealed, staged, and permanently deleted through exact object-bound authority; internal-hardlink items remain staged and undoable because permanent purge is unsupported.",
-            Tone::Destructive,
-            prepared.settings.ui.colors.stdout,
-        )
-    } else if prepared.settings.purge {
+    // Same as `print_mechanism`: the unsupported variants were unreachable.
+    let mechanism = if prepared.settings.purge {
         semantic::paint(
             "sealed, staged, and permanently deleted through exact object-bound authority; not restorable.",
             Tone::Destructive,
             prepared.settings.ui.colors.stdout,
         )
-    } else if sealed_staging && plan_has_purge_unsupported(prepared) {
-        "restorable with degu undo; internal-hardlink entries remain staged because permanent purge is unsupported, while unrelated purge-supported entries may be purged after seven days. Legacy path-based cleanup cannot delete sealed entries.".to_string()
     } else if sealed_staging {
         format!(
             "restorable with degu undo; a later clean may purge it after {TRASH_RETENTION_DAYS} days. Legacy path-based cleanup cannot delete it."
@@ -258,7 +233,6 @@ pub(super) fn print_execution(
             executed
                 .iter()
                 .any(CleanExecution::requires_manual_recovery),
-            plan_has_purge_unsupported(prepared),
         ) {
             stdoutln!("{}", ui.prose(&note))?;
         }

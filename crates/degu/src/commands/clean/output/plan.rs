@@ -297,7 +297,7 @@ fn print_staging_preview(
         "{}",
         semantic::paint(
             prepared.settings.ui.prose(
-                "Quota can change only after permanent deletion: inspect degu trash list; trash purge deletes purge-supported entries but retains sealed internal-hardlink entries."
+                "Quota can change only after permanent deletion: inspect degu trash list; trash purge deletes purge-supported entries but retains sealed entries carrying a directory extended attribute."
             ),
             Tone::Secondary,
             prepared.settings.ui.colors.stdout

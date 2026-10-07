@@ -17,14 +17,12 @@ fn trash_resolution_failure_escapes_path_and_reason() {
 #[test]
 fn a_run_needing_manual_recovery_never_offers_undo() {
     for sealed_authority in [false, true] {
-        for purge_unsupported in [false, true] {
-            let note = staged_note(sealed_authority, true, purge_unsupported).unwrap_or_default();
-            assert!(
-                !note.contains("restore with 'degu undo'"),
-                "sealed_authority={sealed_authority} purge_unsupported={purge_unsupported}: {note}"
-            );
-        }
-        let ordinary = staged_note(sealed_authority, false, false).expect("a note");
+        let note = staged_note(sealed_authority, true).unwrap_or_default();
+        assert!(
+            !note.contains("restore with 'degu undo'"),
+            "sealed_authority={sealed_authority}: {note}"
+        );
+        let ordinary = staged_note(sealed_authority, false).expect("a note");
         assert!(ordinary.contains("restore with 'degu undo'"), "{ordinary}");
     }
 }

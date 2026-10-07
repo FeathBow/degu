@@ -65,11 +65,11 @@ fn internal_hardlink_pair_previews_stages_and_fresh_process_undo_preserves_inode
     let human = fixture.run(&["clean", "-n"]);
     assert_output_success(&human);
     let human = String::from_utf8(human.stdout).unwrap();
-    assert!(
-        human.contains("staging, undo and permanent deletion are all supported"),
-        "{human}"
-    );
     assert!(human.contains("last name for each inode"), "{human}");
+    assert!(
+        !human.contains("permanent deletion are all supported"),
+        "the hardlink note must not claim purge support: {human}"
+    );
 
     let clean = fixture.run(&[
         "clean",
@@ -1217,8 +1217,19 @@ fn a_mixed_plan_names_only_what_it_retains() {
         human.contains("directory extended attributes"),
         "the retained reason must be named: {human}"
     );
+    // The contradiction this guards is in the conjunction, not in either half:
+    // the same location claimed "permanent deletion are all supported" for its
+    // hardlink groups while the plan line said it would not be permanently
+    // deleted. Asserting each half on its own could not see it.
+    let claims_supported = human.contains("permanent deletion are all supported")
+        || human.contains("permanently deleted through exact object-bound authority");
+    let claims_unsupported = human.contains("not permanently delete");
     assert!(
-        !human.to_lowercase().contains("hardlink") || human.contains("last name for each inode"),
-        "no surface may describe the hardlink group as retained: {human}"
+        !(claims_supported && claims_unsupported),
+        "one plan said both that it would and would not permanently delete: {human}"
+    );
+    assert!(
+        claims_unsupported,
+        "a plan whose only location is retained must say so: {human}"
     );
 }

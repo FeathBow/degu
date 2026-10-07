@@ -1389,7 +1389,7 @@ fn verified_purge_mints_one_use_authority_after_durable_terminal_transition() {
 }
 
 #[test]
-fn internal_hardlink_purge_unlinks_every_alias_and_frees_the_inode() {
+fn internal_hardlink_purge_unlinks_every_alias_of_one_group() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -3808,4 +3808,60 @@ fn interruption_with_one_alias_left_stops_at_purge_intent() {
         boundaries_between_aliases > 0,
         "no progress boundary left exactly one alias of the group in place"
     );
+}
+
+/// Two groups in one tree, with different link counts, interleaved by path so
+/// the plan does not meet either group's aliases consecutively. A per-group
+/// counter keyed on anything but the inode, or shared across groups, predicts
+/// the wrong link count for the second group it reaches.
+#[test]
+fn two_hardlink_groups_in_one_tree_are_counted_apart() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let child = fixture.source_root.join("child");
+    // Group A has two names, group B three, and their names interleave in
+    // canonical order: a-one, b-one, a-two, b-two, b-three.
+    let a_one = child.join("a-one");
+    let b_one = child.join("b-one");
+    std::fs::write(&a_one, b"group a").unwrap();
+    std::fs::write(&b_one, b"group b").unwrap();
+    std::fs::hard_link(&a_one, child.join("a-two")).unwrap();
+    std::fs::hard_link(&b_one, child.join("b-two")).unwrap();
+    std::fs::hard_link(&b_one, child.join("b-three")).unwrap();
+
+    let transaction = TransactionId([0xee; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let staged_child = fixture.destination_root.join("child");
+    let a_inode = std::fs::metadata(staged_child.join("a-one")).unwrap().ino();
+    let b_inode = std::fs::metadata(staged_child.join("b-one")).unwrap().ino();
+    assert_ne!(
+        a_inode, b_inode,
+        "the fixture must have two distinct groups"
+    );
+    assert_eq!(
+        std::fs::metadata(staged_child.join("a-two"))
+            .unwrap()
+            .nlink(),
+        2
+    );
+    assert_eq!(
+        std::fs::metadata(staged_child.join("b-three"))
+            .unwrap()
+            .nlink(),
+        3
+    );
+
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    ready.execute_verified_purge(authority).unwrap();
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purged));
+    for name in ["a-one", "a-two", "b-one", "b-two", "b-three"] {
+        assert!(
+            !staged_child.join(name).exists(),
+            "{name} survived the purge"
+        );
+    }
+    assert!(!fixture.destination_root.exists());
 }

@@ -177,11 +177,14 @@ fn assert_size_human_output(stdout: &str, small_path: &str) {
         !stdout.contains("Blocked by sealed staging preflight"),
         "{stdout}"
     );
-    assert!(
-        stdout.contains("staging, undo and permanent deletion are all supported"),
-        "{stdout}"
-    );
+    // The note says only what the reader cannot infer. Whether the location is
+    // purgeable is the plan's own line, so this one must not claim it either
+    // way — the same location can carry a directory extended attribute.
     assert!(stdout.contains("last name for each inode"), "{stdout}");
+    assert!(
+        !stdout.contains("permanent deletion are all supported"),
+        "the hardlink note must not claim purge support: {stdout}"
+    );
     assert!(stdout.contains("Hidden by filters: 1 location"));
     assert!(!stdout.contains(small_path));
     assert!(stdout.contains("Would move "), "{stdout}");

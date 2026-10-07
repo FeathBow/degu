@@ -114,11 +114,13 @@ fn print_selected(prepared: &PreparedClean) -> Result<()> {
             })
             .count();
         if internal_hard_link_items != 0 {
-            // Purge admits these now, so what is left to say is the one thing
-            // a reader cannot infer: the deleted amount is not the freed
-            // amount while any name outside the tree holds the same inode.
+            // Says only what a reader cannot infer: the deleted amount is not
+            // the freed amount while a name outside the tree holds the same
+            // inode. Whether a location is purgeable is the plan's own line to
+            // make — the same location can carry a directory extended
+            // attribute, and claiming support here contradicted it.
             let note = format!(
-                "{internal_hard_link_items} location(s) contain complete internal regular-file hardlink groups: staging, undo and permanent deletion are all supported, and space returns only once the last name for each inode is gone."
+                "{internal_hard_link_items} location(s) contain complete internal regular-file hardlink groups: space returns only once the last name for each inode is gone."
             );
             stdoutln!(
                 "{}",

@@ -1226,6 +1226,12 @@ pub(crate) struct StreamedV3Purger {
     previous_path: Option<Vec<u8>>,
     content_budget: Budget,
     actual_record: Vec<u8>,
+    /// How many aliases of each multi-link group this purge has already
+    /// unlinked, so the next one's link count is predicted rather than taken
+    /// on trust. Only groups whose recorded count is above one are tracked,
+    /// and a group leaves the map once its last alias is gone, so this holds
+    /// at most one entry per group still being unlinked.
+    group_unlinked: BTreeMap<NodeIdentity, u64>,
 }
 
 /// Builds private purge-plan records while a canonical v3 manifest is decoded.
@@ -3233,6 +3239,7 @@ impl StreamedV3Inventory {
             previous_path: None,
             content_budget: Budget::new(limits, CONTENT_PROOF_VERSION),
             actual_record: Vec::new(),
+            group_unlinked: BTreeMap::new(),
         }
     }
 
@@ -3430,7 +3437,13 @@ impl StreamedV3Purger {
             &mut self.content_budget,
             CONTENT_PROOF_VERSION,
         )?;
-        let actual = before.into_manifest(plan.path.clone(), content);
+        let mut actual = before.into_manifest(plan.path.clone(), content);
+        let already_unlinked = self
+            .group_unlinked
+            .get(&plan.expected.identity)
+            .copied()
+            .unwrap_or(0);
+        reconcile_group_alias_drift(&plan.expected, &mut actual, already_unlinked)?;
         self.actual_record.clear();
         emit_manifest_entry_v3(&actual, |bytes| self.actual_record.extend_from_slice(bytes));
         if self.actual_record.as_slice() != plan.expected_raw || actual != plan.expected {
@@ -3443,6 +3456,7 @@ impl StreamedV3Purger {
         };
         retry_interrupted(|| with_fd(parent, |fd| rustix::fs::unlinkat(fd, name, flags)))
             .map_err(|error| io_error(&actual.path, error))?;
+        note_group_alias_unlinked(&mut self.group_unlinked, &plan.expected);
         drop(reopened);
         self.removed = self.removed.checked_add(1).ok_or(HeldTreeError::Limit {
             kind: HeldTreeLimit::Entries,
@@ -4192,6 +4206,9 @@ impl HeldTreeInventory {
         });
         let mut content_budget = Budget::new(self.limits, self.manifest_schema);
         let mut removed = 0_u64;
+        // See `reconcile_group_alias_drift`: a group's remaining aliases are
+        // predicted from what this purge has already unlinked.
+        let mut group_unlinked: BTreeMap<NodeIdentity, u64> = BTreeMap::new();
         for expected in entries {
             #[cfg(test)]
             if PURGE_FAIL_AFTER_REMOVALS.with(|limit| limit.get() == Some(removed)) {
@@ -4219,7 +4236,9 @@ impl HeldTreeInventory {
                 &mut content_budget,
                 self.manifest_schema,
             )?;
-            let actual = before.into_manifest(expected.path.clone(), content);
+            let mut actual = before.into_manifest(expected.path.clone(), content);
+            let already_unlinked = group_unlinked.get(&expected.identity).copied().unwrap_or(0);
+            reconcile_group_alias_drift(expected, &mut actual, already_unlinked)?;
             if &actual != expected {
                 return Err(HeldTreeError::IdentityChanged(expected.path.clone()).into());
             }
@@ -4231,6 +4250,7 @@ impl HeldTreeInventory {
             retry_interrupted(|| with_fd(parent, |fd| rustix::fs::unlinkat(fd, name, flags)))
                 .map_err(|error| io_error(&expected.path, error))?;
             drop(reopened);
+            note_group_alias_unlinked(&mut group_unlinked, expected);
             removed = removed.checked_add(1).ok_or(HeldTreeError::Limit {
                 kind: HeldTreeLimit::Entries,
                 limit: self.limits.max_entries,
@@ -5823,6 +5843,86 @@ fn require_owner(path: &Path, actual: u32, expected: u32) -> Result<(), HeldTree
         Ok(())
     } else {
         Err(HeldTreeError::ForeignOwner(path.to_path_buf()))
+    }
+}
+
+/// Accounts for the only drift a purge causes in its own evidence.
+///
+/// Unlinking one name of a complete internal hard-link group drops the shared
+/// inode's link count and bumps its ctime, so the aliases still to come can no
+/// longer equal the record that was proven when all of them existed. Both
+/// movements are ours and both are predictable: the count must be exactly the
+/// recorded one less the aliases this purge has already removed, and the ctime
+/// must not have gone backwards. Once that is checked, the observation is
+/// normalised to the recorded values so every other field — the content hash,
+/// size, mode, owner and identity — is still compared exactly, against the
+/// authenticated bytes, immediately before the unlink.
+///
+/// A single-link file never enters this: its recorded count is one, nothing of
+/// ours has touched it, and it is compared as it always was.
+fn reconcile_group_alias_drift(
+    expected: &ManifestEntry,
+    actual: &mut ManifestEntry,
+    already_unlinked: u64,
+) -> Result<(), HeldTreeError> {
+    let path = expected.path.as_path();
+    let ContentProof::Regular {
+        nlink: recorded,
+        ctime_sec: recorded_ctime_sec,
+        ctime_nsec: recorded_ctime_nsec,
+        ..
+    } = expected.content
+    else {
+        return Ok(());
+    };
+    if recorded <= 1 {
+        return Ok(());
+    }
+    let ContentProof::Regular {
+        nlink,
+        ctime_sec,
+        ctime_nsec,
+        ..
+    } = &mut actual.content
+    else {
+        return Ok(());
+    };
+    let predicted = recorded
+        .checked_sub(already_unlinked)
+        .ok_or_else(|| HeldTreeError::IdentityChanged(path.to_path_buf()))?;
+    if *nlink != predicted {
+        return Err(HeldTreeError::IdentityChanged(path.to_path_buf()));
+    }
+    if already_unlinked != 0 {
+        if (*ctime_sec, *ctime_nsec) < (recorded_ctime_sec, recorded_ctime_nsec) {
+            return Err(HeldTreeError::IdentityChanged(path.to_path_buf()));
+        }
+        *ctime_sec = recorded_ctime_sec;
+        *ctime_nsec = recorded_ctime_nsec;
+    }
+    *nlink = recorded;
+    Ok(())
+}
+
+/// Records one alias of a group as removed, and forgets the group once its last
+/// name is gone so the map holds only groups still being unlinked.
+fn note_group_alias_unlinked(
+    group_unlinked: &mut BTreeMap<NodeIdentity, u64>,
+    expected: &ManifestEntry,
+) {
+    let ContentProof::Regular {
+        nlink: recorded, ..
+    } = expected.content
+    else {
+        return;
+    };
+    if recorded <= 1 {
+        return;
+    }
+    let seen = group_unlinked.entry(expected.identity).or_insert(0);
+    *seen += 1;
+    if *seen >= recorded {
+        group_unlinked.remove(&expected.identity);
     }
 }
 

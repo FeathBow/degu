@@ -61,14 +61,14 @@ fn internal_hardlink_pair_previews_stages_and_fresh_process_undo_preserves_inode
     );
     assert_eq!(preflight["regular_hard_links"]["multi_link_groups"], 1);
     assert_eq!(preflight["regular_hard_links"]["linked_entries"], 2);
-    assert_eq!(preflight["purge_admission"]["supported"], false);
+    assert_eq!(preflight["purge_admission"]["supported"], true);
     let human = fixture.run(&["clean", "-n"]);
     assert_output_success(&human);
     let human = String::from_utf8(human.stdout).unwrap();
-    assert!(human.contains("staging and undo are supported"), "{human}");
+    assert!(human.contains("last name for each inode"), "{human}");
     assert!(
-        human.contains("later permanent purge is unsupported"),
-        "{human}"
+        !human.contains("permanent deletion are all supported"),
+        "the hardlink note must not claim purge support: {human}"
     );
 
     let clean = fixture.run(&[
@@ -100,7 +100,7 @@ fn internal_hardlink_pair_previews_stages_and_fresh_process_undo_preserves_inode
 }
 
 #[test]
-fn internal_hardlink_purge_stages_full_tree_then_reports_unsupported_and_undoes() {
+fn internal_hardlink_purge_deletes_every_alias_because_the_proof_binds_the_link_count() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -111,17 +111,29 @@ fn internal_hardlink_purge_stages_full_tree_then_reports_unsupported_and_undoes(
     let preview = fixture.run(&["clean", "-n", "--purge", "--json"]);
     assert_output_success(&preview);
     let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
-    assert_eq!(preview["staging_preflight"][0]["requested_action"], "purge");
+    let assessed = &preview["staging_preflight"][0];
+    assert_eq!(assessed["requested_action"], "purge");
+    assert_eq!(assessed["contains_internal_hardlinks"], true);
     assert_eq!(
-        preview["staging_preflight"][0]["purge_admission"]["supported"],
-        false
+        assessed["regular_hard_links"]["topology"],
+        "internal_complete"
     );
+    assert_eq!(assessed["purge_admission"]["supported"], true);
+    assert!(
+        assessed["purge_admission"]["limitation"].is_null(),
+        "{preview:#}"
+    );
+
     let human = fixture.run(&["clean", "-n", "--purge"]);
     assert_output_success(&human);
     let human = String::from_utf8(human.stdout).unwrap();
-    assert!(human.contains("Would stage"), "{human}");
-    assert!(human.contains("not permanently delete"), "{human}");
-    assert!(!human.contains("Would permanently delete 4"), "{human}");
+    assert!(
+        !human.contains("not permanently delete"),
+        "a supported topology must not be reported as retained: {human}"
+    );
+    // The one thing left to say about an alias group is that the deleted
+    // amount is not the freed amount while a name outside the tree remains.
+    assert!(human.contains("last name for each inode"), "{human}");
 
     let clean = fixture.run(&[
         "clean",
@@ -131,32 +143,12 @@ fn internal_hardlink_purge_stages_full_tree_then_reports_unsupported_and_undoes(
         "--path",
         fixture.cache.to_str().unwrap(),
     ]);
+    assert_output_success(&clean);
     let report: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
     let item = &report["executed"][0];
-    assert_eq!(item["state"], "staged", "{report:#}");
-    assert_eq!(item["purged"], false, "{report:#}");
-    assert!(
-        item["outcome"]["failed"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("does not support a tree containing multi-link regular-file groups"),
-        "{report:#}"
-    );
-    let trash = PathBuf::from(item["trash_entry"].as_str().unwrap());
-    assert!(trash.join("wheel.whl").is_file());
-    assert!(trash.join("wheel-alias.whl").is_file());
-    assert_eq!(
-        std::fs::metadata(trash.join("wheel.whl")).unwrap().nlink(),
-        2
-    );
-
-    let undo = fixture.run(&["undo", "--json"]);
-    assert_output_success(&undo);
-    assert_eq!(
-        std::fs::metadata(&original).unwrap().ino(),
-        std::fs::metadata(&alias).unwrap().ino()
-    );
-    assert_eq!(std::fs::metadata(&original).unwrap().nlink(), 2);
+    assert_eq!(item["purged"], true, "{report:#}");
+    assert!(!original.exists(), "{report:#}");
+    assert!(!alias.exists(), "{report:#}");
 }
 
 /// What the preview says the fixture's regular files already carry, as degu counts
@@ -394,14 +386,28 @@ fn xattr_only_human_purge_preview_promises_the_deletion_it_will_perform() {
     assert_eq!(report["executed"][0]["purged"], true, "{report:#}");
 }
 
+/// The retained-entry contract still exists; directory metadata is what
+/// triggers it now that a complete internal hardlink group does not. The
+/// property under test is unchanged — one retained entry must not stop the
+/// unrelated ones — and the hardlink group here is inside the retained entry,
+/// so it stays put with it. A hardlink entry of its own is purged, which
+/// `internal_hardlink_purge_deletes_every_alias_because_the_proof_binds_the_link_count`
+/// is what shows.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn trash_purge_retains_internal_hardlink_and_continues_legacy_entry() {
+fn trash_purge_retains_a_directory_xattr_entry_and_continues_the_unrelated_entry() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
     let original = fixture.cache.join("wheel.whl");
     let alias = fixture.cache.join("wheel-alias.whl");
     std::fs::hard_link(&original, &alias).unwrap();
+    // The entry that must be retained carries the one thing no proof covers.
+    let nested = fixture.cache.join("wheels");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(nested.join("inner.whl"), b"inner").unwrap();
+    set_ordinary_xattr(&nested, b"on-a-directory");
     let staged = fixture.run(&[
         "clean",
         "--yes",
@@ -444,10 +450,6 @@ fn trash_purge_retains_internal_hardlink_and_continues_legacy_entry() {
     let reason = report["failed"][0]["reason"].as_str().unwrap();
     assert!(reason.contains("retained"), "{reason}");
     assert!(reason.contains("remains undoable"), "{reason}");
-    assert!(
-        reason.contains("permanent purge is unsupported"),
-        "{reason}"
-    );
     assert!(retained.is_dir());
     assert!(!legacy.exists(), "unrelated legacy entry was not purged");
 
@@ -459,14 +461,25 @@ fn trash_purge_retains_internal_hardlink_and_continues_legacy_entry() {
     );
 }
 
+/// Expiry's continue-past-a-retained-entry contract, re-pointed at the one
+/// topology that still refuses a permanent deletion now that a complete
+/// internal hardlink group does not. The others continued past are the
+/// unrelated legacy entries; the hardlink group is inside the retained entry.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn expiry_retains_middle_internal_hardlink_and_continues_legacy_entries() {
+fn expiry_retains_a_middle_directory_xattr_entry_and_continues_the_unrelated_ones() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
     let original = fixture.cache.join("wheel.whl");
     let alias = fixture.cache.join("wheel-alias.whl");
     std::fs::hard_link(&original, &alias).unwrap();
+    // The middle entry must be one purge still refuses.
+    let nested = fixture.cache.join("wheels");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(nested.join("inner.whl"), b"inner").unwrap();
+    set_ordinary_xattr(&nested, b"on-a-directory");
     let staged = fixture.run(&[
         "clean",
         "--yes",
@@ -1160,4 +1173,63 @@ fn count_directories(root: &Path) -> usize {
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .count()
+}
+
+/// A plan holding both a purgeable hardlink group and a retained
+/// directory-xattr entry is where the two were conflated. The surface a reader
+/// actually sees for this is the dry-run plan — the execution-path mechanism
+/// line has no preview assessment to consult, which is why its "some entries
+/// are retained" variants were unreachable and were deleted rather than
+/// reworded. So this pins the dry run: the retained thing is named by what
+/// retains it, and no surface describes the hardlink group as retained.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_mixed_plan_names_only_what_it_retains() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let original = fixture.cache.join("wheel.whl");
+    let alias = fixture.cache.join("wheel-alias.whl");
+    std::fs::hard_link(&original, &alias).unwrap();
+    let nested = fixture.cache.join("wheels");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(nested.join("inner.whl"), b"inner").unwrap();
+    set_ordinary_xattr(&nested, b"on-a-directory");
+
+    let json = fixture.run(&["clean", "-n", "--purge", "--json"]);
+    assert_output_success(&json);
+    let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let assessed = &json["staging_preflight"][0];
+    assert_eq!(assessed["contains_internal_hardlinks"], true, "{json:#}");
+    assert_eq!(assessed["directory_xattrs_block_purge"], true, "{json:#}");
+    assert_eq!(assessed["purge_admission"]["supported"], false, "{json:#}");
+    assert_eq!(
+        assessed["purge_admission"]["limitation"],
+        "directory extended attributes may be staged and undone, but sealed purge is unsupported",
+        "the limitation must name what causes it: {json:#}"
+    );
+
+    let human = fixture.run(&["clean", "-n", "--purge"]);
+    assert_output_success(&human);
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        human.contains("directory extended attributes"),
+        "the retained reason must be named: {human}"
+    );
+    // The contradiction this guards is in the conjunction, not in either half:
+    // the same location claimed "permanent deletion are all supported" for its
+    // hardlink groups while the plan line said it would not be permanently
+    // deleted. Asserting each half on its own could not see it.
+    let claims_supported = human.contains("permanent deletion are all supported")
+        || human.contains("permanently deleted through exact object-bound authority");
+    let claims_unsupported = human.contains("not permanently delete");
+    assert!(
+        !(claims_supported && claims_unsupported),
+        "one plan said both that it would and would not permanently delete: {human}"
+    );
+    assert!(
+        claims_unsupported,
+        "a plan whose only location is retained must say so: {human}"
+    );
 }

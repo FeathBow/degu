@@ -158,8 +158,6 @@ pub(crate) enum RecoveryRebindError {
     UndoRenameUnknown(#[source] io::Error),
     #[error("verified undo parent fsync failed: {0}")]
     UndoParentSync(#[source] io::Error),
-    #[error("sealed purge does not support a tree containing multi-link regular-file groups")]
-    PurgeUnsupportedInternalHardLinks,
     #[error("sealed purge does not support a tree containing directory extended attributes")]
     PurgeUnsupportedDirectoryXattrs,
     #[error("directory extended-attribute evidence could not be read before purge: {0}")]
@@ -1070,15 +1068,15 @@ impl VerifiedPurgeSession<'_> {
                     return Err(error);
                 }
             };
-            // These admission gates precede plan sealing, PurgeAuthorized, and
+            // This admission gate precedes plan sealing, PurgeAuthorized, and
             // every unlink. Unsupported trees remain committed and undoable.
-            if inventory
-                .regular_hard_link_topology()
-                .contains_multi_link_group()
-            {
-                *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
-                return Err(RecoveryRebindError::PurgeUnsupportedInternalHardLinks);
-            }
+            //
+            // A complete internal hard-link group is not one of them. The walk
+            // just above refused any group whose in-tree link count differed
+            // from the inode's, and `reconcile_group_alias_drift` accounts for
+            // the only drift the purge then causes in its own evidence, so each
+            // alias is still compared exactly against the authenticated bytes
+            // immediately before it is unlinked.
             if verifier.tree_directory_xattrs_block_purge()? {
                 *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
                 return Err(RecoveryRebindError::PurgeUnsupportedDirectoryXattrs);
@@ -1121,13 +1119,6 @@ impl VerifiedPurgeSession<'_> {
                     return Err(error);
                 }
             };
-            if inventory
-                .regular_hard_link_topology()
-                .contains_multi_link_group()
-            {
-                *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
-                return Err(RecoveryRebindError::PurgeUnsupportedInternalHardLinks);
-            }
             if verifier.tree_directory_xattrs_block_purge()? {
                 *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
                 return Err(RecoveryRebindError::PurgeUnsupportedDirectoryXattrs);

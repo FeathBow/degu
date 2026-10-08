@@ -3493,3 +3493,85 @@ fn v3_mode_offset_matches_the_emitted_prefix() {
         );
     }
 }
+
+/// Each clause of the one relaxation a purge makes to its own evidence. The
+/// end-to-end purge proves the wiring; these prove the checks that were kept
+/// are doing something, which an all-green happy path cannot.
+#[test]
+fn group_alias_drift_is_predicted_rather_than_excused() {
+    fn alias(nlink: u64, ctime_sec: i64, ctime_nsec: u32) -> ManifestEntry {
+        ManifestEntry {
+            path: PathBuf::from("child/data"),
+            identity: NodeIdentity {
+                kind: NodeKind::Regular,
+                device: 7,
+                inode: 11,
+                incarnation: 14,
+            },
+            uid: 12,
+            gid: 13,
+            mode: 0o640,
+            content: ContentProof::Regular {
+                size: 3,
+                nlink,
+                mtime_sec: 17,
+                mtime_nsec: 18,
+                ctime_sec,
+                ctime_nsec,
+                sha256: [0x42; 32],
+                xattrs: empty_regular_xattr_proof(),
+            },
+        }
+    }
+    let proven = alias(2, 19, 20);
+
+    // The first alias of a group is compared exactly: nothing of ours has
+    // touched it yet, so neither field may have moved.
+    let mut first = alias(2, 19, 20);
+    assert!(reconcile_group_alias_drift(&proven, &mut first, 0).is_ok());
+    assert_eq!(first, proven);
+    let mut first_drifted_ctime = alias(2, 25, 0);
+    assert!(
+        reconcile_group_alias_drift(&proven, &mut first_drifted_ctime, 0).is_ok(),
+        "the check itself passes; the caller's byte comparison is what refuses it"
+    );
+    assert_ne!(
+        first_drifted_ctime, proven,
+        "a ctime that moved before any of our unlinks must survive to the comparison"
+    );
+
+    // The second alias: the count must be exactly one lower, and once that
+    // holds both fields are normalised so the rest is compared as proven.
+    let mut second = alias(1, 25, 0);
+    assert!(reconcile_group_alias_drift(&proven, &mut second, 1).is_ok());
+    assert_eq!(second, proven);
+
+    // A count that is not the predicted one is refused, whichever side it
+    // lands on: one extra name means a link we did not prove.
+    for observed in [2, 0] {
+        let mut wrong = alias(observed, 25, 0);
+        assert!(
+            reconcile_group_alias_drift(&proven, &mut wrong, 1).is_err(),
+            "nlink {observed} is not the predicted 1"
+        );
+    }
+
+    // A ctime older than the proven one did not come from our unlink.
+    let mut backwards = alias(1, 18, 999);
+    assert!(reconcile_group_alias_drift(&proven, &mut backwards, 1).is_err());
+
+    // More aliases removed than the record ever had is not arithmetic to wrap.
+    let mut overshoot = alias(1, 25, 0);
+    assert!(reconcile_group_alias_drift(&proven, &mut overshoot, 3).is_err());
+
+    // A single-link file is never relaxed: it is returned untouched whatever
+    // the caller passes, so its comparison is the one it always had.
+    let single = alias(1, 19, 20);
+    let mut observed_single = alias(1, 25, 0);
+    assert!(reconcile_group_alias_drift(&single, &mut observed_single, 0).is_ok());
+    assert_eq!(
+        observed_single,
+        alias(1, 25, 0),
+        "a single-link observation must reach the comparison exactly as observed"
+    );
+}

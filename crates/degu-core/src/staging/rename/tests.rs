@@ -1389,7 +1389,7 @@ fn verified_purge_mints_one_use_authority_after_durable_terminal_transition() {
 }
 
 #[test]
-fn internal_hardlink_purge_is_rejected_before_authority_and_restart_undo_preserves_aliases() {
+fn internal_hardlink_purge_unlinks_every_alias_of_one_group() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -1399,59 +1399,30 @@ fn internal_hardlink_purge_is_rejected_before_authority_and_restart_undo_preserv
     let transaction = TransactionId([0xeb; 16]);
     let mut ready = stage_production(&fixture, transaction);
 
-    let error = ready
-        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
-        .unwrap_err();
-    assert!(error.is_unsupported_internal_hard_links(), "{error}");
+    let staged_data = fixture.destination_root.join("child/data");
+    let staged_alias = fixture.destination_root.join("child/data-alias");
+    let staged_inode = std::fs::metadata(&staged_data).unwrap().ino();
     assert_eq!(
-        error.disposition(),
-        VerifiedPurgeFailureDisposition::NotStarted
+        std::fs::metadata(&staged_alias).unwrap().ino(),
+        staged_inode
     );
-    assert_eq!(
-        ready.state(transaction),
-        Some(TransactionState::VerifiedCommitted)
-    );
-    for path in [
-        fixture.destination_root.join("child/data"),
-        fixture.destination_root.join("child/data-alias"),
-    ] {
-        assert!(path.is_file());
+    for path in [&staged_data, &staged_alias] {
         assert_eq!(std::fs::metadata(path).unwrap().nlink(), 2);
     }
-    drop(ready);
 
-    let mut lease = fixture.store.try_lease().unwrap();
-    let replay = lease.replay_and_repair().unwrap();
-    let staged = &replay.transactions[&transaction];
-    assert_eq!(staged.state, TransactionState::VerifiedCommitted);
-    assert_eq!(staged.purge_removed_entries, 0);
-    assert!(staged.purge_last_path.is_none());
-    drop(lease);
-
-    // A fresh engine generation must still regard the committed transaction as
-    // healthy and permit exact undo without any recovery/quarantine promotion.
-    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
-    assert!(report.is_empty());
-    let (mut ready, summary) = engine
-        .recover_startup(report, |_, _| {
-            Err(std::io::Error::other(
-                "VerifiedCommitted must not request startup recovery anchors",
-            ))
-        })
+    // The plan is path-keyed, so each alias is its own record. Unlinking the
+    // first drops the shared count and bumps the shared ctime, which is the
+    // drift `reconcile_group_alias_drift` predicts rather than ignores.
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
         .unwrap();
-    assert!(summary.recovered.is_empty());
-    let token = ready
-        .verified_undo_token(transaction, "undo-group")
-        .unwrap();
-    ready
-        .undo_verified(token, verified_undo_request(&fixture))
-        .unwrap();
-    let restored = std::fs::metadata(&original).unwrap();
-    let restored_alias = std::fs::metadata(&alias).unwrap();
-    assert_eq!(restored.ino(), restored_alias.ino());
-    assert_eq!(restored.nlink(), 2);
-    assert_eq!(restored_alias.nlink(), 2);
-    assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+    ready.execute_verified_purge(authority).unwrap();
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purged));
+    assert!(!staged_data.exists());
+    assert!(!staged_alias.exists());
+    assert!(!fixture.destination_root.exists());
+    assert!(!original.exists());
+    assert!(!alias.exists());
 }
 
 #[test]
@@ -1467,7 +1438,6 @@ fn hardlink_topology_drift_after_stage_uses_existing_recovery_required_tamper_pa
     let error = ready
         .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
         .unwrap_err();
-    assert!(!error.is_unsupported_internal_hard_links());
     assert_eq!(
         error.disposition(),
         VerifiedPurgeFailureDisposition::Terminal(TransactionState::RecoveryRequired)
@@ -3766,4 +3736,132 @@ fn staged_recovery_descendant_replacement_is_quarantined_without_chmod_replaceme
         recovered.state(transaction),
         Some(TransactionState::Quarantined)
     );
+}
+
+/// Interruption with one alias of a group gone and the other still there is
+/// the interrupted purge that already exists: progress is durable, the
+/// transaction stops at `PurgeIntent`, and startup hands it to recovery rather
+/// than resuming a plan whose remaining alias can no longer match the record
+/// it was proven by.
+///
+/// The progress hook fires *after* an unlink, so the index alone says nothing
+/// about how many names are left. Which boundary lands between the two aliases
+/// depends on the plan's order, so the test looks for it on the filesystem
+/// instead of assuming one.
+#[test]
+fn interruption_with_one_alias_left_stops_at_purge_intent() {
+    let mut boundaries_between_aliases = 0;
+    for progress in 1..=4_u64 {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let original = fixture.source_root.join("child/data");
+        let alias = fixture.source_root.join("child/data-alias");
+        std::fs::hard_link(&original, &alias).unwrap();
+        let transaction = TransactionId([0xed; 16]);
+        let mut ready = stage_production(&fixture, transaction);
+        let staged = [
+            fixture.destination_root.join("child/data"),
+            fixture.destination_root.join("child/data-alias"),
+        ];
+        let authority = ready
+            .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+            .unwrap();
+
+        crate::staging::recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(Some(progress)));
+        assert!(ready.execute_verified_purge(authority).is_err());
+        crate::staging::recovery::PURGE_FAIL_PROGRESS_AT.with(|at| at.set(None));
+        assert_eq!(
+            ready.state(transaction),
+            Some(TransactionState::PurgeIntent)
+        );
+        drop(ready);
+
+        let surviving = staged.iter().filter(|path| path.exists()).count();
+        let mut lease = fixture.store.try_lease().unwrap();
+        let replay = lease.replay_and_repair().unwrap();
+        let recorded = &replay.transactions[&transaction];
+        assert_eq!(recorded.state, TransactionState::PurgeIntent);
+        assert_eq!(
+            crate::seal::wal::decide_recovery(recorded, |_| {
+                crate::seal::wal::RecoveryIdentity::Reestablished
+            }),
+            crate::seal::wal::RecoveryWork::RecoveryRequired {
+                transaction,
+                reason: crate::seal::wal::RecoveryRequiredReason::InterruptedPurge,
+            },
+            "every boundary is the existing interrupted purge"
+        );
+        drop(lease);
+
+        if surviving == 1 {
+            boundaries_between_aliases += 1;
+            let left = staged.iter().find(|path| path.exists()).unwrap();
+            assert_eq!(
+                std::fs::metadata(left).unwrap().nlink(),
+                1,
+                "the surviving name is the group's last, so the inode is still alive"
+            );
+        }
+    }
+    assert!(
+        boundaries_between_aliases > 0,
+        "no progress boundary left exactly one alias of the group in place"
+    );
+}
+
+/// Two groups in one tree, with different link counts, interleaved by path so
+/// the plan does not meet either group's aliases consecutively. A per-group
+/// counter keyed on anything but the inode, or shared across groups, predicts
+/// the wrong link count for the second group it reaches.
+#[test]
+fn two_hardlink_groups_in_one_tree_are_counted_apart() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let child = fixture.source_root.join("child");
+    // Group A has two names, group B three, and their names interleave in
+    // canonical order: a-one, b-one, a-two, b-two, b-three.
+    let a_one = child.join("a-one");
+    let b_one = child.join("b-one");
+    std::fs::write(&a_one, b"group a").unwrap();
+    std::fs::write(&b_one, b"group b").unwrap();
+    std::fs::hard_link(&a_one, child.join("a-two")).unwrap();
+    std::fs::hard_link(&b_one, child.join("b-two")).unwrap();
+    std::fs::hard_link(&b_one, child.join("b-three")).unwrap();
+
+    let transaction = TransactionId([0xee; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let staged_child = fixture.destination_root.join("child");
+    let a_inode = std::fs::metadata(staged_child.join("a-one")).unwrap().ino();
+    let b_inode = std::fs::metadata(staged_child.join("b-one")).unwrap().ino();
+    assert_ne!(
+        a_inode, b_inode,
+        "the fixture must have two distinct groups"
+    );
+    assert_eq!(
+        std::fs::metadata(staged_child.join("a-two"))
+            .unwrap()
+            .nlink(),
+        2
+    );
+    assert_eq!(
+        std::fs::metadata(staged_child.join("b-three"))
+            .unwrap()
+            .nlink(),
+        3
+    );
+
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    ready.execute_verified_purge(authority).unwrap();
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purged));
+    for name in ["a-one", "a-two", "b-one", "b-two", "b-three"] {
+        assert!(
+            !staged_child.join(name).exists(),
+            "{name} survived the purge"
+        );
+    }
+    assert!(!fixture.destination_root.exists());
 }

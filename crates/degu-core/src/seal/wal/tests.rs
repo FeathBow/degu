@@ -3630,12 +3630,27 @@ fn applied_tree_seal_mode_index_matches_the_scan_it_replaced() {
     ];
 
     for (name, permissions, expected) in cases {
-        let borrowed = || permissions.iter().map(|(owner, record)| (*owner, record));
-        let index = AppliedTreeSealModes::from_permissions(tx(1), borrowed());
-        let indexed = index.mode(Path::new(PATH), DEVICE, INODE, INCARNATION, PRE_MODE);
+        let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+        // These projection cases include records that WAL admission rejects.
+        for (owner, permission) in &permissions {
+            wal.ledgers
+                .entry(*owner)
+                .or_default()
+                .permissions
+                .insert(permission.mutation_id, permission.clone());
+        }
+        let indexed = wal.applied_tree_seal_modes(tx(1)).mode(
+            Path::new(PATH),
+            DEVICE,
+            INODE,
+            INCARNATION,
+            PRE_MODE,
+        );
         let scanned = AppliedTreeSealModes::mode_by_scan(
-            tx(1),
-            borrowed(),
+            permissions
+                .iter()
+                .filter(|(owner, _)| *owner == tx(1))
+                .map(|(_, record)| record),
             Path::new(PATH),
             DEVICE,
             INODE,
@@ -3739,3 +3754,5 @@ fn compaction_keeps_a_terminal_transaction_whose_group_is_unfinished() {
         "a transaction with no production association is in no mapping to break"
     );
 }
+
+mod permission_ledger;

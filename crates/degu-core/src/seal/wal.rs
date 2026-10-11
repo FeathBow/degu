@@ -22,6 +22,9 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod permission_ledger;
+use permission_ledger::{PermissionLedger, PhaseTally, SealCoverage};
+
 const MAGIC: &[u8; 4] = b"DSWL";
 const VERSION: u16 = 12;
 const LEGACY_CONTENT_PROOF_MANIFEST_VERSION: u16 = 2;
@@ -554,9 +557,7 @@ pub struct SealWal<W> {
     poisoned: bool,
     states: HashMap<TransactionId, TransactionState>,
     staging_schema_versions: HashMap<TransactionId, u16>,
-    used_mutations: HashSet<(TransactionId, u64)>,
-    permissions: HashMap<(TransactionId, u64), DurablePermission>,
-    unresolved_mutations: HashMap<(TransactionId, u64), DurablePermission>,
+    ledgers: HashMap<TransactionId, PermissionLedger>,
     staging: HashMap<TransactionId, StagingTransactionMetadata>,
     manifests: HashMap<TransactionId, DurableTreeManifest>,
     sidecars: HashMap<TransactionId, TreeSidecarCommitment>,
@@ -586,9 +587,7 @@ impl<W: DurableWrite> SealWal<W> {
             poisoned: false,
             states: HashMap::new(),
             staging_schema_versions: HashMap::new(),
-            used_mutations: HashSet::new(),
-            permissions: HashMap::new(),
-            unresolved_mutations: HashMap::new(),
+            ledgers: HashMap::new(),
             staging: HashMap::new(),
             manifests: HashMap::new(),
             sidecars: HashMap::new(),
@@ -688,12 +687,15 @@ impl<W: DurableWrite> SealWal<W> {
                     ),
                 );
             }
+            // Replayed in record order, through the same two ledger entry
+            // points the append path uses, so the derived counts of a resumed
+            // WAL are produced by one implementation rather than two.
+            let ledger = wal.ledgers.entry(transaction.id).or_default();
             for permission in &transaction.permissions {
-                let key = (transaction.id, permission.mutation_id);
-                wal.used_mutations.insert(key);
-                wal.permissions.insert(key, permission.clone());
-                if permission.application == ApplicationStatus::IntentDurableApplicationUnknown {
-                    wal.unresolved_mutations.insert(key, permission.clone());
+                let resolution = permission.application.resolution();
+                ledger.record_intent(permission.clone());
+                if let Some(resolution) = resolution {
+                    ledger.record_resolution(permission.mutation_id, resolution);
                 }
             }
         }
@@ -778,14 +780,12 @@ impl<W: DurableWrite> SealWal<W> {
         transaction: TransactionId,
     ) -> Option<ReplayedTransaction> {
         let state = self.states.get(&transaction).copied()?;
-        let mut permissions = self
-            .permissions
-            .iter()
-            .filter_map(|((owner, _), permission)| {
-                (*owner == transaction).then_some(permission.clone())
-            })
-            .collect::<Vec<_>>();
-        permissions.sort_by_key(|permission| permission.mutation_id);
+        let permissions = self
+            .ledgers
+            .get(&transaction)
+            .map_or_else(Vec::new, |ledger| {
+                ledger.permissions.values().cloned().collect()
+            });
         Some(ReplayedTransaction {
             id: transaction,
             state,
@@ -813,10 +813,10 @@ impl<W: DurableWrite> SealWal<W> {
         transaction: TransactionId,
     ) -> AppliedTreeSealModes {
         AppliedTreeSealModes::from_permissions(
-            transaction,
-            self.permissions
-                .iter()
-                .map(|((owner, _), permission)| (*owner, permission)),
+            self.ledgers
+                .get(&transaction)
+                .into_iter()
+                .flat_map(|ledger| ledger.permissions.values()),
         )
     }
 
@@ -824,10 +824,9 @@ impl<W: DurableWrite> SealWal<W> {
     /// IDs are never reused across original seals, failed intents, or inverses.
     #[allow(dead_code)] // consumed by the startup recovery execution seam
     pub(crate) fn next_recovery_mutation_id(&self, transaction: TransactionId) -> Option<u64> {
-        self.used_mutations
-            .iter()
-            .filter_map(|(owner, id)| (*owner == transaction).then_some(*id))
-            .max()
+        self.ledgers
+            .get(&transaction)
+            .and_then(|ledger| ledger.highest_mutation_id)
             .map_or(Some(0), |id| id.checked_add(1))
     }
 
@@ -848,12 +847,10 @@ impl<W: DurableWrite> SealWal<W> {
                         | TransactionState::UndoConflict
                         | TransactionState::RolledBack
                 ) || (*state == TransactionState::Quarantined
-                    && !retains_active_permission_seals(
-                        self.permissions
-                            .iter()
-                            .filter(|((owner, _), _)| owner == transaction)
-                            .map(|(_, permission)| permission),
-                    ))
+                    && self
+                        .ledgers
+                        .get(transaction)
+                        .is_none_or(|ledger| !ledger.retains_active_seals()))
             })
     }
 
@@ -1179,49 +1176,30 @@ impl<W: DurableWrite> SealWal<W> {
                 "purgeable requires its explicit proof-gated durable record",
             ));
         }
+        let ledger = self.ledgers.get(&transaction);
+        let coverage = ledger.map_or_else(SealCoverage::default, |ledger| ledger.coverage);
         if next != TransactionState::RecoveryRequired
-            && self
-                .unresolved_mutations
-                .keys()
-                .any(|(owner, _)| *owner == transaction)
+            && ledger.is_some_and(PermissionLedger::has_unresolved)
         {
             return Err(AppendError::InvalidState(
                 "transaction has an unresolved permission intent",
             ));
         }
-        if !phase_completion_is_valid(
-            self.permissions
-                .iter()
-                .filter(|((owner, _), _)| *owner == transaction)
-                .map(|(_, permission)| permission),
-            current,
-            next,
-        ) {
+        if !phase_completion_is_recorded(ledger, current, next) {
             return Err(AppendError::InvalidState(
                 "seal phase contains a permission intent not durably applied",
             ));
         }
         if current == TransactionState::ParentSealIntent
             && next == TransactionState::ParentSealed
-            && !staging_parent_strategy_is_complete(
-                self.staging.get(&transaction),
-                self.permissions
-                    .iter()
-                    .filter(|((owner, _), _)| *owner == transaction)
-                    .map(|(_, permission)| permission),
-            )
+            && !staging_parent_strategy_is_recorded(self.staging.get(&transaction), ledger)
         {
             return Err(AppendError::InvalidState(
                 "source-parent strategy lacks its required durable proof",
             ));
         }
         if next == TransactionState::SourceParentRestored
-            && !all_applied_parent_seals_have_applied_inverse(
-                self.permissions
-                    .iter()
-                    .filter(|((owner, _), _)| *owner == transaction)
-                    .map(|(_, permission)| permission),
-            )
+            && !coverage.every_applied_parent_seal_is_restored()
         {
             return Err(AppendError::InvalidState(
                 "source-parent restoration requires applied inverses",
@@ -1230,23 +1208,21 @@ impl<W: DurableWrite> SealWal<W> {
         if matches!(
             next,
             TransactionState::Restored | TransactionState::RolledBack
-        ) && !all_applied_seals_have_applied_inverse(
-            self.permissions
-                .iter()
-                .filter(|((owner, _), _)| *owner == transaction)
-                .map(|(_, permission)| permission),
-        ) {
+        ) && !coverage.every_applied_seal_is_reversed()
+        {
             return Err(AppendError::InvalidState(
                 "terminal restore requires an applied inverse for every applied seal",
             ));
         }
+        // The tree-specific count, which is what the scan here asked for.
+        // Reaching undo means passing SourceParentRestored, which already
+        // required every applied parent seal restored, and the restore,
+        // rollback and quarantine phases that could reverse a tree seal
+        // without undoing it have no edge to VerifiedCommitted -- so the
+        // whole-transaction count cannot differ here. The specific one is
+        // still the one asked, because that is the claim being made.
         if next == TransactionState::UndoModesRestored
-            && !all_applied_tree_seals_have_applied_inverse(
-                self.permissions
-                    .iter()
-                    .filter(|((owner, _), _)| *owner == transaction)
-                    .map(|(_, permission)| permission),
-            )
+            && !coverage.every_applied_tree_seal_is_undone()
         {
             return Err(AppendError::InvalidState(
                 "verified undo requires every committed tree seal inverse",
@@ -1375,17 +1351,12 @@ impl<W: DurableWrite> SealWal<W> {
             ));
         }
         validate_tree_sidecar_commitment(commitment).map_err(AppendError::InvalidState)?;
+        let ledger = self.ledgers.get(&transaction);
         if self.manifests.contains_key(&transaction)
             || self.sidecars.contains_key(&transaction)
-            || self
-                .unresolved_mutations
-                .keys()
-                .any(|(owner, _)| *owner == transaction)
-            || self.permissions.iter().any(|((owner, _), permission)| {
-                *owner == transaction
-                    && permission.phase == TransactionState::TreeSealIntent
-                    && permission.application != ApplicationStatus::Applied
-            })
+            || ledger.is_some_and(PermissionLedger::has_unresolved)
+            || ledger
+                .is_some_and(|ledger| !ledger.phase(TransactionState::TreeSealIntent).is_complete())
         {
             return Err(AppendError::InvalidState(
                 "tree completion is duplicate or permission work is unresolved",
@@ -1607,7 +1578,11 @@ impl<W: DurableWrite> SealWal<W> {
                 | TransactionState::Quarantined,
                 Some(original),
             ) => {
-                let Some(original) = self.permissions.get(&(transaction, original)) else {
+                let Some(original) = self
+                    .ledgers
+                    .get(&transaction)
+                    .and_then(|ledger| ledger.permissions.get(&original))
+                else {
                     return Err(MutationAppendError::IntentWal(AppendError::InvalidState(
                         "permission inverse references no durable mutation",
                     )));
@@ -1628,14 +1603,8 @@ impl<W: DurableWrite> SealWal<W> {
                         }))
                     || intent.pre_mode != original.expected_mode
                     || intent.expected_mode != original.pre_mode
-                    || self.permissions.iter().any(|((owner, _), permission)| {
-                        *owner == transaction
-                            && permission.reverses_mutation_id == Some(original.mutation_id)
-                            && matches!(
-                                permission.application,
-                                ApplicationStatus::Applied
-                                    | ApplicationStatus::IntentDurableApplicationUnknown
-                            )
+                    || self.ledgers.get(&transaction).is_some_and(|ledger| {
+                        ledger.active_inverses.contains_key(&original.mutation_id)
                     })
                 {
                     return Err(MutationAppendError::IntentWal(AppendError::InvalidState(
@@ -1649,18 +1618,24 @@ impl<W: DurableWrite> SealWal<W> {
                 )));
             }
         }
-        if !self.used_mutations.insert((transaction, mutation_id)) {
+        if self
+            .ledgers
+            .get(&transaction)
+            .is_some_and(|ledger| ledger.permissions.contains_key(&mutation_id))
+        {
             return Err(MutationAppendError::IntentWal(AppendError::InvalidState(
                 "duplicate permission mutation id",
             )));
         }
-        if let Err(error) = self.append_synced(&intent.clone().into_record()) {
-            self.used_mutations.remove(&(transaction, mutation_id));
-            return Err(MutationAppendError::IntentWal(error));
-        }
-        self.unresolved_mutations.insert(
-            (transaction, mutation_id),
-            DurablePermission {
+        // The ledger takes the intent only once its frame is durable, so a
+        // failed append leaves the mutation id unused instead of needing to be
+        // taken back out of an index that already counted it.
+        self.append_synced(&intent.clone().into_record())
+            .map_err(MutationAppendError::IntentWal)?;
+        self.ledgers
+            .entry(transaction)
+            .or_default()
+            .record_intent(DurablePermission {
                 mutation_id,
                 phase: phase.unwrap(),
                 evidence: intent.evidence,
@@ -1668,10 +1643,7 @@ impl<W: DurableWrite> SealWal<W> {
                 expected_mode: intent.expected_mode,
                 reverses_mutation_id: intent.reverses_mutation_id,
                 application: ApplicationStatus::IntentDurableApplicationUnknown,
-            },
-        );
-        let durable = self.unresolved_mutations[&(transaction, mutation_id)].clone();
-        self.permissions.insert((transaction, mutation_id), durable);
+            });
         mutate().map_err(MutationAppendError::Mutation)?;
         self.append_synced(&SealRecord::PermissionApplied {
             transaction,
@@ -1681,12 +1653,10 @@ impl<W: DurableWrite> SealWal<W> {
             source,
             mutation_applied: true,
         })?;
-        self.unresolved_mutations
-            .remove(&(transaction, mutation_id));
-        self.permissions
-            .get_mut(&(transaction, mutation_id))
-            .unwrap()
-            .application = ApplicationStatus::Applied;
+        self.ledgers
+            .entry(transaction)
+            .or_default()
+            .record_resolution(mutation_id, PermissionResolution::Applied);
         Ok(())
     }
 
@@ -1733,10 +1703,13 @@ impl<W: DurableWrite> SealWal<W> {
     where
         F: FnOnce(&DurablePermission) -> io::Result<PermissionResolution>,
     {
-        let key = (transaction, mutation_id);
         let permission = self
-            .unresolved_mutations
-            .get(&key)
+            .ledgers
+            .get(&transaction)
+            .and_then(|ledger| ledger.permissions.get(&mutation_id))
+            .filter(|permission| {
+                permission.application == ApplicationStatus::IntentDurableApplicationUnknown
+            })
             .ok_or(ResolveError::NotUnresolved)?;
         if self.states.get(&transaction).copied() != Some(permission.phase) {
             return Err(ResolveError::WrongPhase);
@@ -1753,11 +1726,10 @@ impl<W: DurableWrite> SealWal<W> {
             },
         };
         self.append_synced(&record).map_err(ResolveError::Wal)?;
-        self.unresolved_mutations.remove(&key);
-        self.permissions.get_mut(&key).unwrap().application = match resolution {
-            PermissionResolution::Applied => ApplicationStatus::Applied,
-            PermissionResolution::ConfirmedNotApplied => ApplicationStatus::ConfirmedNotApplied,
-        };
+        self.ledgers
+            .entry(transaction)
+            .or_default()
+            .record_resolution(mutation_id, resolution);
         Ok(resolution)
     }
 }
@@ -1806,6 +1778,20 @@ pub enum ApplicationStatus {
     IntentDurableApplicationUnknown,
 }
 
+impl ApplicationStatus {
+    /// The resolution this status records, or `None` while the application of
+    /// the durable intent is still unknown.
+    fn resolution(self) -> Option<PermissionResolution> {
+        match self {
+            ApplicationStatus::Applied => Some(PermissionResolution::Applied),
+            ApplicationStatus::ConfirmedNotApplied => {
+                Some(PermissionResolution::ConfirmedNotApplied)
+            }
+            ApplicationStatus::IntentDurableApplicationUnknown => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionResolution {
     Applied,
@@ -1841,15 +1827,13 @@ pub(crate) struct AppliedTreeSealModes {
 
 impl AppliedTreeSealModes {
     /// Built from the permissions themselves, so the index and the scan it
-    /// replaced can be compared on the same input.
-    fn from_permissions<'a>(
-        transaction: TransactionId,
-        permissions: impl Iterator<Item = (TransactionId, &'a DurablePermission)>,
-    ) -> Self {
+    /// replaced can be compared on the same input. Both are given one
+    /// transaction's permissions: which transaction owns a permission is now
+    /// settled by which ledger holds it.
+    fn from_permissions<'a>(permissions: impl Iterator<Item = &'a DurablePermission>) -> Self {
         let mut by_path: HashMap<PathBuf, Vec<AppliedTreeSeal>> = HashMap::new();
-        for (owner, permission) in permissions {
-            if owner != transaction
-                || permission.phase != TransactionState::TreeSealIntent
+        for permission in permissions {
+            if permission.phase != TransactionState::TreeSealIntent
                 || permission.application != ApplicationStatus::Applied
                 || permission.reverses_mutation_id.is_some()
                 || permission.evidence.expected_mode() != permission.expected_mode
@@ -1876,8 +1860,7 @@ impl AppliedTreeSealModes {
     /// from the tests that happened to pass.
     #[cfg(test)]
     fn mode_by_scan<'a>(
-        transaction: TransactionId,
-        permissions: impl Iterator<Item = (TransactionId, &'a DurablePermission)>,
+        permissions: impl Iterator<Item = &'a DurablePermission>,
         relative_path: &Path,
         device: u64,
         inode: u64,
@@ -1885,9 +1868,8 @@ impl AppliedTreeSealModes {
         pre_mode: u32,
     ) -> Option<u32> {
         let mut matched = None;
-        for (owner, permission) in permissions {
-            if owner != transaction
-                || permission.phase != TransactionState::TreeSealIntent
+        for permission in permissions {
+            if permission.phase != TransactionState::TreeSealIntent
                 || permission.application != ApplicationStatus::Applied
                 || permission.reverses_mutation_id.is_some()
                 || permission.evidence.relative_path() != relative_path
@@ -2514,11 +2496,29 @@ pub enum RecoveryRequiredReason {
     InterruptedPurge,
 }
 
+/// Whether a quarantined transaction still holds a mode no applied inverse has
+/// given back. One pass collects the reversed seals, so the answer costs this
+/// transaction's permissions rather than their square.
 pub(crate) fn quarantined_transaction_retains_active_permission_seals(
     transaction: &ReplayedTransaction,
 ) -> bool {
-    transaction.state == TransactionState::Quarantined
-        && retains_active_permission_seals(transaction.permissions.iter())
+    if transaction.state != TransactionState::Quarantined {
+        return false;
+    }
+    let reversed = transaction
+        .permissions
+        .iter()
+        .filter(|permission| permission.application == ApplicationStatus::Applied)
+        .filter_map(|permission| permission.reverses_mutation_id)
+        .collect::<HashSet<_>>();
+    transaction.permissions.iter().any(|seal| {
+        seal.application == ApplicationStatus::Applied
+            && matches!(
+                seal.phase,
+                TransactionState::ParentSealIntent | TransactionState::TreeSealIntent
+            )
+            && !reversed.contains(&seal.mutation_id)
+    })
 }
 
 fn staging_recovery_needs_mount_authority(transaction: &ReplayedTransaction) -> bool {
@@ -2878,8 +2878,7 @@ fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
 struct ReplayBuilding {
     state: Option<TransactionState>,
     staging_schema_version: Option<u16>,
-    permissions: Vec<DurablePermission>,
-    indices: HashMap<u64, (usize, TransactionState)>,
+    ledger: PermissionLedger,
     staging: Option<StagingTransactionMetadata>,
     tree_manifest: Option<DurableTreeManifest>,
     tree_sidecar: Option<TreeSidecarCommitment>,
@@ -2930,11 +2929,11 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                 if tx.state != Some(TransactionState::TreeSealIntent)
                     || tx.tree_manifest.is_some()
                     || tx.tree_sidecar.is_some()
-                    || tx.permissions.iter().any(|permission| {
-                        permission.application == ApplicationStatus::IntentDurableApplicationUnknown
-                            || (permission.phase == TransactionState::TreeSealIntent
-                                && permission.application != ApplicationStatus::Applied)
-                    })
+                    || tx.ledger.has_unresolved()
+                    || !tx
+                        .ledger
+                        .phase(TransactionState::TreeSealIntent)
+                        .is_complete()
                 {
                     return Err(ReplayError::InvalidHistory(
                         "tree manifest is duplicate, unordered, or has unresolved permissions",
@@ -2962,11 +2961,11 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                 if tx.state != Some(TransactionState::TreeSealIntent)
                     || tx.tree_manifest.is_some()
                     || tx.tree_sidecar.is_some()
-                    || tx.permissions.iter().any(|permission| {
-                        permission.application == ApplicationStatus::IntentDurableApplicationUnknown
-                            || (permission.phase == TransactionState::TreeSealIntent
-                                && permission.application != ApplicationStatus::Applied)
-                    })
+                    || tx.ledger.has_unresolved()
+                    || !tx
+                        .ledger
+                        .phase(TransactionState::TreeSealIntent)
+                        .is_complete()
                 {
                     return Err(ReplayError::InvalidHistory(
                         "tree completion is duplicate, unordered, or has unresolved permissions",
@@ -3103,26 +3102,21 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                             "purge outcome precedes complete durable progress",
                         ));
                     }
-                    if state != TransactionState::RecoveryRequired
-                        && tx.permissions.iter().any(|permission| {
-                            permission.application
-                                == ApplicationStatus::IntentDurableApplicationUnknown
-                        })
-                    {
+                    if state != TransactionState::RecoveryRequired && tx.ledger.has_unresolved() {
                         return Err(ReplayError::InvalidHistory(
                             "state advanced with an unresolved permission intent",
                         ));
                     }
-                    if !phase_completion_is_valid(tx.permissions.iter(), previous, state) {
+                    if !phase_completion_is_recorded(Some(&tx.ledger), previous, state) {
                         return Err(ReplayError::InvalidHistory(
                             "seal phase contains a permission intent not durably applied",
                         ));
                     }
                     if previous == TransactionState::ParentSealIntent
                         && state == TransactionState::ParentSealed
-                        && !staging_parent_strategy_is_complete(
+                        && !staging_parent_strategy_is_recorded(
                             tx.staging.as_ref(),
-                            tx.permissions.iter(),
+                            Some(&tx.ledger),
                         )
                     {
                         return Err(ReplayError::InvalidHistory(
@@ -3130,7 +3124,7 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                         ));
                     }
                     if state == TransactionState::SourceParentRestored
-                        && !all_applied_parent_seals_have_applied_inverse(tx.permissions.iter())
+                        && !tx.ledger.coverage.every_applied_parent_seal_is_restored()
                     {
                         return Err(ReplayError::InvalidHistory(
                             "source-parent restoration lacks applied inverses",
@@ -3139,7 +3133,7 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                     if matches!(
                         state,
                         TransactionState::Restored | TransactionState::RolledBack
-                    ) && !all_applied_seals_have_applied_inverse(tx.permissions.iter())
+                    ) && !tx.ledger.coverage.every_applied_seal_is_reversed()
                     {
                         return Err(ReplayError::InvalidHistory(
                             "terminal restore lacks an applied inverse for an applied seal",
@@ -3194,7 +3188,7 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                         }
                     }
                     if state == TransactionState::UndoModesRestored
-                        && !all_applied_tree_seals_have_applied_inverse(tx.permissions.iter())
+                        && !tx.ledger.coverage.every_applied_tree_seal_is_undone()
                     {
                         return Err(ReplayError::InvalidHistory(
                             "verified undo mode restoration lacks applied tree inverses",
@@ -3273,10 +3267,14 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                         })
                         && match reverses_mutation_id {
                             None => phase == TransactionState::ParentSealIntent,
-                            Some(original) => tx.permissions.iter().any(|permission| {
-                                permission.mutation_id == original
-                                    && permission.phase == TransactionState::ParentSealIntent
-                            }),
+                            Some(original) => {
+                                tx.ledger
+                                    .permissions
+                                    .get(&original)
+                                    .is_some_and(|permission| {
+                                        permission.phase == TransactionState::ParentSealIntent
+                                    })
+                            }
                         };
                     if !exact_v11_parent {
                         return Err(ReplayError::InvalidHistory(
@@ -3284,22 +3282,19 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                         ));
                     }
                 }
-                if tx.indices.contains_key(&mutation_id) {
+                if tx.ledger.permissions.contains_key(&mutation_id) {
                     return Err(ReplayError::InvalidHistory("duplicate permission intent"));
                 }
-                tx.indices
-                    .insert(mutation_id, (tx.permissions.len(), phase));
                 validate_replayed_inverse(
-                    &tx.permissions,
+                    &tx.ledger,
                     tx.staging.as_ref(),
                     phase,
-                    mutation_id,
                     &evidence,
                     pre_mode,
                     expected_mode,
                     reverses_mutation_id,
                 )?;
-                tx.permissions.push(DurablePermission {
+                tx.ledger.record_intent(DurablePermission {
                     mutation_id,
                     phase,
                     evidence,
@@ -3336,12 +3331,12 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                 tx.undo_rename_outcome = Some(outcome);
             }
             SealRecord::PermissionApplied { mutation_id, .. } => {
-                resolve_replayed_permission(tx, mutation_id, ApplicationStatus::Applied)?
+                resolve_replayed_permission(tx, mutation_id, PermissionResolution::Applied)?
             }
             SealRecord::PermissionNotApplied { mutation_id, .. } => resolve_replayed_permission(
                 tx,
                 mutation_id,
-                ApplicationStatus::ConfirmedNotApplied,
+                PermissionResolution::ConfirmedNotApplied,
             )?,
         }
     }
@@ -3357,7 +3352,7 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                     id,
                     state,
                     staging_schema_version: tx.staging_schema_version,
-                    permissions: tx.permissions,
+                    permissions: tx.ledger.into_record_order(),
                     staging: tx.staging,
                     tree_manifest: tx.tree_manifest,
                     tree_sidecar: tx.tree_sidecar,
@@ -3388,10 +3383,9 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
 
 #[allow(clippy::too_many_arguments)]
 fn validate_replayed_inverse(
-    permissions: &[DurablePermission],
+    ledger: &PermissionLedger,
     staging: Option<&StagingTransactionMetadata>,
     phase: TransactionState,
-    mutation_id: u64,
     evidence: &PersistentRecoveryEvidence,
     pre_mode: u32,
     expected_mode: u32,
@@ -3407,12 +3401,13 @@ fn validate_replayed_inverse(
             | TransactionState::Quarantined,
             Some(original_id),
         ) => {
-            let original = permissions
-                .iter()
-                .find(|permission| permission.mutation_id == original_id)
-                .ok_or(ReplayError::InvalidHistory(
-                    "permission inverse references no mutation in its transaction",
-                ))?;
+            let original =
+                ledger
+                    .permissions
+                    .get(&original_id)
+                    .ok_or(ReplayError::InvalidHistory(
+                        "permission inverse references no mutation in its transaction",
+                    ))?;
             if original.application != ApplicationStatus::Applied
                 || original.reverses_mutation_id.is_some()
                 || (phase == TransactionState::SourceParentRestoreIntent
@@ -3426,15 +3421,7 @@ fn validate_replayed_inverse(
                     }))
                 || pre_mode != original.expected_mode
                 || expected_mode != original.pre_mode
-                || permissions.iter().any(|permission| {
-                    permission.reverses_mutation_id == Some(original_id)
-                        && permission.mutation_id != mutation_id
-                        && matches!(
-                            permission.application,
-                            ApplicationStatus::Applied
-                                | ApplicationStatus::IntentDurableApplicationUnknown
-                        )
-                })
+                || ledger.active_inverses.contains_key(&original_id)
             {
                 return Err(ReplayError::InvalidHistory(
                     "permission inverse does not match its applied seal mutation",
@@ -3451,26 +3438,26 @@ fn validate_replayed_inverse(
 fn resolve_replayed_permission(
     transaction: &mut ReplayBuilding,
     mutation_id: u64,
-    resolution: ApplicationStatus,
+    resolution: PermissionResolution,
 ) -> Result<(), ReplayError> {
-    let Some((index, intent_phase)) = transaction.indices.get(&mutation_id).copied() else {
+    let Some(permission) = transaction.ledger.permissions.get(&mutation_id) else {
         return Err(ReplayError::InvalidHistory(
             "permission resolution has no intent",
         ));
     };
-    if transaction.state != Some(intent_phase) {
+    if transaction.state != Some(permission.phase) {
         return Err(ReplayError::InvalidHistory(
             "permission resolution is outside its intent phase",
         ));
     }
-    if transaction.permissions[index].application
-        != ApplicationStatus::IntentDurableApplicationUnknown
-    {
+    if permission.application != ApplicationStatus::IntentDurableApplicationUnknown {
         return Err(ReplayError::InvalidHistory(
             "duplicate permission resolution",
         ));
     }
-    transaction.permissions[index].application = resolution;
+    transaction
+        .ledger
+        .record_resolution(mutation_id, resolution);
     Ok(())
 }
 
@@ -3485,6 +3472,58 @@ fn evidence_is_exact_source_parent(
         && evidence.generation_or_btime() == Some(metadata.source_parent_identity.incarnation.get())
 }
 
+/// Whether the recorded source-parent work matches the strategy the staging
+/// metadata bound, read from the ledger's parent-phase tally.
+fn staging_parent_strategy_is_recorded(
+    metadata: Option<&StagingTransactionMetadata>,
+    ledger: Option<&PermissionLedger>,
+) -> bool {
+    let Some(metadata) = metadata else {
+        return true;
+    };
+    let parent = ledger.map_or_else(PhaseTally::default, |ledger| {
+        ledger.phase(TransactionState::ParentSealIntent)
+    });
+    match metadata.source_parent_strategy {
+        DurableSourceParentStrategy::PermissionSeal => parent.recorded != 0 && parent.is_complete(),
+        DurableSourceParentStrategy::AlreadyExclusive(_) => parent.recorded == 0,
+    }
+}
+
+/// The intent phase a transition completes, if it completes one. Shared by the
+/// ledger's answer and the scan it replaced so only the predicate differs.
+fn completed_phase(from: TransactionState, to: TransactionState) -> Option<TransactionState> {
+    match (from, to) {
+        (TransactionState::ParentSealIntent, TransactionState::ParentSealed) => {
+            Some(TransactionState::ParentSealIntent)
+        }
+        (TransactionState::TreeSealIntent, TransactionState::TreeSealed) => {
+            Some(TransactionState::TreeSealIntent)
+        }
+        (TransactionState::SourceParentRestoreIntent, TransactionState::SourceParentRestored) => {
+            Some(TransactionState::SourceParentRestoreIntent)
+        }
+        (TransactionState::UndoIntent, TransactionState::UndoModesRestored) => {
+            Some(TransactionState::UndoIntent)
+        }
+        _ => None,
+    }
+}
+
+/// Whether every permission of the phase this transition completes resolved
+/// the way that phase requires.
+fn phase_completion_is_recorded(
+    ledger: Option<&PermissionLedger>,
+    from: TransactionState,
+    to: TransactionState,
+) -> bool {
+    completed_phase(from, to)
+        .is_none_or(|phase| ledger.is_none_or(|ledger| ledger.phase(phase).is_complete()))
+}
+
+/// The scan the parent-strategy tally replaced, kept as the oracle its tests
+/// compare against.
+#[cfg(test)]
 fn staging_parent_strategy_is_complete<'a>(
     metadata: Option<&StagingTransactionMetadata>,
     permissions: impl Iterator<Item = &'a DurablePermission>,
@@ -3516,27 +3555,15 @@ fn same_recovery_object(
         && left.generation_or_btime() == right.generation_or_btime()
 }
 
+/// The scan the phase tally replaced, kept as the oracle its tests compare
+/// against.
+#[cfg(test)]
 fn phase_completion_is_valid<'a>(
     permissions: impl Iterator<Item = &'a DurablePermission>,
     from: TransactionState,
     to: TransactionState,
 ) -> bool {
-    let completed_phase = match (from, to) {
-        (TransactionState::ParentSealIntent, TransactionState::ParentSealed) => {
-            Some(TransactionState::ParentSealIntent)
-        }
-        (TransactionState::TreeSealIntent, TransactionState::TreeSealed) => {
-            Some(TransactionState::TreeSealIntent)
-        }
-        (TransactionState::SourceParentRestoreIntent, TransactionState::SourceParentRestored) => {
-            Some(TransactionState::SourceParentRestoreIntent)
-        }
-        (TransactionState::UndoIntent, TransactionState::UndoModesRestored) => {
-            Some(TransactionState::UndoIntent)
-        }
-        _ => None,
-    };
-    completed_phase.is_none_or(|phase| {
+    completed_phase(from, to).is_none_or(|phase| {
         permissions
             .filter(|permission| permission.phase == phase)
             .all(|permission| {
@@ -3549,6 +3576,9 @@ fn phase_completion_is_valid<'a>(
     })
 }
 
+/// The scan the parent-seal restoration coverage counts replaced, kept as the oracle its
+/// tests compare against.
+#[cfg(test)]
 fn all_applied_parent_seals_have_applied_inverse<'a>(
     permissions: impl Iterator<Item = &'a DurablePermission>,
 ) -> bool {
@@ -3564,12 +3594,18 @@ fn all_applied_parent_seals_have_applied_inverse<'a>(
     })
 }
 
+/// The scan `PermissionLedger::retains_active_seals` replaced, kept as the
+/// oracle its tests compare against.
+#[cfg(test)]
 fn retains_active_permission_seals<'a>(
     permissions: impl Iterator<Item = &'a DurablePermission>,
 ) -> bool {
     !all_applied_seals_have_applied_inverse(permissions)
 }
 
+/// The scan the committed tree-seal undo coverage counts replaced, kept as the oracle its
+/// tests compare against.
+#[cfg(test)]
 fn all_applied_tree_seals_have_applied_inverse<'a>(
     permissions: impl Iterator<Item = &'a DurablePermission>,
 ) -> bool {
@@ -3585,6 +3621,9 @@ fn all_applied_tree_seals_have_applied_inverse<'a>(
     })
 }
 
+/// The scan the terminal restore coverage counts replaced, kept as the oracle its
+/// tests compare against.
+#[cfg(test)]
 fn all_applied_seals_have_applied_inverse<'a>(
     permissions: impl Iterator<Item = &'a DurablePermission>,
 ) -> bool {

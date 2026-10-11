@@ -3630,12 +3630,29 @@ fn applied_tree_seal_mode_index_matches_the_scan_it_replaced() {
     ];
 
     for (name, permissions, expected) in cases {
-        let borrowed = || permissions.iter().map(|(owner, record)| (*owner, record));
-        let index = AppliedTreeSealModes::from_permissions(tx(1), borrowed());
-        let indexed = index.mode(Path::new(PATH), DEVICE, INODE, INCARNATION, PRE_MODE);
+        // The index is built through the per-transaction ledgers a leased WAL
+        // keeps, so which transaction owns a permission is settled where
+        // production settles it rather than by a clause inside the index.
+        let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+        for (owner, permission) in &permissions {
+            let ledger = wal.ledgers.entry(*owner).or_default();
+            ledger.record_intent(permission.clone());
+            if let Some(resolution) = permission.application.resolution() {
+                ledger.record_resolution(permission.mutation_id, resolution);
+            }
+        }
+        let indexed = wal.applied_tree_seal_modes(tx(1)).mode(
+            Path::new(PATH),
+            DEVICE,
+            INODE,
+            INCARNATION,
+            PRE_MODE,
+        );
         let scanned = AppliedTreeSealModes::mode_by_scan(
-            tx(1),
-            borrowed(),
+            permissions
+                .iter()
+                .filter(|(owner, _)| *owner == tx(1))
+                .map(|(_, record)| record),
             Path::new(PATH),
             DEVICE,
             INODE,
@@ -3737,5 +3754,770 @@ fn compaction_keeps_a_terminal_transaction_whose_group_is_unfinished() {
         ]),
         vec![1],
         "a transaction with no production association is in no mapping to break"
+    );
+}
+
+fn evidence_object(path: &str, inode: u64, mode: u32) -> PersistentRecoveryEvidence {
+    PersistentRecoveryEvidence::new(
+        PathBuf::from(path),
+        Some("local-fs".to_string()),
+        11,
+        inode,
+        Some(33),
+        mode,
+    )
+    .unwrap()
+}
+
+/// One recorded permission, as a scenario names it.
+#[derive(Clone, Copy)]
+enum Recorded {
+    /// A seal in this phase, resolved this way, or left unresolved.
+    Seal(u64, TransactionState, Option<PermissionResolution>),
+    /// An inverse of `reverses`, in this phase, resolved this way.
+    Inverse(u64, u64, TransactionState, Option<PermissionResolution>),
+}
+
+fn ledger_permission(
+    mutation_id: u64,
+    phase: TransactionState,
+    reverses_mutation_id: Option<u64>,
+) -> DurablePermission {
+    DurablePermission {
+        mutation_id,
+        phase,
+        evidence: evidence_object(&format!("seal{mutation_id}"), mutation_id + 1, 0o500),
+        pre_mode: 0o700,
+        expected_mode: 0o500,
+        reverses_mutation_id,
+        application: ApplicationStatus::IntentDurableApplicationUnknown,
+    }
+}
+
+fn record(ledger: &mut PermissionLedger, step: Recorded) {
+    let (mutation_id, phase, reverses, resolution) = match step {
+        Recorded::Seal(id, phase, resolution) => (id, phase, None, resolution),
+        Recorded::Inverse(id, reverses, phase, resolution) => {
+            (id, phase, Some(reverses), resolution)
+        }
+    };
+    ledger.record_intent(ledger_permission(mutation_id, phase, reverses));
+    if let Some(resolution) = resolution {
+        ledger.record_resolution(mutation_id, resolution);
+    }
+}
+
+/// Every answer the ledger gives, against the scan it replaced, over the same
+/// records. The scans are the authority here: each one is the implementation
+/// that shipped, so an equality below is the whole equivalence claim and not an
+/// inference from a suite that happened to stay green.
+fn assert_ledger_matches_the_scans(ledger: &PermissionLedger, label: &str) {
+    let all = || ledger.permissions.values();
+
+    assert_eq!(
+        ledger.has_unresolved(),
+        all().any(|permission| {
+            permission.application == ApplicationStatus::IntentDurableApplicationUnknown
+        }),
+        "unresolved disagrees: {label}"
+    );
+
+    // Every transition that completes a phase, and one that completes none.
+    for (from, to) in [
+        (
+            TransactionState::ParentSealIntent,
+            TransactionState::ParentSealed,
+        ),
+        (
+            TransactionState::TreeSealIntent,
+            TransactionState::TreeSealed,
+        ),
+        (
+            TransactionState::SourceParentRestoreIntent,
+            TransactionState::SourceParentRestored,
+        ),
+        (
+            TransactionState::UndoIntent,
+            TransactionState::UndoModesRestored,
+        ),
+        (
+            TransactionState::Prepared,
+            TransactionState::ParentSealIntent,
+        ),
+    ] {
+        assert_eq!(
+            phase_completion_is_recorded(Some(ledger), from, to),
+            phase_completion_is_valid(all(), from, to),
+            "phase completion {from:?} -> {to:?} disagrees: {label}"
+        );
+    }
+
+    for metadata in [
+        None,
+        Some(permission_seal_staging_metadata()),
+        Some(staging_metadata()),
+    ] {
+        assert_eq!(
+            staging_parent_strategy_is_recorded(metadata.as_ref(), Some(ledger)),
+            staging_parent_strategy_is_complete(metadata.as_ref(), all()),
+            "parent strategy {:?} disagrees: {label}",
+            metadata.map(|metadata| metadata.source_parent_strategy)
+        );
+    }
+
+    assert_eq!(
+        ledger.coverage.every_applied_seal_is_reversed(),
+        all_applied_seals_have_applied_inverse(all()),
+        "seal coverage disagrees: {label}"
+    );
+    assert_eq!(
+        ledger.coverage.every_applied_parent_seal_is_restored(),
+        all_applied_parent_seals_have_applied_inverse(all()),
+        "parent seal coverage disagrees: {label}"
+    );
+    assert_eq!(
+        ledger.coverage.every_applied_tree_seal_is_undone(),
+        all_applied_tree_seals_have_applied_inverse(all()),
+        "tree seal coverage disagrees: {label}"
+    );
+    assert_eq!(
+        ledger.retains_active_seals(),
+        retains_active_permission_seals(all()),
+        "retained seals disagree: {label}"
+    );
+
+    assert_eq!(
+        ledger.highest_mutation_id,
+        all().map(|permission| permission.mutation_id).max(),
+        "highest mutation id disagrees: {label}"
+    );
+
+    // The guard that refuses a second live inverse of one seal, over every id
+    // the scenario could have named plus one it did not.
+    for id in 0..=ledger.highest_mutation_id.unwrap_or(0) + 1 {
+        assert_eq!(
+            ledger.active_inverses.contains_key(&id),
+            all().any(|permission| {
+                permission.reverses_mutation_id == Some(id)
+                    && matches!(
+                        permission.application,
+                        ApplicationStatus::Applied
+                            | ApplicationStatus::IntentDurableApplicationUnknown
+                    )
+            }),
+            "active inverse of {id} disagrees: {label}"
+        );
+    }
+
+    // The quarantine question, asked of a finished transaction rather than a
+    // ledger, so its single pass is checked against the same scan.
+    let quarantined = ReplayedTransaction {
+        id: tx(1),
+        state: TransactionState::Quarantined,
+        staging_schema_version: None,
+        permissions: all().cloned().collect(),
+        staging: None,
+        tree_manifest: None,
+        tree_sidecar: None,
+        rename_outcome: None,
+        undo_rename_outcome: None,
+        purge_removed_entries: 0,
+        purge_last_path: None,
+    };
+    assert_eq!(
+        quarantined_transaction_retains_active_permission_seals(&quarantined),
+        retains_active_permission_seals(all()),
+        "quarantined retention disagrees: {label}"
+    );
+}
+
+#[test]
+fn permission_ledger_answers_match_the_scans_they_replaced() {
+    use PermissionResolution::{Applied, ConfirmedNotApplied};
+    use TransactionState as S;
+
+    let resolutions = [None, Some(Applied), Some(ConfirmedNotApplied)];
+    let mut scenarios: Vec<(String, Vec<Recorded>)> = Vec::new();
+
+    // One seal and one inverse of it, over every phase and resolution pair.
+    // A seal recorded outside a sealing phase is included because neither the
+    // counts nor the scan attribute it to either seal family.
+    for seal_phase in [S::ParentSealIntent, S::TreeSealIntent, S::RestoreIntent] {
+        for seal_resolution in resolutions {
+            for inverse_phase in [
+                S::RestoreIntent,
+                S::SourceParentRestoreIntent,
+                S::RollbackIntent,
+                S::UndoIntent,
+                S::Quarantined,
+            ] {
+                for inverse_resolution in resolutions {
+                    scenarios.push((
+                        format!(
+                            "{seal_phase:?}/{seal_resolution:?} reversed by \
+                             {inverse_phase:?}/{inverse_resolution:?}"
+                        ),
+                        vec![
+                            Recorded::Seal(0, seal_phase, seal_resolution),
+                            Recorded::Inverse(1, 0, inverse_phase, inverse_resolution),
+                        ],
+                    ));
+                }
+            }
+        }
+    }
+
+    let named: Vec<(&str, Vec<Recorded>)> = vec![
+        ("nothing recorded", vec![]),
+        (
+            "a retry after an inverse confirmed unapplied",
+            vec![
+                Recorded::Seal(0, S::TreeSealIntent, Some(Applied)),
+                Recorded::Inverse(1, 0, S::UndoIntent, Some(ConfirmedNotApplied)),
+                Recorded::Inverse(2, 0, S::UndoIntent, Some(Applied)),
+            ],
+        ),
+        (
+            "two applied tree seals and one undo",
+            vec![
+                Recorded::Seal(0, S::TreeSealIntent, Some(Applied)),
+                Recorded::Seal(1, S::TreeSealIntent, Some(Applied)),
+                Recorded::Inverse(2, 0, S::UndoIntent, Some(Applied)),
+            ],
+        ),
+        (
+            "a parent seal reversed by a restore that is not the parent restore",
+            vec![
+                Recorded::Seal(0, S::ParentSealIntent, Some(Applied)),
+                Recorded::Inverse(1, 0, S::RestoreIntent, Some(Applied)),
+            ],
+        ),
+        (
+            "a tree seal reversed by a rollback that is not the undo",
+            vec![
+                Recorded::Seal(0, S::TreeSealIntent, Some(Applied)),
+                Recorded::Inverse(1, 0, S::RollbackIntent, Some(Applied)),
+            ],
+        ),
+        (
+            "an inverse of a mutation that was never recorded",
+            vec![
+                Recorded::Seal(0, S::TreeSealIntent, Some(Applied)),
+                Recorded::Inverse(1, 99, S::UndoIntent, Some(Applied)),
+            ],
+        ),
+        (
+            "both seal families fully reversed",
+            vec![
+                Recorded::Seal(0, S::ParentSealIntent, Some(Applied)),
+                Recorded::Seal(1, S::TreeSealIntent, Some(Applied)),
+                Recorded::Inverse(2, 0, S::SourceParentRestoreIntent, Some(Applied)),
+                Recorded::Inverse(3, 1, S::UndoIntent, Some(Applied)),
+            ],
+        ),
+        (
+            "sparse mutation ids",
+            vec![
+                Recorded::Seal(7, S::TreeSealIntent, Some(Applied)),
+                Recorded::Seal(3, S::TreeSealIntent, Some(ConfirmedNotApplied)),
+                Recorded::Inverse(11, 7, S::UndoIntent, None),
+            ],
+        ),
+        (
+            "a parent seal confirmed unapplied needs no inverse",
+            vec![Recorded::Seal(
+                0,
+                S::ParentSealIntent,
+                Some(ConfirmedNotApplied),
+            )],
+        ),
+        (
+            "an inverse applied before the seal it reverses",
+            vec![
+                Recorded::Inverse(1, 0, S::UndoIntent, Some(Applied)),
+                Recorded::Seal(0, S::TreeSealIntent, Some(Applied)),
+            ],
+        ),
+        (
+            "an inverse applied before a parent seal it does not restore",
+            vec![
+                Recorded::Inverse(1, 0, S::RollbackIntent, Some(Applied)),
+                Recorded::Seal(0, S::ParentSealIntent, Some(Applied)),
+            ],
+        ),
+        (
+            "a record that reverses a seal from inside a sealing phase",
+            vec![
+                Recorded::Seal(0, S::TreeSealIntent, Some(Applied)),
+                Recorded::Inverse(1, 0, S::TreeSealIntent, Some(Applied)),
+            ],
+        ),
+    ];
+    scenarios.extend(
+        named
+            .into_iter()
+            .map(|(name, steps)| (name.to_owned(), steps)),
+    );
+
+    for (name, steps) in scenarios {
+        let mut ledger = PermissionLedger::default();
+        assert_ledger_matches_the_scans(&ledger, &format!("{name} (before any record)"));
+        for (index, step) in steps.into_iter().enumerate() {
+            record(&mut ledger, step);
+            assert_ledger_matches_the_scans(&ledger, &format!("{name} (after step {index})"));
+        }
+    }
+}
+
+#[test]
+fn resuming_a_replayed_wal_rebuilds_the_ledger_the_appends_built() {
+    let transaction = tx(0xb2);
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    wal.begin(transaction).unwrap();
+    for next in [
+        TransactionState::ParentSealIntent,
+        TransactionState::ParentSealed,
+        TransactionState::TreeSealIntent,
+    ] {
+        wal.transition(transaction, next).unwrap();
+    }
+    for id in 0..3_u64 {
+        wal.apply_permission_mutation(
+            PermissionIntent {
+                transaction,
+                mutation_id: id,
+                evidence: evidence_object(&format!("dir{id}"), id + 100, 0o500),
+                pre_mode: 0o700,
+                expected_mode: 0o500,
+                reverses_mutation_id: None,
+            },
+            || Ok(()),
+        )
+        .unwrap();
+    }
+    wal.transition(transaction, TransactionState::RestoreIntent)
+        .unwrap();
+    for id in 0..3_u64 {
+        wal.apply_permission_mutation(
+            PermissionIntent {
+                transaction,
+                mutation_id: 3 + id,
+                evidence: evidence_object(&format!("dir{id}"), id + 100, 0o700),
+                pre_mode: 0o500,
+                expected_mode: 0o700,
+                reverses_mutation_id: Some(id),
+            },
+            || Ok(()),
+        )
+        .unwrap();
+    }
+    wal.transition(transaction, TransactionState::Restored)
+        .unwrap();
+
+    let appended = wal.ledgers.remove(&transaction).unwrap();
+    let bytes = wal.into_inner().bytes;
+    let parsed = parse_frames(&bytes).unwrap();
+    let committed_len = parsed.committed_len as u64;
+    let mut replay = replay_records(parsed.records).unwrap();
+    replay.committed_len = committed_len;
+    let resumed = SealWal::resume(
+        FaultWriter {
+            bytes,
+            ..FaultWriter::default()
+        },
+        &replay,
+    )
+    .unwrap();
+
+    assert_eq!(
+        resumed.ledgers.get(&transaction),
+        Some(&appended),
+        "a resumed ledger differs from the one the appends built"
+    );
+    assert_ledger_matches_the_scans(&appended, "appended history");
+}
+
+/// Two live inverses of one seal is the one shape where the ledger and the
+/// scan may disagree, because the ledger counts reversals while the scan asks
+/// whether any exists. Append and replay both refuse it, so it never reaches a
+/// ledger -- and if it ever did, the disagreement has to be the refusing one.
+#[test]
+fn two_live_inverses_of_one_seal_are_refused_and_otherwise_fail_closed() {
+    let transaction = tx(0xc3);
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    wal.begin(transaction).unwrap();
+    for next in [
+        TransactionState::ParentSealIntent,
+        TransactionState::ParentSealed,
+        TransactionState::TreeSealIntent,
+    ] {
+        wal.transition(transaction, next).unwrap();
+    }
+    let seal =
+        |mutation_id: u64, reverses: Option<u64>, pre: u32, expected: u32| PermissionIntent {
+            transaction,
+            mutation_id,
+            evidence: evidence_object("dir", 100, expected),
+            pre_mode: pre,
+            expected_mode: expected,
+            reverses_mutation_id: reverses,
+        };
+    wal.apply_permission_mutation(seal(0, None, 0o700, 0o500), || Ok(()))
+        .unwrap();
+    wal.transition(transaction, TransactionState::RestoreIntent)
+        .unwrap();
+    wal.apply_permission_mutation(seal(1, Some(0), 0o500, 0o700), || Ok(()))
+        .unwrap();
+
+    // The append guard, on the exact shape.
+    let second = wal.apply_permission_mutation(seal(2, Some(0), 0o500, 0o700), || Ok(()));
+    assert!(
+        matches!(
+            second,
+            Err(MutationAppendError::IntentWal(AppendError::InvalidState(
+                "permission inverse does not match its applied seal mutation"
+            )))
+        ),
+        "append accepted a second live inverse: {second:?}"
+    );
+
+    // The same history written past the append guard must not replay.
+    let mut bytes = wal.into_inner().bytes;
+    for record in [
+        SealRecord::PermissionIntent {
+            transaction,
+            mutation_id: 2,
+            evidence: evidence_object("dir", 100, 0o700),
+            pre_mode: 0o500,
+            expected_mode: 0o700,
+            reverses_mutation_id: Some(0),
+        },
+        SealRecord::PermissionApplied {
+            transaction,
+            mutation_id: 2,
+        },
+    ] {
+        bytes.extend_from_slice(&encode_frame(&record).unwrap());
+    }
+    let replayed = replay_records(parse_frames(&bytes).unwrap().records);
+    assert!(
+        matches!(
+            replayed,
+            Err(ReplayError::InvalidHistory(
+                "permission inverse does not match its applied seal mutation"
+            ))
+        ),
+        "replay accepted a second live inverse: {replayed:?}"
+    );
+
+    // Fed one anyway, the counts report an uncovered seal rather than an
+    // absent one, so a terminal transition is refused rather than permitted.
+    let mut ledger = PermissionLedger::default();
+    for (mutation_id, reverses) in [(0, None), (1, Some(0)), (2, Some(0))] {
+        ledger.record_intent(ledger_permission(
+            mutation_id,
+            if reverses.is_some() {
+                TransactionState::UndoIntent
+            } else {
+                TransactionState::TreeSealIntent
+            },
+            reverses,
+        ));
+        ledger.record_resolution(mutation_id, PermissionResolution::Applied);
+    }
+    assert!(
+        all_applied_tree_seals_have_applied_inverse(ledger.permissions.values()),
+        "the scan answers that the seal is covered, which is what makes this the disagreeing shape"
+    );
+    assert!(
+        !ledger.coverage.every_applied_tree_seal_is_undone(),
+        "the ledger must refuse the undo completion it cannot account for"
+    );
+    assert!(
+        ledger.retains_active_seals(),
+        "the ledger must report the seal as still held"
+    );
+}
+
+#[test]
+fn resolving_a_permission_twice_does_not_move_the_counts() {
+    let mut ledger = PermissionLedger::default();
+    ledger.record_intent(ledger_permission(0, TransactionState::TreeSealIntent, None));
+    ledger.record_resolution(0, PermissionResolution::Applied);
+    let once = (
+        ledger.coverage,
+        ledger.phase(TransactionState::TreeSealIntent),
+        ledger.recorded - ledger.resolved,
+    );
+    ledger.record_resolution(0, PermissionResolution::Applied);
+    ledger.record_resolution(0, PermissionResolution::ConfirmedNotApplied);
+    assert_eq!(
+        (
+            ledger.coverage,
+            ledger.phase(TransactionState::TreeSealIntent),
+            ledger.recorded - ledger.resolved,
+        ),
+        once,
+        "a repeated resolution moved the counts"
+    );
+    assert_ledger_matches_the_scans(&ledger, "resolved twice");
+}
+
+/// Mutation ids are caller-chosen. Recovery allocates them monotonically, but
+/// a history may name an inverse with a lower id than the seal it reverses,
+/// and coverage is rebuilt one record at a time -- so replay reports the order
+/// the intents were recorded in rather than the order of their ids.
+#[test]
+fn replay_reports_permissions_in_the_order_their_intents_were_recorded() {
+    let transaction = tx(0xd4);
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    wal.begin(transaction).unwrap();
+    for next in [
+        TransactionState::ParentSealIntent,
+        TransactionState::ParentSealed,
+        TransactionState::TreeSealIntent,
+    ] {
+        wal.transition(transaction, next).unwrap();
+    }
+    wal.apply_permission_mutation(
+        PermissionIntent {
+            transaction,
+            mutation_id: 9,
+            evidence: evidence_object("dir", 100, 0o500),
+            pre_mode: 0o700,
+            expected_mode: 0o500,
+            reverses_mutation_id: None,
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    wal.transition(transaction, TransactionState::RestoreIntent)
+        .unwrap();
+    wal.apply_permission_mutation(
+        PermissionIntent {
+            transaction,
+            mutation_id: 2,
+            evidence: evidence_object("dir", 100, 0o700),
+            pre_mode: 0o500,
+            expected_mode: 0o700,
+            reverses_mutation_id: Some(9),
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    wal.transition(transaction, TransactionState::Restored)
+        .unwrap();
+
+    let appended = wal.ledgers.remove(&transaction).unwrap();
+    let bytes = wal.into_inner().bytes;
+    let parsed = parse_frames(&bytes).unwrap();
+    let committed_len = parsed.committed_len as u64;
+    let mut replay = replay_records(parsed.records).unwrap();
+    replay.committed_len = committed_len;
+    assert_eq!(
+        replay.transactions[&transaction]
+            .permissions
+            .iter()
+            .map(|permission| permission.mutation_id)
+            .collect::<Vec<_>>(),
+        vec![9, 2],
+        "replay reordered the permissions by mutation id"
+    );
+
+    // Rebuilding from that order is what keeps the seal accounted for: fed the
+    // inverse first, the coverage counts would report the seal as never sealed.
+    let resumed = SealWal::resume(
+        FaultWriter {
+            bytes,
+            ..FaultWriter::default()
+        },
+        &replay,
+    )
+    .unwrap();
+    assert_eq!(resumed.ledgers.get(&transaction), Some(&appended));
+    assert!(
+        !appended.retains_active_seals(),
+        "the restored seal is still reported as held"
+    );
+}
+
+#[test]
+fn a_duplicate_permission_mutation_id_is_refused_by_append_and_replay() {
+    let transaction = tx(0xe5);
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    wal.begin(transaction).unwrap();
+    for next in [
+        TransactionState::ParentSealIntent,
+        TransactionState::ParentSealed,
+        TransactionState::TreeSealIntent,
+    ] {
+        wal.transition(transaction, next).unwrap();
+    }
+    let seal = |inode: u64, mode: u32| PermissionIntent {
+        transaction,
+        mutation_id: 4,
+        evidence: evidence_object("dir", inode, mode),
+        pre_mode: 0o700,
+        expected_mode: mode,
+        reverses_mutation_id: None,
+    };
+    wal.apply_permission_mutation(seal(100, 0o500), || Ok(()))
+        .unwrap();
+
+    let again = wal.apply_permission_mutation(seal(101, 0o550), || Ok(()));
+    assert!(
+        matches!(
+            again,
+            Err(MutationAppendError::IntentWal(AppendError::InvalidState(
+                "duplicate permission mutation id"
+            )))
+        ),
+        "append reused a mutation id: {again:?}"
+    );
+
+    let mut bytes = wal.into_inner().bytes;
+    bytes.extend_from_slice(
+        &encode_frame(&SealRecord::PermissionIntent {
+            transaction,
+            mutation_id: 4,
+            evidence: evidence_object("dir", 101, 0o550),
+            pre_mode: 0o700,
+            expected_mode: 0o550,
+            reverses_mutation_id: None,
+        })
+        .unwrap(),
+    );
+    let replayed = replay_records(parse_frames(&bytes).unwrap().records);
+    assert!(
+        matches!(
+            replayed,
+            Err(ReplayError::InvalidHistory("duplicate permission intent"))
+        ),
+        "replay accepted a reused mutation id: {replayed:?}"
+    );
+}
+
+/// A tree seal recovery confirmed was never applied leaves the phase
+/// incomplete, which is not the same as leaving it unresolved. The manifest
+/// freezes tree membership, so it may not close over one.
+#[test]
+fn a_manifest_over_a_tree_seal_confirmed_not_applied_is_refused() {
+    let transaction = tx(0xe6);
+    let manifest = DurableTreeManifest {
+        schema_version: CONTENT_PROOF_MANIFEST_VERSION,
+        entry_count: 1,
+        sha256: [0xe6; 32],
+    };
+    let commitment = sidecar_commitment(transaction, 1, 1, 48);
+    let intent = || PermissionIntent {
+        transaction,
+        mutation_id: 1,
+        evidence: staging_tree_evidence("tree", 20),
+        pre_mode: 0o770,
+        expected_mode: 0o500,
+        reverses_mutation_id: None,
+    };
+
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    wal.begin_staging(transaction, staging_metadata()).unwrap();
+    advance_to_tree_intent(&mut wal, transaction);
+    let failed = wal.apply_staging_permission_mutation(intent(), || {
+        Err(io::Error::from_raw_os_error(libc::EPERM))
+    });
+    assert!(
+        matches!(failed, Err(MutationAppendError::Mutation(_))),
+        "the fixture needs a durable intent whose mutation failed: {failed:?}"
+    );
+    assert_eq!(
+        wal.resolve_staging_permission(transaction, 1, |_| {
+            Ok(PermissionResolution::ConfirmedNotApplied)
+        })
+        .unwrap(),
+        PermissionResolution::ConfirmedNotApplied
+    );
+
+    let refused = wal.complete_tree_manifest_with_sidecar(transaction, manifest, commitment);
+    assert!(
+        matches!(
+            refused,
+            Err(AppendError::InvalidState(
+                "tree completion is duplicate or permission work is unresolved"
+            ))
+        ),
+        "append closed the manifest over an unapplied tree seal: {refused:?}"
+    );
+
+    let mut bytes = wal.into_inner().bytes;
+    bytes.extend_from_slice(
+        &encode_frame(&SealRecord::TreeManifestSidecarComplete {
+            transaction,
+            manifest,
+            commitment,
+        })
+        .unwrap(),
+    );
+    let replayed = replay_records(parse_frames(&bytes).unwrap().records);
+    assert!(
+        matches!(
+            replayed,
+            Err(ReplayError::InvalidHistory(
+                "tree completion is duplicate, unordered, or has unresolved permissions"
+            ))
+        ),
+        "replay accepted a manifest over an unapplied tree seal: {replayed:?}"
+    );
+}
+
+/// The leased WAL reports a transaction's permissions by mutation id, which is
+/// not the order replay reports: recovery addresses a mutation by its id, and
+/// ids are caller-chosen.
+#[test]
+fn a_recovery_snapshot_reports_permissions_by_mutation_id() {
+    let transaction = tx(0xe7);
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    wal.begin(transaction).unwrap();
+    for next in [
+        TransactionState::ParentSealIntent,
+        TransactionState::ParentSealed,
+        TransactionState::TreeSealIntent,
+    ] {
+        wal.transition(transaction, next).unwrap();
+    }
+    wal.apply_permission_mutation(
+        PermissionIntent {
+            transaction,
+            mutation_id: 9,
+            evidence: evidence_object("dir", 100, 0o500),
+            pre_mode: 0o700,
+            expected_mode: 0o500,
+            reverses_mutation_id: None,
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    wal.transition(transaction, TransactionState::RestoreIntent)
+        .unwrap();
+    wal.apply_permission_mutation(
+        PermissionIntent {
+            transaction,
+            mutation_id: 2,
+            evidence: evidence_object("dir", 100, 0o700),
+            pre_mode: 0o500,
+            expected_mode: 0o700,
+            reverses_mutation_id: Some(9),
+        },
+        || Ok(()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        wal.recovery_snapshot(transaction)
+            .unwrap()
+            .permissions
+            .iter()
+            .map(|permission| permission.mutation_id)
+            .collect::<Vec<_>>(),
+        vec![2, 9],
+        "the snapshot is not ordered by mutation id"
     );
 }

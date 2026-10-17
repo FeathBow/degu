@@ -30,7 +30,8 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      # rolling-ref: v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
           components: rustfmt, clippy
@@ -73,7 +74,8 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      # rolling-ref: v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
       - name: Install expect
@@ -93,7 +95,8 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      # rolling-ref: v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
       - name: Install quota support
@@ -137,7 +140,8 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      # rolling-ref: v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
           targets: x86_64-unknown-linux-musl

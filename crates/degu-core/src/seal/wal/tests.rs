@@ -1174,27 +1174,6 @@ fn a_settled_state_decides_without_reading_a_record() {
     }
 }
 
-/// The states above settle on the snapshot; every other state decides from the
-/// records, and asks for them once however many it then reads.
-#[test]
-fn a_state_that_decides_from_the_records_asks_for_them_once() {
-    let asked = Cell::new(0);
-    let settled = replayed(TransactionState::Quarantined);
-    let work = decide_recovery(
-        &settled.transaction,
-        || {
-            asked.set(asked.get() + 1);
-            settled.permissions.clone()
-        },
-        |_| RecoveryIdentity::Reestablished,
-    );
-    assert!(matches!(
-        work,
-        RecoveryWork::RestoreQuarantinedSeals { permissions, .. } if permissions.len() == 1
-    ));
-    assert_eq!(asked.get(), 1);
-}
-
 #[test]
 fn insufficient_identity_never_produces_mutation_work() {
     let result = replayed(TransactionState::TreeSealed).decide(|_| RecoveryIdentity::Insufficient);

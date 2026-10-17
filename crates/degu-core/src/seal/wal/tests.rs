@@ -1490,6 +1490,21 @@ fn compaction_selects_surviving_frames_byte_for_byte() {
         compacted.transactions[&kept_transaction], replay.transactions[&kept_transaction],
         "a surviving transaction must replay to exactly what it did before"
     );
+    // What the name of this test claims, asserted over the bytes rather than
+    // over what they replay to. The snapshot above carries measured totals, so
+    // on its own it accepts any selection a replay still accepts; these bytes
+    // accept exactly one.
+    let survivor_frames = parsed
+        .spans
+        .iter()
+        .filter(|span| span.transaction == kept_transaction)
+        .flat_map(|span| &bytes[span.start..span.end])
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kept, survivor_frames,
+        "the kept bytes must be the survivor's frames, in file order"
+    );
     assert_eq!(compacted.committed_len, kept.len() as u64);
 }
 

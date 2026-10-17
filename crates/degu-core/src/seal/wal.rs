@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod permission_ledger;
+pub use permission_ledger::PermissionWorkload;
 use permission_ledger::{PermissionLedger, PhaseTally, SealCoverage};
 
 const MAGIC: &[u8; 4] = b"DSWL";
@@ -780,17 +781,16 @@ impl<W: DurableWrite> SealWal<W> {
         transaction: TransactionId,
     ) -> Option<ReplayedTransaction> {
         let state = self.states.get(&transaction).copied()?;
-        let permissions = self
-            .ledgers
-            .get(&transaction)
-            .map_or_else(Vec::new, |ledger| {
-                ledger.permissions.values().cloned().collect()
-            });
+        let ledger = self.ledgers.get(&transaction);
+        let permissions = ledger.map_or_else(Vec::new, |ledger| {
+            ledger.permissions.values().cloned().collect()
+        });
         Some(ReplayedTransaction {
             id: transaction,
             state,
             staging_schema_version: self.staging_schema_versions.get(&transaction).copied(),
             permissions,
+            permission_workload: ledger.map(PermissionLedger::workload).unwrap_or_default(),
             staging: self.staging.get(&transaction).cloned(),
             tree_manifest: self.manifests.get(&transaction).copied(),
             tree_sidecar: self.sidecars.get(&transaction).copied(),
@@ -1932,6 +1932,11 @@ pub struct ReplayedTransaction {
     /// Legacy-version state fixtures do not weaken v4 staging metadata.
     pub staging_schema_version: Option<u16>,
     pub permissions: Vec<DurablePermission>,
+    /// What this transaction's permissions amount to, measured while the
+    /// frames were admitted. Recovery validation reads this rather than
+    /// re-scanning `permissions`, which is what makes its cost independent of
+    /// how many records a transaction holds.
+    pub permission_workload: PermissionWorkload,
     pub staging: Option<StagingTransactionMetadata>,
     pub tree_manifest: Option<DurableTreeManifest>,
     /// Exact authority-neutral sidecar commitment bound atomically with the manifest.
@@ -2497,28 +2502,13 @@ pub enum RecoveryRequiredReason {
 }
 
 /// Whether a quarantined transaction still holds a mode no applied inverse has
-/// given back. One pass collects the reversed seals, so the answer costs this
-/// transaction's permissions rather than their square.
+/// given back. The seals are counted as the frames are admitted, so the answer
+/// no longer costs this transaction's permissions.
 pub(crate) fn quarantined_transaction_retains_active_permission_seals(
     transaction: &ReplayedTransaction,
 ) -> bool {
-    if transaction.state != TransactionState::Quarantined {
-        return false;
-    }
-    let reversed = transaction
-        .permissions
-        .iter()
-        .filter(|permission| permission.application == ApplicationStatus::Applied)
-        .filter_map(|permission| permission.reverses_mutation_id)
-        .collect::<HashSet<_>>();
-    transaction.permissions.iter().any(|seal| {
-        seal.application == ApplicationStatus::Applied
-            && matches!(
-                seal.phase,
-                TransactionState::ParentSealIntent | TransactionState::TreeSealIntent
-            )
-            && !reversed.contains(&seal.mutation_id)
-    })
+    transaction.state == TransactionState::Quarantined
+        && transaction.permission_workload.active_seals > 0
 }
 
 fn staging_recovery_needs_mount_authority(transaction: &ReplayedTransaction) -> bool {
@@ -3346,6 +3336,7 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
             let state = tx
                 .state
                 .ok_or(ReplayError::InvalidHistory("transaction has no state"))?;
+            let permission_workload = tx.ledger.workload();
             Ok((
                 id,
                 ReplayedTransaction {
@@ -3353,6 +3344,7 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                     state,
                     staging_schema_version: tx.staging_schema_version,
                     permissions: tx.ledger.into_record_order(),
+                    permission_workload,
                     staging: tx.staging,
                     tree_manifest: tx.tree_manifest,
                     tree_sidecar: tx.tree_sidecar,
@@ -3592,6 +3584,53 @@ fn all_applied_parent_seals_have_applied_inverse<'a>(
                     && inverse.reverses_mutation_id == Some(seal.mutation_id)
             })
     })
+}
+
+/// The scans `PermissionLedger::workload` replaced, kept as the oracle its
+/// tests compare against. The nested inverse lookup is the form recovery
+/// validation used before the measurements existed.
+#[cfg(test)]
+fn permission_workload_by_scan<'a>(
+    permissions: impl Iterator<Item = &'a DurablePermission>,
+) -> PermissionWorkload {
+    let permissions = permissions.collect::<Vec<_>>();
+    PermissionWorkload {
+        recorded: permissions.len() as u64,
+        unresolved: permissions
+            .iter()
+            .filter(|permission| {
+                permission.application == ApplicationStatus::IntentDurableApplicationUnknown
+            })
+            .count() as u64,
+        active_seals: permissions
+            .iter()
+            .filter(|seal| {
+                seal.application == ApplicationStatus::Applied
+                    && seal.reverses_mutation_id.is_none()
+                    && !permissions.iter().any(|inverse| {
+                        inverse.application == ApplicationStatus::Applied
+                            && inverse.reverses_mutation_id == Some(seal.mutation_id)
+                    })
+            })
+            .count() as u64,
+        deepest_path_components: permissions
+            .iter()
+            .map(|permission| permission.evidence.relative_path().components().count() as u32)
+            .max()
+            .unwrap_or(0),
+        longest_path_bytes: permissions
+            .iter()
+            .map(|permission| {
+                permission
+                    .evidence
+                    .relative_path()
+                    .as_os_str()
+                    .as_bytes()
+                    .len() as u32
+            })
+            .max()
+            .unwrap_or(0),
+    }
 }
 
 /// The scan `PermissionLedger::retains_active_seals` replaced, kept as the

@@ -3,7 +3,7 @@ use crate::authority::PersistentRecoveryEvidence;
 use crate::backend::CertifiedLocalBackend;
 use crate::seal::wal::{
     ApplicationStatus, DurablePermission, DurableSourceParentStrategy, DurableTreeManifest,
-    ObjectIncarnation, PermissionIntent, StagingLocator, StrongObjectIdentity,
+    ObjectIncarnation, PermissionIntent, PermissionWorkload, StagingLocator, StrongObjectIdentity,
 };
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -426,9 +426,13 @@ fn active_seals_in_quarantine_block_runtime_and_reopen() {
 
 #[test]
 fn permission_and_path_workload_limits_are_checked_before_rebind() {
-    let permission = DurablePermission {
-        mutation_id: 1,
-        phase: TransactionState::TreeSealIntent,
+    let permission = |mutation_id: u64, reverses_mutation_id: Option<u64>| DurablePermission {
+        mutation_id,
+        phase: if reverses_mutation_id.is_some() {
+            TransactionState::UndoIntent
+        } else {
+            TransactionState::TreeSealIntent
+        },
         evidence: PersistentRecoveryEvidence::new(
             PathBuf::from("source-parent/root"),
             Some("fs".into()),
@@ -440,14 +444,15 @@ fn permission_and_path_workload_limits_are_checked_before_rebind() {
         .unwrap(),
         pre_mode: 0o700,
         expected_mode: 0o500,
-        reverses_mutation_id: None,
+        reverses_mutation_id,
         application: ApplicationStatus::Applied,
     };
     let mut snapshot = ReplayedTransaction {
         id: TransactionId([0xd1; 16]),
         state: TransactionState::TreeSealIntent,
         staging_schema_version: Some(4),
-        permissions: vec![permission; MAX_RECOVERY_PERMISSION_RECORDS + 1],
+        permissions: Vec::new(),
+        permission_workload: PermissionWorkload::default(),
         staging: Some(metadata()),
         tree_manifest: None,
         tree_sidecar: None,
@@ -456,31 +461,108 @@ fn permission_and_path_workload_limits_are_checked_before_rebind() {
         purge_removed_entries: 0,
         purge_last_path: None,
     };
-    assert!(validate_recovery_workload(&snapshot).is_err());
+    // The limits are read off the ledger's counts, so the fixture derives them
+    // from its own record list by the scans those counts replaced. A workload
+    // that trips a limit must still trip it through the counts.
+    let mut workload = |permissions: Vec<DurablePermission>| {
+        snapshot.permission_workload = workload_by_scan(&permissions);
+        snapshot.permissions = permissions;
+        validate_recovery_workload(&snapshot)
+    };
 
-    let permission = snapshot.permissions[0].clone();
-    snapshot.permissions = vec![permission.clone(); RECOVERY_MAX_ACTIVE_PERMISSIONS];
+    // Seals paired with their own applied inverses, so all but one seal is
+    // undone and the active count stays three orders of magnitude below the
+    // operation limit. A workload of identical seals trips both limits at once,
+    // which is why the record limit used to be asserted by nothing: removing
+    // its check left every test green.
+    let half = MAX_RECOVERY_PERMISSION_RECORDS as u64 / 2;
+    let mut records: Vec<DurablePermission> = (0..=half)
+        .map(|index| permission(index * 2, None))
+        .collect();
+    records.extend((0..half).map(|index| permission(index * 2 + 1, Some(index * 2))));
+    assert_eq!(records.len(), MAX_RECOVERY_PERMISSION_RECORDS + 1);
+    assert_eq!(workload_by_scan(&records).active_seals, 1);
+    assert!(workload(records.clone()).is_err());
+    records.pop();
     assert!(
-        validate_recovery_workload(&snapshot).is_ok(),
+        workload(records).is_ok(),
+        "the exact 4,096-record recovery envelope must remain accepted"
+    );
+
+    let seal = permission(1, None);
+    assert!(
+        workload(vec![seal.clone(); RECOVERY_MAX_ACTIVE_PERMISSIONS]).is_ok(),
         "the exact 1,024-operation recovery envelope must remain accepted"
     );
-    snapshot.permissions = vec![permission; RECOVERY_MAX_ACTIVE_PERMISSIONS + 1];
-    assert!(validate_recovery_workload(&snapshot).is_err());
+    assert!(workload(vec![seal; RECOVERY_MAX_ACTIVE_PERMISSIONS + 1]).is_err());
+
+    // A path can be too deep without being too long and too long without
+    // being too deep, so each bound needs a record only it refuses. The byte
+    // bound used to be asserted by nothing: removing its check left every test
+    // green.
+    let record_at = |path: PathBuf| {
+        vec![DurablePermission {
+            mutation_id: 2,
+            phase: TransactionState::TreeSealIntent,
+            evidence: PersistentRecoveryEvidence::new(
+                path,
+                Some("fs".into()),
+                1,
+                2,
+                Some(3),
+                0o500,
+            )
+            .unwrap(),
+            pre_mode: 0o700,
+            expected_mode: 0o500,
+            reverses_mutation_id: None,
+            application: ApplicationStatus::Applied,
+        }]
+    };
 
     let deep = (0..=MAX_RECOVERY_PATH_COMPONENTS)
         .map(|index| format!("d{index}"))
         .collect::<PathBuf>();
-    snapshot.permissions = vec![DurablePermission {
-        mutation_id: 2,
-        phase: TransactionState::TreeSealIntent,
-        evidence: PersistentRecoveryEvidence::new(deep, Some("fs".into()), 1, 2, Some(3), 0o500)
-            .unwrap(),
-        pre_mode: 0o700,
-        expected_mode: 0o500,
-        reverses_mutation_id: None,
-        application: ApplicationStatus::Applied,
-    }];
-    assert!(validate_recovery_workload(&snapshot).is_err());
+    assert_eq!(deep.components().count(), MAX_RECOVERY_PATH_COMPONENTS + 1);
+    assert!(deep.as_os_str().as_bytes().len() < MAX_RECOVERY_PATH_BYTES);
+    assert!(workload(record_at(deep)).is_err());
+
+    let long = PathBuf::from("d").join("n".repeat(MAX_RECOVERY_PATH_BYTES));
+    assert!(long.components().count() < MAX_RECOVERY_PATH_COMPONENTS);
+    assert!(long.as_os_str().as_bytes().len() > MAX_RECOVERY_PATH_BYTES);
+    assert!(workload(record_at(long)).is_err());
+}
+
+/// The counts `validate_recovery_workload` used to derive inline, kept for the
+/// fixtures that build a record list directly instead of through the ledger.
+fn workload_by_scan(permissions: &[DurablePermission]) -> PermissionWorkload {
+    PermissionWorkload {
+        recorded: permissions.len() as u64,
+        unresolved: permissions
+            .iter()
+            .filter(|permission| {
+                permission.application == ApplicationStatus::IntentDurableApplicationUnknown
+            })
+            .count() as u64,
+        active_seals: active_permission_count_by_scan(permissions) as u64,
+        deepest_path_components: permissions
+            .iter()
+            .map(|permission| permission.evidence.relative_path().components().count() as u32)
+            .max()
+            .unwrap_or(0),
+        longest_path_bytes: permissions
+            .iter()
+            .map(|permission| {
+                permission
+                    .evidence
+                    .relative_path()
+                    .as_os_str()
+                    .as_bytes()
+                    .len() as u32
+            })
+            .max()
+            .unwrap_or(0),
+    }
 }
 
 #[test]

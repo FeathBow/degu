@@ -1,5 +1,6 @@
 use super::{ApplicationStatus, DurablePermission, PermissionResolution, TransactionState};
 use std::collections::{BTreeMap, HashMap};
+use std::os::unix::ffi::OsStrExt;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PhaseTally {
@@ -79,6 +80,45 @@ impl SealCoverage {
     pub(super) fn every_applied_tree_seal_is_undone(self) -> bool {
         self.undone_tree_seals == self.applied_tree_seals
     }
+
+    /// Applied seals no applied inverse has reversed, counted per seal kind.
+    ///
+    /// An inverse is counted only once its own resolution is applied, and only
+    /// against an original the ledger already counted as an applied seal, so
+    /// neither difference can go negative. Append and replay admit at most one
+    /// live inverse per applied seal and refuse a second resolution, so no seal
+    /// is reversed twice and the differences are exact rather than an upper
+    /// bound.
+    pub(super) fn active_seals(self) -> u64 {
+        self.applied_parent_seals
+            .saturating_sub(self.reversed_parent_seals)
+            + self
+                .applied_tree_seals
+                .saturating_sub(self.reversed_tree_seals)
+    }
+}
+
+/// What recovery validation asks about a transaction's permissions, measured
+/// while frames are admitted rather than by re-reading the records.
+///
+/// These are facts about the transaction, not limits: the ledger reports the
+/// extremes it has seen and recovery decides what is too much. Append and
+/// replay feed the same ledger, so a resumed WAL and a fresh replay produce
+/// these from one implementation rather than two.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PermissionWorkload {
+    /// Durable permission intents this transaction admitted.
+    pub recorded: u64,
+    /// Intents whose application the WAL has resolved neither way.
+    pub unresolved: u64,
+    /// Applied seals no applied inverse has reversed: what startup recovery
+    /// would still have to undo.
+    pub active_seals: u64,
+    /// Components in the longest evidence path any of these intents carries.
+    pub deepest_path_components: u32,
+    /// Bytes in the longest evidence path any of these intents carries. A path
+    /// can be long without being deep, so neither bound implies the other.
+    pub longest_path_bytes: u32,
 }
 
 /// Transaction-local records and counts shared by append, replay and resume.
@@ -95,6 +135,8 @@ pub(super) struct PermissionLedger {
     pub(super) active_inverses: HashMap<u64, u64>,
     phases: HashMap<TransactionState, PhaseTally>,
     pub(super) coverage: SealCoverage,
+    deepest_path_components: u32,
+    longest_path_bytes: u32,
 }
 
 impl PermissionLedger {
@@ -110,6 +152,17 @@ impl PermissionLedger {
         );
         self.phases.entry(permission.phase).or_default().recorded += 1;
         self.recorded += 1;
+        let path = permission.evidence.relative_path();
+        self.deepest_path_components = self
+            .deepest_path_components
+            .max(path.components().count().try_into().unwrap_or(u32::MAX));
+        self.longest_path_bytes = self.longest_path_bytes.max(
+            path.as_os_str()
+                .as_bytes()
+                .len()
+                .try_into()
+                .unwrap_or(u32::MAX),
+        );
         if let Some(original) = permission.reverses_mutation_id {
             self.active_inverses.insert(original, mutation_id);
         }
@@ -174,5 +227,15 @@ impl PermissionLedger {
 
     pub(super) fn retains_active_seals(&self) -> bool {
         !self.coverage.every_applied_seal_is_reversed()
+    }
+
+    pub(super) fn workload(&self) -> PermissionWorkload {
+        PermissionWorkload {
+            recorded: self.recorded,
+            unresolved: self.recorded.saturating_sub(self.resolved),
+            active_seals: self.coverage.active_seals(),
+            deepest_path_components: self.deepest_path_components,
+            longest_path_bytes: self.longest_path_bytes,
+        }
     }
 }

@@ -2664,7 +2664,9 @@ where
         transaction.state,
         TransactionState::UndoIntent | TransactionState::UndoModesRestored
     ) {
-        let mut permissions = records.clone();
+        // Moved, not copied: this branch owns the records and returns, so
+        // nothing below reads them again.
+        let mut permissions = records;
         sort_permissions_deepest_first(&mut permissions);
         return RecoveryWork::ResumeVerifiedUndo {
             transaction: transaction.id,

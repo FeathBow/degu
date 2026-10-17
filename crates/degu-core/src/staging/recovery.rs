@@ -1178,11 +1178,11 @@ impl VerifiedUndoRecoverySession<'_> {
                     .cmp(&left.evidence.relative_path().components().count())
                     .then_with(|| left.mutation_id.cmp(&right.mutation_id))
             });
-            // The seals a previous interrupted run already restored. The snapshot
-            // this reads clones and sorts every permission in the transaction, so
-            // taking one per directory was quadratic in both time and allocation.
-            // Each iteration writes the inverse of its own original, so the set is
-            // extended in step rather than re-read.
+            // The seals a previous interrupted run already restored. The
+            // snapshot this reads clones every permission in the transaction,
+            // so taking one per directory was quadratic in both time and
+            // allocation. Each iteration writes the inverse of its own
+            // original, so the set is extended in step rather than re-read.
             let snapshot = self
                 .wal
                 .recovery_snapshot(transaction)

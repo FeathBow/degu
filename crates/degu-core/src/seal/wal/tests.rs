@@ -1036,19 +1036,21 @@ fn recovery_drop_unlocks_a_fork_inherited_file_description() {
 }
 
 fn replayed(state: TransactionState) -> ReplayedTransaction {
+    let permissions = vec![DurablePermission {
+        mutation_id: 1,
+        phase: TransactionState::TreeSealIntent,
+        evidence: evidence("tree/dir"),
+        pre_mode: 0o770,
+        expected_mode: 0o500,
+        reverses_mutation_id: None,
+        application: ApplicationStatus::Applied,
+    }];
     ReplayedTransaction {
         id: tx(10),
         state,
         staging_schema_version: None,
-        permissions: vec![DurablePermission {
-            mutation_id: 1,
-            phase: TransactionState::TreeSealIntent,
-            evidence: evidence("tree/dir"),
-            pre_mode: 0o770,
-            expected_mode: 0o500,
-            reverses_mutation_id: None,
-            application: ApplicationStatus::Applied,
-        }],
+        permission_workload: permission_workload_by_scan(permissions.iter()),
+        permissions,
         staging: None,
         tree_manifest: None,
         tree_sidecar: None,
@@ -3693,6 +3695,7 @@ fn compaction_keeps_a_terminal_transaction_whose_group_is_unfinished() {
                     state: *state,
                     staging_schema_version: None,
                     permissions: Vec::new(),
+                    permission_workload: PermissionWorkload::default(),
                     staging: Some(staging),
                     tree_manifest: None,
                     tree_sidecar: None,

@@ -21,8 +21,8 @@ use crate::seal::sidecar::{
 };
 use crate::seal::store::{SealWalStore, StoreError};
 use crate::seal::wal::{
-    AppendError, DurablePermission, ProductionAssociation, RECOVERY_MAX_ACTIVE_PERMISSIONS,
-    RecoveryIdentity, RecoverySession, RecoveryWork, ReplayError, ReplayedTransaction, SealWal,
+    AppendError, ProductionAssociation, RECOVERY_MAX_ACTIVE_PERMISSIONS, RecoveryIdentity,
+    RecoverySession, RecoveryWork, ReplayError, ReplayedTransaction, SealWal,
     StagingTransactionMetadata, StrongObjectIdentity, TransactionId, decide_recovery,
     quarantined_transaction_retains_active_permission_seals,
 };
@@ -1304,78 +1304,26 @@ fn recovery_work_requires_candidate(work: &RecoveryWork) -> bool {
     )
 }
 
-/// The applied permissions no applied inverse has undone: what startup
-/// recovery would still have to reverse.
-///
-/// The inverses are indexed in one pass. Asking the whole permission list for
-/// each permission made this quadratic in the number of sealed directories,
-/// and recovery validation runs once per step.
-fn active_permission_count(permissions: &[DurablePermission]) -> usize {
-    let reversed: std::collections::HashSet<u64> = permissions
-        .iter()
-        .filter(|permission| permission.application == crate::seal::wal::ApplicationStatus::Applied)
-        .filter_map(|permission| permission.reverses_mutation_id)
-        .collect();
-    permissions
-        .iter()
-        .filter(|permission| {
-            permission.application == crate::seal::wal::ApplicationStatus::Applied
-                && permission.reverses_mutation_id.is_none()
-                && !reversed.contains(&permission.mutation_id)
-        })
-        .count()
-}
-
-/// The nested scan the index replaced, kept as the oracle its test compares
-/// against: no test in the suite distinguished the two.
-#[cfg(test)]
-fn active_permission_count_by_scan(permissions: &[DurablePermission]) -> usize {
-    permissions
-        .iter()
-        .filter(|permission| {
-            permission.application == crate::seal::wal::ApplicationStatus::Applied
-                && permission.reverses_mutation_id.is_none()
-                && !permissions.iter().any(|other| {
-                    other.application == crate::seal::wal::ApplicationStatus::Applied
-                        && other.reverses_mutation_id == Some(permission.mutation_id)
-                })
-        })
-        .count()
-}
-
+/// Every limit here is read off the measurements the WAL took as it admitted
+/// the frames, so the cost of validating a transaction does not grow with the
+/// number of records it holds. Recovery validation runs once per candidate.
 fn validate_recovery_workload(snapshot: &ReplayedTransaction) -> io::Result<()> {
-    if snapshot.permissions.len() > MAX_RECOVERY_PERMISSION_RECORDS {
+    let workload = snapshot.permission_workload;
+    if workload.recorded > MAX_RECOVERY_PERMISSION_RECORDS as u64 {
         return Err(io::Error::other(format!(
             "transaction contains {} permission records, above the limit of {MAX_RECOVERY_PERMISSION_RECORDS}",
-            snapshot.permissions.len()
+            workload.recorded
         )));
     }
-    let unresolved = snapshot
-        .permissions
-        .iter()
-        .filter(|permission| {
-            permission.application
-                == crate::seal::wal::ApplicationStatus::IntentDurableApplicationUnknown
-        })
-        .count();
-    let active = active_permission_count(&snapshot.permissions);
-    if unresolved > RECOVERY_MAX_ACTIVE_PERMISSIONS || active > RECOVERY_MAX_ACTIVE_PERMISSIONS {
+    if workload.unresolved > RECOVERY_MAX_ACTIVE_PERMISSIONS as u64
+        || workload.active_seals > RECOVERY_MAX_ACTIVE_PERMISSIONS as u64
+    {
         return Err(io::Error::other(format!(
             "transaction exceeds the {RECOVERY_MAX_ACTIVE_PERMISSIONS}-operation permission recovery limit"
         )));
     }
     let validate_path = |path: &Path| -> io::Result<()> {
-        if path.components().count() > MAX_RECOVERY_PATH_COMPONENTS {
-            return Err(io::Error::other(format!(
-                "recovery path exceeds the {MAX_RECOVERY_PATH_COMPONENTS}-component limit"
-            )));
-        }
-        if path.as_os_str().as_bytes().len() > MAX_RECOVERY_PATH_BYTES {
-            return Err(io::Error::other(format!(
-                "recovery path exceeds the {MAX_RECOVERY_PATH_BYTES}-byte limit"
-            )));
-        }
-        Ok(())
+        validate_path_extremes(path.components().count(), path.as_os_str().as_bytes().len())
     };
     if let Some(metadata) = &snapshot.staging {
         validate_path(metadata.source_parent().relative_path())?;
@@ -1388,8 +1336,24 @@ fn validate_recovery_workload(snapshot: &ReplayedTransaction) -> io::Result<()> 
             ));
         }
     }
-    for permission in &snapshot.permissions {
-        validate_path(permission.evidence.relative_path())?;
+    // Last, as the walk over the records was, so a transaction that violates
+    // both this and the metadata bounds still reports the metadata first.
+    validate_path_extremes(
+        workload.deepest_path_components as usize,
+        workload.longest_path_bytes as usize,
+    )
+}
+
+fn validate_path_extremes(components: usize, bytes: usize) -> io::Result<()> {
+    if components > MAX_RECOVERY_PATH_COMPONENTS {
+        return Err(io::Error::other(format!(
+            "recovery path exceeds the {MAX_RECOVERY_PATH_COMPONENTS}-component limit"
+        )));
+    }
+    if bytes > MAX_RECOVERY_PATH_BYTES {
+        return Err(io::Error::other(format!(
+            "recovery path exceeds the {MAX_RECOVERY_PATH_BYTES}-byte limit"
+        )));
     }
     Ok(())
 }

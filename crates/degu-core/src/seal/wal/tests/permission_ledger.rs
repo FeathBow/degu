@@ -33,6 +33,18 @@ fn assert_matches_scans(ledger: &PermissionLedger) {
     assert_coverage(ledger);
     assert_active_inverses(ledger);
     assert_quarantine_retention(ledger);
+    assert_workload(ledger);
+}
+
+/// The counts recovery validation reads, against the scans they replaced. Every
+/// scenario below asserts this after each intent and each resolution, so the
+/// agreement is checked over the histories the ledger can actually reach rather
+/// than over a record list assembled by hand.
+fn assert_workload(ledger: &PermissionLedger) {
+    assert_eq!(
+        ledger.workload(),
+        permission_workload_by_scan(ledger.permissions.values())
+    );
 }
 
 fn assert_phase_completion(ledger: &PermissionLedger) {
@@ -107,6 +119,7 @@ fn assert_quarantine_retention(ledger: &PermissionLedger) {
         state: TransactionState::Quarantined,
         staging_schema_version: None,
         permissions: ledger.permissions.values().cloned().collect(),
+        permission_workload: ledger.workload(),
         staging: None,
         tree_manifest: None,
         tree_sidecar: None,

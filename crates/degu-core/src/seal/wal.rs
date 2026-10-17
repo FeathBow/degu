@@ -3586,11 +3586,28 @@ fn all_applied_parent_seals_have_applied_inverse<'a>(
     })
 }
 
-/// The scans `PermissionLedger::workload` replaced, kept as the oracle its
-/// tests compare against. The nested inverse lookup is the form recovery
-/// validation used before the measurements existed.
+/// An applied seal no applied inverse has reversed, by the nested lookup
+/// recovery validation used before the ledger counted them. The one definition
+/// of the predicate every test compares `active_seals` against.
 #[cfg(test)]
-fn permission_workload_by_scan<'a>(
+pub(crate) fn active_permission_seals_by_scan(permissions: &[&DurablePermission]) -> usize {
+    permissions
+        .iter()
+        .filter(|seal| {
+            seal.application == ApplicationStatus::Applied
+                && seal.reverses_mutation_id.is_none()
+                && !permissions.iter().any(|inverse| {
+                    inverse.application == ApplicationStatus::Applied
+                        && inverse.reverses_mutation_id == Some(seal.mutation_id)
+                })
+        })
+        .count()
+}
+
+/// The scans `PermissionLedger::workload` replaced, kept as the oracle its
+/// tests compare against.
+#[cfg(test)]
+pub(crate) fn permission_workload_by_scan<'a>(
     permissions: impl Iterator<Item = &'a DurablePermission>,
 ) -> PermissionWorkload {
     let permissions = permissions.collect::<Vec<_>>();
@@ -3602,17 +3619,7 @@ fn permission_workload_by_scan<'a>(
                 permission.application == ApplicationStatus::IntentDurableApplicationUnknown
             })
             .count() as u64,
-        active_seals: permissions
-            .iter()
-            .filter(|seal| {
-                seal.application == ApplicationStatus::Applied
-                    && seal.reverses_mutation_id.is_none()
-                    && !permissions.iter().any(|inverse| {
-                        inverse.application == ApplicationStatus::Applied
-                            && inverse.reverses_mutation_id == Some(seal.mutation_id)
-                    })
-            })
-            .count() as u64,
+        active_seals: active_permission_seals_by_scan(&permissions) as u64,
         deepest_path_components: permissions
             .iter()
             .map(|permission| permission.evidence.relative_path().components().count() as u32)

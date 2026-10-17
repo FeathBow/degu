@@ -20,8 +20,6 @@ use crate::seal::sidecar::{
     TreeSidecarFoldError, TreeSidecarStore, tree_sidecar_required_for_state,
 };
 use crate::seal::store::{SealWalStore, StoreError};
-#[cfg(test)]
-use crate::seal::wal::DurablePermission;
 use crate::seal::wal::{
     AppendError, ProductionAssociation, RECOVERY_MAX_ACTIVE_PERMISSIONS, RecoveryIdentity,
     RecoverySession, RecoveryWork, ReplayError, ReplayedTransaction, SealWal,
@@ -1304,47 +1302,6 @@ fn recovery_work_requires_candidate(work: &RecoveryWork) -> bool {
             | RecoveryWork::FinalizePurge { .. }
             | RecoveryWork::RecoveryRequired { .. }
     )
-}
-
-/// The applied permissions no applied inverse has undone: what startup
-/// recovery would still have to reverse.
-///
-/// The ledger now counts this while the frames are admitted, so this one-pass
-/// index is retained only as the middle rung of the oracle its test compares
-/// against: the ledger's count, this index, and the nested scan both replaced
-/// must agree.
-#[cfg(test)]
-fn active_permission_count(permissions: &[DurablePermission]) -> usize {
-    let reversed: std::collections::HashSet<u64> = permissions
-        .iter()
-        .filter(|permission| permission.application == crate::seal::wal::ApplicationStatus::Applied)
-        .filter_map(|permission| permission.reverses_mutation_id)
-        .collect();
-    permissions
-        .iter()
-        .filter(|permission| {
-            permission.application == crate::seal::wal::ApplicationStatus::Applied
-                && permission.reverses_mutation_id.is_none()
-                && !reversed.contains(&permission.mutation_id)
-        })
-        .count()
-}
-
-/// The nested scan the index replaced, kept as the oracle its test compares
-/// against: no test in the suite distinguished the two.
-#[cfg(test)]
-fn active_permission_count_by_scan(permissions: &[DurablePermission]) -> usize {
-    permissions
-        .iter()
-        .filter(|permission| {
-            permission.application == crate::seal::wal::ApplicationStatus::Applied
-                && permission.reverses_mutation_id.is_none()
-                && !permissions.iter().any(|other| {
-                    other.application == crate::seal::wal::ApplicationStatus::Applied
-                        && other.reverses_mutation_id == Some(permission.mutation_id)
-                })
-        })
-        .count()
 }
 
 /// Every limit here is read off the measurements the WAL took as it admitted

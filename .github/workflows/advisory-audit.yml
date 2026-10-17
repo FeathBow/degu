@@ -18,3 +18,16 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+
+  action-pins:
+    name: pinned actions (scheduled)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Reconcile pinned actions against their refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./tools/reconcile-action-pins.sh

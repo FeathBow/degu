@@ -1183,9 +1183,6 @@ impl VerifiedUndoRecoverySession<'_> {
             // taking one per directory was quadratic in both time and
             // allocation. Each iteration writes the inverse of its own
             // original, so the set is extended in step rather than re-read.
-            if self.wal.transaction_state(transaction).is_none() {
-                return Err(RecoveryRebindError::TransactionMismatch);
-            }
             let mut restored: BTreeSet<u64> = self
                 .wal
                 .permission_records(transaction)

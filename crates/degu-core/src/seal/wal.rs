@@ -692,7 +692,12 @@ impl<W: DurableWrite> SealWal<W> {
             // points the append path uses, so the derived counts of a resumed
             // WAL are produced by one implementation rather than two.
             let ledger = wal.ledgers.entry(transaction.id).or_default();
-            for permission in &transaction.permissions {
+            for permission in replay
+                .permissions
+                .get(&transaction.id)
+                .into_iter()
+                .flatten()
+            {
                 let resolution = permission.application.resolution();
                 ledger.record_intent(permission.clone());
                 if let Some(resolution) = resolution {
@@ -782,14 +787,10 @@ impl<W: DurableWrite> SealWal<W> {
     ) -> Option<ReplayedTransaction> {
         let state = self.states.get(&transaction).copied()?;
         let ledger = self.ledgers.get(&transaction);
-        let permissions = ledger.map_or_else(Vec::new, |ledger| {
-            ledger.permissions.values().cloned().collect()
-        });
         Some(ReplayedTransaction {
             id: transaction,
             state,
             staging_schema_version: self.staging_schema_versions.get(&transaction).copied(),
-            permissions,
             permission_workload: ledger.map(PermissionLedger::workload).unwrap_or_default(),
             staging: self.staging.get(&transaction).cloned(),
             tree_manifest: self.manifests.get(&transaction).copied(),
@@ -799,6 +800,20 @@ impl<W: DurableWrite> SealWal<W> {
             purge_removed_entries: self.purge_progress.get(&transaction).map_or(0, |v| v.0),
             purge_last_path: self.purge_progress.get(&transaction).map(|v| v.1.clone()),
         })
+    }
+
+    /// This transaction's durable permission intents, by mutation id.
+    ///
+    /// Separate from [`Self::recovery_snapshot`] because most recovery
+    /// decisions never reach a record: a committed trash entry is preserved on
+    /// its state alone, and a snapshot that carried the records charged every
+    /// such decision for a copy of them.
+    pub(crate) fn permission_records(&self, transaction: TransactionId) -> Vec<DurablePermission> {
+        self.ledgers
+            .get(&transaction)
+            .map_or_else(Vec::new, |ledger| {
+                ledger.permissions.values().cloned().collect()
+            })
     }
 
     /// This transaction's applied tree seals, indexed by the path each one names.
@@ -1931,11 +1946,12 @@ pub struct ReplayedTransaction {
     /// Schema version of the transaction's atomic `StagingBegin` frame.
     /// Legacy-version state fixtures do not weaken v4 staging metadata.
     pub staging_schema_version: Option<u16>,
-    pub permissions: Vec<DurablePermission>,
-    /// What this transaction's permissions amount to, measured while the
-    /// frames were admitted. Recovery validation reads this rather than
-    /// re-scanning `permissions`, which is what makes its cost independent of
-    /// how many records a transaction holds.
+    /// What this transaction's permissions amount to, measured while the frames
+    /// were admitted. Recovery validation reads this rather than the records,
+    /// which is what makes its cost independent of how many a transaction
+    /// holds. The records themselves are asked for by the few decisions that
+    /// need them: [`SealWal::permission_records`] on a leased WAL, and
+    /// [`Replay::permissions`] on the replay a resume is built from.
     pub permission_workload: PermissionWorkload,
     pub staging: Option<StagingTransactionMetadata>,
     pub tree_manifest: Option<DurableTreeManifest>,
@@ -1963,6 +1979,10 @@ pub struct Replay {
     /// or parsing the WAL a second time -- which measured at roughly the cost
     /// of the whole open.
     pub frame_bytes: BTreeMap<TransactionId, u64>,
+    /// Each transaction's durable permission intents, in the order the frames
+    /// admitted them. A resume replays these to rebuild its ledgers, which is
+    /// the one caller that needs every record of every transaction at once.
+    pub permissions: BTreeMap<TransactionId, Vec<DurablePermission>>,
 }
 
 /// What a compacted WAL would hold, decided from the bytes and their replay
@@ -2530,9 +2550,20 @@ fn staging_recovery_needs_mount_authority(transaction: &ReplayedTransaction) -> 
 
 /// Converts durable state into work only. The caller must independently obtain
 /// live, authority-bearing handles before any chmod/rename/quarantine action.
-pub fn decide_recovery<F>(transaction: &ReplayedTransaction, identity: F) -> RecoveryWork
+///
+/// `records` is called at most once, and only by the states that decide from
+/// the permissions themselves. Every state that settles on the snapshot alone
+/// returns first, a committed trash entry among them, so handing this function
+/// the records up front charged those decisions for a copy of every record the
+/// transaction holds.
+pub fn decide_recovery<F, R>(
+    transaction: &ReplayedTransaction,
+    records: R,
+    identity: F,
+) -> RecoveryWork
 where
     F: Fn(&PersistentRecoveryEvidence) -> RecoveryIdentity,
+    R: FnOnce() -> Vec<DurablePermission>,
 {
     if let Some(version @ 0..=3) = transaction.staging_schema_version
         && staging_recovery_needs_mount_authority(transaction)
@@ -2581,8 +2612,10 @@ where
     ) {
         return RecoveryWork::Nothing;
     }
-    let uncertain = transaction
-        .permissions
+    // Every state that reaches here decides from the records, and every state
+    // above returned without them.
+    let records = records();
+    let uncertain = records
         .iter()
         .filter(|permission| {
             permission.application == ApplicationStatus::IntentDurableApplicationUnknown
@@ -2598,8 +2631,7 @@ where
     // The applied inverses, indexed once. Asking the whole permission list for
     // each permission made every decision below quadratic in the number of
     // sealed directories, and this runs on every startup.
-    let reversed: HashSet<u64> = transaction
-        .permissions
+    let reversed: HashSet<u64> = records
         .iter()
         .filter(|permission| permission.application == ApplicationStatus::Applied)
         .filter_map(|permission| permission.reverses_mutation_id)
@@ -2610,8 +2642,7 @@ where
             && !reversed.contains(&permission.mutation_id)
     };
     let active_permissions = || {
-        transaction
-            .permissions
+        records
             .iter()
             .filter(|permission| is_active(permission))
             .cloned()
@@ -2633,7 +2664,7 @@ where
         transaction.state,
         TransactionState::UndoIntent | TransactionState::UndoModesRestored
     ) {
-        let mut permissions = transaction.permissions.clone();
+        let mut permissions = records.clone();
         sort_permissions_deepest_first(&mut permissions);
         return RecoveryWork::ResumeVerifiedUndo {
             transaction: transaction.id,
@@ -2661,8 +2692,7 @@ where
             reason: RecoveryRequiredReason::RenameOutcomeUnknown,
         };
     }
-    if transaction
-        .permissions
+    if records
         .iter()
         .filter(|permission| is_active(permission))
         .any(|permission| identity(&permission.evidence) == RecoveryIdentity::Insufficient)
@@ -3330,6 +3360,7 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
             )?,
         }
     }
+    let mut permissions: BTreeMap<TransactionId, Vec<DurablePermission>> = BTreeMap::new();
     let transactions: BTreeMap<TransactionId, ReplayedTransaction> = transactions
         .into_iter()
         .map(|(id, tx)| {
@@ -3337,13 +3368,13 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                 .state
                 .ok_or(ReplayError::InvalidHistory("transaction has no state"))?;
             let permission_workload = tx.ledger.workload();
+            permissions.insert(id, tx.ledger.into_record_order());
             Ok((
                 id,
                 ReplayedTransaction {
                     id,
                     state,
                     staging_schema_version: tx.staging_schema_version,
-                    permissions: tx.ledger.into_record_order(),
                     permission_workload,
                     staging: tx.staging,
                     tree_manifest: tx.tree_manifest,
@@ -3367,6 +3398,7 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
     Ok(Replay {
         frame_bytes: BTreeMap::new(),
         transactions,
+        permissions,
         transaction_order,
         tail_repair: None,
         committed_len: 0,

@@ -174,8 +174,7 @@ fn replay_preserves_intent_order_when_an_inverse_has_a_lower_id() {
         .unwrap();
     let replay = replay_bytes(&wal.writer.bytes);
     assert_eq!(
-        replay.transactions[&TRANSACTION]
-            .permissions
+        replay.permissions[&TRANSACTION]
             .iter()
             .map(|permission| permission.mutation_id)
             .collect::<Vec<_>>(),
@@ -195,12 +194,10 @@ fn assert_resumed_ledger(wal: SealWal<FaultWriter>) {
 }
 
 #[test]
-fn recovery_snapshot_preserves_mutation_id_order() {
+fn permission_records_are_read_in_mutation_id_order() {
     let wal = restored_wal(&[(9, 2)]);
     assert_eq!(
-        wal.recovery_snapshot(TRANSACTION)
-            .unwrap()
-            .permissions
+        wal.permission_records(TRANSACTION)
             .iter()
             .map(|permission| permission.mutation_id)
             .collect::<Vec<_>>(),

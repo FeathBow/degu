@@ -22,6 +22,15 @@ pins=$(mktemp)
 report=$(mktemp)
 trap 'rm -f "$pins" "$report"' EXIT INT TERM
 
+# Both workflow extensions, through a guarded list: an unmatched glob reaches
+# awk as a literal filename, and a workflow this skips is a pin nothing checks.
+set --
+for workflow in "$workflows_dir"/*.yml "$workflows_dir"/*.yaml; do
+  [ -f "$workflow" ] || continue
+  set -- "$@" "$workflow"
+done
+[ "$#" -gt 0 ] || fail "No workflow files found under $workflows_dir"
+
 # One row per distinct pin, with the step count and the first site. Refs that
 # are not SHA pins are left to zizmor's unpinned-uses audit.
 awk '
@@ -57,7 +66,7 @@ awk '
   }
   { rolling = "" }
   END { for (i = 1; i <= n; i++) print order[i], uses[order[i]], first[order[i]] }
-' "$workflows_dir"/*.yml > "$pins"
+' "$@" > "$pins"
 
 [ -s "$pins" ] || fail "No SHA-pinned actions found under $workflows_dir"
 
@@ -68,6 +77,7 @@ moved=0
 unresolved=0
 unexplained=0
 drifted=0
+uncompared=0
 printf '| action | ref | uses | pinned | ref now | verdict |\n|---|---|--:|---|---|---|\n' > "$report"
 
 while IFS="$tab" read -r kind repo ref pin uses where; do
@@ -101,14 +111,28 @@ while IFS="$tab" read -r kind repo ref pin uses where; do
     continue
   fi
   drifted=$((drifted + 1))
-  span=$(gh api "repos/$repo/compare/$pin...$now" \
-    -q '[(.commits | length), ([.files[].filename | select(test("^action[.]ya?ml$"))] | length)] | @tsv' \
-    2>/dev/null || printf '?\t?')
-  behind=${span%%"$tab"*}
-  runtime=${span##*"$tab"}
-  printf '| `%s` | `%s` (rolling) | %s | `%s` | `%s` | %s commit(s) behind, %s touching `action.yml` -- [compare](https://github.com/%s/compare/%s...%s) |\n' \
+  # ahead_by is what the pin is behind by: commits the ref has that the pin
+  # lacks. behind_by is the other direction and reads 0 here. The report exists
+  # for these two numbers, so a comparison that fails to produce them fails the
+  # job rather than printing a question mark every week.
+  if span=$(gh api "repos/$repo/compare/$pin...$now" \
+    -q '[.ahead_by, ([.files[].filename | select(test("^action[.]ya?ml$"))] | length), .status] | @tsv' \
+    2>/dev/null); then
+    behind=$(printf '%s' "$span" | cut -f1)
+    runtime=$(printf '%s' "$span" | cut -f2)
+    case $(printf '%s' "$span" | cut -f3) in
+      ahead) note="" ;;
+      *) note=", history diverged" ;;
+    esac
+  else
+    uncompared=$((uncompared + 1))
+    behind="?"
+    runtime="?"
+    note=", comparison failed"
+  fi
+  printf '| `%s` | `%s` (rolling) | %s | `%s` | `%s` | %s commit(s) behind, %s touching `action.yml`%s -- [compare](https://github.com/%s/compare/%s...%s) |\n' \
     "$repo" "$ref" "$uses" "$(short "$pin")" "$(short "$now")" \
-    "$behind" "$runtime" "$repo" "$pin" "$now" >> "$report"
+    "$behind" "$runtime" "$note" "$repo" "$pin" "$now" >> "$report"
 done < "$pins"
 
 {
@@ -121,3 +145,4 @@ done < "$pins"
 [ "$unexplained" -eq 0 ] || fail "$unexplained pinned action(s) carry no version or rolling-ref comment"
 [ "$unresolved" -eq 0 ] || fail "$unresolved pinned action(s) name a ref that does not resolve"
 [ "$moved" -eq 0 ] || fail "$moved pinned action(s) no longer match the release ref they name"
+[ "$uncompared" -eq 0 ] || fail "$uncompared rolling comparison(s) could not be made"

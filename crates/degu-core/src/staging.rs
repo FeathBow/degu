@@ -1366,8 +1366,12 @@ impl SealedStagingEngine {
         store: &SealWalStore,
     ) -> Result<(Self, StartupRecoveryReport), StagingEngineError> {
         let mut recovery = store.try_lease()?;
-        let mut replay = recovery.replay_and_repair()?.clone();
-        if replay
+        // Borrowed for each fact, never cloned. The replay owns the permission
+        // ledgers the resume below takes, so copying it to satisfy the borrow
+        // checker would copy every record of every transaction to answer two
+        // questions about their metadata.
+        if recovery
+            .replay_and_repair()?
             .transactions
             .values()
             .any(|transaction| transaction.staging.is_none())
@@ -1385,10 +1389,6 @@ impl SealedStagingEngine {
         match store.compact_terminal_transactions(&recovery)? {
             crate::seal::store::Compaction::Done(compacted) => {
                 recovery = compacted;
-                replay = recovery
-                    .replay()
-                    .ok_or(ReplayError::InvalidHistory("leased WAL was not replayed"))?
-                    .clone();
             }
             // Reported rather than failed on; see `Compaction` for why both.
             crate::seal::store::Compaction::Abandoned(error) => {
@@ -1404,7 +1404,9 @@ impl SealedStagingEngine {
         // substituted, truncated, or tampered referenced sidecars are converted
         // into a durable fail-closed transaction state before recovery work is
         // exposed. Terminal transactions no longer consume manifest evidence.
-        let invalid_sidecars = replay
+        let invalid_sidecars = recovery
+            .replay()
+            .ok_or(ReplayError::InvalidHistory("leased WAL was not replayed"))?
             .transactions
             .values()
             .filter(|transaction| tree_sidecar_required_for_state(transaction.state))

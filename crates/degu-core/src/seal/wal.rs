@@ -643,22 +643,26 @@ impl<W: DurableWrite> SealWal<W> {
 
     /// Hydrates append-side validation from a fail-closed replay. The caller
     /// must supply a writer positioned for append to the same validated WAL.
-    fn resume(mut writer: W, replay: &Replay) -> Result<Self, AppendError> {
+    fn resume(mut writer: W, replay: Replay) -> Result<Self, AppendError> {
         let actual_len = writer.prepare_append().map_err(AppendError::Io)?;
         if actual_len != replay.committed_len || actual_len > MAX_WAL_LEN {
             return Err(AppendError::InvalidState(
                 "writer length does not match validated replay",
             ));
         }
+        let Replay {
+            transactions,
+            transaction_order,
+            mut ledgers,
+            ..
+        } = replay;
         let mut wal = Self::from_validated(writer, actual_len, MAX_WAL_LEN);
-        for transaction_id in &replay.transaction_order {
-            let transaction =
-                replay
-                    .transactions
-                    .get(transaction_id)
-                    .ok_or(AppendError::InvalidState(
-                        "replay transaction order is inconsistent",
-                    ))?;
+        for transaction_id in &transaction_order {
+            let transaction = transactions
+                .get(transaction_id)
+                .ok_or(AppendError::InvalidState(
+                    "replay transaction order is inconsistent",
+                ))?;
             wal.transaction_order.push(transaction.id);
             wal.states.insert(transaction.id, transaction.state);
             if let Some(version) = transaction.staging_schema_version {
@@ -688,22 +692,15 @@ impl<W: DurableWrite> SealWal<W> {
                     ),
                 );
             }
-            // Replayed in record order, through the same two ledger entry
-            // points the append path uses, so the derived counts of a resumed
-            // WAL are produced by one implementation rather than two.
-            let ledger = wal.ledgers.entry(transaction.id).or_default();
-            for permission in replay
-                .permissions
-                .get(&transaction.id)
-                .into_iter()
-                .flatten()
-            {
-                let resolution = permission.application.resolution();
-                ledger.record_intent(permission.clone());
-                if let Some(resolution) = resolution {
-                    ledger.record_resolution(permission.mutation_id, resolution);
-                }
-            }
+            // Moved, not rebuilt. Replay fed this ledger through the same two
+            // entry points the append path uses, so a resumed WAL's derived
+            // counts already come from one implementation. Re-deriving the
+            // ledger from its own records would run that implementation twice
+            // and hold a second copy of every record while it did.
+            wal.ledgers.insert(
+                transaction.id,
+                ledgers.remove(&transaction.id).unwrap_or_default(),
+            );
         }
         Ok(wal)
     }
@@ -1793,20 +1790,6 @@ pub enum ApplicationStatus {
     IntentDurableApplicationUnknown,
 }
 
-impl ApplicationStatus {
-    /// The resolution this status records, or `None` while the application of
-    /// the durable intent is still unknown.
-    fn resolution(self) -> Option<PermissionResolution> {
-        match self {
-            ApplicationStatus::Applied => Some(PermissionResolution::Applied),
-            ApplicationStatus::ConfirmedNotApplied => {
-                Some(PermissionResolution::ConfirmedNotApplied)
-            }
-            ApplicationStatus::IntentDurableApplicationUnknown => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionResolution {
     Applied,
@@ -1965,7 +1948,7 @@ pub struct ReplayedTransaction {
     pub purge_last_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct Replay {
     pub transactions: BTreeMap<TransactionId, ReplayedTransaction>,
     /// First-frame order, retained so production grouping never depends on
@@ -1979,10 +1962,27 @@ pub struct Replay {
     /// or parsing the WAL a second time -- which measured at roughly the cost
     /// of the whole open.
     pub frame_bytes: BTreeMap<TransactionId, u64>,
-    /// Each transaction's durable permission intents, in the order the frames
-    /// admitted them. A resume replays these to rebuild its ledgers, which is
-    /// the one caller that needs every record of every transaction at once.
-    pub permissions: BTreeMap<TransactionId, Vec<DurablePermission>>,
+    /// The permission ledger each transaction's frames built, which the resume
+    /// takes ownership of. Private, and the replay is not [`Clone`], so the
+    /// ledgers reach a WAL by being moved rather than derived a second time
+    /// from records nothing else reads.
+    ledgers: BTreeMap<TransactionId, PermissionLedger>,
+}
+
+impl Replay {
+    /// A transaction's recovered permission intents, by mutation id.
+    ///
+    /// Test-only: production moves these ledgers into the WAL and asks the WAL
+    /// ([`SealWal::permission_records`]). Reading records off a replay is what
+    /// a test does when it exercises replay without resuming one.
+    #[cfg(test)]
+    pub(crate) fn permission_records(&self, transaction: TransactionId) -> Vec<DurablePermission> {
+        self.ledgers
+            .get(&transaction)
+            .map_or_else(Vec::new, |ledger| {
+                ledger.permissions.values().cloned().collect()
+            })
+    }
 }
 
 /// What a compacted WAL would hold, decided from the bytes and their replay
@@ -2337,6 +2337,14 @@ impl RecoverySession {
         self.replay.as_ref()
     }
 
+    /// Takes the replay out of the session, leaving it unable to resume.
+    /// Test-only: production hands the replay straight to [`Self::resume`],
+    /// which is what owns the ledgers it carries.
+    #[cfg(test)]
+    pub(crate) fn take_replay(&mut self) -> Option<Replay> {
+        self.replay.take()
+    }
+
     /// Reads back a synced compaction entry and confirms it replays to exactly
     /// the transactions and states that were meant to survive, with no partial
     /// trailing frame. A compaction that cannot prove this never replaces the
@@ -2398,7 +2406,7 @@ impl RecoverySession {
         let replay = self.replay.take().ok_or(AppendError::InvalidState(
             "WAL lease has not completed validated replay",
         ))?;
-        SealWal::resume(self, &replay)
+        SealWal::resume(self, replay)
     }
 }
 
@@ -3362,7 +3370,7 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
             )?,
         }
     }
-    let mut permissions: BTreeMap<TransactionId, Vec<DurablePermission>> = BTreeMap::new();
+    let mut ledgers: BTreeMap<TransactionId, PermissionLedger> = BTreeMap::new();
     let transactions: BTreeMap<TransactionId, ReplayedTransaction> = transactions
         .into_iter()
         .map(|(id, tx)| {
@@ -3370,7 +3378,7 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                 .state
                 .ok_or(ReplayError::InvalidHistory("transaction has no state"))?;
             let permission_workload = tx.ledger.workload();
-            permissions.insert(id, tx.ledger.into_record_order());
+            ledgers.insert(id, tx.ledger);
             Ok((
                 id,
                 ReplayedTransaction {
@@ -3400,7 +3408,7 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
     Ok(Replay {
         frame_bytes: BTreeMap::new(),
         transactions,
-        permissions,
+        ledgers,
         transaction_order,
         tail_repair: None,
         committed_len: 0,

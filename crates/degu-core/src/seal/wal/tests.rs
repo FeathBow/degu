@@ -425,7 +425,7 @@ fn v11_manifest_history_remains_replayable_but_cross_version_tags_fail_closed() 
             bytes: v11_prefix.clone(),
             ..FaultWriter::default()
         },
-        &replay,
+        replay,
     )
     .unwrap();
     assert!(matches!(
@@ -511,7 +511,8 @@ fn replay_checked_fixture(bytes: &[u8]) -> Replay {
     let path = temp.path().join("legacy.wal");
     std::fs::write(&path, bytes).unwrap();
     let mut session = RecoverySession::try_acquire(open_rw(&path)).unwrap();
-    session.replay_and_repair().unwrap().clone()
+    session.replay_and_repair().unwrap();
+    session.take_replay().unwrap()
 }
 
 #[derive(Default)]
@@ -670,7 +671,7 @@ fn applied_is_synced_only_after_successful_mutation() {
     let parsed = parse_frames(&wal.into_inner().bytes).unwrap();
     let replay = replay_records(parsed.records).unwrap();
     assert_eq!(
-        replay.permissions[&tx(4)][0].application,
+        replay.permission_records(tx(4))[0].application,
         ApplicationStatus::Applied
     );
 }
@@ -699,7 +700,7 @@ fn mutation_failure_leaves_durable_uncertain_intent_without_applied() {
     let parsed = parse_frames(&wal.into_inner().bytes).unwrap();
     let replay = replay_records(parsed.records).unwrap();
     assert_eq!(
-        replay.permissions[&tx(5)][0].application,
+        replay.permission_records(tx(5))[0].application,
         ApplicationStatus::IntentDurableApplicationUnknown
     );
 }
@@ -871,7 +872,7 @@ fn legacy_v1_checksummed_unresolved_permission_replays_explicitly() {
         None
     );
     assert_eq!(
-        replay.permissions[&transaction][0].application,
+        replay.permission_records(transaction)[0].application,
         ApplicationStatus::IntentDurableApplicationUnknown
     );
 }
@@ -902,7 +903,7 @@ fn legacy_v3_staging_frame_replays_without_inventing_mount_authority() {
         0
     );
     assert_eq!(
-        replay.permissions[&transaction][0].application,
+        replay.permission_records(transaction)[0].application,
         ApplicationStatus::IntentDurableApplicationUnknown
     );
     assert!(matches!(
@@ -917,7 +918,7 @@ fn legacy_v3_staging_frame_replays_without_inventing_mount_authority() {
             bytes,
             ..FaultWriter::default()
         },
-        &replay,
+        replay,
     )
     .unwrap();
     assert_eq!(
@@ -967,7 +968,7 @@ fn terminal_legacy_staging_metadata_does_not_block_the_next_transaction() {
         legacy.state = terminal;
         let replay = Replay {
             transactions: [(old_id, legacy.clone())].into_iter().collect(),
-            permissions: BTreeMap::new(),
+            ledgers: BTreeMap::new(),
             transaction_order: vec![old_id],
             tail_repair: None,
             frame_bytes: BTreeMap::new(),
@@ -980,7 +981,7 @@ fn terminal_legacy_staging_metadata_does_not_block_the_next_transaction() {
                 ..
             }
         ));
-        let mut wal = SealWal::resume(FaultWriter::default(), &replay).unwrap();
+        let mut wal = SealWal::resume(FaultWriter::default(), replay).unwrap();
         assert!(wal.can_begin_staging_transaction());
         wal.begin_staging(tx(0x40 + index as u8), staging_metadata())
             .unwrap();
@@ -1050,7 +1051,7 @@ impl Replayed {
     fn of(replay: &Replay, transaction: TransactionId) -> Self {
         Self {
             transaction: replay.transactions[&transaction].clone(),
-            permissions: replay.permissions[&transaction].clone(),
+            permissions: replay.permission_records(transaction),
         }
     }
 
@@ -1744,9 +1745,9 @@ fn restore_and_rollback_phases_accept_separate_permission_mutations() {
         state(transaction, TransactionState::Restored),
     ];
     let replay = replay_records(restore_records).unwrap();
-    assert_eq!(replay.permissions[&transaction].len(), 2);
+    assert_eq!(replay.permission_records(transaction).len(), 2);
     assert_eq!(
-        replay.permissions[&transaction][1].phase,
+        replay.permission_records(transaction)[1].phase,
         TransactionState::RestoreIntent
     );
     let mut before_terminal = Replayed::of(&replay, transaction);
@@ -1795,7 +1796,7 @@ fn replay_resume_resolves_applied_then_records_restore_to_restored() {
             bytes,
             ..FaultWriter::default()
         },
-        &replay,
+        replay,
     )
     .unwrap();
     resumed
@@ -1825,7 +1826,7 @@ fn replay_resume_resolves_applied_then_records_restore_to_restored() {
         .unwrap();
     let parsed = parse_frames(&resumed.into_inner().bytes).unwrap();
     let replay = replay_records(parsed.records).unwrap();
-    let recovered = &replay.permissions[&transaction];
+    let recovered = replay.permission_records(transaction);
     assert_eq!(
         replay.transactions[&transaction].state,
         TransactionState::Restored
@@ -1861,7 +1862,7 @@ fn confirmed_not_applied_does_not_require_identity_or_restore_work() {
             bytes,
             ..FaultWriter::default()
         },
-        &replay,
+        replay,
     )
     .unwrap();
     resumed
@@ -1872,7 +1873,7 @@ fn confirmed_not_applied_does_not_require_identity_or_restore_work() {
     let bytes = resumed.into_inner().bytes;
     let replay = replay_bytes(&bytes);
     assert_eq!(
-        replay.permissions[&transaction][0].application,
+        replay.permission_records(transaction)[0].application,
         ApplicationStatus::ConfirmedNotApplied
     );
     assert!(matches!(
@@ -2147,11 +2148,11 @@ fn confirmed_not_applied_inverse_can_be_retried_and_folded() {
         TransactionState::Restored
     );
     assert_eq!(
-        replay.permissions[&transaction][1].application,
+        replay.permission_records(transaction)[1].application,
         ApplicationStatus::ConfirmedNotApplied
     );
     assert_eq!(
-        replay.permissions[&transaction][2].application,
+        replay.permission_records(transaction)[2].application,
         ApplicationStatus::Applied
     );
     let mut before_terminal = Replayed::of(&replay, transaction);
@@ -3798,7 +3799,7 @@ fn compaction_keeps_a_terminal_transaction_whose_group_is_unfinished() {
         }
         Replay {
             transactions,
-            permissions: BTreeMap::new(),
+            ledgers: BTreeMap::new(),
             transaction_order: Vec::new(),
             tail_repair: None,
             frame_bytes: BTreeMap::new(),

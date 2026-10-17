@@ -599,11 +599,11 @@ mod tests {
         let replay = recovery.replay_and_repair().unwrap();
         let recovered = &replay.transactions[&transaction];
         assert_eq!(recovered.state, TransactionState::Restored);
-        assert_eq!(replay.permissions[&transaction].len(), 2);
+        assert_eq!(replay.permission_records(transaction).len(), 2);
         assert!(matches!(
             decide_recovery(
                 recovered,
-                || replay.permissions[&transaction].clone(),
+                || replay.permission_records(transaction),
                 |_| panic!("restored work needs no identity probe")
             ),
             RecoveryWork::Nothing

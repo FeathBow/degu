@@ -1485,10 +1485,11 @@ impl SealedStagingEngine {
         Self::open(store)
     }
 
-    /// Exhausts the exact report from [`Self::open`]. The provider is invoked
-    /// only for work that may safely inspect a known side of the namespace; a
-    /// rename-unknown or already-`RecoveryRequired` transaction is blocked and
-    /// recorded without requesting anchors.
+    /// Exhausts the exact report from
+    /// [`open_staging`](crate::activation::ActivatedSealWalStore::open_staging).
+    /// The provider is invoked only for work that may safely inspect a known
+    /// side of the namespace; a rename-unknown or already-`RecoveryRequired`
+    /// transaction is blocked and recorded without requesting anchors.
     pub fn recover_startup<F>(
         mut self,
         report: StartupRecoveryReport,

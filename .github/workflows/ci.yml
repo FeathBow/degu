@@ -37,6 +37,12 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Intra-doc links are invisible to clippy, and the `docs` job's link check
+      # reads markdown only, so a link to a deleted or private item ships
+      # silently. This is the step that sees it.
+      - run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   docs:
     runs-on: ubuntu-latest

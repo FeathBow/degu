@@ -476,9 +476,10 @@ fn uncertain_staging_intent_resolves_before_after_and_at_fresh_resolution() {
         };
         restore.execute().unwrap();
         let snapshot = wal.recovery_snapshot(transaction).unwrap();
+        let records = wal.permission_records(transaction);
         assert_eq!(snapshot.state, TransactionState::Restored);
         assert_eq!(
-            snapshot.permissions[0].application,
+            records[0].application,
             if physically_applied || change_after_certification {
                 ApplicationStatus::Applied
             } else {
@@ -486,8 +487,7 @@ fn uncertain_staging_intent_resolves_before_after_and_at_fresh_resolution() {
             }
         );
         assert_eq!(
-            snapshot
-                .permissions
+            records
                 .iter()
                 .filter(|permission| permission.reverses_mutation_id.is_some())
                 .count(),
@@ -759,9 +759,11 @@ fn uncertain_inverse_intents_resolve_before_and_after_fchmod_in_every_restore_ph
                 continue;
             }
             let snapshot = wal.recovery_snapshot(transaction).unwrap();
-            let RecoveryWork::ResolveUncertainPermissions { permissions, .. } =
-                decide_recovery(&snapshot, |_| RecoveryIdentity::Reestablished)
-            else {
+            let RecoveryWork::ResolveUncertainPermissions { permissions, .. } = decide_recovery(
+                &snapshot,
+                || wal.permission_records(transaction),
+                |_| RecoveryIdentity::Reestablished,
+            ) else {
                 panic!("inverse intent must remain uncertain after crash");
             };
             resolve_uncertain_permissions(
@@ -773,9 +775,7 @@ fn uncertain_inverse_intents_resolve_before_and_after_fchmod_in_every_restore_ph
             )
             .unwrap();
             let resolved = wal
-                .recovery_snapshot(transaction)
-                .unwrap()
-                .permissions
+                .permission_records(transaction)
                 .into_iter()
                 .find(|permission| permission.mutation_id == 3)
                 .unwrap();
@@ -900,12 +900,12 @@ fn exact_staging_snapshot_restores_all_applied_permissions_and_reaches_restored(
         0o770
     );
     let snapshot = wal.recovery_snapshot(transaction).unwrap();
+    let records = wal.permission_records(transaction);
     assert_eq!(snapshot.state, TransactionState::Restored);
     assert!(!startup_blocked);
-    assert_eq!(snapshot.permissions.len(), 4);
+    assert_eq!(records.len(), 4);
     assert_eq!(
-        snapshot
-            .permissions
+        records
             .iter()
             .filter(|permission| permission.reverses_mutation_id.is_some())
             .count(),

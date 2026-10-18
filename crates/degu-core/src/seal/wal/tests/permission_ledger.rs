@@ -118,7 +118,6 @@ fn assert_quarantine_retention(ledger: &PermissionLedger) {
         id: TRANSACTION,
         state: TransactionState::Quarantined,
         staging_schema_version: None,
-        permissions: ledger.permissions.values().cloned().collect(),
         permission_workload: ledger.workload(),
         staging: None,
         tree_manifest: None,

@@ -1178,17 +1178,14 @@ impl VerifiedUndoRecoverySession<'_> {
                     .cmp(&left.evidence.relative_path().components().count())
                     .then_with(|| left.mutation_id.cmp(&right.mutation_id))
             });
-            // The seals a previous interrupted run already restored. The
-            // snapshot this reads clones every permission in the transaction,
-            // so taking one per directory was quadratic in both time and
+            // The seals a previous interrupted run already restored. Reading
+            // the records copies every permission in the transaction, so
+            // taking one per directory was quadratic in both time and
             // allocation. Each iteration writes the inverse of its own
             // original, so the set is extended in step rather than re-read.
-            let snapshot = self
+            let mut restored: BTreeSet<u64> = self
                 .wal
-                .recovery_snapshot(transaction)
-                .ok_or(RecoveryRebindError::TransactionMismatch)?;
-            let mut restored: BTreeSet<u64> = snapshot
-                .permissions
+                .permission_records(transaction)
                 .iter()
                 .filter(|permission| {
                     permission.application == ApplicationStatus::Applied
@@ -1654,9 +1651,11 @@ pub(crate) fn prepare_startup_recovery<'a>(
         let snapshot = wal
             .recovery_snapshot(transaction)
             .ok_or(RecoveryRebindError::TransactionMismatch)?;
-        let work = crate::seal::wal::decide_recovery(&snapshot, |_| {
-            crate::seal::wal::RecoveryIdentity::Reestablished
-        });
+        let work = crate::seal::wal::decide_recovery(
+            &snapshot,
+            || wal.permission_records(transaction),
+            |_| crate::seal::wal::RecoveryIdentity::Reestablished,
+        );
         // Preserve the typed RenameIntent+missing-outcome ambiguity. Repeated
         // attempts must never turn it into a generic state that permits lookup.
         if recovery_lookup_is_forbidden(&work) {
@@ -1800,7 +1799,7 @@ pub(crate) fn prepare_verified_undo<'a>(
         .ok_or(RecoveryRebindError::TransactionMismatch)?;
     let work = RecoveryWork::ResumeVerifiedUndo {
         transaction,
-        permissions: snapshot.permissions,
+        permissions: wal.permission_records(transaction),
     };
     match rebind_work(
         &metadata,
@@ -1848,7 +1847,7 @@ pub(crate) fn prepare_verified_purge<'a>(
     }
     let work = RecoveryWork::ResumeVerifiedUndo {
         transaction,
-        permissions: snapshot.permissions,
+        permissions: wal.permission_records(transaction),
     };
     match rebind_work(
         &metadata,
@@ -1917,12 +1916,13 @@ fn resolve_uncertain_permissions(
     permissions: Vec<DurablePermission>,
 ) -> Result<(), RecoveryRebindError> {
     validate_anchors(metadata, anchors)?;
-    let snapshot = wal
-        .recovery_snapshot(transaction)
-        .ok_or(RecoveryRebindError::TransactionMismatch)?;
+    if wal.transaction_state(transaction).is_none() {
+        return Err(RecoveryRebindError::TransactionMismatch);
+    }
+    let records = wal.permission_records(transaction);
     for permission in permissions {
         let (anchor, path) =
-            uncertain_permission_location(&permission, &snapshot.permissions, metadata, anchors)?;
+            uncertain_permission_location(&permission, &records, metadata, anchors)?;
         let expected = StrongObjectIdentity::new_with_mount(
             permission.evidence.device(),
             permission.evidence.inode(),

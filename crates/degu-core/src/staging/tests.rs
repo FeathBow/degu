@@ -425,13 +425,14 @@ fn active_seals_in_quarantine_block_runtime_and_reopen() {
     );
 }
 
+/// A snapshot of the transaction these records would make. Validation reads
+/// only the measurement, so the records are measured and let go.
 fn workload_snapshot(permissions: Vec<DurablePermission>) -> ReplayedTransaction {
     ReplayedTransaction {
         id: TransactionId([0xd1; 16]),
         state: TransactionState::TreeSealIntent,
         staging_schema_version: Some(4),
         permission_workload: permission_workload_by_scan(permissions.iter()),
-        permissions,
         staging: Some(metadata()),
         tree_manifest: None,
         tree_sidecar: None,

@@ -670,7 +670,7 @@ fn applied_is_synced_only_after_successful_mutation() {
     let parsed = parse_frames(&wal.into_inner().bytes).unwrap();
     let replay = replay_records(parsed.records).unwrap();
     assert_eq!(
-        replay.transactions[&tx(4)].permissions[0].application,
+        replay.permissions[&tx(4)][0].application,
         ApplicationStatus::Applied
     );
 }
@@ -699,7 +699,7 @@ fn mutation_failure_leaves_durable_uncertain_intent_without_applied() {
     let parsed = parse_frames(&wal.into_inner().bytes).unwrap();
     let replay = replay_records(parsed.records).unwrap();
     assert_eq!(
-        replay.transactions[&tx(5)].permissions[0].application,
+        replay.permissions[&tx(5)][0].application,
         ApplicationStatus::IntentDurableApplicationUnknown
     );
 }
@@ -866,10 +866,12 @@ fn legacy_v1_checksummed_unresolved_permission_replays_explicitly() {
     ]
     .concat();
     let replay = replay_checked_fixture(&bytes);
-    let transaction = &replay.transactions[&transaction];
-    assert_eq!(transaction.staging_schema_version, None);
     assert_eq!(
-        transaction.permissions[0].application,
+        replay.transactions[&transaction].staging_schema_version,
+        None
+    );
+    assert_eq!(
+        replay.permissions[&transaction][0].application,
         ApplicationStatus::IntentDurableApplicationUnknown
     );
 }
@@ -900,11 +902,11 @@ fn legacy_v3_staging_frame_replays_without_inventing_mount_authority() {
         0
     );
     assert_eq!(
-        legacy.permissions[0].application,
+        replay.permissions[&transaction][0].application,
         ApplicationStatus::IntentDurableApplicationUnknown
     );
     assert!(matches!(
-        decide_recovery(legacy, |_| RecoveryIdentity::Reestablished),
+        Replayed::of(&replay, transaction).decide(|_| RecoveryIdentity::Reestablished),
         RecoveryWork::RecoveryRequired {
             reason: RecoveryRequiredReason::LegacySchemaMissingMountIdentity { version: 3 },
             ..
@@ -965,13 +967,14 @@ fn terminal_legacy_staging_metadata_does_not_block_the_next_transaction() {
         legacy.state = terminal;
         let replay = Replay {
             transactions: [(old_id, legacy.clone())].into_iter().collect(),
+            permissions: BTreeMap::new(),
             transaction_order: vec![old_id],
             tail_repair: None,
             frame_bytes: BTreeMap::new(),
             committed_len: 0,
         };
         assert!(!matches!(
-            decide_recovery(&legacy, |_| RecoveryIdentity::Reestablished),
+            decide_recovery(&legacy, Vec::new, |_| RecoveryIdentity::Reestablished),
             RecoveryWork::RecoveryRequired {
                 reason: RecoveryRequiredReason::LegacySchemaMissingMountIdentity { .. },
                 ..
@@ -1035,7 +1038,31 @@ fn recovery_drop_unlocks_a_fork_inherited_file_description() {
     drop(inherited);
 }
 
-fn replayed(state: TransactionState) -> ReplayedTransaction {
+/// A snapshot and the records a decision reads. The WAL keeps them apart
+/// because most states settle without reaching a record, so anything that
+/// drives `decide_recovery` has to hold both.
+struct Replayed {
+    transaction: ReplayedTransaction,
+    permissions: Vec<DurablePermission>,
+}
+
+impl Replayed {
+    fn of(replay: &Replay, transaction: TransactionId) -> Self {
+        Self {
+            transaction: replay.transactions[&transaction].clone(),
+            permissions: replay.permissions[&transaction].clone(),
+        }
+    }
+
+    fn decide<F>(&self, identity: F) -> RecoveryWork
+    where
+        F: Fn(&PersistentRecoveryEvidence) -> RecoveryIdentity,
+    {
+        decide_recovery(&self.transaction, || self.permissions.clone(), identity)
+    }
+}
+
+fn replayed(state: TransactionState) -> Replayed {
     let permissions = vec![DurablePermission {
         mutation_id: 1,
         phase: TransactionState::TreeSealIntent,
@@ -1045,49 +1072,111 @@ fn replayed(state: TransactionState) -> ReplayedTransaction {
         reverses_mutation_id: None,
         application: ApplicationStatus::Applied,
     }];
-    ReplayedTransaction {
-        id: tx(10),
-        state,
-        staging_schema_version: None,
-        permission_workload: permission_workload_by_scan(permissions.iter()),
+    Replayed {
+        transaction: ReplayedTransaction {
+            id: tx(10),
+            state,
+            staging_schema_version: None,
+            permission_workload: permission_workload_by_scan(permissions.iter()),
+            staging: None,
+            tree_manifest: None,
+            tree_sidecar: None,
+            rename_outcome: None,
+            undo_rename_outcome: None,
+            purge_removed_entries: 0,
+            purge_last_path: None,
+        },
         permissions,
-        staging: None,
-        tree_manifest: None,
-        tree_sidecar: None,
-        rename_outcome: None,
-        undo_rename_outcome: None,
-        purge_removed_entries: 0,
-        purge_last_path: None,
     }
 }
 
 #[test]
 fn decision_engine_separates_before_after_and_committed_recovery() {
     assert!(matches!(
-        decide_recovery(&replayed(TransactionState::TreeSealed), |_| {
-            RecoveryIdentity::Reestablished
-        }),
+        replayed(TransactionState::TreeSealed).decide(|_| { RecoveryIdentity::Reestablished }),
         RecoveryWork::RestoreBeforeRename { .. }
     ));
     assert!(matches!(
-        decide_recovery(&replayed(TransactionState::StagedUnverified), |_| {
-            RecoveryIdentity::Reestablished
-        }),
+        replayed(TransactionState::StagedUnverified)
+            .decide(|_| { RecoveryIdentity::Reestablished }),
         RecoveryWork::VerifyOrQuarantineAfterRename { .. }
     ));
     assert!(matches!(
-        decide_recovery(&replayed(TransactionState::VerifiedCommitted), |_| {
-            RecoveryIdentity::Insufficient
-        }),
+        replayed(TransactionState::VerifiedCommitted)
+            .decide(|_| { RecoveryIdentity::Insufficient }),
         RecoveryWork::PreserveCommittedSeal { .. }
     ));
 }
 
+/// Every state a transaction settles in on its own, with the work it settles
+/// to. The provider refuses rather than returning an empty list: an empty list
+/// would let a decision read the records and still come out right, which is
+/// the cost this seam exists to avoid.
+#[test]
+fn a_settled_state_decides_without_reading_a_record() {
+    let transaction = tx(10);
+    for (state, expected) in [
+        (
+            TransactionState::PurgeOutcome,
+            RecoveryWork::FinalizePurge { transaction },
+        ),
+        (
+            TransactionState::PurgeIntent,
+            RecoveryWork::RecoveryRequired {
+                transaction,
+                reason: RecoveryRequiredReason::InterruptedPurge,
+            },
+        ),
+        (
+            TransactionState::RecoveryRequired,
+            RecoveryWork::RecoveryRequired {
+                transaction,
+                reason: RecoveryRequiredReason::RecordedRecoveryRequired,
+            },
+        ),
+        (
+            TransactionState::VerifiedCommitted,
+            RecoveryWork::PreserveCommittedSeal {
+                transaction,
+                state: TransactionState::VerifiedCommitted,
+            },
+        ),
+        (
+            TransactionState::Purgeable,
+            RecoveryWork::PreserveCommittedSeal {
+                transaction,
+                state: TransactionState::Purgeable,
+            },
+        ),
+        (
+            TransactionState::Purged,
+            RecoveryWork::PreserveCommittedSeal {
+                transaction,
+                state: TransactionState::Purged,
+            },
+        ),
+        (
+            TransactionState::UndoConflict,
+            RecoveryWork::PreserveUndoConflict { transaction },
+        ),
+        (TransactionState::Restored, RecoveryWork::Nothing),
+        (TransactionState::RolledBack, RecoveryWork::Nothing),
+    ] {
+        assert_eq!(
+            decide_recovery(
+                &replayed(state).transaction,
+                || panic!("{state:?} must settle without reading a record"),
+                |_| panic!("{state:?} must settle without an identity probe"),
+            ),
+            expected,
+            "{state:?}"
+        );
+    }
+}
+
 #[test]
 fn insufficient_identity_never_produces_mutation_work() {
-    let result = decide_recovery(&replayed(TransactionState::TreeSealed), |_| {
-        RecoveryIdentity::Insufficient
-    });
+    let result = replayed(TransactionState::TreeSealed).decide(|_| RecoveryIdentity::Insufficient);
     assert_eq!(
         result,
         RecoveryWork::RecoveryRequired {
@@ -1125,7 +1214,7 @@ fn invalid_history_fails_closed() {
 #[test]
 fn decision_callback_receives_evidence_but_not_authority() {
     let seen = Cell::new(false);
-    let _ = decide_recovery(&replayed(TransactionState::TreeSealed), |item| {
+    let _ = replayed(TransactionState::TreeSealed).decide(|item| {
         assert_eq!(item.relative_path(), Path::new("tree/dir"));
         seen.set(true);
         RecoveryIdentity::Reestablished
@@ -1217,9 +1306,7 @@ fn applied_record_must_share_the_intent_phase() {
 
 #[test]
 fn quarantine_is_not_reported_as_a_committed_seal() {
-    let result = decide_recovery(&replayed(TransactionState::Quarantined), |_| {
-        RecoveryIdentity::Insufficient
-    });
+    let result = replayed(TransactionState::Quarantined).decide(|_| RecoveryIdentity::Insufficient);
     assert!(matches!(
         result,
         RecoveryWork::RestoreQuarantinedSeals { transaction, permissions }
@@ -1382,6 +1469,21 @@ fn compaction_selects_surviving_frames_byte_for_byte() {
         compacted.transactions[&kept_transaction], replay.transactions[&kept_transaction],
         "a surviving transaction must replay to exactly what it did before"
     );
+    // What the name of this test claims, asserted over the bytes rather than
+    // over what they replay to. The snapshot above carries measured totals, so
+    // on its own it accepts any selection a replay still accepts; these bytes
+    // accept exactly one.
+    let survivor_frames = parsed
+        .spans
+        .iter()
+        .filter(|span| span.transaction == kept_transaction)
+        .flat_map(|span| &bytes[span.start..span.end])
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kept, survivor_frames,
+        "the kept bytes must be the survivor's frames, in file order"
+    );
     assert_eq!(compacted.committed_len, kept.len() as u64);
 }
 
@@ -1430,7 +1532,7 @@ fn compaction_drops_exactly_the_states_with_nothing_left_to_do() {
 /// that filter turns the restore below into `PreserveQuarantine`.
 #[test]
 fn only_an_applied_inverse_reverses_a_quarantined_seal() {
-    fn quarantined_with_inverse(application: ApplicationStatus) -> ReplayedTransaction {
+    fn quarantined_with_inverse(application: ApplicationStatus) -> Replayed {
         let mut transaction = replayed(TransactionState::Quarantined);
         transaction.permissions.push(DurablePermission {
             mutation_id: 2,
@@ -1447,7 +1549,7 @@ fn only_an_applied_inverse_reverses_a_quarantined_seal() {
     let unapplied = quarantined_with_inverse(ApplicationStatus::ConfirmedNotApplied);
     assert!(
         matches!(
-            decide_recovery(&unapplied, |_| RecoveryIdentity::Reestablished),
+            unapplied.decide(|_| RecoveryIdentity::Reestablished),
             RecoveryWork::RestoreQuarantinedSeals { permissions, .. }
                 if permissions.len() == 1 && permissions[0].mutation_id == 1
         ),
@@ -1457,7 +1559,7 @@ fn only_an_applied_inverse_reverses_a_quarantined_seal() {
     let applied = quarantined_with_inverse(ApplicationStatus::Applied);
     assert!(
         matches!(
-            decide_recovery(&applied, |_| RecoveryIdentity::Reestablished),
+            applied.decide(|_| RecoveryIdentity::Reestablished),
             RecoveryWork::PreserveQuarantine { .. }
         ),
         "an applied inverse already restored the seal"
@@ -1642,15 +1744,15 @@ fn restore_and_rollback_phases_accept_separate_permission_mutations() {
         state(transaction, TransactionState::Restored),
     ];
     let replay = replay_records(restore_records).unwrap();
-    assert_eq!(replay.transactions[&transaction].permissions.len(), 2);
+    assert_eq!(replay.permissions[&transaction].len(), 2);
     assert_eq!(
-        replay.transactions[&transaction].permissions[1].phase,
+        replay.permissions[&transaction][1].phase,
         TransactionState::RestoreIntent
     );
-    let mut before_terminal = replay.transactions[&transaction].clone();
-    before_terminal.state = TransactionState::RestoreIntent;
+    let mut before_terminal = Replayed::of(&replay, transaction);
+    before_terminal.transaction.state = TransactionState::RestoreIntent;
     assert!(matches!(
-        decide_recovery(&before_terminal, |_| RecoveryIdentity::Reestablished),
+        before_terminal.decide(|_| RecoveryIdentity::Reestablished),
         RecoveryWork::RestoreBeforeRename { permissions, .. } if permissions.is_empty()
     ));
 
@@ -1723,19 +1825,15 @@ fn replay_resume_resolves_applied_then_records_restore_to_restored() {
         .unwrap();
     let parsed = parse_frames(&resumed.into_inner().bytes).unwrap();
     let replay = replay_records(parsed.records).unwrap();
-    let recovered = &replay.transactions[&transaction];
-    assert_eq!(recovered.state, TransactionState::Restored);
+    let recovered = &replay.permissions[&transaction];
     assert_eq!(
-        recovered.permissions[0].phase,
-        TransactionState::ParentSealIntent
+        replay.transactions[&transaction].state,
+        TransactionState::Restored
     );
-    assert_eq!(
-        recovered.permissions[1].phase,
-        TransactionState::RestoreIntent
-    );
+    assert_eq!(recovered[0].phase, TransactionState::ParentSealIntent);
+    assert_eq!(recovered[1].phase, TransactionState::RestoreIntent);
     assert!(
         recovered
-            .permissions
             .iter()
             .all(|permission| permission.application == ApplicationStatus::Applied)
     );
@@ -1773,13 +1871,13 @@ fn confirmed_not_applied_does_not_require_identity_or_restore_work() {
         .unwrap();
     let bytes = resumed.into_inner().bytes;
     let replay = replay_bytes(&bytes);
-    let transaction = &replay.transactions[&transaction];
     assert_eq!(
-        transaction.permissions[0].application,
+        replay.permissions[&transaction][0].application,
         ApplicationStatus::ConfirmedNotApplied
     );
     assert!(matches!(
-        decide_recovery(transaction, |_| panic!("identity must not be consulted")),
+        Replayed::of(&replay, transaction)
+            .decide(|_| panic!("identity must not be consulted")),
         RecoveryWork::RestoreBeforeRename { permissions, .. } if permissions.is_empty()
     ));
 }
@@ -1904,9 +2002,8 @@ fn unknown_intent_only_produces_resolution_work_and_can_stop_recovery() {
     ));
     let replay = replay_bytes(&wal.writer.bytes);
     assert!(matches!(
-        decide_recovery(&replay.transactions[&transaction], |_| {
-            panic!("uncertain intent must be resolved before identity work")
-        }),
+        Replayed::of(&replay, transaction)
+            .decide(|_| { panic!("uncertain intent must be resolved before identity work") }),
         RecoveryWork::ResolveUncertainPermissions { .. }
     ));
     wal.transition(transaction, TransactionState::RecoveryRequired)
@@ -2045,20 +2142,22 @@ fn confirmed_not_applied_inverse_can_be_retried_and_folded() {
         .unwrap();
 
     let replay = replay_bytes(&wal.into_inner().bytes);
-    let recovered = &replay.transactions[&transaction];
-    assert_eq!(recovered.state, TransactionState::Restored);
     assert_eq!(
-        recovered.permissions[1].application,
+        replay.transactions[&transaction].state,
+        TransactionState::Restored
+    );
+    assert_eq!(
+        replay.permissions[&transaction][1].application,
         ApplicationStatus::ConfirmedNotApplied
     );
     assert_eq!(
-        recovered.permissions[2].application,
+        replay.permissions[&transaction][2].application,
         ApplicationStatus::Applied
     );
-    let mut before_terminal = recovered.clone();
-    before_terminal.state = TransactionState::RestoreIntent;
+    let mut before_terminal = Replayed::of(&replay, transaction);
+    before_terminal.transaction.state = TransactionState::RestoreIntent;
     assert!(matches!(
-        decide_recovery(&before_terminal, |_| RecoveryIdentity::Reestablished),
+        before_terminal.decide(|_| RecoveryIdentity::Reestablished),
         RecoveryWork::RestoreBeforeRename { permissions, .. } if permissions.is_empty()
     ));
 }
@@ -2287,7 +2386,7 @@ fn manifest_and_explicit_rename_intent_enforce_order_and_uniqueness() {
 fn replay_rename_crash_boundary(
     transaction: TransactionId,
     outcome: Option<DurableRenameOutcome>,
-) -> ReplayedTransaction {
+) -> Replayed {
     let metadata = staging_metadata();
     let mut records = vec![
         SealRecord::StagingBegin {
@@ -2338,11 +2437,7 @@ fn replay_rename_crash_boundary(
             outcome,
         });
     }
-    replay_records(records)
-        .unwrap()
-        .transactions
-        .remove(&transaction)
-        .unwrap()
+    Replayed::of(&replay_records(records).unwrap(), transaction)
 }
 
 #[test]
@@ -2353,9 +2448,9 @@ fn crash_after_durable_applied_rename_outcome_routes_to_post_rename_verification
         transaction,
         Some(DurableRenameOutcome::AppliedAndParentsSynced(root)),
     );
-    assert_eq!(replayed.state, TransactionState::RenameIntent);
+    assert_eq!(replayed.transaction.state, TransactionState::RenameIntent);
     assert!(matches!(
-        decide_recovery(&replayed, |_| RecoveryIdentity::Reestablished),
+        replayed.decide(|_| RecoveryIdentity::Reestablished),
         RecoveryWork::VerifyOrQuarantineAfterRename {
             transaction: id,
             permissions,
@@ -2364,7 +2459,7 @@ fn crash_after_durable_applied_rename_outcome_routes_to_post_rename_verification
                 == vec![1, 2]
     ));
     assert_eq!(
-        decide_recovery(&replayed, |_| RecoveryIdentity::Insufficient),
+        replayed.decide(|_| RecoveryIdentity::Insufficient),
         RecoveryWork::RecoveryRequired {
             transaction,
             reason: RecoveryRequiredReason::InsufficientPersistentIdentity,
@@ -2380,9 +2475,9 @@ fn crash_after_durable_not_applied_rename_outcome_restores_deepest_first() {
         transaction,
         Some(DurableRenameOutcome::ConfirmedNotAppliedAtSource(root)),
     );
-    assert_eq!(replayed.state, TransactionState::RenameIntent);
+    assert_eq!(replayed.transaction.state, TransactionState::RenameIntent);
     assert!(matches!(
-        decide_recovery(&replayed, |_| RecoveryIdentity::Reestablished),
+        replayed.decide(|_| RecoveryIdentity::Reestablished),
         RecoveryWork::RestoreBeforeRename {
             transaction: id,
             permissions,
@@ -2396,12 +2491,10 @@ fn crash_after_durable_not_applied_rename_outcome_restores_deepest_first() {
 fn crash_after_rename_intent_without_outcome_requires_outcome_recovery() {
     let transaction = tx(79);
     let replayed = replay_rename_crash_boundary(transaction, None);
-    assert_eq!(replayed.state, TransactionState::RenameIntent);
-    assert_eq!(replayed.rename_outcome, None);
+    assert_eq!(replayed.transaction.state, TransactionState::RenameIntent);
+    assert_eq!(replayed.transaction.rename_outcome, None);
     assert_eq!(
-        decide_recovery(&replayed, |_| panic!(
-            "no mutation identity needed without an outcome"
-        )),
+        replayed.decide(|_| panic!("no mutation identity needed without an outcome")),
         RecoveryWork::RecoveryRequired {
             transaction,
             reason: RecoveryRequiredReason::RenameOutcomeUnknown,
@@ -3072,9 +3165,7 @@ fn purgeable_has_only_the_explicit_v8_authorization_record() {
         TransactionState::Purgeable
     );
     assert!(matches!(
-        decide_recovery(&replayed.transactions[&transaction], |_| {
-            RecoveryIdentity::Reestablished
-        }),
+        Replayed::of(&replayed, transaction).decide(|_| RecoveryIdentity::Reestablished),
         RecoveryWork::PreserveCommittedSeal {
             state: TransactionState::Purgeable,
             ..
@@ -3694,7 +3785,6 @@ fn compaction_keeps_a_terminal_transaction_whose_group_is_unfinished() {
                     id: tx(*byte),
                     state: *state,
                     staging_schema_version: None,
-                    permissions: Vec::new(),
                     permission_workload: PermissionWorkload::default(),
                     staging: Some(staging),
                     tree_manifest: None,
@@ -3708,6 +3798,7 @@ fn compaction_keeps_a_terminal_transaction_whose_group_is_unfinished() {
         }
         Replay {
             transactions,
+            permissions: BTreeMap::new(),
             transaction_order: Vec::new(),
             tail_repair: None,
             frame_bytes: BTreeMap::new(),

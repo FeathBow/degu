@@ -161,11 +161,11 @@ fn set_mode(path: &Path, mode: u32) {
 fn assert_only_parent_seal_is_durable(fixture: &Fixture, transaction: TransactionId) {
     let mut lease = fixture.store.try_lease().unwrap();
     let replay = lease.replay_and_repair().unwrap();
-    let recovered = &replay.transactions[&transaction];
-    assert_eq!(recovered.permissions.len(), 1);
-    assert_eq!(recovered.permissions[0].mutation_id, 0);
+    let recovered = &replay.permissions[&transaction];
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].mutation_id, 0);
     assert_eq!(
-        recovered.permissions[0].evidence.relative_path(),
+        recovered[0].evidence.relative_path(),
         Path::new("source-parent")
     );
     assert_eq!(mode(&fixture.source_parent), 0o750);
@@ -222,7 +222,7 @@ fn anonymous_directory_plan_preserves_reverse_bfs_wal_modes_and_restart_verifica
 
     let mut lease = fixture.store.try_lease().unwrap();
     let replay = lease.replay_and_repair().unwrap();
-    let permissions = &replay.transactions[&transaction].permissions;
+    let permissions = &replay.permissions[&transaction];
     assert_eq!(permissions.len(), 4);
     assert_eq!(
         permissions
@@ -413,10 +413,10 @@ fn exact_held_tree_reaches_only_staged_unverified() {
         Some(DurableRenameOutcome::AppliedAndParentsSynced(identity))
             if identity == recovered.staging.as_ref().unwrap().root_identity()
     ));
-    assert_eq!(recovered.permissions.len(), 3);
+    let records = &replay.permissions[&transaction];
+    assert_eq!(records.len(), 3);
     assert_eq!(
-        recovered
-            .permissions
+        records
             .iter()
             .map(|permission| permission.mutation_id)
             .collect::<Vec<_>>(),
@@ -424,11 +424,11 @@ fn exact_held_tree_reaches_only_staged_unverified() {
         "source parent remains mutation 0, then reverse-BFS child and root"
     );
     assert_eq!(
-        recovered.permissions[1].evidence.relative_path(),
+        records[1].evidence.relative_path(),
         Path::new("source-parent/root/child")
     );
     assert_eq!(
-        recovered.permissions[2].evidence.relative_path(),
+        records[2].evidence.relative_path(),
         Path::new("source-parent/root")
     );
     let manifest = recovered.tree_manifest.unwrap();
@@ -630,7 +630,7 @@ fn corrupted_anonymous_directory_plan_mutates_no_tree_directory() {
     let mut lease = fixture.store.try_lease().unwrap();
     let replay = lease.replay_and_repair().unwrap();
     let recovered = &replay.transactions[&transaction];
-    assert_eq!(recovered.permissions.len(), 1);
+    assert_eq!(replay.permissions[&transaction].len(), 1);
     assert!(recovered.tree_manifest.is_none());
     assert!(recovered.tree_sidecar.is_none());
     drop(lease);
@@ -691,7 +691,7 @@ fn pre_seal_scratch_crash_boundaries_cleanup_and_restore_exact_wal_prefix() {
         let replay = lease.replay_and_repair().unwrap();
         let recovered = &replay.transactions[&transaction];
         assert_eq!(recovered.state, expected_state);
-        assert_eq!(recovered.permissions.len(), expected_permissions);
+        assert_eq!(replay.permissions[&transaction].len(), expected_permissions);
         assert!(recovered.tree_manifest.is_none());
         assert!(recovered.tree_sidecar.is_none());
         drop(lease);
@@ -3783,9 +3783,11 @@ fn interruption_with_one_alias_left_stops_at_purge_intent() {
         let recorded = &replay.transactions[&transaction];
         assert_eq!(recorded.state, TransactionState::PurgeIntent);
         assert_eq!(
-            crate::seal::wal::decide_recovery(recorded, |_| {
-                crate::seal::wal::RecoveryIdentity::Reestablished
-            }),
+            crate::seal::wal::decide_recovery(
+                recorded,
+                || replay.permissions[&transaction].clone(),
+                |_| crate::seal::wal::RecoveryIdentity::Reestablished,
+            ),
             crate::seal::wal::RecoveryWork::RecoveryRequired {
                 transaction,
                 reason: crate::seal::wal::RecoveryRequiredReason::InterruptedPurge,

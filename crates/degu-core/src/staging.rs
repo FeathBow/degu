@@ -1438,7 +1438,13 @@ impl SealedStagingEngine {
         let snapshots = wal.recovery_snapshots();
         let mut work = snapshots
             .iter()
-            .map(|transaction| decide_recovery(transaction, |_| RecoveryIdentity::Reestablished))
+            .map(|transaction| {
+                decide_recovery(
+                    transaction,
+                    || wal.permission_records(transaction.id),
+                    |_| RecoveryIdentity::Reestablished,
+                )
+            })
             .filter(recovery_work_requires_candidate)
             .collect::<Vec<_>>();
         work.sort_by_key(recovery_transaction);
@@ -1561,7 +1567,13 @@ impl SealedStagingEngine {
             .wal
             .recovery_snapshots()
             .iter()
-            .map(|transaction| decide_recovery(transaction, |_| RecoveryIdentity::Reestablished))
+            .map(|transaction| {
+                decide_recovery(
+                    transaction,
+                    || self.wal.permission_records(transaction.id),
+                    |_| RecoveryIdentity::Reestablished,
+                )
+            })
             .filter(recovery_work_requires_candidate)
             .map(|work| recovery_transaction(&work))
             .collect::<Vec<_>>();
@@ -1635,7 +1647,11 @@ impl SealedStagingEngine {
                     error,
                 ));
             }
-            let work = decide_recovery(&snapshot, |_| RecoveryIdentity::Reestablished);
+            let work = decide_recovery(
+                &snapshot,
+                || self.wal.permission_records(transaction),
+                |_| RecoveryIdentity::Reestablished,
+            );
             if let RecoveryWork::RecoveryRequired { reason, .. } = work {
                 if snapshot.state != TransactionState::RecoveryRequired {
                     self.wal

@@ -128,8 +128,6 @@ pub struct PermissionWorkload {
 pub(super) struct PermissionLedger {
     pub(super) permissions: BTreeMap<u64, DurablePermission>,
     pub(super) highest_mutation_id: Option<u64>,
-    // Intent order differs from mutation-ID order when callers choose sparse IDs.
-    record_order: Vec<u64>,
     recorded: u64,
     resolved: u64,
     pub(super) active_inverses: HashMap<u64, u64>,
@@ -166,20 +164,7 @@ impl PermissionLedger {
         if let Some(original) = permission.reverses_mutation_id {
             self.active_inverses.insert(original, mutation_id);
         }
-        self.record_order.push(mutation_id);
         self.permissions.insert(mutation_id, permission);
-    }
-
-    pub(super) fn into_record_order(self) -> Vec<DurablePermission> {
-        let Self {
-            record_order,
-            mut permissions,
-            ..
-        } = self;
-        record_order
-            .into_iter()
-            .map(|id| permissions.remove(&id).expect("recorded permission"))
-            .collect()
     }
 
     pub(super) fn record_resolution(&mut self, mutation_id: u64, resolution: PermissionResolution) {

@@ -167,19 +167,17 @@ fn resuming_a_replayed_wal_rebuilds_the_appended_ledger() {
     assert_resumed_ledger(wal);
 }
 
+/// The inverse's mutation id is lower than the seal it reverses. Rebuilding the
+/// ledger from its own records in id order would therefore resolve the inverse
+/// before the seal it reverses had been recorded, which is why the order the
+/// frames admitted these intents used to be carried alongside them. The resume
+/// moves the ledger, so the only thing left to prove is that replaying the
+/// frames builds what appending them built.
 #[test]
-fn replay_preserves_intent_order_when_an_inverse_has_a_lower_id() {
+fn an_inverse_with_a_lower_id_than_its_seal_resumes_to_the_appended_ledger() {
     let mut wal = restored_wal(&[(9, 2)]);
     wal.transition(TRANSACTION, TransactionState::Restored)
         .unwrap();
-    let replay = replay_bytes(&wal.writer.bytes);
-    assert_eq!(
-        replay.permissions[&TRANSACTION]
-            .iter()
-            .map(|permission| permission.mutation_id)
-            .collect::<Vec<_>>(),
-        vec![9, 2]
-    );
     assert_resumed_ledger(wal);
 }
 
@@ -188,7 +186,7 @@ fn assert_resumed_ledger(wal: SealWal<FaultWriter>) {
         writer, ledgers, ..
     } = wal;
     let replay = replay_bytes(&writer.bytes);
-    let resumed = SealWal::resume(writer, &replay).unwrap();
+    let resumed = SealWal::resume(writer, replay).unwrap();
     assert_eq!(resumed.ledgers[&TRANSACTION], ledgers[&TRANSACTION]);
     assert_matches_scans(&resumed.ledgers[&TRANSACTION]);
 }

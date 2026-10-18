@@ -591,8 +591,8 @@ fn compaction_reclaims_terminal_transactions_and_leaves_an_appendable_wal() {
     );
 
     let mut lease = store.try_lease().unwrap();
-    let original = lease.replay_and_repair().unwrap().clone();
-    assert_eq!(original.transactions.len(), 3);
+    let original = lease.replay_and_repair().unwrap().transactions.clone();
+    assert_eq!(original.len(), 3);
 
     let Compaction::Done(compacted) = store.compact_terminal_transactions(&lease).unwrap() else {
         panic!("a fixture over both thresholds must compact");
@@ -612,7 +612,7 @@ fn compaction_reclaims_terminal_transactions_and_leaves_an_appendable_wal() {
     );
     assert_eq!(
         replay.transactions[&transaction(200)],
-        original.transactions[&transaction(200)],
+        original[&transaction(200)],
         "a surviving transaction must replay to exactly what it did before"
     );
     assert_eq!(replay.committed_len, after);

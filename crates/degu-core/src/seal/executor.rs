@@ -394,6 +394,10 @@ mod tests {
         fn prepare_append(&mut self) -> io::Result<u64> {
             Ok(self.bytes.len() as u64)
         }
+
+        fn read_committed(&self, start: u64, into: &mut [u8]) -> io::Result<()> {
+            crate::seal::wal::read_committed_from_memory(&self.bytes, start, into)
+        }
     }
 
     #[test]
@@ -599,13 +603,23 @@ mod tests {
         let replay = recovery.replay_and_repair().unwrap();
         let recovered = &replay.transactions[&transaction];
         assert_eq!(recovered.state, TransactionState::Restored);
-        assert_eq!(replay.permission_records(transaction).len(), 2);
+        // The records are the frames, so the decision reads them from the file
+        // the replay was built from.
+        let frames = std::fs::read(store_path.join(crate::seal::store::WAL_FILE_NAME)).unwrap();
+        assert_eq!(
+            replay
+                .permission_records(transaction, &frames)
+                .unwrap()
+                .len(),
+            2
+        );
         assert!(matches!(
             decide_recovery(
                 recovered,
-                || replay.permission_records(transaction),
+                || replay.permission_records(transaction, &frames),
                 |_| panic!("restored work needs no identity probe")
-            ),
+            )
+            .unwrap(),
             RecoveryWork::Nothing
         ));
     }

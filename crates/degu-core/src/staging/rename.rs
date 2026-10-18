@@ -356,6 +356,8 @@ pub(crate) enum StagingRenameError {
     Binding(#[from] PreparedRootError),
     #[error("staging WAL operation failed before a confirmed rename: {0}")]
     Wal(#[from] AppendError),
+    #[error("durable permission record could not be read back: {0}")]
+    PermissionRecord(#[from] crate::seal::wal::PermissionReadError),
     #[error("source-parent seal failed: {0}")]
     ParentSeal(#[from] LocalModeExecutionError),
     #[error("source-parent seal was confirmed not applied")]
@@ -811,7 +813,7 @@ pub(crate) fn execute_prepared_rename<'a>(
     let mut expectation_builder = tree.post_seal_expectation_builder();
     // Indexed once, before the fold: the projection this replaces scanned every
     // permission for every directory it was asked about.
-    let applied_modes = wal.applied_tree_seal_modes(transaction);
+    let applied_modes = wal.applied_tree_seal_modes(transaction)?;
     let expectation_fold = sidecars.read_sorted_manifest_scratch(
         wal,
         transaction,

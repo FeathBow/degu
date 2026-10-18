@@ -3,51 +3,80 @@ use super::*;
 mod boundaries;
 mod scenarios;
 
-fn record(
-    ledger: &mut PermissionLedger,
-    permission: DurablePermission,
-    resolution: Option<PermissionResolution>,
-) {
-    let mutation_id = permission.mutation_id;
-    ledger.record_intent(permission);
-    assert_matches_scans(ledger);
-    if let Some(resolution) = resolution {
-        ledger.record_resolution(mutation_id, resolution);
-        assert_matches_scans(ledger);
+/// A ledger and the records the fixture admitted into it, in mutation-id order.
+///
+/// The ledger holds no record of its own, so the scans these tests check its
+/// counters against read this list. That is the right way round: an oracle that
+/// read the subject's own copy of the records would agree with it by
+/// construction. These fixtures frame nothing, which is why they keep the
+/// records rather than reading them back.
+#[derive(Default)]
+struct Admitted {
+    ledger: PermissionLedger,
+    records: BTreeMap<u64, DurablePermission>,
+}
+
+impl Admitted {
+    /// Admits an intent and, if given, its resolution, checking after each step
+    /// that every counter still agrees with a scan.
+    fn record(&mut self, permission: DurablePermission, resolution: Option<PermissionResolution>) {
+        let mutation_id = permission.mutation_id;
+        self.ledger.record_intent(permission.clone(), None);
+        self.records.insert(
+            mutation_id,
+            DurablePermission {
+                application: ApplicationStatus::IntentDurableApplicationUnknown,
+                ..permission
+            },
+        );
+        self.assert_matches_scans();
+        if let Some(resolution) = resolution {
+            self.ledger.record_resolution(mutation_id, resolution);
+            self.records.get_mut(&mutation_id).unwrap().application = match resolution {
+                PermissionResolution::Applied => ApplicationStatus::Applied,
+                PermissionResolution::ConfirmedNotApplied => ApplicationStatus::ConfirmedNotApplied,
+            };
+            self.assert_matches_scans();
+        }
+    }
+
+    fn assert_matches_scans(&self) {
+        let records = self.records.values().cloned().collect::<Vec<_>>();
+        assert_matches_scans(&self.ledger, &records);
     }
 }
 
-fn assert_matches_scans(ledger: &PermissionLedger) {
+fn assert_matches_scans(ledger: &PermissionLedger, admitted: &[DurablePermission]) {
     assert_eq!(
         ledger.has_unresolved(),
-        ledger.permissions.values().any(|permission| {
+        admitted.iter().any(|permission| {
             permission.application == ApplicationStatus::IntentDurableApplicationUnknown
         })
     );
     assert_eq!(
         ledger.highest_mutation_id,
-        ledger.permissions.keys().copied().max()
+        ledger.entries().map(|(id, _)| id).max()
     );
-    assert_phase_completion(ledger);
-    assert_parent_strategy(ledger);
-    assert_coverage(ledger);
-    assert_active_inverses(ledger);
-    assert_quarantine_retention(ledger);
-    assert_workload(ledger);
+    assert_phase_completion(ledger, admitted);
+    assert_parent_strategy(ledger, admitted);
+    assert_coverage(ledger, admitted);
+    assert_active_inverses(ledger, admitted);
+    assert_quarantine_retention(ledger, admitted);
+    assert_workload(ledger, admitted);
 }
 
 /// The counts recovery validation reads, against the scans they replaced. Every
 /// scenario below asserts this after each intent and each resolution, so the
 /// agreement is checked over the histories the ledger can actually reach rather
 /// than over a record list assembled by hand.
-fn assert_workload(ledger: &PermissionLedger) {
+fn assert_workload(ledger: &PermissionLedger, admitted: &[DurablePermission]) {
     assert_eq!(
         ledger.workload(),
-        permission_workload_by_scan(ledger.permissions.values())
+        permission_workload_by_scan(admitted.iter())
     );
 }
 
-fn assert_phase_completion(ledger: &PermissionLedger) {
+fn assert_phase_completion(ledger: &PermissionLedger, admitted: &[DurablePermission]) {
     use TransactionState as S;
     for (from, to) in [
         (S::ParentSealIntent, S::ParentSealed),
@@ -58,13 +87,13 @@ fn assert_phase_completion(ledger: &PermissionLedger) {
     ] {
         assert_eq!(
             phase_completion_is_recorded(Some(ledger), from, to),
-            phase_completion_is_valid(ledger.permissions.values(), from, to),
+            phase_completion_is_valid(admitted.iter(), from, to),
             "phase completion {from:?} -> {to:?}"
         );
     }
 }
 
-fn assert_parent_strategy(ledger: &PermissionLedger) {
+fn assert_parent_strategy(ledger: &PermissionLedger, admitted: &[DurablePermission]) {
     for metadata in [
         None,
         Some(permission_seal_staging_metadata()),
@@ -72,35 +101,35 @@ fn assert_parent_strategy(ledger: &PermissionLedger) {
     ] {
         assert_eq!(
             staging_parent_strategy_is_recorded(metadata.as_ref(), Some(ledger)),
-            staging_parent_strategy_is_complete(metadata.as_ref(), ledger.permissions.values())
+            staging_parent_strategy_is_complete(metadata.as_ref(), admitted.iter())
         );
     }
 }
 
-fn assert_coverage(ledger: &PermissionLedger) {
+fn assert_coverage(ledger: &PermissionLedger, admitted: &[DurablePermission]) {
     assert_eq!(
         ledger.coverage.every_applied_seal_is_reversed(),
-        all_applied_seals_have_applied_inverse(ledger.permissions.values())
+        all_applied_seals_have_applied_inverse(admitted.iter())
     );
     assert_eq!(
         ledger.coverage.every_applied_parent_seal_is_restored(),
-        all_applied_parent_seals_have_applied_inverse(ledger.permissions.values())
+        all_applied_parent_seals_have_applied_inverse(admitted.iter())
     );
     assert_eq!(
         ledger.coverage.every_applied_tree_seal_is_undone(),
-        all_applied_tree_seals_have_applied_inverse(ledger.permissions.values())
+        all_applied_tree_seals_have_applied_inverse(admitted.iter())
     );
     assert_eq!(
         ledger.retains_active_seals(),
-        retains_active_permission_seals(ledger.permissions.values())
+        retains_active_permission_seals(admitted.iter())
     );
 }
 
-fn assert_active_inverses(ledger: &PermissionLedger) {
+fn assert_active_inverses(ledger: &PermissionLedger, admitted: &[DurablePermission]) {
     for id in 0..=ledger.highest_mutation_id.unwrap_or(0) + 1 {
         assert_eq!(
             ledger.active_inverses.contains_key(&id),
-            ledger.permissions.values().any(|permission| {
+            admitted.iter().any(|permission| {
                 permission.reverses_mutation_id == Some(id)
                     && matches!(
                         permission.application,
@@ -113,7 +142,7 @@ fn assert_active_inverses(ledger: &PermissionLedger) {
     }
 }
 
-fn assert_quarantine_retention(ledger: &PermissionLedger) {
+fn assert_quarantine_retention(ledger: &PermissionLedger, admitted: &[DurablePermission]) {
     let quarantined = ReplayedTransaction {
         id: TRANSACTION,
         state: TransactionState::Quarantined,
@@ -129,7 +158,7 @@ fn assert_quarantine_retention(ledger: &PermissionLedger) {
     };
     assert_eq!(
         quarantined_transaction_retains_active_permission_seals(&quarantined),
-        retains_active_permission_seals(ledger.permissions.values())
+        retains_active_permission_seals(admitted.iter())
     );
 }
 
@@ -233,5 +262,5 @@ fn replay_with_record(
 ) -> Result<Replay, ReplayError> {
     let mut bytes = wal.into_inner().bytes;
     bytes.extend_from_slice(&encode_frame(&record).unwrap());
-    replay_records(parse_frames(&bytes).unwrap().records)
+    replay_records(parse_frames(&bytes).unwrap().records, &bytes)
 }

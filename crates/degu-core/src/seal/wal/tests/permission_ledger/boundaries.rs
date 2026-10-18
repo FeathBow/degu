@@ -188,7 +188,10 @@ fn assert_resumed_ledger(wal: SealWal<FaultWriter>) {
     let replay = replay_bytes(&writer.bytes);
     let resumed = SealWal::resume(writer, replay).unwrap();
     assert_eq!(resumed.ledgers[&TRANSACTION], ledgers[&TRANSACTION]);
-    assert_matches_scans(&resumed.ledgers[&TRANSACTION]);
+    // These records come out of the frames the resume was built from, which is
+    // the only copy there is.
+    let admitted = resumed.permission_records(TRANSACTION).unwrap();
+    assert_matches_scans(&resumed.ledgers[&TRANSACTION], &admitted);
 }
 
 #[test]
@@ -196,6 +199,7 @@ fn permission_records_are_read_in_mutation_id_order() {
     let wal = restored_wal(&[(9, 2)]);
     assert_eq!(
         wal.permission_records(TRANSACTION)
+            .unwrap()
             .iter()
             .map(|permission| permission.mutation_id)
             .collect::<Vec<_>>(),

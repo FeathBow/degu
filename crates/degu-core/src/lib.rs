@@ -57,6 +57,10 @@ impl crate::seal::wal::DurableWrite for MemoryWal {
     fn prepare_append(&mut self) -> std::io::Result<u64> {
         Ok(self.bytes.len() as u64)
     }
+
+    fn read_committed(&self, start: u64, into: &mut [u8]) -> std::io::Result<()> {
+        crate::seal::wal::read_committed_from_memory(&self.bytes, start, into)
+    }
 }
 
 /// Overwrites a store's WAL with an exact frame sequence built in memory.

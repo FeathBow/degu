@@ -1,4 +1,6 @@
-use super::{ApplicationStatus, DurablePermission, PermissionResolution, TransactionState};
+use super::{
+    ApplicationStatus, DurablePermission, FrameExtent, PermissionResolution, TransactionState,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::os::unix::ffi::OsStrExt;
 
@@ -121,12 +123,33 @@ pub struct PermissionWorkload {
     pub longest_path_bytes: u32,
 }
 
+/// What the ledger keeps of one admitted permission intent.
+///
+/// Not the record. The record is the frame the intent was written as, and the
+/// extent is how a decision reads it back. What stays resident is what no
+/// intent frame carries -- the phase the intent was admitted under, and the
+/// resolution a later frame gave it -- plus the original an inverse reverses,
+/// which every resolution consults and which would otherwise cost a frame read
+/// per resolved record.
+///
+/// The extent is `None` for an intent a fixture replayed from records it never
+/// framed. Reading one of those fails closed rather than decoding whatever sits
+/// at offset zero, so such a fixture cannot reach a record at all.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(test, derive(PartialEq))]
+pub(super) struct PermissionEntry {
+    pub(super) frame: Option<FrameExtent>,
+    pub(super) reverses_mutation_id: Option<u64>,
+    pub(super) phase: TransactionState,
+    pub(super) application: ApplicationStatus,
+}
+
 /// Transaction-local records and counts shared by append, replay and resume.
 /// Callers validate intents and resolutions before advancing the ledger.
 #[derive(Debug, Default)]
 #[cfg_attr(test, derive(PartialEq))]
 pub(super) struct PermissionLedger {
-    pub(super) permissions: BTreeMap<u64, DurablePermission>,
+    pub(super) permissions: BTreeMap<u64, PermissionEntry>,
     pub(super) highest_mutation_id: Option<u64>,
     recorded: u64,
     resolved: u64,
@@ -138,11 +161,28 @@ pub(super) struct PermissionLedger {
 }
 
 impl PermissionLedger {
-    pub(super) fn record_intent(&mut self, permission: DurablePermission) {
-        let permission = DurablePermission {
-            application: ApplicationStatus::IntentDurableApplicationUnknown,
-            ..permission
-        };
+    /// One admitted intent, for the decisions that read a single mutation
+    /// rather than the whole transaction.
+    pub(super) fn entry(&self, mutation_id: u64) -> Option<&PermissionEntry> {
+        self.permissions.get(&mutation_id)
+    }
+
+    /// Every admitted intent in mutation-id order, which is the order the
+    /// frames were written in.
+    pub(super) fn entries(&self) -> impl Iterator<Item = (u64, &PermissionEntry)> {
+        self.permissions.iter().map(|(id, entry)| (*id, entry))
+    }
+
+    /// Admits an intent, keeping the extent of its frame in place of the record.
+    ///
+    /// The record is still handed in because the tallies are measured off it
+    /// while it is here; what the entry keeps is the projection of it that no
+    /// frame holds.
+    pub(super) fn record_intent(
+        &mut self,
+        permission: DurablePermission,
+        frame: Option<FrameExtent>,
+    ) {
         let mutation_id = permission.mutation_id;
         self.highest_mutation_id = Some(
             self.highest_mutation_id
@@ -164,20 +204,28 @@ impl PermissionLedger {
         if let Some(original) = permission.reverses_mutation_id {
             self.active_inverses.insert(original, mutation_id);
         }
-        self.permissions.insert(mutation_id, permission);
+        self.permissions.insert(
+            mutation_id,
+            PermissionEntry {
+                frame,
+                reverses_mutation_id: permission.reverses_mutation_id,
+                phase: permission.phase,
+                application: ApplicationStatus::IntentDurableApplicationUnknown,
+            },
+        );
     }
 
     pub(super) fn record_resolution(&mut self, mutation_id: u64, resolution: PermissionResolution) {
-        let permission = self
+        let entry = self
             .permissions
             .get_mut(&mutation_id)
             .expect("validated permission intent");
-        permission.application = match resolution {
+        entry.application = match resolution {
             PermissionResolution::Applied => ApplicationStatus::Applied,
             PermissionResolution::ConfirmedNotApplied => ApplicationStatus::ConfirmedNotApplied,
         };
-        let phase = permission.phase;
-        let reverses = permission.reverses_mutation_id;
+        let phase = entry.phase;
+        let reverses = entry.reverses_mutation_id;
         self.resolved += 1;
         if phase_accepts_resolution(phase, resolution) {
             self.phases.entry(phase).or_default().completed += 1;

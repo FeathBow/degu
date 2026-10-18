@@ -1932,9 +1932,9 @@ pub struct ReplayedTransaction {
     /// What this transaction's permissions amount to, measured while the frames
     /// were admitted. Recovery validation reads this rather than the records,
     /// which is what makes its cost independent of how many a transaction
-    /// holds. The records themselves are asked for by the few decisions that
-    /// need them: [`SealWal::permission_records`] on a leased WAL, and
-    /// [`Replay::permissions`] on the replay a resume is built from.
+    /// holds. The records themselves live on the leased WAL, which the few
+    /// decisions that need them ask. A resume is handed the ledger its replay
+    /// built, so it never asks for the records that ledger was built from.
     pub permission_workload: PermissionWorkload,
     pub staging: Option<StagingTransactionMetadata>,
     pub tree_manifest: Option<DurableTreeManifest>,

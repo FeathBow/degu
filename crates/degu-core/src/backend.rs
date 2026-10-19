@@ -494,10 +494,20 @@ impl fmt::Display for HeldTreeAssessmentFailureKind {
     }
 }
 
+/// How far past a resource limit a tree went, as the assessment counted it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeldTreeLimitExceeded {
+    /// The most the limit admits.
+    pub limit: u64,
+    /// How many the tree has.
+    pub observed: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeldTreeAssessmentFailure {
     kind: HeldTreeAssessmentFailureKind,
     relative_path: Option<PathBuf>,
+    exceeded: Option<HeldTreeLimitExceeded>,
 }
 impl HeldTreeAssessmentFailure {
     pub fn kind(&self) -> HeldTreeAssessmentFailureKind {
@@ -511,6 +521,15 @@ impl HeldTreeAssessmentFailure {
     pub fn relative_path(&self) -> Option<&Path> {
         self.relative_path.as_deref()
     }
+    /// The limit and the size the tree was found to have, when the assessment
+    /// counted past the limit rather than stopping at it.
+    ///
+    /// Only a directory-limit refusal carries one. Directories are the one limit
+    /// the assessment counts past; the others either bound the walk itself or are
+    /// crossed by a single entry.
+    pub fn exceeded(&self) -> Option<HeldTreeLimitExceeded> {
+        self.exceeded
+    }
 }
 impl fmt::Display for HeldTreeAssessmentFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -519,6 +538,9 @@ impl fmt::Display for HeldTreeAssessmentFailure {
             "held-tree assessment failed: {}",
             self.kind.user_message()
         )?;
+        if let Some(HeldTreeLimitExceeded { limit, observed }) = self.exceeded {
+            write!(f, " (observed {observed}, limit {limit})")?;
+        }
         if let Some(path) = &self.relative_path {
             write!(f, " at {}", path.display())?;
         }
@@ -594,6 +616,10 @@ fn map_tree_assessment(a: held::HeldTreeAdmissionAssessment) -> HeldTreePolicyAs
 
 fn map_tree_assessment_failure(e: held::HeldTreeError) -> HeldTreeAssessmentFailure {
     use held::{HeldTreeError as E, HeldTreeLimit as L};
+    let exceeded = match e {
+        E::DirectoryCount { limit, observed } => Some(HeldTreeLimitExceeded { limit, observed }),
+        _ => None,
+    };
     let (kind, path) = match e {
         E::InvalidRoot => (HeldTreeAssessmentFailureKind::InvalidRoot, None),
         E::InvalidDirectoryPath(p) => (HeldTreeAssessmentFailureKind::IdentityChanged, Some(p)),
@@ -609,6 +635,7 @@ fn map_tree_assessment_failure(e: held::HeldTreeError) -> HeldTreeAssessmentFail
             },
             None,
         ),
+        E::DirectoryCount { .. } => (HeldTreeAssessmentFailureKind::DirectoryLimitExceeded, None),
         E::ParentPolicyRejected => (
             HeldTreeAssessmentFailureKind::SourceParentPolicyRejected,
             None,
@@ -684,6 +711,7 @@ fn map_tree_assessment_failure(e: held::HeldTreeError) -> HeldTreeAssessmentFail
     HeldTreeAssessmentFailure {
         kind,
         relative_path: path.filter(|p| !p.as_os_str().is_empty()),
+        exceeded,
     }
 }
 

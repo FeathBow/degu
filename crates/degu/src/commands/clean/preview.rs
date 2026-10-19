@@ -2,7 +2,7 @@ use crate::lifecycle::feasibility::ProbeFailure;
 use crate::presentation::escape_terminal_text;
 use degu_core::backend::{
     CertificationError, HeldTreeAssessmentFailure, HeldTreeAssessmentFailureCategory,
-    HeldTreeAssessmentFailureKind, HeldTreePolicyAssessmentOutcome,
+    HeldTreeAssessmentFailureKind, HeldTreeLimitExceeded, HeldTreePolicyAssessmentOutcome,
     HeldTreeRegularHardLinkTopology, HeldTreeRegularXattrTopology,
 };
 use degu_core::finding::Finding;
@@ -32,6 +32,8 @@ pub(super) enum PreviewStagingStatus {
         category: &'static str,
         relative_path: Option<PathBuf>,
         reason: String,
+        /// The limit and the tree's size, when the assessment counted past it.
+        exceeded: Option<HeldTreeLimitExceeded>,
     },
     DeferredUntilExecutionSeal {
         kind: &'static str,
@@ -183,12 +185,14 @@ impl PreviewStagingAssessment {
                 category,
                 relative_path,
                 reason,
+                exceeded,
             } => blocked_json(
                 path.into_owned(),
                 kind,
                 category,
                 relative_path.as_deref(),
                 reason,
+                *exceeded,
             ),
             PreviewStagingStatus::DeferredUntilExecutionSeal {
                 kind,
@@ -225,8 +229,16 @@ fn blocked_json(
     category: &str,
     relative_path: Option<&Path>,
     reason: &str,
+    exceeded: Option<HeldTreeLimitExceeded>,
 ) -> Value {
-    path_status_json(path, "blocked", kind, category, relative_path, reason)
+    let mut json = path_status_json(path, "blocked", kind, category, relative_path, reason);
+    if let (Value::Object(fields), Some(HeldTreeLimitExceeded { limit, observed })) =
+        (&mut json, exceeded)
+    {
+        fields.insert("limit".to_owned(), Value::from(limit));
+        fields.insert("observed".to_owned(), Value::from(observed));
+    }
+    json
 }
 
 fn unavailable_json(
@@ -359,6 +371,7 @@ fn apply_selection_policy(
                 kind: "atomic_batch_preflight_deferred",
                 category: "execution_validation",
                 relative_path: None,
+                exceeded: None,
                 reason: safe(&format!(
                     "explicit path/review batches require every item to complete pre-seal assessment and execution will reject this batch before mutation: {reason}"
                 )),
@@ -373,6 +386,7 @@ fn assessment_failure_status(error: HeldTreeAssessmentFailure) -> PreviewStaging
         error.kind(),
         error.relative_path().map(Path::to_path_buf),
         &error.to_string(),
+        error.exceeded(),
     )
 }
 
@@ -380,6 +394,7 @@ fn assessment_failure_status_from_parts(
     kind: HeldTreeAssessmentFailureKind,
     relative_path: Option<PathBuf>,
     reason: &str,
+    exceeded: Option<HeldTreeLimitExceeded>,
 ) -> PreviewStagingStatus {
     let category = kind.category();
     match category {
@@ -390,6 +405,7 @@ fn assessment_failure_status_from_parts(
             category: category.as_str(),
             relative_path,
             reason: safe(reason),
+            exceeded,
         },
         HeldTreeAssessmentFailureCategory::PlatformEvidence
         | HeldTreeAssessmentFailureCategory::RaceOrIo
@@ -410,11 +426,13 @@ fn certification_unavailable(error: CertificationError) -> PreviewStagingStatus 
             HeldTreeAssessmentFailureKind::AclPresent,
             None,
             "sealed staging source parent has an ACL",
+            None,
         ),
         CertificationError::NotDirectory => assessment_failure_status_from_parts(
             HeldTreeAssessmentFailureKind::RootNotDirectory,
             None,
             "sealed staging source parent is not a directory",
+            None,
         ),
         error => {
             let kind = match error {
@@ -509,6 +527,7 @@ mod tests {
                     category: "tree_policy",
                     relative_path: Some(PathBuf::from("child")),
                     reason: "blocked".to_owned(),
+                    exceeded: None,
                 },
                 "blocked",
             ),
@@ -554,6 +573,7 @@ mod tests {
                 b'd', b'i', b'r', b'/', 0xff,
             ]))),
             "blocked",
+            None,
         );
         assert!(json["relative_path"].is_null());
         assert_eq!(json["relative_path_unix_bytes_hex"], "6469722fff");
@@ -567,9 +587,33 @@ mod tests {
             "tree_policy",
             Some(Path::new("child")),
             "blocked",
+            None,
         );
         assert_eq!(json["relative_path"], "child");
         assert!(json.get("relative_path_unix_bytes_hex").is_none());
+    }
+
+    #[test]
+    fn only_a_counted_refusal_reports_a_limit_and_a_size() {
+        let blocked = |exceeded| {
+            blocked_json(
+                "/preview/item".to_owned(),
+                "directory_limit_exceeded",
+                "resource_limit",
+                None,
+                "blocked",
+                exceeded,
+            )
+        };
+        let counted = blocked(Some(HeldTreeLimitExceeded {
+            limit: 1_023,
+            observed: 5_080,
+        }));
+        assert_eq!(counted["limit"], 1_023);
+        assert_eq!(counted["observed"], 5_080);
+        let uncounted = blocked(None);
+        assert!(uncounted.get("limit").is_none(), "{uncounted:#}");
+        assert!(uncounted.get("observed").is_none(), "{uncounted:#}");
     }
 
     #[cfg(unix)]
@@ -584,6 +628,7 @@ mod tests {
                 b'd', b'i', b'r', b'/', 0xff,
             ]))),
             "identity changed",
+            None,
         );
         let assessment = PreviewStagingAssessment {
             purge_requested: false,
@@ -614,6 +659,7 @@ mod tests {
                 kind,
                 Some(PathBuf::from("child")),
                 "first\nsecond\u{1b}[31m",
+                None,
             );
             assert!(
                 !matches!(status, PreviewStagingStatus::Blocked { .. }),
@@ -645,6 +691,7 @@ mod tests {
             HeldTreeAssessmentFailureKind::ProtectedName,
             Some(PathBuf::from(".git")),
             "protected name encountered",
+            None,
         );
         let PreviewStagingStatus::Blocked { kind, category, .. } = status else {
             panic!("stable tree policy must remain blocked")

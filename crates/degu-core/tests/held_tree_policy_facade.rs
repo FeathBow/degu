@@ -1,7 +1,8 @@
 use degu_core::backend::{
     CertificationError, HeldLocalBackendEvidence, HeldTreeAssessmentFailureCategory,
-    HeldTreeAssessmentFailureKind, HeldTreePolicyAssessmentOutcome, HeldTreePolicyDeferralReason,
-    SourceParentSealAssessmentStatus, assess_held_tree_policy_metadata, certify_held_fd,
+    HeldTreeAssessmentFailureKind, HeldTreeLimitExceeded, HeldTreePolicyAssessmentOutcome,
+    HeldTreePolicyDeferralReason, SourceParentSealAssessmentStatus,
+    assess_held_tree_policy_metadata, certify_held_fd,
 };
 use rustix::fs::{Mode, OFlags};
 use std::ffi::OsStr;
@@ -108,9 +109,17 @@ fn public_default_directory_boundary_and_hardlink_are_structured() {
         HeldTreeAssessmentFailureCategory::ResourceLimit
     );
     assert!(error.relative_path().is_none());
+    // The refusal says how big the tree is, not only that it is too big.
+    assert_eq!(
+        error.exceeded(),
+        Some(HeldTreeLimitExceeded {
+            limit: MAX_TREE_DIRECTORIES as u64,
+            observed: MAX_TREE_DIRECTORIES as u64 + 1,
+        })
+    );
     assert_eq!(
         error.to_string(),
-        "held-tree assessment failed: directory limit exceeded"
+        "held-tree assessment failed: directory limit exceeded (observed 1024, limit 1023)"
     );
 
     let (temp, root) = setup();

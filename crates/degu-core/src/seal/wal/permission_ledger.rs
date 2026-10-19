@@ -167,8 +167,10 @@ impl PermissionLedger {
         self.permissions.get(&mutation_id)
     }
 
-    /// Every admitted intent in mutation-id order, which is the order the
-    /// frames were written in.
+    /// Every admitted intent, in mutation-id order.
+    ///
+    /// Not necessarily the order the frames were written in: append refuses a
+    /// mutation id it has already admitted, but not one lower than the last.
     pub(super) fn entries(&self) -> impl Iterator<Item = (u64, &PermissionEntry)> {
         self.permissions.iter().map(|(id, entry)| (*id, entry))
     }

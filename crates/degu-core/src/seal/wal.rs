@@ -612,14 +612,15 @@ fn decode_indexed_intent(
         mutation_id,
         reason,
     };
-    if frame.len() < HEADER_LEN || &frame[..4] != MAGIC {
-        return Err(mismatch("not a WAL frame"));
-    }
-    let version = u16::from_le_bytes([frame[4], frame[5]]);
-    let payload = &frame[HEADER_LEN..];
-    if crc32(payload) != u32::from_le_bytes(frame[16..20].try_into().unwrap()) {
-        return Err(mismatch("payload checksum does not match the frame header"));
-    }
+    // The checks replay applied when it indexed this frame, applied again: the
+    // bytes are read back later, and a header that changed in between would
+    // otherwise be read here and refused by the next replay.
+    let CheckedFrame { version, payload } = check_frame(frame, 0)
+        .map_err(|_| mismatch("frame fails the checks replay applies"))?
+        .filter(|checked| HEADER_LEN + checked.payload.len() == frame.len())
+        .ok_or(mismatch(
+            "frame's declared length does not match its extent",
+        ))?;
     let record =
         decode_record(payload, 0, version).map_err(|_| mismatch("payload is malformed"))?;
     let SealRecord::PermissionIntent {
@@ -3156,59 +3157,80 @@ struct FrameSpan {
     end: usize,
 }
 
+/// One frame that passed [`check_frame`].
+struct CheckedFrame<'a> {
+    version: u16,
+    payload: &'a [u8],
+}
+
+/// Checks the frame that starts at `offset`: its magic, header checksum, a
+/// version this binary reads, clear reserved bits, a declared length within
+/// bounds, and its payload checksum.
+///
+/// `Ok(None)` is a frame the bytes end inside of. Replay reads that as an
+/// uncommitted tail; a read of one indexed frame reads it as a declared length
+/// that overruns the extent.
+fn check_frame(bytes: &[u8], offset: usize) -> Result<Option<CheckedFrame<'_>>, ReplayError> {
+    if bytes.len() - offset < HEADER_LEN {
+        return Ok(None);
+    }
+    let header = &bytes[offset..offset + HEADER_LEN];
+    if &header[..4] != MAGIC {
+        return Err(ReplayError::Malformed {
+            offset: offset as u64,
+            reason: "bad frame magic",
+        });
+    }
+    let expected_header_crc = u32::from_le_bytes(header[12..16].try_into().unwrap());
+    if crc32(&header[4..12]) != expected_header_crc {
+        return Err(ReplayError::HeaderChecksum {
+            offset: offset as u64,
+        });
+    }
+    let version = u16::from_le_bytes([header[4], header[5]]);
+    if !matches!(version, 1 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | VERSION) {
+        return Err(ReplayError::UnsupportedLegacyVersion {
+            offset: offset as u64,
+            version,
+        });
+    }
+    if header[6] != 0 || header[7] != 0 {
+        return Err(ReplayError::Malformed {
+            offset: offset as u64,
+            reason: "nonzero reserved header bits",
+        });
+    }
+    let payload_len = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+    if payload_len > MAX_PAYLOAD_LEN {
+        return Err(ReplayError::Malformed {
+            offset: offset as u64,
+            reason: "frame exceeds maximum size",
+        });
+    }
+    let frame_len = HEADER_LEN + payload_len;
+    if bytes.len() - offset < frame_len {
+        return Ok(None);
+    }
+    let expected = u32::from_le_bytes(header[16..20].try_into().unwrap());
+    let payload = &bytes[offset + HEADER_LEN..offset + frame_len];
+    if crc32(payload) != expected {
+        return Err(ReplayError::Checksum {
+            offset: offset as u64,
+        });
+    }
+    Ok(Some(CheckedFrame { version, payload }))
+}
+
 fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
     let mut records = Vec::new();
     let mut spans = Vec::new();
     let mut offset = 0;
     let mut last_version = None;
     while offset < bytes.len() {
-        if bytes.len() - offset < HEADER_LEN {
+        let Some(CheckedFrame { version, payload }) = check_frame(bytes, offset)? else {
             break;
-        }
-        let header = &bytes[offset..offset + HEADER_LEN];
-        if &header[..4] != MAGIC {
-            return Err(ReplayError::Malformed {
-                offset: offset as u64,
-                reason: "bad frame magic",
-            });
-        }
-        let expected_header_crc = u32::from_le_bytes(header[12..16].try_into().unwrap());
-        if crc32(&header[4..12]) != expected_header_crc {
-            return Err(ReplayError::HeaderChecksum {
-                offset: offset as u64,
-            });
-        }
-        let version = u16::from_le_bytes([header[4], header[5]]);
-        if !matches!(version, 1 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | VERSION) {
-            return Err(ReplayError::UnsupportedLegacyVersion {
-                offset: offset as u64,
-                version,
-            });
-        }
-        if header[6] != 0 || header[7] != 0 {
-            return Err(ReplayError::Malformed {
-                offset: offset as u64,
-                reason: "nonzero reserved header bits",
-            });
-        }
-        let payload_len = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
-        if payload_len > MAX_PAYLOAD_LEN {
-            return Err(ReplayError::Malformed {
-                offset: offset as u64,
-                reason: "frame exceeds maximum size",
-            });
-        }
-        let frame_len = HEADER_LEN + payload_len;
-        if bytes.len() - offset < frame_len {
-            break;
-        }
-        let expected = u32::from_le_bytes(header[16..20].try_into().unwrap());
-        let payload = &bytes[offset + HEADER_LEN..offset + frame_len];
-        if crc32(payload) != expected {
-            return Err(ReplayError::Checksum {
-                offset: offset as u64,
-            });
-        }
+        };
+        let frame_len = HEADER_LEN + payload.len();
         let record = decode_record(payload, offset as u64, version)?;
         if last_version.is_some_and(|previous| version < previous) {
             return Err(ReplayError::InvalidHistory("WAL frame version regressed"));

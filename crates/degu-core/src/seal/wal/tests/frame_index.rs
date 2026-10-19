@@ -188,6 +188,70 @@ fn a_frame_that_changed_after_it_was_indexed_is_refused() {
     );
 }
 
+/// The header is checked on the way back in the same way the replay that built
+/// the index checked it. The payload is left intact in every case below, so its
+/// checksum still passes and only the header check can refuse the frame; each
+/// change other than the checksum's own recomputes the header checksum, so the
+/// header check that refuses it is the one the case is named for.
+#[test]
+fn a_frame_whose_header_changed_after_it_was_indexed_is_refused() {
+    fn reseal(header: &mut [u8]) {
+        let crc = crc32(&header[4..12]);
+        header[12..16].copy_from_slice(&crc.to_le_bytes());
+    }
+    type HeaderChange = fn(&mut [u8]);
+    let cases: [(&str, HeaderChange); 4] = [
+        ("header checksum", |header| header[12] ^= 0xff),
+        ("unsupported version", |header| {
+            header[4..6].copy_from_slice(&2_u16.to_le_bytes());
+            reseal(header);
+        }),
+        ("reserved bits", |header| {
+            header[6] = 1;
+            reseal(header);
+        }),
+        ("declared length", |header| {
+            let len = u32::from_le_bytes(header[8..12].try_into().unwrap());
+            header[8..12].copy_from_slice(&(len + 1).to_le_bytes());
+            reseal(header);
+        }),
+    ];
+    for (case, change) in cases {
+        let mut wal = seal_and_inverse();
+        assert_eq!(
+            wal.permission_records(TRANSACTION).unwrap(),
+            expected_records(),
+            "{case}: the unchanged frame must read back"
+        );
+        let start = entry_mut(&mut wal, 1).frame.unwrap().start() as usize;
+        change(&mut wal.writer.bytes[start..start + HEADER_LEN]);
+        let error = wal.permission_records(TRANSACTION).unwrap_err();
+        assert!(
+            matches!(error, PermissionReadError::Mismatch { mutation_id: 1, .. }),
+            "{case}: {error:?}"
+        );
+    }
+}
+
+/// An extent that runs past the end of its frame names more than one frame.
+/// The first of them may well be the record the entry indexed, but an index
+/// that disagrees with the file about where a frame ends is not one to act on.
+#[test]
+fn an_extent_longer_than_its_frame_is_refused() {
+    let mut wal = seal_and_inverse();
+    let seal = entry_mut(&mut wal, 1).frame.unwrap();
+    let inverse = entry_mut(&mut wal, 2).frame.unwrap();
+    entry_mut(&mut wal, 1).frame = FrameExtent::new(
+        seal.start() as usize,
+        (inverse.start() - seal.start()) as usize + inverse.len(),
+    );
+    let error = wal.permission_records(TRANSACTION).unwrap_err();
+    assert!(
+        matches!(error, PermissionReadError::Mismatch { mutation_id: 1, .. }),
+        "{error:?}"
+    );
+}
+
 /// The projection a directory query consumes is built from the same read, so a
 /// refused record must refuse the projection rather than leave a seal out of it.
 #[test]

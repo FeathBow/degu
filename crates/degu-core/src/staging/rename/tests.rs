@@ -4721,3 +4721,85 @@ fn settled_refusal_not_retry() {
     assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
     assert!(wal_len(&fixture) <= limit);
 }
+
+/// The room is read while another session holds the lease, and it is the room
+/// that session sees: the same committed bytes, the same allowances held.
+#[test]
+fn room_matches_lease() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let fresh = fixture.store.room().unwrap();
+    assert_eq!((fresh.committed, fresh.reserved), (0, 0));
+
+    let transaction = TransactionId([0x72; 16]);
+    let ready = stage_production(&fixture, transaction);
+    let room = fixture.store.room().unwrap();
+    let wal = &ready.engine.wal;
+    assert_eq!(room.committed, wal_len(&fixture));
+    assert_eq!(room.reserved, wal.reserved(None).unwrap());
+    assert_eq!(room.reserved, wal.remaining_allowance(transaction).unwrap());
+    assert_eq!(room.available(), wal.headroom(None).unwrap());
+}
+
+/// Measuring changes nothing. A torn tail is left out of the measure, as replay
+/// leaves it out, and left in the file, where only a lease may repair it.
+#[test]
+fn room_repairs_nothing() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0x73; 16]);
+    drop(stage_production(&fixture, transaction));
+    let committed = wal_len(&fixture);
+    let wal_path = fixture
+        .base
+        .join("wal-store")
+        .join(crate::seal::store::WAL_FILE_NAME);
+    std::io::Write::write_all(
+        &mut std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .unwrap(),
+        b"DSWL torn",
+    )
+    .unwrap();
+
+    let room = fixture.store.room().unwrap();
+    assert_eq!(room.committed, committed);
+    assert_eq!(wal_len(&fixture), committed + 9);
+}
+
+/// A transaction part way through blocks a new staging until recovery moves it
+/// on, and what it then holds depends on how. There is no room to report, and
+/// the measure says so rather than guessing.
+#[test]
+fn unsettled_room_refused() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let destination = fixture.destination_root.clone();
+    BEFORE_RENAME.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::fs::create_dir(&destination).unwrap();
+        }));
+    });
+    let transaction = TransactionId([0x74; 16]);
+    let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+    assert!(matches!(
+        engine.stage_prepared_root(transaction, fixture.prepare()),
+        Err(StagingRenameError::ConfirmedNotApplied(_))
+    ));
+    drop(engine);
+
+    let error = fixture.store.room().unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::seal::wal::WalRoomError::Unsettled(crate::seal::wal::AllowanceError::Unsettled(
+                TransactionState::RenameIntent
+            ))
+        ),
+        "{error:?}"
+    );
+}

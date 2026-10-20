@@ -555,6 +555,34 @@ pub fn check_current_euid_authority_readiness()
 /// Where nothing redirects the anchor the two answers are identical, which is
 /// every real account; they part only under the mutation seam, and answering
 /// from the account database there refuses work that would have succeeded.
+/// Why the room in the current EUID's seal WAL could not be measured.
+#[derive(Debug, thiserror::Error)]
+pub enum WalRoomInspectionError {
+    #[error(transparent)]
+    Activation(#[from] StoreActivationError),
+    /// The store is part way through activation, lost, or replaced, so there
+    /// is no WAL to measure and staging would be refused before reaching one.
+    #[error("the sealed-staging store is {0:?}, so its room cannot be measured")]
+    Unavailable(StoreActivationKind),
+    #[error(transparent)]
+    Room(#[from] crate::seal::wal::WalRoomError),
+}
+
+/// The room the current EUID's seal WAL leaves for a new staging, for a
+/// preview that must not change anything to learn it.
+///
+/// The store is found the way readiness finds it, and measured without a
+/// lease. A store that was never activated holds nothing yet, so its room is
+/// all of it; activating it is the first thing a real clean does.
+pub fn current_euid_wal_room() -> Result<crate::seal::wal::WalRoom, WalRoomInspectionError> {
+    let selection = production_authority_selection()?;
+    match &selection.selected.state {
+        StoreActivationState::Activated(activated) => Ok(activated.store.room()?),
+        StoreActivationState::NeverActivated => Ok(crate::seal::wal::WalRoom::empty()),
+        other => Err(WalRoomInspectionError::Unavailable(other.kind())),
+    }
+}
+
 pub fn check_current_euid_mutation_readiness()
 -> Result<CurrentEuidAuthorityReadiness, StoreActivationError> {
     readiness_from(production_authority_selection()?)

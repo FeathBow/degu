@@ -77,9 +77,10 @@ use selection::{
 pub use selection::{
     ActivationAuthorityMode, AuthorityClaimPublicationState, CurrentEuidAuthorityReadiness,
     SelfAuthorityInitializationError, SelfAuthorityInitializationOutcome,
-    SelfAuthorityInitializationPostProvisionError, activate_current_euid_store,
-    check_current_euid_authority_readiness, check_current_euid_mutation_readiness,
-    current_euid_system_authority, initialize_current_euid_self_authority,
+    SelfAuthorityInitializationPostProvisionError, WalRoomInspectionError,
+    activate_current_euid_store, check_current_euid_authority_readiness,
+    check_current_euid_mutation_readiness, current_euid_system_authority, current_euid_wal_room,
+    initialize_current_euid_self_authority,
 };
 #[cfg(test)]
 use selection::{

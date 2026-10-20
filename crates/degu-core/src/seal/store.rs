@@ -13,7 +13,10 @@ use crate::backend::{
     HeldLocalBackendEvidence, certify_held_fd, certify_held_fd_backend, require_held_fd_acl_absent,
 };
 use crate::seal::sidecar::TreeSidecarStore;
-use crate::seal::wal::{CompactionPlan, ExclusiveFileLock, RecoveryLockError, RecoverySession};
+use crate::seal::wal::{
+    CompactionPlan, ExclusiveFileLock, MAX_WAL_LEN, RecoveryLockError, RecoverySession, WalRoom,
+    WalRoomError, room_in,
+};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{FileType, Mode, OFlags, RenameFlags};
 use std::ffi::OsString;
@@ -75,6 +78,9 @@ const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 const OPEN_WAL: OFlags = OFlags::RDWR.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+const READ_WAL: OFlags = OFlags::RDONLY
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
 const MAX_INITIALIZER_NAMES: usize = 128;
 static NEXT_INITIALIZER_NAME: AtomicU64 = AtomicU64::new(1);
 
@@ -295,6 +301,45 @@ impl SealWalStore {
     /// Opens the mandatory exact WAL entry and acquires a nonblocking exclusive
     /// lock on that same descriptor. A missing entry in an existing store is
     /// lost authority, never permission to initialize an empty WAL.
+    /// The room this store's WAL leaves for a new staging, measured without a
+    /// lease: no lock is taken, no torn tail is repaired, nothing is compacted.
+    /// The WAL entry is read under the binding checks a lease applies, and
+    /// only its committed frames are measured.
+    ///
+    /// A process holding the lease may be appending as this reads. A frame it
+    /// has only begun is left out the way a torn tail is; one caught part way
+    /// through its bytes fails its checksum, which is an error here rather than
+    /// a guess. Either way the measure is advice, since staging measures again
+    /// under the lease before it writes anything.
+    pub fn room(&self) -> Result<WalRoom, WalRoomError> {
+        let wal_path = self.path.join(WAL_FILE_NAME);
+        let parent_path = self.path.parent().unwrap_or_else(|| Path::new("/"));
+        validate_store_binding(
+            &self.parent,
+            &self.name,
+            &self.directory,
+            self.backend,
+            self.device,
+            &self.path,
+            parent_path,
+        )?;
+        let fd = match rustix::fs::openat(&self.directory, WAL_FILE_NAME, READ_WAL, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => {
+                return Err(StoreError::MissingWal { path: wal_path }.into());
+            }
+            Err(error) => return Err(io_error(&wal_path, error.into()).into()),
+        };
+        validate_wal(&fd, self.backend, self.device, &wal_path)?;
+        validate_entry_binding(&self.directory, &fd, &wal_path)?;
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(
+            &mut io::Read::take(File::from(fd), MAX_WAL_LEN + 1),
+            &mut bytes,
+        )?;
+        room_in(bytes)
+    }
+
     pub(crate) fn try_lease(&self) -> Result<RecoverySession, StoreError> {
         let wal_path = self.path.join(WAL_FILE_NAME);
         let parent_path = self.path.parent().unwrap_or_else(|| Path::new("/"));

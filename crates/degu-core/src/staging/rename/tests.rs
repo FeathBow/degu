@@ -4441,3 +4441,227 @@ fn allowance_measured_once() {
     assert_eq!(ready.engine.wal.headroom(None).unwrap(), first);
     assert_eq!(reads(), measured, "a second measure read the records again");
 }
+
+/// A refused undo inverse is tried again at the next open only while the WAL
+/// has room for the rest of the undo and a `RecoveryRequired` frame after it.
+/// With exactly that room the retry runs and the undo completes inside the
+/// limit; one byte less and the transaction fails closed instead, also inside
+/// it.
+#[test]
+fn undo_retry_room() {
+    for short in [1, 0] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let transaction = TransactionId([0x6e + short as u8; 16]);
+        let mut ready = stage_production(&fixture, transaction);
+        let undo = ready.engine.wal.undo_allowance(transaction).unwrap();
+        let token = ready
+            .verified_undo_token(transaction, "undo-group")
+            .unwrap();
+        crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(Some("inverse-intent")));
+        let error = ready
+            .undo_verified(token, verified_undo_request(&fixture))
+            .unwrap_err();
+        crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(None));
+        assert_eq!(
+            error.disposition(),
+            VerifiedUndoFailureDisposition::RecoveryBlocked
+        );
+        drop(ready);
+
+        // At the next open recovery first records the interrupted inverse as
+        // not applied, a 45-byte frame, and then retries. No inverse was
+        // applied, so the retry needs every one of them again and the frames
+        // that close the undo: the undo's allowance less the `UndoIntent`
+        // already written, and the `RecoveryRequired` frame, which is the same
+        // size, back on top.
+        let limit = wal_len(&fixture) + 45 + undo - short;
+        let _limit = WalLimit::set(limit);
+        let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+        let recovered = engine.recover_startup(report, |_, _| Ok(fixture.raw_anchors()));
+        if short == 1 {
+            assert!(recovered.is_err(), "a retry ran without room after it");
+            let mut lease = fixture.store.try_lease().unwrap();
+            let replay = lease.replay_and_repair().unwrap();
+            assert_eq!(
+                replay.transactions[&transaction].state,
+                TransactionState::RecoveryRequired
+            );
+        } else {
+            let (ready, _) = recovered.unwrap();
+            assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+        }
+        assert!(wal_len(&fixture) <= limit);
+    }
+}
+
+/// The same holds for the source parent's restore at the end of staging. Its
+/// retry needs the parent's inverse again, the two states that commit the
+/// entry, and the room the committed entry then holds, with a
+/// `RecoveryRequired` frame after it.
+#[test]
+fn parent_retry_room() {
+    for short in [1, 0] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        // The source parent stays group-writable, so its seal changes its mode
+        // and an interrupted inverse is found not applied rather than moot.
+        let request = || fixture.forward_request("root", "staged");
+        let transaction = TransactionId([0x70 + short as u8; 16]);
+        let (binding, _) = request().prepare().unwrap();
+        let (begin, tree) = projections(&fixture, transaction, &binding.metadata);
+        drop(binding);
+
+        let mut ready = fixture.ready_engine();
+        crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(Some("inverse-intent")));
+        let error = ready
+            .stage_to_verified_commit(transaction, request())
+            .unwrap_err();
+        crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(None));
+        assert_eq!(
+            error.disposition(),
+            ForwardFailureDisposition::RecoveryBlocked,
+            "{error}"
+        );
+        assert_eq!(
+            ready.state(transaction),
+            Some(TransactionState::SourceParentRestoreIntent)
+        );
+        drop(ready);
+
+        // The parent's inverse and its resolution are what undoing the parent
+        // seal writes between its two states; then the two states that commit
+        // the entry, its room, and `RecoveryRequired`.
+        let parent_inverse = begin.rolled_back - 2 * 38;
+        let needed = parent_inverse + 2 * 38 + tree.committed + 38;
+        let limit = wal_len(&fixture) + 45 + needed - short;
+        let _limit = WalLimit::set(limit);
+        let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+        let recovered = engine.recover_startup(report, |_, _| Ok(fixture.raw_anchors()));
+        if short == 1 {
+            assert!(recovered.is_err(), "a retry ran without room after it");
+            let mut lease = fixture.store.try_lease().unwrap();
+            let replay = lease.replay_and_repair().unwrap();
+            assert_eq!(
+                replay.transactions[&transaction].state,
+                TransactionState::RecoveryRequired
+            );
+        } else {
+            let (ready, _) = recovered.unwrap();
+            assert_eq!(
+                ready.state(transaction),
+                Some(TransactionState::VerifiedCommitted)
+            );
+        }
+        assert!(wal_len(&fixture) <= limit);
+    }
+}
+
+/// Drives one transaction until one of its inverses is interrupted after its
+/// intent, in the phase a scenario means to retry.
+type InterruptAt = fn(&Fixture, TransactionId);
+
+/// For a phase whose retry writes everything it needs, the room a retry needs
+/// is what the retry then writes, and a `RecoveryRequired` frame. The first
+/// run measures what it writes; each later run gets exactly that room, or one
+/// byte less, and either finishes or fails closed inside it.
+fn assert_retry_threshold(interrupt: InterruptAt, finished: TransactionState) {
+    let mut written = None;
+    for short in [None, Some(1), Some(0)] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let transaction = TransactionId([0x80 + short.map_or(0, |short| short + 1) as u8; 16]);
+        interrupt(&fixture, transaction);
+        // Recovery first records the interrupted inverse as not applied, a
+        // 45-byte frame, and only then retries.
+        let resolved = wal_len(&fixture) + 45;
+        let _limit = short.map(|short| WalLimit::set(resolved + written.unwrap() + 38 - short));
+        let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+        let recovered = engine.recover_startup(report, |_, _| Ok(fixture.raw_anchors()));
+        match short {
+            None => {
+                let (ready, _) = recovered.unwrap();
+                assert_eq!(ready.state(transaction), Some(finished));
+                written = Some(wal_len(&fixture) - resolved);
+            }
+            Some(1) => {
+                assert!(recovered.is_err(), "a retry ran without room after it");
+                let mut lease = fixture.store.try_lease().unwrap();
+                let replay = lease.replay_and_repair().unwrap();
+                assert_eq!(
+                    replay.transactions[&transaction].state,
+                    TransactionState::RecoveryRequired
+                );
+            }
+            Some(_) => {
+                let (ready, _) = recovered.unwrap();
+                assert_eq!(ready.state(transaction), Some(finished));
+            }
+        }
+    }
+}
+
+/// A rollback whose first inverse was interrupted retries every inverse.
+#[test]
+fn rollback_retry_room() {
+    assert_retry_threshold(
+        |fixture, transaction| {
+            let destination = fixture.destination_root.clone();
+            BEFORE_RENAME.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    std::fs::create_dir(&destination).unwrap();
+                }));
+            });
+            let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+            assert!(matches!(
+                engine.stage_prepared_root(transaction, fixture.prepare()),
+                Err(StagingRenameError::ConfirmedNotApplied(_))
+            ));
+            drop(engine);
+            let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+            crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(Some("inverse-intent")));
+            assert!(
+                engine
+                    .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+                    .is_err()
+            );
+            crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(None));
+        },
+        TransactionState::Restored,
+    );
+}
+
+/// A quarantine whose first inverse was interrupted retries every inverse,
+/// the tree's where they now are under the destination root.
+#[test]
+fn quarantine_retry_room() {
+    assert_retry_threshold(
+        |fixture, transaction| {
+            let destination = fixture.destination_root.clone();
+            AFTER_RENAME.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    std::fs::write(destination.join("unexpected"), b"mismatch").unwrap();
+                }));
+            });
+            let mut ready = fixture.ready_engine();
+            crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(Some("inverse-intent")));
+            assert!(
+                ready
+                    .stage_to_verified_commit(
+                        transaction,
+                        fixture.forward_request("root", "staged")
+                    )
+                    .is_err()
+            );
+            crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(None));
+            assert_eq!(
+                ready.state(transaction),
+                Some(TransactionState::Quarantined)
+            );
+        },
+        TransactionState::Quarantined,
+    );
+}

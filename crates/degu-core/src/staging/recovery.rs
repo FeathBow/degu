@@ -142,6 +142,12 @@ pub(crate) enum RecoveryRebindError {
     Wal(#[from] AppendError),
     #[error("durable permission record could not be read back: {0}")]
     PermissionRecord(#[from] crate::seal::wal::PermissionReadError),
+    /// A retry of a refused inverse would leave the WAL without room for the
+    /// rest of this transaction's life, so the transaction failed closed.
+    #[error("the seal WAL needs {needed} bytes to retry this recovery but has {available}")]
+    WalFull { needed: u64, available: u64 },
+    #[error("the room a retry needs could not be measured: {0}")]
+    Allowance(#[from] crate::seal::wal::AllowanceError),
     #[error("uncertain staging permission could not be resolved: {0}")]
     Resolution(#[from] ResolveError),
     #[error("held recovery mutation failed: {0}")]
@@ -823,6 +829,8 @@ impl RecoveryRestoreSession<'_> {
             }
         }
 
+        require_room_to_retry(self.wal, transaction)?;
+
         // Sorting is repeated here rather than trusting serialized/report order.
         // The exact source parent is forced after every descendant and sibling.
         sort_restore_plans(&mut self.restore.entries, &self.restore.source_parent_last);
@@ -1152,6 +1160,7 @@ impl VerifiedUndoRecoverySession<'_> {
         }
 
         if self.wal.transaction_state(transaction) == Some(TransactionState::UndoIntent) {
+            require_room_to_retry(self.wal, transaction)?;
             // Durable evidence order is ignored; descriptor-free plans are
             // independently sorted deepest-first before any inverse fchmod.
             self.undo.tree_seals.sort_by(|left, right| {
@@ -1866,6 +1875,24 @@ pub(crate) fn prepare_verified_purge<'a>(
             }
             Err(error)
         }
+    }
+}
+
+/// A transaction that has had an inverse refused is about to try again, and a
+/// retry is the one write admission set no room aside for. It goes ahead only
+/// if the rest of the transaction's life still fits, with room left to fail
+/// closed after it; otherwise it fails closed now, while that room is there.
+fn require_room_to_retry(
+    wal: &mut SealWal<RecoverySession>,
+    transaction: TransactionId,
+) -> Result<(), RecoveryRebindError> {
+    match wal.retry_room(transaction)? {
+        Some((needed, available)) if needed > available => fail_closed(
+            wal,
+            transaction,
+            RecoveryRebindError::WalFull { needed, available },
+        ),
+        _ => Ok(()),
     }
 }
 

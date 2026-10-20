@@ -450,6 +450,120 @@ impl<W: DurableWrite> SealWal<W> {
     }
 }
 
+impl<W: DurableWrite> SealWal<W> {
+    /// The room a transaction needs to retry reversing its seals, beside the
+    /// room it has, once an inverse of it has been refused; `None` before.
+    ///
+    /// Admission set room aside for one attempt at each inverse. A refused one
+    /// is tried again at the next open, and every attempt writes a frame pair
+    /// no allowance covered, so retries have to be paid for out of what is
+    /// left. What a retry needs is everything this transaction may still
+    /// write -- an inverse for each seal not yet reversed, the frames that
+    /// close its state, and for a source parent about to be restored the room
+    /// the committed entry then holds -- and a `RecoveryRequired` frame, so a
+    /// retry that fails can still fail closed.
+    pub(crate) fn retry_room(
+        &self,
+        transaction: TransactionId,
+    ) -> Result<Option<(u64, u64)>, AllowanceError> {
+        let Some(&state) = self.states.get(&transaction) else {
+            return Ok(None);
+        };
+        let records = self.permission_records(transaction)?;
+        if !records.iter().any(|permission| {
+            permission.reverses_mutation_id.is_some()
+                && permission.application == ApplicationStatus::ConfirmedNotApplied
+        }) {
+            return Ok(None);
+        }
+        let metadata = self
+            .staging
+            .get(&transaction)
+            .ok_or(AllowanceError::Missing("staging metadata"))?;
+        let filesystem_id = metadata.filesystem_id();
+        let source_root = metadata
+            .source_parent()
+            .relative_path()
+            .join(metadata.source_basename());
+        let destination_root = metadata
+            .destination_parent()
+            .relative_path()
+            .join(metadata.destination_basename());
+        let resolution = frame_len(&SealRecord::PermissionApplied {
+            transaction,
+            mutation_id: ANY_MUTATION_ID,
+        })?;
+        let reversed = records
+            .iter()
+            .filter(|permission| permission.application == ApplicationStatus::Applied)
+            .filter_map(|permission| permission.reverses_mutation_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut needed = 0;
+        for seal in records.iter().filter(|permission| {
+            permission.reverses_mutation_id.is_none()
+                && permission.application == ApplicationStatus::Applied
+                && !reversed.contains(&permission.mutation_id)
+        }) {
+            let tree = seal.phase == TransactionState::TreeSealIntent;
+            // A source parent's seal is reversed before its entry commits, so an
+            // undo never finds it among these. A tree seal is reversed where the
+            // tree now is once it has been renamed, and a source parent being
+            // restored is the one seal its phase reverses.
+            let path = match (state, tree) {
+                (TransactionState::UndoIntent, true) | (TransactionState::Quarantined, true) => {
+                    let suffix = seal
+                        .evidence
+                        .relative_path()
+                        .strip_prefix(&source_root)
+                        .map_err(|_| AllowanceError::SealOutsideRoot {
+                            mutation_id: seal.mutation_id,
+                        })?;
+                    destination_root.join(suffix)
+                }
+                (TransactionState::SourceParentRestoreIntent, true) => continue,
+                _ => seal.evidence.relative_path().to_path_buf(),
+            };
+            needed += staging_intent_len(transaction, path, filesystem_id, Some(ANY_MUTATION_ID))?
+                + resolution;
+        }
+        needed += match state {
+            TransactionState::RestoreIntent => {
+                states_len(transaction, &[TransactionState::Restored])?
+            }
+            TransactionState::SourceParentRestoreIntent => {
+                states_len(
+                    transaction,
+                    &[
+                        TransactionState::SourceParentRestored,
+                        TransactionState::VerifiedCommitted,
+                    ],
+                )? + self
+                    .undo_allowance(transaction)?
+                    .max(self.purge_allowance(transaction, true)?)
+            }
+            TransactionState::Quarantined => 0,
+            TransactionState::UndoIntent => {
+                states_len(
+                    transaction,
+                    &[
+                        TransactionState::UndoModesRestored,
+                        TransactionState::UndoRenameIntent,
+                        TransactionState::Restored,
+                    ],
+                )? + frame_len(&SealRecord::UndoRenameOutcome {
+                    transaction,
+                    outcome: DurableUndoRenameOutcome::AppliedAndParentsSynced(
+                        metadata.root_identity(),
+                    ),
+                })?
+            }
+            other => return Err(AllowanceError::Unsettled(other)),
+        };
+        needed += states_len(transaction, &[TransactionState::RecoveryRequired])?;
+        Ok(Some((needed, self.headroom(Some(transaction))?)))
+    }
+}
+
 /// What a staging transaction writes before it walks its tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BeginProjection {

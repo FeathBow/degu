@@ -734,6 +734,73 @@ send "q"
     );
 }
 
+/// The review builds an explicit-path batch, and the batch preflight rejects the
+/// whole batch on any item whose assessment did not complete -- not only on one it
+/// refused. A tree with a file the assessment cannot open is not refused, it is
+/// unavailable, and leaving it checked offers a run that rejects every other
+/// location in the plan along with it.
+#[test]
+fn a_tree_the_assessment_could_not_finish_is_not_offered_as_ready_to_clean() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir_in(home.path()).unwrap();
+    let config = config_home_with_roots(&[]);
+    let cache = common::platform_cache_dir(home.path(), "pip");
+    std::fs::create_dir_all(cache.join("http")).unwrap();
+    std::fs::write(cache.join("http/blob"), vec![0u8; 4096]).unwrap();
+    std::fs::write(cache.join("http/locked"), vec![0u8; 4096]).unwrap();
+    common::make_tree_non_shared_writable(home.path()).unwrap();
+    // The scan measures the file without opening it; the assessment opens it.
+    std::fs::set_permissions(
+        cache.join("http/locked"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
+    )
+    .unwrap();
+
+    let out = run_pty(PtyRun {
+        body: r#"
+spawn -noecho sh -c {stty rows 24 columns 80; exec "$DEGU_BIN" --color never tui}
+expect -ex "\033\[?1049h"
+sleep 1
+send "q"
+"#,
+        home: home.path(),
+        config_home: config.path(),
+        state_home: state.path(),
+        extra_env: &[],
+    });
+    let lines = screen::render(&out.stdout, 24, 80);
+    let row = lines
+        .iter()
+        .find(|line| line.contains("Caches/pip") || line.contains(".cache/pip"))
+        .unwrap_or_else(|| panic!("the cache is not on the screen: {lines:#?}"));
+    assert!(
+        !row.contains('✓'),
+        "a tree the batch would reject starts in the plan: {row}"
+    );
+    assert!(
+        row.contains("Blocked"),
+        "the row calls a tree the batch would reject ready: {row}"
+    );
+    let plan = lines
+        .iter()
+        .find(|line| line.contains("In the plan"))
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        plan.contains("0 locations") || plan.is_empty(),
+        "the plan total counts a tree the batch would reject: {plan}"
+    );
+    // The panel says why, and names the file: that is what the reader can fix.
+    let screen = lines.join(" ");
+    assert!(
+        screen.contains("Blocked by sealed staging preflight") && screen.contains("http/locked"),
+        "the review never says why the tree was left out: {screen}"
+    );
+}
+
 /// One cache of each tier the screen distinguishes, plus a second Ready one: the
 /// layout has to hold rows the reader can act on and rows they cannot.
 fn caches_of_every_tier(home: &Path) {

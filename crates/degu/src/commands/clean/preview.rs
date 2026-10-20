@@ -54,12 +54,16 @@ pub(super) enum PreviewStagingStatus {
 ///
 /// Assessed as an explicit-path batch, because every surface that asks this builds
 /// one: that is the strictest reading, and the one the reader's own preview applies.
+/// Under it only a tree whose policy was assessed can run. The batch preflight
+/// rejects the whole batch on any other answer, so a tree whose assessment could
+/// not finish is a refusal here, although the preview, which reports rather than
+/// offers, files it as unavailable rather than blocked.
 pub(crate) fn staging_refusal(finding: &Finding) -> Option<String> {
     match PreviewStagingAssessment::assess(finding, false, true).status {
-        PreviewStagingStatus::Blocked { reason, .. } => Some(reason),
-        PreviewStagingStatus::TreePolicyAssessed { .. }
-        | PreviewStagingStatus::DeferredUntilExecutionSeal { .. }
-        | PreviewStagingStatus::SealedPathUnavailable { .. } => None,
+        PreviewStagingStatus::TreePolicyAssessed { .. } => None,
+        PreviewStagingStatus::Blocked { reason, .. }
+        | PreviewStagingStatus::DeferredUntilExecutionSeal { reason, .. }
+        | PreviewStagingStatus::SealedPathUnavailable { reason, .. } => Some(reason),
     }
 }
 

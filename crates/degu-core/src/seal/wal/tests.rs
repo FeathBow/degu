@@ -50,6 +50,34 @@ fn frame(record: &SealRecord) -> Vec<u8> {
     encode_frame(record).unwrap()
 }
 
+/// Replays records nothing framed, for the fixtures that build a history as
+/// values rather than as bytes.
+///
+/// A replay that has to read an earlier record back finds no extent here and
+/// refuses. A fixture whose outcome turns on such a read frames its records
+/// with [`framed`] instead; left unframed, its refusal would be the missing
+/// frame rather than the thing it means to check.
+fn replay_unframed<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, ReplayError> {
+    replay_records(records, &[])
+}
+
+/// The bytes a fixture's records would have been written as.
+///
+/// Frame versions never regress within a WAL, so a fixture holding a record the
+/// current version cannot emit -- the legacy tree manifest is the only one --
+/// is written entirely at the last version that could. That is what a WAL
+/// carrying one actually looks like.
+fn framed(records: &[SealRecord]) -> Vec<u8> {
+    let legacy_manifest = records
+        .iter()
+        .any(|record| matches!(record, SealRecord::TreeManifestComplete { .. }));
+    let version = if legacy_manifest { 11 } else { VERSION };
+    records
+        .iter()
+        .flat_map(|record| legacy_frame(version, record))
+        .collect()
+}
+
 fn checked_frame(version: u16, payload: Vec<u8>) -> Vec<u8> {
     let mut frame = Vec::new();
     frame.extend_from_slice(MAGIC);
@@ -213,7 +241,7 @@ fn v12_sidecar_completion_round_trips_and_replays_atomically() {
             ..
         }) if *decoded_manifest == manifest && *decoded_commitment == commitment
     ));
-    let replay = replay_records(parsed.records).unwrap();
+    let replay = replay_records(parsed.records, &bytes).unwrap();
     let replayed = &replay.transactions[&transaction];
     assert_eq!(replayed.tree_manifest, Some(manifest));
     assert_eq!(replayed.tree_sidecar, Some(commitment));
@@ -288,7 +316,7 @@ fn v12_writer_rejects_forged_or_structurally_impossible_sidecar_bindings() {
     .concat();
     let parsed = parse_frames(&malformed_history).unwrap();
     assert!(matches!(
-        replay_records(parsed.records),
+        replay_records(parsed.records, &malformed_history),
         Err(ReplayError::InvalidHistory(
             "v12 tree completion has an invalid manifest or sidecar commitment"
         ))
@@ -413,7 +441,7 @@ fn v11_manifest_history_remains_replayable_but_cross_version_tags_fail_closed() 
     let invalid_mixed_history = [v11_prefix.clone(), frame(&sidecar_completion)].concat();
     let parsed = parse_frames(&invalid_mixed_history).unwrap();
     assert!(matches!(
-        replay_records(parsed.records),
+        replay_records(parsed.records, &invalid_mixed_history),
         Err(ReplayError::InvalidHistory(
             "v12 tree completion has an invalid manifest or sidecar commitment"
         ))
@@ -460,7 +488,7 @@ fn wal_frame_versions_may_advance_but_never_regress() {
             .collect::<Vec<_>>(),
         vec![10, 11, VERSION]
     );
-    assert!(replay_records(parsed.records).is_ok());
+    assert!(replay_records(parsed.records, &advancing).is_ok());
 
     let regressing = [
         frame(&state(first, TransactionState::Prepared)),
@@ -491,7 +519,7 @@ fn version_six_manifest_decodes_as_metadata_only_content_unproven() {
 fn replay_bytes(bytes: &[u8]) -> Replay {
     let parsed = parse_frames(bytes).unwrap();
     let committed_len = parsed.committed_len as u64;
-    let mut replay = replay_records(parsed.records).unwrap();
+    let mut replay = replay_records(parsed.records, bytes).unwrap();
     replay.committed_len = committed_len;
     replay
 }
@@ -565,6 +593,10 @@ impl DurableWrite for FaultWriter {
     fn prepare_append(&mut self) -> io::Result<u64> {
         Ok(self.bytes.len() as u64)
     }
+
+    fn read_committed(&self, start: u64, into: &mut [u8]) -> io::Result<()> {
+        read_committed_from_memory(&self.bytes, start, into)
+    }
 }
 
 #[test]
@@ -576,8 +608,9 @@ fn short_writes_are_completed_and_frames_replay() {
     let mut wal = SealWal::new(writer).unwrap();
     wal.append_synced(&state(tx(1), TransactionState::Prepared))
         .unwrap();
-    let parsed = parse_frames(&wal.into_inner().bytes).unwrap();
-    let replay = replay_records(parsed.records).unwrap();
+    let frames = wal.into_inner().bytes;
+    let parsed = parse_frames(&frames).unwrap();
+    let replay = replay_records(parsed.records, &frames).unwrap();
     assert_eq!(
         replay.transactions[&tx(1)].state,
         TransactionState::Prepared
@@ -668,10 +701,11 @@ fn applied_is_synced_only_after_successful_mutation() {
     )
     .unwrap();
     assert!(called.get());
-    let parsed = parse_frames(&wal.into_inner().bytes).unwrap();
-    let replay = replay_records(parsed.records).unwrap();
+    let frames = wal.into_inner().bytes;
+    let parsed = parse_frames(&frames).unwrap();
+    let replay = replay_records(parsed.records, &frames).unwrap();
     assert_eq!(
-        replay.permission_records(tx(4))[0].application,
+        replay.permission_records(tx(4), &frames).unwrap()[0].application,
         ApplicationStatus::Applied
     );
 }
@@ -697,10 +731,11 @@ fn mutation_failure_leaves_durable_uncertain_intent_without_applied() {
         )
         .unwrap_err();
     assert!(matches!(error, MutationAppendError::Mutation(_)));
-    let parsed = parse_frames(&wal.into_inner().bytes).unwrap();
-    let replay = replay_records(parsed.records).unwrap();
+    let frames = wal.into_inner().bytes;
+    let parsed = parse_frames(&frames).unwrap();
+    let replay = replay_records(parsed.records, &frames).unwrap();
     assert_eq!(
-        replay.permission_records(tx(5))[0].application,
+        replay.permission_records(tx(5), &frames).unwrap()[0].application,
         ApplicationStatus::IntentDurableApplicationUnknown
     );
 }
@@ -872,7 +907,7 @@ fn legacy_v1_checksummed_unresolved_permission_replays_explicitly() {
         None
     );
     assert_eq!(
-        replay.permission_records(transaction)[0].application,
+        replay.permission_records(transaction, &bytes).unwrap()[0].application,
         ApplicationStatus::IntentDurableApplicationUnknown
     );
 }
@@ -903,11 +938,11 @@ fn legacy_v3_staging_frame_replays_without_inventing_mount_authority() {
         0
     );
     assert_eq!(
-        replay.permission_records(transaction)[0].application,
+        replay.permission_records(transaction, &bytes).unwrap()[0].application,
         ApplicationStatus::IntentDurableApplicationUnknown
     );
     assert!(matches!(
-        Replayed::of(&replay, transaction).decide(|_| RecoveryIdentity::Reestablished),
+        Replayed::of(&replay, transaction, &bytes).decide(|_| RecoveryIdentity::Reestablished),
         RecoveryWork::RecoveryRequired {
             reason: RecoveryRequiredReason::LegacySchemaMissingMountIdentity { version: 3 },
             ..
@@ -975,7 +1010,12 @@ fn terminal_legacy_staging_metadata_does_not_block_the_next_transaction() {
             committed_len: 0,
         };
         assert!(!matches!(
-            decide_recovery(&legacy, Vec::new, |_| RecoveryIdentity::Reestablished),
+            decide_recovery(
+                &legacy,
+                || Ok(Vec::new()),
+                |_| RecoveryIdentity::Reestablished
+            )
+            .unwrap(),
             RecoveryWork::RecoveryRequired {
                 reason: RecoveryRequiredReason::LegacySchemaMissingMountIdentity { .. },
                 ..
@@ -1048,10 +1088,10 @@ struct Replayed {
 }
 
 impl Replayed {
-    fn of(replay: &Replay, transaction: TransactionId) -> Self {
+    fn of(replay: &Replay, transaction: TransactionId, frames: &[u8]) -> Self {
         Self {
             transaction: replay.transactions[&transaction].clone(),
-            permissions: replay.permission_records(transaction),
+            permissions: replay.permission_records(transaction, frames).unwrap(),
         }
     }
 
@@ -1059,7 +1099,7 @@ impl Replayed {
     where
         F: Fn(&PersistentRecoveryEvidence) -> RecoveryIdentity,
     {
-        decide_recovery(&self.transaction, || self.permissions.clone(), identity)
+        decide_recovery(&self.transaction, || Ok(self.permissions.clone()), identity).unwrap()
     }
 }
 
@@ -1168,7 +1208,8 @@ fn a_settled_state_decides_without_reading_a_record() {
                 &replayed(state).transaction,
                 || panic!("{state:?} must settle without reading a record"),
                 |_| panic!("{state:?} must settle without an identity probe"),
-            ),
+            )
+            .unwrap(),
             expected,
             "{state:?}"
         );
@@ -1207,7 +1248,7 @@ fn invalid_history_fails_closed() {
         },
     ];
     assert!(matches!(
-        replay_records(records),
+        replay_unframed(records),
         Err(ReplayError::InvalidHistory(_))
     ));
 }
@@ -1257,7 +1298,7 @@ fn permission_records_are_confined_to_seal_intent_phase() {
         reverses_mutation_id: None,
     };
     assert!(matches!(
-        replay_records(vec![
+        replay_unframed(vec![
             state(transaction, TransactionState::Prepared),
             state(transaction, TransactionState::ParentSealIntent),
             intent.clone(),
@@ -1268,7 +1309,7 @@ fn permission_records_are_confined_to_seal_intent_phase() {
         ))
     ));
     assert!(matches!(
-        replay_records(vec![
+        replay_unframed(vec![
             state(transaction, TransactionState::Prepared),
             state(transaction, TransactionState::ParentSealIntent),
             state(transaction, TransactionState::ParentSealed),
@@ -1302,7 +1343,7 @@ fn applied_record_must_share_the_intent_phase() {
         },
         state(transaction, TransactionState::ParentSealed),
     ];
-    assert!(replay_records(records).is_ok());
+    assert!(replay_unframed(records).is_ok());
 }
 
 #[test]
@@ -1641,8 +1682,11 @@ fn inverse_binding_rejects_changed_stable_identity_and_cross_transaction_matches
             reverses_mutation_id: Some(1),
         },
     ];
+    // Framed, because the refusal depends on the replay reading mutation 1 back
+    // out of its own frame to compare identities against.
+    let bytes = framed(&changed_identity);
     assert!(matches!(
-        replay_records(changed_identity),
+        replay_records(parse_frames(&bytes).unwrap().records, &bytes),
         Err(ReplayError::InvalidHistory(
             "permission inverse does not match its applied seal mutation"
         ))
@@ -1686,8 +1730,9 @@ fn inverse_binding_rejects_changed_stable_identity_and_cross_transaction_matches
         state(other, TransactionState::Restored),
         state(transaction, TransactionState::Restored),
     ]);
+    let bytes = framed(&records);
     assert!(matches!(
-        replay_records(records),
+        replay_records(parse_frames(&bytes).unwrap().records, &bytes),
         Err(ReplayError::InvalidHistory(
             "terminal restore lacks an applied inverse for an applied seal"
         ))
@@ -1744,13 +1789,12 @@ fn restore_and_rollback_phases_accept_separate_permission_mutations() {
         },
         state(transaction, TransactionState::Restored),
     ];
-    let replay = replay_records(restore_records).unwrap();
-    assert_eq!(replay.permission_records(transaction).len(), 2);
-    assert_eq!(
-        replay.permission_records(transaction)[1].phase,
-        TransactionState::RestoreIntent
-    );
-    let mut before_terminal = Replayed::of(&replay, transaction);
+    let bytes = framed(&restore_records);
+    let replay = replay_records(parse_frames(&bytes).unwrap().records, &bytes).unwrap();
+    let recovered = replay.permission_records(transaction, &bytes).unwrap();
+    assert_eq!(recovered.len(), 2);
+    assert_eq!(recovered[1].phase, TransactionState::RestoreIntent);
+    let mut before_terminal = Replayed::of(&replay, transaction, &bytes);
     before_terminal.transaction.state = TransactionState::RestoreIntent;
     assert!(matches!(
         before_terminal.decide(|_| RecoveryIdentity::Reestablished),
@@ -1824,9 +1868,10 @@ fn replay_resume_resolves_applied_then_records_restore_to_restored() {
     resumed
         .transition(transaction, TransactionState::Restored)
         .unwrap();
-    let parsed = parse_frames(&resumed.into_inner().bytes).unwrap();
-    let replay = replay_records(parsed.records).unwrap();
-    let recovered = replay.permission_records(transaction);
+    let frames = resumed.into_inner().bytes;
+    let parsed = parse_frames(&frames).unwrap();
+    let replay = replay_records(parsed.records, &frames).unwrap();
+    let recovered = replay.permission_records(transaction, &frames).unwrap();
     assert_eq!(
         replay.transactions[&transaction].state,
         TransactionState::Restored
@@ -1873,11 +1918,11 @@ fn confirmed_not_applied_does_not_require_identity_or_restore_work() {
     let bytes = resumed.into_inner().bytes;
     let replay = replay_bytes(&bytes);
     assert_eq!(
-        replay.permission_records(transaction)[0].application,
+        replay.permission_records(transaction, &bytes).unwrap()[0].application,
         ApplicationStatus::ConfirmedNotApplied
     );
     assert!(matches!(
-        Replayed::of(&replay, transaction)
+        Replayed::of(&replay, transaction, &bytes)
             .decide(|_| panic!("identity must not be consulted")),
         RecoveryWork::RestoreBeforeRename { permissions, .. } if permissions.is_empty()
     ));
@@ -2003,7 +2048,7 @@ fn unknown_intent_only_produces_resolution_work_and_can_stop_recovery() {
     ));
     let replay = replay_bytes(&wal.writer.bytes);
     assert!(matches!(
-        Replayed::of(&replay, transaction)
+        Replayed::of(&replay, transaction, &wal.writer.bytes)
             .decide(|_| { panic!("uncertain intent must be resolved before identity work") }),
         RecoveryWork::ResolveUncertainPermissions { .. }
     ));
@@ -2078,7 +2123,7 @@ fn confirmed_not_applied_seal_cannot_complete_its_phase() {
     let mut records = parse_frames(&bytes).unwrap().records;
     records.push(state(transaction, TransactionState::ParentSealed).into_versioned());
     assert!(matches!(
-        replay_records(records),
+        replay_unframed(records),
         Err(ReplayError::InvalidHistory(
             "seal phase contains a permission intent not durably applied"
         ))
@@ -2142,20 +2187,21 @@ fn confirmed_not_applied_inverse_can_be_retried_and_folded() {
     wal.transition(transaction, TransactionState::Restored)
         .unwrap();
 
-    let replay = replay_bytes(&wal.into_inner().bytes);
+    let frames = wal.into_inner().bytes;
+    let replay = replay_bytes(&frames);
     assert_eq!(
         replay.transactions[&transaction].state,
         TransactionState::Restored
     );
     assert_eq!(
-        replay.permission_records(transaction)[1].application,
+        replay.permission_records(transaction, &frames).unwrap()[1].application,
         ApplicationStatus::ConfirmedNotApplied
     );
     assert_eq!(
-        replay.permission_records(transaction)[2].application,
+        replay.permission_records(transaction, &frames).unwrap()[2].application,
         ApplicationStatus::Applied
     );
-    let mut before_terminal = Replayed::of(&replay, transaction);
+    let mut before_terminal = Replayed::of(&replay, transaction, &frames);
     before_terminal.transaction.state = TransactionState::RestoreIntent;
     assert!(matches!(
         before_terminal.decide(|_| RecoveryIdentity::Reestablished),
@@ -2283,7 +2329,7 @@ fn append_and_replay_refuse_the_same_transitions() {
         );
         let parsed = parse_frames(&bytes).unwrap();
         assert!(
-            replay_records(parsed.records).is_err(),
+            replay_records(parsed.records, &bytes).is_err(),
             "replay accepted {from:?} -> {to:?} that append refused"
         );
     }
@@ -2304,14 +2350,15 @@ fn staging_begin_is_one_first_frame_and_roundtrips_complete_metadata() {
     let metadata = staging_metadata();
     let mut wal = SealWal::new(FaultWriter::default()).unwrap();
     wal.begin_staging(transaction, metadata.clone()).unwrap();
-    let parsed = parse_frames(&wal.into_inner().bytes).unwrap();
+    let frames = wal.into_inner().bytes;
+    let parsed = parse_frames(&frames).unwrap();
     assert_eq!(parsed.records.len(), 1);
     assert!(matches!(
         &parsed.records[0].record,
         SealRecord::StagingBegin { transaction: id, metadata: actual }
             if *id == transaction && actual == &metadata
     ));
-    let replay = replay_records(parsed.records).unwrap();
+    let replay = replay_records(parsed.records, &frames).unwrap();
     assert_eq!(
         replay.transactions[&transaction].staging.as_ref(),
         Some(&metadata)
@@ -2372,8 +2419,9 @@ fn manifest_and_explicit_rename_intent_enforce_order_and_uniqueness() {
 
     // There is intentionally no writer API for a rename outcome until the
     // held-tree executor can retain both authenticated parent capabilities.
-    let parsed = parse_frames(&wal.into_inner().bytes).unwrap();
-    let replay = replay_records(parsed.records).unwrap();
+    let frames = wal.into_inner().bytes;
+    let parsed = parse_frames(&frames).unwrap();
+    let replay = replay_records(parsed.records, &frames).unwrap();
     assert_eq!(
         replay.transactions[&transaction].tree_manifest,
         Some(manifest)
@@ -2438,7 +2486,11 @@ fn replay_rename_crash_boundary(
             outcome,
         });
     }
-    Replayed::of(&replay_records(records).unwrap(), transaction)
+    // Framed, because the decision this fixture drives reads the transaction's
+    // permission records back.
+    let bytes = framed(&records);
+    let replay = replay_records(parse_frames(&bytes).unwrap().records, &bytes).unwrap();
+    Replayed::of(&replay, transaction, &bytes)
 }
 
 #[test]
@@ -2508,7 +2560,7 @@ fn replay_rejects_bare_or_duplicate_staging_history_and_conflicting_outcomes() {
     let transaction = tx(74);
     let metadata = staging_metadata();
     assert!(matches!(
-        replay_records(vec![
+        replay_unframed(vec![
             state(transaction, TransactionState::Prepared),
             SealRecord::RenameIntent { transaction },
         ]),
@@ -2517,7 +2569,7 @@ fn replay_rejects_bare_or_duplicate_staging_history_and_conflicting_outcomes() {
     let mut conflicting = metadata.clone();
     conflicting.root_identity = strong(1, 700, 701);
     assert!(matches!(
-        replay_records(vec![
+        replay_unframed(vec![
             SealRecord::StagingBegin {
                 transaction,
                 metadata: metadata.clone(),
@@ -2530,7 +2582,7 @@ fn replay_rejects_bare_or_duplicate_staging_history_and_conflicting_outcomes() {
         Err(ReplayError::InvalidHistory(_))
     ));
     assert!(matches!(
-        replay_records(vec![
+        replay_unframed(vec![
             SealRecord::StagingBegin {
                 transaction,
                 metadata: metadata.clone(),
@@ -2548,7 +2600,7 @@ fn replay_rejects_bare_or_duplicate_staging_history_and_conflicting_outcomes() {
         sha256: [9; 32],
     };
     assert!(matches!(
-        replay_records(vec![
+        replay_unframed(vec![
             SealRecord::StagingBegin {
                 transaction,
                 metadata: metadata.clone(),
@@ -2568,7 +2620,7 @@ fn replay_rejects_bare_or_duplicate_staging_history_and_conflicting_outcomes() {
         Err(ReplayError::InvalidHistory(_))
     ));
     assert!(matches!(
-        replay_records(vec![
+        replay_unframed(vec![
             SealRecord::StagingBegin {
                 transaction,
                 metadata,
@@ -2630,7 +2682,7 @@ fn replay_requires_the_post_stage_source_parent_restore_order() {
         TransactionState::SourceParentRestoreIntent,
     ));
     assert!(matches!(
-        replay_records(early_restore),
+        replay_unframed(early_restore),
         Err(ReplayError::InvalidHistory(
             "invalid transaction transition"
         ))
@@ -2644,7 +2696,7 @@ fn replay_requires_the_post_stage_source_parent_restore_order() {
         state(transaction, TransactionState::VerifiedCommitted),
     ]);
     assert_eq!(
-        replay_records(complete).unwrap().transactions[&transaction].state,
+        replay_unframed(complete).unwrap().transactions[&transaction].state,
         TransactionState::VerifiedCommitted
     );
 }
@@ -2716,7 +2768,7 @@ fn manifest_completion_freezes_tree_permission_membership_at_runtime_and_replay(
     assert!(!called.get());
 
     assert!(matches!(
-        replay_records(vec![
+        replay_unframed(vec![
             SealRecord::StagingBegin {
                 transaction,
                 metadata,
@@ -2772,7 +2824,7 @@ fn parent_seal_and_inverse_are_bound_to_exact_metadata_parent() {
         Err(MutationAppendError::IntentWal(AppendError::InvalidState(_)))
     ));
     assert!(matches!(
-        replay_records(vec![
+        replay_unframed(vec![
             SealRecord::StagingBegin {
                 transaction,
                 metadata: metadata.clone(),
@@ -3144,7 +3196,7 @@ fn purgeable_has_only_the_explicit_v8_authorization_record() {
 
     let mut generic = prefix.clone();
     generic.push(state(transaction, TransactionState::Purgeable));
-    let generic_result = replay_records(generic);
+    let generic_result = replay_unframed(generic);
     assert!(
         matches!(
             generic_result,
@@ -3160,13 +3212,13 @@ fn purgeable_has_only_the_explicit_v8_authorization_record() {
         transaction,
         commitment: DurablePurgeCommitment::exact(&metadata, manifest),
     });
-    let replayed = replay_records(explicit).unwrap();
+    let replayed = replay_unframed(explicit).unwrap();
     assert_eq!(
         replayed.transactions[&transaction].state,
         TransactionState::Purgeable
     );
     assert!(matches!(
-        Replayed::of(&replayed, transaction).decide(|_| RecoveryIdentity::Reestablished),
+        Replayed::of(&replayed, transaction, &[]).decide(|_| RecoveryIdentity::Reestablished),
         RecoveryWork::PreserveCommittedSeal {
             state: TransactionState::Purgeable,
             ..
@@ -3181,7 +3233,7 @@ fn purgeable_has_only_the_explicit_v8_authorization_record() {
         commitment,
     });
     assert!(matches!(
-        replay_records(forged),
+        replay_unframed(forged),
         Err(ReplayError::InvalidHistory(
             "purge authorization does not bind the exact committed object"
         ))
@@ -3272,7 +3324,7 @@ fn v10_purge_claim_and_progress_replay_fail_closed_on_every_invalid_shape() {
     ];
     for records in cases {
         assert!(matches!(
-            replay_records(records),
+            replay_unframed(records),
             Err(ReplayError::InvalidHistory(_))
         ));
     }
@@ -3285,7 +3337,7 @@ fn v10_purge_claim_and_progress_replay_fail_closed_on_every_invalid_shape() {
         commitment,
     });
     assert!(matches!(
-        replay_records(forged_claim),
+        replay_unframed(forged_claim),
         Err(ReplayError::InvalidHistory(
             "purge claim is not bound to the exact authorized object"
         ))
@@ -3724,22 +3776,17 @@ fn applied_tree_seal_mode_index_matches_the_scan_it_replaced() {
     ];
 
     for (name, permissions, expected) in cases {
-        let mut wal = SealWal::new(FaultWriter::default()).unwrap();
-        // These projection cases include records that WAL admission rejects.
-        for (owner, permission) in &permissions {
-            wal.ledgers
-                .entry(*owner)
-                .or_default()
-                .permissions
-                .insert(permission.mutation_id, permission.clone());
-        }
-        let indexed = wal.applied_tree_seal_modes(tx(1)).mode(
-            Path::new(PATH),
-            DEVICE,
-            INODE,
-            INCARNATION,
-            PRE_MODE,
-        );
+        // The projection is compared on the records themselves, not through a
+        // WAL. These cases include records no frame can hold -- an intent whose
+        // evidence and expected mode disagree is refused by the decoder -- and
+        // the projection has to answer for those too.
+        let indexed = AppliedTreeSealModes::from_permissions(
+            permissions
+                .iter()
+                .filter(|(owner, _)| *owner == tx(1))
+                .map(|(_, record)| record),
+        )
+        .mode(Path::new(PATH), DEVICE, INODE, INCARNATION, PRE_MODE);
         let scanned = AppliedTreeSealModes::mode_by_scan(
             permissions
                 .iter()
@@ -3850,4 +3897,5 @@ fn compaction_keeps_a_terminal_transaction_whose_group_is_unfinished() {
     );
 }
 
+mod frame_index;
 mod permission_ledger;

@@ -18,6 +18,7 @@ use crate::staging::rename::{FreshlyConfirmedSourceResident, ParentsSyncedApplie
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::num::NonZeroU32;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -518,12 +519,199 @@ impl SealRecord {
     }
 }
 
+/// Where one frame sits in the WAL it was written to.
+///
+/// A frame is at most `HEADER_LEN + MAX_PAYLOAD_LEN` bytes and the whole file
+/// at most `MAX_WAL_LEN`, which is 64 MiB against the 4 GiB a `u32` holds, so
+/// both fields fit with room to spare. [`FrameExtent::new`] is the only
+/// constructor and refuses anything outside those bounds, so an extent cannot
+/// name bytes no WAL could hold.
+///
+/// The length is a [`NonZeroU32`] because a frame always carries at least its
+/// own header. That makes `Option<FrameExtent>` the same eight bytes as an
+/// extent, which matters: the ledger keeps one per admitted intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameExtent {
+    start: u32,
+    len: NonZeroU32,
+}
+
+impl FrameExtent {
+    fn new(start: usize, len: usize) -> Option<Self> {
+        let end = start.checked_add(len)?;
+        if !(HEADER_LEN..=HEADER_LEN + MAX_PAYLOAD_LEN).contains(&len) || end as u64 > MAX_WAL_LEN {
+            return None;
+        }
+        Some(Self {
+            start: start.try_into().ok()?,
+            len: NonZeroU32::new(len.try_into().ok()?)?,
+        })
+    }
+
+    fn start(self) -> u64 {
+        u64::from(self.start)
+    }
+
+    fn len(self) -> usize {
+        self.len.get() as usize
+    }
+
+    /// The frame this extent names, out of the bytes it is an offset into.
+    ///
+    /// `None` when those bytes do not reach the whole extent, which a caller
+    /// turns into a refusal: an extent that overruns the bytes it is read
+    /// against names a frame nobody committed.
+    fn of(self, bytes: &[u8]) -> Option<&[u8]> {
+        let start = usize::try_from(self.start()).ok()?;
+        bytes.get(start..start.checked_add(self.len())?)
+    }
+}
+
+/// Why a permission record could not be read back out of the WAL.
+///
+/// Every variant is a refusal, never a fallback: a decision that asked for a
+/// record and did not get the exact one it indexed must not continue on a
+/// record it decoded from somewhere else.
+#[derive(Debug, thiserror::Error)]
+pub enum PermissionReadError {
+    #[error("permission intent {mutation_id} was never framed and cannot be read back")]
+    Unframed { mutation_id: u64 },
+    #[error("reading the frame of permission intent {mutation_id} failed: {source}")]
+    Io {
+        mutation_id: u64,
+        #[source]
+        source: io::Error,
+    },
+    #[error("the frame recorded for permission intent {mutation_id} does not hold it: {reason}")]
+    Mismatch {
+        mutation_id: u64,
+        reason: &'static str,
+    },
+}
+
+/// Decodes the permission intent a ledger entry points at, and refuses any
+/// frame that is not the one the entry indexed.
+///
+/// The verification is the point. An extent is an offset into a file that
+/// appends, so a wrong or stale one still lands on a valid, checksummed frame;
+/// without checking what came back, a decision would silently act on another
+/// mutation's record. The frame names its own transaction and mutation id, and
+/// no two admitted frames share that pair.
+///
+/// Phase and resolution come from the entry because no intent frame carries
+/// them: the phase is the transaction state the intent was admitted under, and
+/// the resolution arrives in a later `PermissionApplied` or
+/// `PermissionNotApplied` frame.
+fn decode_indexed_intent(
+    frame: &[u8],
+    transaction: TransactionId,
+    mutation_id: u64,
+    entry: &permission_ledger::PermissionEntry,
+) -> Result<DurablePermission, PermissionReadError> {
+    let mismatch = |reason| PermissionReadError::Mismatch {
+        mutation_id,
+        reason,
+    };
+    // The checks replay applied when it indexed this frame, applied again: the
+    // bytes are read back later, and a header that changed in between would
+    // otherwise be read here and refused by the next replay.
+    let CheckedFrame { version, payload } = check_frame(frame, 0)
+        .map_err(|_| mismatch("frame fails the checks replay applies"))?
+        .filter(|checked| HEADER_LEN + checked.payload.len() == frame.len())
+        .ok_or(mismatch(
+            "frame's declared length does not match its extent",
+        ))?;
+    let record =
+        decode_record(payload, 0, version).map_err(|_| mismatch("payload is malformed"))?;
+    let SealRecord::PermissionIntent {
+        transaction: framed_transaction,
+        mutation_id: framed_mutation_id,
+        evidence,
+        pre_mode,
+        expected_mode,
+        reverses_mutation_id,
+    } = record
+    else {
+        return Err(mismatch("frame is not a permission intent"));
+    };
+    // Append refuses a duplicate mutation id and replay refuses a duplicate
+    // intent, so at most one admitted frame carries this pair. Checking it is
+    // therefore enough to identify the frame; checking the inverse binding on
+    // top of it could never fail, and a check that cannot fail is not a check.
+    if framed_transaction != transaction || framed_mutation_id != mutation_id {
+        return Err(mismatch("frame belongs to another mutation"));
+    }
+    Ok(DurablePermission {
+        mutation_id,
+        phase: entry.phase,
+        evidence,
+        pre_mode,
+        expected_mode,
+        reverses_mutation_id,
+        application: entry.application,
+    })
+}
+
+/// Reads one indexed permission intent out of WAL bytes already in memory.
+///
+/// Replay reads this way because it has no writer: the bytes it is replaying
+/// are the file. The [`SealWal`] reads the same frames through its writer, and
+/// both answer with [`decode_indexed_intent`], so a record is verified against
+/// its extent the same way whichever side asked.
+fn read_framed_intent(
+    frames: &[u8],
+    transaction: TransactionId,
+    mutation_id: u64,
+    entry: &permission_ledger::PermissionEntry,
+) -> Result<DurablePermission, PermissionReadError> {
+    let extent = entry
+        .frame
+        .ok_or(PermissionReadError::Unframed { mutation_id })?;
+    let frame = extent.of(frames).ok_or(PermissionReadError::Io {
+        mutation_id,
+        source: short_committed_read(),
+    })?;
+    decode_indexed_intent(frame, transaction, mutation_id, entry)
+}
+
 /// The durability surface needed by [`SealWal`]. Tests can inject short writes
 /// and sync failures without making filesystem mutations.
 pub trait DurableWrite: Write {
     fn sync_record(&mut self) -> io::Result<()>;
     /// Positions this writer at its physical EOF and returns that length.
     fn prepare_append(&mut self) -> io::Result<u64>;
+    /// Fills `into` from the already-committed bytes beginning at `start`.
+    ///
+    /// Takes `&self` and leaves the append position alone, so a frame can be
+    /// read back while the WAL is borrowed immutably and without disturbing the
+    /// writer an append is about to use. A short read is an error: a caller asks
+    /// for the exact extent of a frame it already knows is committed.
+    fn read_committed(&self, start: u64, into: &mut [u8]) -> io::Result<()>;
+}
+
+/// Reads `extent` out of `bytes`, for the fixture writers that keep the WAL in
+/// memory. [`File`] and [`RecoverySession`] are the only production writers.
+#[cfg(test)]
+pub(crate) fn read_committed_from_memory(
+    bytes: &[u8],
+    start: u64,
+    into: &mut [u8],
+) -> io::Result<()> {
+    let start = usize::try_from(start).map_err(|_| short_committed_read())?;
+    let end = start
+        .checked_add(into.len())
+        .ok_or_else(short_committed_read)?;
+    let frame = bytes.get(start..end).ok_or_else(short_committed_read)?;
+    into.copy_from_slice(frame);
+    Ok(())
+}
+
+/// What a reader says when the bytes it was given stop inside a frame extent.
+fn short_committed_read() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "WAL holds fewer bytes than the frame extent names",
+    )
 }
 
 impl DurableWrite for File {
@@ -533,6 +721,10 @@ impl DurableWrite for File {
 
     fn prepare_append(&mut self) -> io::Result<u64> {
         self.seek(SeekFrom::End(0))
+    }
+
+    fn read_committed(&self, start: u64, into: &mut [u8]) -> io::Result<()> {
+        std::os::unix::fs::FileExt::read_exact_at(self, into, start)
     }
 }
 
@@ -610,6 +802,16 @@ impl<W: DurableWrite> SealWal<W> {
     }
 
     fn append_synced(&mut self, record: &SealRecord) -> Result<(), AppendError> {
+        self.append_synced_at(record).map(|_| ())
+    }
+
+    /// Appends like [`Self::append_synced`] and says where the frame landed.
+    ///
+    /// Only the permission intent asks: it is the one record a later decision
+    /// reads back, so its extent is what the ledger indexes instead of keeping
+    /// the record itself. The extent is known exactly here and nowhere else --
+    /// the frame starts at the length this append is committing from.
+    fn append_synced_at(&mut self, record: &SealRecord) -> Result<FrameExtent, AppendError> {
         if self.poisoned {
             return Err(AppendError::Poisoned);
         }
@@ -625,6 +827,16 @@ impl<W: DurableWrite> SealWal<W> {
                 limit: self.max_wal_len,
             });
         }
+        // `max_wal_len` is at most `MAX_WAL_LEN` and a frame at most
+        // `HEADER_LEN + MAX_PAYLOAD_LEN`, which is exactly what a `FrameExtent`
+        // admits, so the extent is built before the write rather than being
+        // reported as uncertain after it.
+        let extent = usize::try_from(self.committed_len)
+            .ok()
+            .and_then(|start| FrameExtent::new(start, frame.len()))
+            .ok_or(AppendError::TotalSize {
+                limit: self.max_wal_len,
+            })?;
         let result = self
             .writer
             .write_all(&frame)
@@ -634,7 +846,7 @@ impl<W: DurableWrite> SealWal<W> {
             return Err(AppendError::Io(error));
         }
         self.committed_len = next_len;
-        Ok(())
+        Ok(extent)
     }
 
     pub fn into_inner(self) -> W {
@@ -799,18 +1011,57 @@ impl<W: DurableWrite> SealWal<W> {
         })
     }
 
+    /// Reads one indexed permission intent back out of the WAL.
+    ///
+    /// The read is positioned and takes `&self`, so it neither moves the append
+    /// position nor needs the WAL mutably: asking for a record is a question
+    /// about bytes that are already durable.
+    fn read_permission_record(
+        &self,
+        transaction: TransactionId,
+        mutation_id: u64,
+        entry: &permission_ledger::PermissionEntry,
+    ) -> Result<DurablePermission, PermissionReadError> {
+        let extent = entry
+            .frame
+            .ok_or(PermissionReadError::Unframed { mutation_id })?;
+        let mut frame = vec![0; extent.len()];
+        self.writer
+            .read_committed(extent.start(), &mut frame)
+            .map_err(|source| PermissionReadError::Io {
+                mutation_id,
+                source,
+            })?;
+        decode_indexed_intent(&frame, transaction, mutation_id, entry)
+    }
+
     /// This transaction's durable permission intents, by mutation id.
     ///
     /// Separate from [`Self::recovery_snapshot`] because most recovery
     /// decisions never reach a record: a committed trash entry is preserved on
     /// its state alone, and a snapshot that carried the records charged every
     /// such decision for a copy of them.
-    pub(crate) fn permission_records(&self, transaction: TransactionId) -> Vec<DurablePermission> {
-        self.ledgers
-            .get(&transaction)
-            .map_or_else(Vec::new, |ledger| {
-                ledger.permissions.values().cloned().collect()
+    ///
+    /// Each record is decoded from the frame it was written as. The ledger
+    /// holds no copy to fall back on, which is the point: a transaction's
+    /// records cost what their frames cost and nothing resident.
+    ///
+    /// A record that cannot be read back is an error rather than an omission:
+    /// a caller handed a short list would read it as a transaction holding
+    /// fewer permissions than it does.
+    pub(crate) fn permission_records(
+        &self,
+        transaction: TransactionId,
+    ) -> Result<Vec<DurablePermission>, PermissionReadError> {
+        let Some(ledger) = self.ledgers.get(&transaction) else {
+            return Ok(Vec::new());
+        };
+        ledger
+            .entries()
+            .map(|(mutation_id, entry)| {
+                self.read_permission_record(transaction, mutation_id, entry)
             })
+            .collect()
     }
 
     /// This transaction's applied tree seals, indexed by the path each one names.
@@ -823,13 +1074,10 @@ impl<W: DurableWrite> SealWal<W> {
     pub(crate) fn applied_tree_seal_modes(
         &self,
         transaction: TransactionId,
-    ) -> AppliedTreeSealModes {
-        AppliedTreeSealModes::from_permissions(
-            self.ledgers
-                .get(&transaction)
-                .into_iter()
-                .flat_map(|ledger| ledger.permissions.values()),
-        )
+    ) -> Result<AppliedTreeSealModes, PermissionReadError> {
+        Ok(AppliedTreeSealModes::from_permissions(
+            self.permission_records(transaction)?.iter(),
+        ))
     }
 
     /// Allocates the next transaction-local mutation id for startup recovery.
@@ -1588,17 +1836,23 @@ impl<W: DurableWrite> SealWal<W> {
                 | TransactionState::RollbackIntent
                 | TransactionState::UndoIntent
                 | TransactionState::Quarantined,
-                Some(original),
+                Some(original_id),
             ) => {
-                let Some(original) = self
+                let Some(entry) = self
                     .ledgers
                     .get(&transaction)
-                    .and_then(|ledger| ledger.permissions.get(&original))
+                    .and_then(|ledger| ledger.entry(original_id))
+                    .copied()
                 else {
                     return Err(MutationAppendError::IntentWal(AppendError::InvalidState(
                         "permission inverse references no durable mutation",
                     )));
                 };
+                // The seal this intent claims to reverse is read back out of
+                // its own frame. Nothing resident holds its evidence or its
+                // modes, so the comparison below is against what was written,
+                // not against a copy that was kept to make it cheap.
+                let original = self.read_permission_record(transaction, original_id, &entry)?;
                 if original.application != ApplicationStatus::Applied
                     || !matches!(
                         original.phase,
@@ -1615,9 +1869,10 @@ impl<W: DurableWrite> SealWal<W> {
                         }))
                     || intent.pre_mode != original.expected_mode
                     || intent.expected_mode != original.pre_mode
-                    || self.ledgers.get(&transaction).is_some_and(|ledger| {
-                        ledger.active_inverses.contains_key(&original.mutation_id)
-                    })
+                    || self
+                        .ledgers
+                        .get(&transaction)
+                        .is_some_and(|ledger| ledger.active_inverses.contains_key(&original_id))
                 {
                     return Err(MutationAppendError::IntentWal(AppendError::InvalidState(
                         "permission inverse does not match its applied seal mutation",
@@ -1633,7 +1888,7 @@ impl<W: DurableWrite> SealWal<W> {
         if self
             .ledgers
             .get(&transaction)
-            .is_some_and(|ledger| ledger.permissions.contains_key(&mutation_id))
+            .is_some_and(|ledger| ledger.entry(mutation_id).is_some())
         {
             return Err(MutationAppendError::IntentWal(AppendError::InvalidState(
                 "duplicate permission mutation id",
@@ -1642,12 +1897,11 @@ impl<W: DurableWrite> SealWal<W> {
         // The ledger takes the intent only once its frame is durable, so a
         // failed append leaves the mutation id unused instead of needing to be
         // taken back out of an index that already counted it.
-        self.append_synced(&intent.clone().into_record())
+        let frame = self
+            .append_synced_at(&intent.clone().into_record())
             .map_err(MutationAppendError::IntentWal)?;
-        self.ledgers
-            .entry(transaction)
-            .or_default()
-            .record_intent(DurablePermission {
+        self.ledgers.entry(transaction).or_default().record_intent(
+            DurablePermission {
                 mutation_id,
                 phase: phase.unwrap(),
                 evidence: intent.evidence,
@@ -1655,7 +1909,9 @@ impl<W: DurableWrite> SealWal<W> {
                 expected_mode: intent.expected_mode,
                 reverses_mutation_id: intent.reverses_mutation_id,
                 application: ApplicationStatus::IntentDurableApplicationUnknown,
-            });
+            },
+            Some(frame),
+        );
         mutate().map_err(MutationAppendError::Mutation)?;
         self.append_synced(&SealRecord::PermissionApplied {
             transaction,
@@ -1715,18 +1971,21 @@ impl<W: DurableWrite> SealWal<W> {
     where
         F: FnOnce(&DurablePermission) -> io::Result<PermissionResolution>,
     {
-        let permission = self
+        let entry = self
             .ledgers
             .get(&transaction)
-            .and_then(|ledger| ledger.permissions.get(&mutation_id))
-            .filter(|permission| {
-                permission.application == ApplicationStatus::IntentDurableApplicationUnknown
-            })
+            .and_then(|ledger| ledger.entry(mutation_id))
+            .copied()
+            .filter(|entry| entry.application == ApplicationStatus::IntentDurableApplicationUnknown)
             .ok_or(ResolveError::NotUnresolved)?;
-        if self.states.get(&transaction).copied() != Some(permission.phase) {
+        if self.states.get(&transaction).copied() != Some(entry.phase) {
             return Err(ResolveError::WrongPhase);
         }
-        let resolution = resolve(permission).map_err(ResolveError::Recovery)?;
+        // Both refusals above are answered from what the ledger keeps resident,
+        // so a frame is read only once this intent is known to be the one being
+        // resolved, and only because the resolver is handed the whole record.
+        let permission = self.read_permission_record(transaction, mutation_id, &entry)?;
+        let resolution = resolve(&permission).map_err(ResolveError::Recovery)?;
         let record = match resolution {
             PermissionResolution::Applied => SealRecord::PermissionApplied {
                 transaction,
@@ -1781,6 +2040,12 @@ pub enum MutationAppendError {
         source: AppendError,
         mutation_applied: bool,
     },
+    /// The seal an inverse claims to reverse could not be read back out of the
+    /// WAL, so there is nothing to validate the inverse against. Refusing is
+    /// the only answer: the alternative is admitting an inverse whose original
+    /// was never confirmed to match it.
+    #[error("the seal this permission inverse reverses could not be read back: {0}")]
+    PermissionRecord(#[from] PermissionReadError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1806,6 +2071,10 @@ pub enum ResolveError {
     Recovery(#[source] io::Error),
     #[error("permission resolution record was not durable: {0}")]
     Wal(#[source] AppendError),
+    /// The intent being resolved could not be read back out of the WAL, so the
+    /// authorized resolver has no record to decide on.
+    #[error("the permission intent being resolved could not be read back: {0}")]
+    PermissionRecord(#[from] PermissionReadError),
 }
 
 /// One applied tree seal, as the index holds it.
@@ -1975,13 +2244,22 @@ impl Replay {
     /// Test-only: production moves these ledgers into the WAL and asks the WAL
     /// ([`SealWal::permission_records`]). Reading records off a replay is what
     /// a test does when it exercises replay without resuming one.
+    ///
+    /// `frames` is the bytes the replay was given, because a replay holds no
+    /// writer and the records are the frames.
     #[cfg(test)]
-    pub(crate) fn permission_records(&self, transaction: TransactionId) -> Vec<DurablePermission> {
-        self.ledgers
-            .get(&transaction)
-            .map_or_else(Vec::new, |ledger| {
-                ledger.permissions.values().cloned().collect()
-            })
+    pub(crate) fn permission_records(
+        &self,
+        transaction: TransactionId,
+        frames: &[u8],
+    ) -> Result<Vec<DurablePermission>, PermissionReadError> {
+        let Some(ledger) = self.ledgers.get(&transaction) else {
+            return Ok(Vec::new());
+        };
+        ledger
+            .entries()
+            .map(|(mutation_id, entry)| read_framed_intent(frames, transaction, mutation_id, entry))
+            .collect()
     }
 }
 
@@ -2155,6 +2433,12 @@ pub enum ReplayError {
     InvalidHistory(&'static str),
     #[error("seal WAL exceeds the {limit} byte startup-recovery limit")]
     TooLarge { limit: u64 },
+    /// A record this replay had to read again could not be read back out of
+    /// the frames it was given. Distinct from [`Self::InvalidHistory`] so a
+    /// history that is sound but unreadable cannot be reported as one that is
+    /// unsound.
+    #[error("a record this replay had to read again could not be read back: {0}")]
+    PermissionRecord(#[from] PermissionReadError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2278,7 +2562,7 @@ impl RecoverySession {
                     *totals.entry(span.transaction).or_default() += (span.end - span.start) as u64;
                     totals
                 });
-        let mut replay = replay_records(parsed.records)?;
+        let mut replay = replay_records(parsed.records, &bytes)?;
         replay.frame_bytes = frame_bytes;
         if parsed.committed_len < bytes.len() {
             file.set_len(parsed.committed_len as u64)?;
@@ -2345,6 +2629,23 @@ impl RecoverySession {
         self.replay.take()
     }
 
+    /// The committed bytes this session replayed.
+    ///
+    /// Test-only: production resumes the session into a [`SealWal`] and asks
+    /// the WAL for a record, which reads these same bytes through this same
+    /// lease. A test that drives a replay without resuming it needs the bytes
+    /// in hand, because the records are the frames.
+    #[cfg(test)]
+    pub(crate) fn committed_frames(&self) -> io::Result<Vec<u8>> {
+        let committed = self
+            .replay
+            .as_ref()
+            .map_or(0, |replay| replay.committed_len);
+        let mut frames = vec![0; usize::try_from(committed).map_err(io::Error::other)?];
+        self.read_committed(0, &mut frames)?;
+        Ok(frames)
+    }
+
     /// Reads back a synced compaction entry and confirms it replays to exactly
     /// the transactions and states that were meant to survive, with no partial
     /// trailing frame. A compaction that cannot prove this never replaces the
@@ -2378,7 +2679,7 @@ impl RecoverySession {
                 reason: "compaction entry ends in a partial frame",
             });
         }
-        let replayed = replay_records(parsed.records)?;
+        let replayed = replay_records(parsed.records, &bytes)?;
         let states = replayed
             .transactions
             .iter()
@@ -2450,6 +2751,10 @@ impl DurableWrite for RecoverySession {
 
     fn prepare_append(&mut self) -> io::Result<u64> {
         self.lock.as_file_mut().seek(SeekFrom::End(0))
+    }
+
+    fn read_committed(&self, start: u64, into: &mut [u8]) -> io::Result<()> {
+        self.lock.as_file().read_committed(start, into)
     }
 }
 
@@ -2568,35 +2873,35 @@ pub fn decide_recovery<F, R>(
     transaction: &ReplayedTransaction,
     records: R,
     identity: F,
-) -> RecoveryWork
+) -> Result<RecoveryWork, PermissionReadError>
 where
     F: Fn(&PersistentRecoveryEvidence) -> RecoveryIdentity,
-    R: FnOnce() -> Vec<DurablePermission>,
+    R: FnOnce() -> Result<Vec<DurablePermission>, PermissionReadError>,
 {
     if let Some(version @ 0..=3) = transaction.staging_schema_version
         && staging_recovery_needs_mount_authority(transaction)
     {
-        return RecoveryWork::RecoveryRequired {
+        return Ok(RecoveryWork::RecoveryRequired {
             transaction: transaction.id,
             reason: RecoveryRequiredReason::LegacySchemaMissingMountIdentity { version },
-        };
+        });
     }
     if transaction.state == TransactionState::PurgeOutcome {
-        return RecoveryWork::FinalizePurge {
+        return Ok(RecoveryWork::FinalizePurge {
             transaction: transaction.id,
-        };
+        });
     }
     if transaction.state == TransactionState::PurgeIntent {
-        return RecoveryWork::RecoveryRequired {
+        return Ok(RecoveryWork::RecoveryRequired {
             transaction: transaction.id,
             reason: RecoveryRequiredReason::InterruptedPurge,
-        };
+        });
     }
     if transaction.state == TransactionState::RecoveryRequired {
-        return RecoveryWork::RecoveryRequired {
+        return Ok(RecoveryWork::RecoveryRequired {
             transaction: transaction.id,
             reason: RecoveryRequiredReason::RecordedRecoveryRequired,
-        };
+        });
     }
     if matches!(
         transaction.state,
@@ -2604,25 +2909,41 @@ where
             | TransactionState::Purgeable
             | TransactionState::Purged
     ) {
-        return RecoveryWork::PreserveCommittedSeal {
+        return Ok(RecoveryWork::PreserveCommittedSeal {
             transaction: transaction.id,
             state: transaction.state,
-        };
+        });
     }
     if transaction.state == TransactionState::UndoConflict {
-        return RecoveryWork::PreserveUndoConflict {
+        return Ok(RecoveryWork::PreserveUndoConflict {
             transaction: transaction.id,
-        };
+        });
     }
     if matches!(
         transaction.state,
         TransactionState::Restored | TransactionState::RolledBack
     ) {
-        return RecoveryWork::Nothing;
+        return Ok(RecoveryWork::Nothing);
     }
     // Every state that reaches here decides from the records, and every state
-    // above returned without them.
-    let records = records();
+    // above returned without them, which is why they are read behind a closure
+    // rather than handed in.
+    Ok(decide_from_records(transaction, records()?, identity))
+}
+
+/// The half of the decision that reads the transaction's permission records.
+///
+/// Split from [`decide_recovery`] so the boundary is in the types: the states
+/// above cannot reach a record, and this half cannot fail, because by the time
+/// it runs the records have already been read.
+fn decide_from_records<F>(
+    transaction: &ReplayedTransaction,
+    records: Vec<DurablePermission>,
+    identity: F,
+) -> RecoveryWork
+where
+    F: Fn(&PersistentRecoveryEvidence) -> RecoveryIdentity,
+{
     let uncertain = records
         .iter()
         .filter(|permission| {
@@ -2785,6 +3106,10 @@ fn sort_permissions_deepest_first(permissions: &mut [DurablePermission]) {
 struct VersionedRecord {
     version: u16,
     record: SealRecord,
+    /// Where the frame this record was decoded from sits in the file. `None`
+    /// for a record a fixture built in memory, which was never framed and so
+    /// cannot be read back.
+    frame: Option<FrameExtent>,
 }
 
 trait IntoVersionedRecord {
@@ -2811,6 +3136,7 @@ impl IntoVersionedRecord for SealRecord {
         VersionedRecord {
             version,
             record: self,
+            frame: None,
         }
     }
 }
@@ -2831,59 +3157,80 @@ struct FrameSpan {
     end: usize,
 }
 
+/// One frame that passed [`check_frame`].
+struct CheckedFrame<'a> {
+    version: u16,
+    payload: &'a [u8],
+}
+
+/// Checks the frame that starts at `offset`: its magic, header checksum, a
+/// version this binary reads, clear reserved bits, a declared length within
+/// bounds, and its payload checksum.
+///
+/// `Ok(None)` is a frame the bytes end inside of. Replay reads that as an
+/// uncommitted tail; a read of one indexed frame reads it as a declared length
+/// that overruns the extent.
+fn check_frame(bytes: &[u8], offset: usize) -> Result<Option<CheckedFrame<'_>>, ReplayError> {
+    if bytes.len() - offset < HEADER_LEN {
+        return Ok(None);
+    }
+    let header = &bytes[offset..offset + HEADER_LEN];
+    if &header[..4] != MAGIC {
+        return Err(ReplayError::Malformed {
+            offset: offset as u64,
+            reason: "bad frame magic",
+        });
+    }
+    let expected_header_crc = u32::from_le_bytes(header[12..16].try_into().unwrap());
+    if crc32(&header[4..12]) != expected_header_crc {
+        return Err(ReplayError::HeaderChecksum {
+            offset: offset as u64,
+        });
+    }
+    let version = u16::from_le_bytes([header[4], header[5]]);
+    if !matches!(version, 1 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | VERSION) {
+        return Err(ReplayError::UnsupportedLegacyVersion {
+            offset: offset as u64,
+            version,
+        });
+    }
+    if header[6] != 0 || header[7] != 0 {
+        return Err(ReplayError::Malformed {
+            offset: offset as u64,
+            reason: "nonzero reserved header bits",
+        });
+    }
+    let payload_len = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+    if payload_len > MAX_PAYLOAD_LEN {
+        return Err(ReplayError::Malformed {
+            offset: offset as u64,
+            reason: "frame exceeds maximum size",
+        });
+    }
+    let frame_len = HEADER_LEN + payload_len;
+    if bytes.len() - offset < frame_len {
+        return Ok(None);
+    }
+    let expected = u32::from_le_bytes(header[16..20].try_into().unwrap());
+    let payload = &bytes[offset + HEADER_LEN..offset + frame_len];
+    if crc32(payload) != expected {
+        return Err(ReplayError::Checksum {
+            offset: offset as u64,
+        });
+    }
+    Ok(Some(CheckedFrame { version, payload }))
+}
+
 fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
     let mut records = Vec::new();
     let mut spans = Vec::new();
     let mut offset = 0;
     let mut last_version = None;
     while offset < bytes.len() {
-        if bytes.len() - offset < HEADER_LEN {
+        let Some(CheckedFrame { version, payload }) = check_frame(bytes, offset)? else {
             break;
-        }
-        let header = &bytes[offset..offset + HEADER_LEN];
-        if &header[..4] != MAGIC {
-            return Err(ReplayError::Malformed {
-                offset: offset as u64,
-                reason: "bad frame magic",
-            });
-        }
-        let expected_header_crc = u32::from_le_bytes(header[12..16].try_into().unwrap());
-        if crc32(&header[4..12]) != expected_header_crc {
-            return Err(ReplayError::HeaderChecksum {
-                offset: offset as u64,
-            });
-        }
-        let version = u16::from_le_bytes([header[4], header[5]]);
-        if !matches!(version, 1 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | VERSION) {
-            return Err(ReplayError::UnsupportedLegacyVersion {
-                offset: offset as u64,
-                version,
-            });
-        }
-        if header[6] != 0 || header[7] != 0 {
-            return Err(ReplayError::Malformed {
-                offset: offset as u64,
-                reason: "nonzero reserved header bits",
-            });
-        }
-        let payload_len = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
-        if payload_len > MAX_PAYLOAD_LEN {
-            return Err(ReplayError::Malformed {
-                offset: offset as u64,
-                reason: "frame exceeds maximum size",
-            });
-        }
-        let frame_len = HEADER_LEN + payload_len;
-        if bytes.len() - offset < frame_len {
-            break;
-        }
-        let expected = u32::from_le_bytes(header[16..20].try_into().unwrap());
-        let payload = &bytes[offset + HEADER_LEN..offset + frame_len];
-        if crc32(payload) != expected {
-            return Err(ReplayError::Checksum {
-                offset: offset as u64,
-            });
-        }
+        };
+        let frame_len = HEADER_LEN + payload.len();
         let record = decode_record(payload, offset as u64, version)?;
         if last_version.is_some_and(|previous| version < previous) {
             return Err(ReplayError::InvalidHistory("WAL frame version regressed"));
@@ -2894,7 +3241,16 @@ fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
             start: offset,
             end: offset + frame_len,
         });
-        records.push(VersionedRecord { version, record });
+        records.push(VersionedRecord {
+            version,
+            record,
+            // The parse has just validated this frame's header, length and
+            // payload checksum at this offset, so the extent names bytes the
+            // file is known to hold. `FrameExtent::new` cannot refuse a frame
+            // `parse_frames` admitted, and a refusal here would mean the loop
+            // above let through a frame no WAL could contain.
+            frame: FrameExtent::new(offset, frame_len),
+        });
         offset += frame_len;
     }
     Ok(ParsedFrames {
@@ -2918,7 +3274,17 @@ struct ReplayBuilding {
     purge_last_path: Option<PathBuf>,
 }
 
-fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, ReplayError> {
+/// Replays records into transaction state, reading back whatever earlier
+/// record a later one has to be validated against.
+///
+/// `frames` is the WAL bytes these records were parsed out of. Replay holds no
+/// writer, so a record it needs again comes from here rather than from a
+/// resident copy; records a fixture built without framing them carry no extent
+/// and a replay that needs one of those refuses.
+fn replay_records<R: IntoVersionedRecord>(
+    records: Vec<R>,
+    frames: &[u8],
+) -> Result<Replay, ReplayError> {
     let mut transactions: BTreeMap<TransactionId, ReplayBuilding> = BTreeMap::new();
     let mut transaction_order = Vec::new();
     for record in records {
@@ -3297,14 +3663,9 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                         })
                         && match reverses_mutation_id {
                             None => phase == TransactionState::ParentSealIntent,
-                            Some(original) => {
-                                tx.ledger
-                                    .permissions
-                                    .get(&original)
-                                    .is_some_and(|permission| {
-                                        permission.phase == TransactionState::ParentSealIntent
-                                    })
-                            }
+                            Some(original) => tx.ledger.entry(original).is_some_and(|entry| {
+                                entry.phase == TransactionState::ParentSealIntent
+                            }),
                         };
                     if !exact_v11_parent {
                         return Err(ReplayError::InvalidHistory(
@@ -3312,11 +3673,13 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                         ));
                     }
                 }
-                if tx.ledger.permissions.contains_key(&mutation_id) {
+                if tx.ledger.entry(mutation_id).is_some() {
                     return Err(ReplayError::InvalidHistory("duplicate permission intent"));
                 }
                 validate_replayed_inverse(
                     &tx.ledger,
+                    frames,
+                    id,
                     tx.staging.as_ref(),
                     phase,
                     &evidence,
@@ -3324,15 +3687,18 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
                     expected_mode,
                     reverses_mutation_id,
                 )?;
-                tx.ledger.record_intent(DurablePermission {
-                    mutation_id,
-                    phase,
-                    evidence,
-                    pre_mode,
-                    expected_mode,
-                    reverses_mutation_id,
-                    application: ApplicationStatus::IntentDurableApplicationUnknown,
-                });
+                tx.ledger.record_intent(
+                    DurablePermission {
+                        mutation_id,
+                        phase,
+                        evidence,
+                        pre_mode,
+                        expected_mode,
+                        reverses_mutation_id,
+                        application: ApplicationStatus::IntentDurableApplicationUnknown,
+                    },
+                    versioned.frame,
+                );
             }
             SealRecord::UndoRenameOutcome { outcome, .. } => {
                 if tx.state != Some(TransactionState::UndoRenameIntent)
@@ -3418,6 +3784,8 @@ fn replay_records<R: IntoVersionedRecord>(records: Vec<R>) -> Result<Replay, Rep
 #[allow(clippy::too_many_arguments)]
 fn validate_replayed_inverse(
     ledger: &PermissionLedger,
+    frames: &[u8],
+    transaction: TransactionId,
     staging: Option<&StagingTransactionMetadata>,
     phase: TransactionState,
     evidence: &PersistentRecoveryEvidence,
@@ -3435,13 +3803,15 @@ fn validate_replayed_inverse(
             | TransactionState::Quarantined,
             Some(original_id),
         ) => {
-            let original =
-                ledger
-                    .permissions
-                    .get(&original_id)
-                    .ok_or(ReplayError::InvalidHistory(
-                        "permission inverse references no mutation in its transaction",
-                    ))?;
+            let entry = *ledger
+                .entry(original_id)
+                .ok_or(ReplayError::InvalidHistory(
+                    "permission inverse references no mutation in its transaction",
+                ))?;
+            // Read back out of the frame the seal was written as, for the same
+            // reason the append path does: the evidence and modes an inverse is
+            // checked against are in the WAL, not in the ledger.
+            let original = read_framed_intent(frames, transaction, original_id, &entry)?;
             if original.application != ApplicationStatus::Applied
                 || original.reverses_mutation_id.is_some()
                 || (phase == TransactionState::SourceParentRestoreIntent
@@ -3474,17 +3844,17 @@ fn resolve_replayed_permission(
     mutation_id: u64,
     resolution: PermissionResolution,
 ) -> Result<(), ReplayError> {
-    let Some(permission) = transaction.ledger.permissions.get(&mutation_id) else {
+    let Some(entry) = transaction.ledger.entry(mutation_id) else {
         return Err(ReplayError::InvalidHistory(
             "permission resolution has no intent",
         ));
     };
-    if transaction.state != Some(permission.phase) {
+    if transaction.state != Some(entry.phase) {
         return Err(ReplayError::InvalidHistory(
             "permission resolution is outside its intent phase",
         ));
     }
-    if permission.application != ApplicationStatus::IntentDurableApplicationUnknown {
+    if entry.application != ApplicationStatus::IntentDurableApplicationUnknown {
         return Err(ReplayError::InvalidHistory(
             "duplicate permission resolution",
         ));

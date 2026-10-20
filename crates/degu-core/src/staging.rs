@@ -21,8 +21,8 @@ use crate::seal::sidecar::{
 };
 use crate::seal::store::{SealWalStore, StoreError};
 use crate::seal::wal::{
-    AppendError, ProductionAssociation, RECOVERY_MAX_ACTIVE_PERMISSIONS, RecoveryIdentity,
-    RecoverySession, RecoveryWork, ReplayError, ReplayedTransaction, SealWal,
+    AppendError, PermissionReadError, ProductionAssociation, RECOVERY_MAX_ACTIVE_PERMISSIONS,
+    RecoveryIdentity, RecoverySession, RecoveryWork, ReplayError, ReplayedTransaction, SealWal,
     StagingTransactionMetadata, StrongObjectIdentity, TransactionId, decide_recovery,
     quarantined_transaction_retains_active_permission_seals,
 };
@@ -63,6 +63,8 @@ pub enum StagingEngineError {
     Wal(#[from] AppendError),
     #[error(transparent)]
     Replay(#[from] ReplayError),
+    #[error("durable permission record could not be read back: {0}")]
+    PermissionRecord(#[from] crate::seal::wal::PermissionReadError),
     #[error("held-tree sidecar cleanup failed: {0}")]
     Sidecar(String),
     #[error("staging recovery metadata is incomplete or inconsistent: {0}")]
@@ -1447,6 +1449,8 @@ impl SealedStagingEngine {
                     |_| RecoveryIdentity::Reestablished,
                 )
             })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
             .filter(recovery_work_requires_candidate)
             .collect::<Vec<_>>();
         work.sort_by_key(recovery_transaction);
@@ -1503,7 +1507,9 @@ impl SealedStagingEngine {
             .iter()
             .map(|candidate| candidate.transaction)
             .collect::<Vec<_>>();
-        let canonical_transactions = self.current_recovery_transactions();
+        let canonical_transactions = self
+            .current_recovery_transactions()
+            .map_err(|error| StartupRecoveryError::new(None, "recovery set", error))?;
         if report.generation != self.recovery_generation
             || report
                 .candidates
@@ -1565,7 +1571,7 @@ impl SealedStagingEngine {
         Ok((ReadyStagingEngine { engine: self }, summary))
     }
 
-    fn current_recovery_transactions(&self) -> Vec<TransactionId> {
+    fn current_recovery_transactions(&self) -> Result<Vec<TransactionId>, PermissionReadError> {
         let mut transactions = self
             .wal
             .recovery_snapshots()
@@ -1577,11 +1583,13 @@ impl SealedStagingEngine {
                     |_| RecoveryIdentity::Reestablished,
                 )
             })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
             .filter(recovery_work_requires_candidate)
             .map(|work| recovery_transaction(&work))
             .collect::<Vec<_>>();
         transactions.sort();
-        transactions
+        Ok(transactions)
     }
 
     #[cfg(test)]
@@ -1654,7 +1662,10 @@ impl SealedStagingEngine {
                 &snapshot,
                 || self.wal.permission_records(transaction),
                 |_| RecoveryIdentity::Reestablished,
-            );
+            )
+            .map_err(|error| {
+                StartupRecoveryError::new(Some(transaction), "permission record", error)
+            })?;
             if let RecoveryWork::RecoveryRequired { reason, .. } = work {
                 if snapshot.state != TransactionState::RecoveryRequired {
                     self.wal

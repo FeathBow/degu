@@ -27,18 +27,35 @@ pub(super) fn assess_source(
     finding: &Finding,
     identity: &EntryIdentity,
 ) -> Result<PreparedSource, String> {
-    require_disposition(finding.disposition().mode)?;
-    let metadata = std::fs::symlink_metadata(finding.path())
-        .map_err(|error| format!("failed to inspect sealed staging source: {error}"))?;
-    if !metadata.is_dir() {
-        return Err("sealed staging currently supports directories only".into());
-    }
+    require_source_shape(finding)?;
     if !identity
         .matches(finding.path())
         .map_err(|error| error.to_string())?
     {
         return Err("clean item identity changed before sealed staging policy checks".into());
     }
+    canonical_source(finding)
+}
+
+/// The source as a preview sees it. A preview has no captured identity to hold
+/// the source to, and needs none: it reports, and staging checks the identity
+/// again before it writes anything.
+pub(super) fn preview_source(finding: &Finding) -> Result<PreparedSource, String> {
+    require_source_shape(finding)?;
+    canonical_source(finding)
+}
+
+fn require_source_shape(finding: &Finding) -> Result<(), String> {
+    require_disposition(finding.disposition().mode)?;
+    let metadata = std::fs::symlink_metadata(finding.path())
+        .map_err(|error| format!("failed to inspect sealed staging source: {error}"))?;
+    if !metadata.is_dir() {
+        return Err("sealed staging currently supports directories only".into());
+    }
+    Ok(())
+}
+
+fn canonical_source(finding: &Finding) -> Result<PreparedSource, String> {
     let canonical_source = std::fs::canonicalize(finding.path())
         .map_err(|error| format!("failed to canonicalize sealed staging source: {error}"))?;
     let canonical_source_parent = canonical_source

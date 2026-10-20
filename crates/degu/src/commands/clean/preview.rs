@@ -6,6 +6,7 @@ use degu_core::backend::{
     HeldTreeRegularHardLinkTopology, HeldTreeRegularXattrTopology,
 };
 use degu_core::finding::Finding;
+use degu_core::seal::wal::{StagingShape, TreeShape, WalRoom, project_begin, project_tree};
 use serde_json::{Map, Value};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -26,6 +27,17 @@ pub(super) enum PreviewStagingStatus {
         regular_hard_links: HeldTreeRegularHardLinkTopology,
         regular_xattrs: HeldTreeRegularXattrTopology,
         directory_xattrs_block_purge: bool,
+        /// What staging this tree will be sized by.
+        tree: TreeShape,
+        /// What its whole life needs in the seal WAL, once measured.
+        wal_needed: Option<u64>,
+    },
+    /// The tree's policy was assessed, but its whole life does not fit in the
+    /// seal WAL beside what the trash and the items before it already hold.
+    WalFull {
+        needed: u64,
+        available: u64,
+        reason: String,
     },
     Blocked {
         kind: &'static str,
@@ -64,6 +76,7 @@ pub(crate) fn staging_refusal(finding: &Finding) -> Option<String> {
     match PreviewStagingAssessment::assess(finding, false, true).status {
         PreviewStagingStatus::TreePolicyAssessed { .. } => None,
         PreviewStagingStatus::Blocked { reason, .. }
+        | PreviewStagingStatus::WalFull { reason, .. }
         | PreviewStagingStatus::DeferredUntilExecutionSeal { reason, .. }
         | PreviewStagingStatus::SealedPathUnavailable { reason, .. } => Some(reason),
     }
@@ -118,7 +131,10 @@ impl PreviewStagingAssessment {
     }
 
     pub(super) fn is_blocked(&self) -> bool {
-        matches!(self.status, PreviewStagingStatus::Blocked { .. })
+        matches!(
+            self.status,
+            PreviewStagingStatus::Blocked { .. } | PreviewStagingStatus::WalFull { .. }
+        )
     }
 
     pub(super) fn needs_execution_validation(&self) -> bool {
@@ -133,6 +149,7 @@ impl PreviewStagingAssessment {
         match &self.status {
             PreviewStagingStatus::TreePolicyAssessed { .. } => None,
             PreviewStagingStatus::Blocked { reason, .. }
+            | PreviewStagingStatus::WalFull { reason, .. }
             | PreviewStagingStatus::DeferredUntilExecutionSeal { reason, .. }
             | PreviewStagingStatus::SealedPathUnavailable { reason, .. } => Some(reason),
         }
@@ -145,6 +162,8 @@ impl PreviewStagingAssessment {
                 regular_hard_links,
                 regular_xattrs,
                 directory_xattrs_block_purge,
+                wal_needed,
+                ..
             } => {
                 let has_hardlinks = regular_hard_links.contains_multi_link_group();
                 let has_xattrs = regular_xattrs.contains_xattrs();
@@ -177,12 +196,32 @@ impl PreviewStagingAssessment {
                         "supported": !directory_xattrs_block_purge,
                         "limitation": limitation,
                     },
+                    "wal_needed": wal_needed,
                     "pending_validation": {
                         "source_parent_seal": "requires_execution",
                         "regular_file_content_read_and_proof": "requires_execution",
                         "runtime_revalidation": "requires_execution",
                     },
                 })
+            }
+            PreviewStagingStatus::WalFull {
+                needed,
+                available,
+                reason,
+            } => {
+                let mut json = blocked_json(
+                    path.into_owned(),
+                    "wal_full",
+                    "resource_limit",
+                    None,
+                    reason,
+                    None,
+                );
+                if let Value::Object(fields) = &mut json {
+                    fields.insert("needed".to_owned(), Value::from(*needed));
+                    fields.insert("available".to_owned(), Value::from(*available));
+                }
+                json
             }
             PreviewStagingStatus::Blocked {
                 kind,
@@ -352,6 +391,12 @@ fn assess_path(path: &Path) -> PreviewStagingStatus {
                 regular_hard_links: tree.regular_hard_links,
                 regular_xattrs: tree.regular_xattrs,
                 directory_xattrs_block_purge: tree.directory_xattrs_block_purge,
+                tree: TreeShape {
+                    directories: tree.directories,
+                    directory_path_bytes: tree.directory_path_bytes,
+                    entries: tree.entries,
+                },
+                wal_needed: None,
             }
         }
         Ok(HeldTreePolicyAssessmentOutcome::TreePolicyDeferredUntilSourceParentSeal { .. }) => {
@@ -362,6 +407,84 @@ fn assess_path(path: &Path) -> PreviewStagingStatus {
                     .to_owned(),
             }
         }
+    }
+}
+
+/// Sizes each assessed item's whole life in the seal WAL, in plan order, and
+/// blocks every one that does not fit beside what the trash already holds and
+/// what the items before it will have left there.
+///
+/// Staging checks the same room under the lease twice: before its first frame,
+/// for the source parent's seal and its undo, and once the tree is planned, for
+/// the rest of the item's life. An item's need here is never less than either
+/// check asks, and its shape rounds the reservation number and the reclamation
+/// id up to their widest, so an item that fits here is admitted there unless
+/// the trash changed in between. One blocked here may still just fit there.
+///
+/// What an item leaves behind is charged as staging would leave it. One that
+/// commits holds the frames it wrote and the allowance its entry keeps, which
+/// is never less than a purge then writes. One whose tree staging refuses --
+/// for its policy, or for room -- has sealed its source parent first and
+/// rolled that back, so it leaves that round trip, or nothing when the first
+/// check refused it too. A tree only the seal can walk is not known here, so
+/// that round trip is all it is charged, which is the least it can leave.
+///
+/// `shape_of` sizes an item from what preflight can see. An item it cannot
+/// size is left as assessed and counts for nothing: on a machine where nothing
+/// is staged yet the trash's parent may not exist to be sized from, and there
+/// the WAL is empty anyway. Staging's own check is the exact one.
+pub(super) fn apply_wal_room(
+    assessments: &mut [PreviewStagingAssessment],
+    planned: &[Finding],
+    mut shape_of: impl FnMut(&Finding) -> Option<StagingShape>,
+    room: WalRoom,
+) {
+    let mut available = room.available();
+    for (assessment, finding) in assessments.iter_mut().zip(planned) {
+        let tree = match &assessment.status {
+            PreviewStagingStatus::TreePolicyAssessed { tree, .. } => Some(*tree),
+            PreviewStagingStatus::Blocked { .. }
+            | PreviewStagingStatus::DeferredUntilExecutionSeal { .. } => None,
+            PreviewStagingStatus::WalFull { .. }
+            | PreviewStagingStatus::SealedPathUnavailable { .. } => continue,
+        };
+        let Some(metadata) = shape_of(finding).and_then(|shape| shape.metadata()) else {
+            continue;
+        };
+        let Ok(begin) = project_begin(&metadata) else {
+            continue;
+        };
+        let round_trip = if begin.needed() <= available {
+            begin.needed()
+        } else {
+            0
+        };
+        let Some(projection) = tree.and_then(|tree| project_tree(&metadata, tree).ok()) else {
+            available -= round_trip;
+            continue;
+        };
+        let needed = begin.forward.saturating_add(projection.needed());
+        if needed > available {
+            assessment.status = PreviewStagingStatus::WalFull {
+                needed,
+                available,
+                reason: format!(
+                    "the seal WAL needs {needed} bytes for this item's whole life but has {available} to give"
+                ),
+            };
+            available -= round_trip;
+            continue;
+        }
+        if let PreviewStagingStatus::TreePolicyAssessed { wal_needed, .. } = &mut assessment.status
+        {
+            *wal_needed = Some(needed);
+        }
+        available = available.saturating_sub(
+            begin
+                .forward
+                .saturating_add(projection.forward)
+                .saturating_add(projection.committed),
+        );
     }
 }
 
@@ -513,6 +636,187 @@ mod tests {
         assert!(reason.contains("execution will reject this batch before mutation"));
     }
 
+    const TREE: TreeShape = TreeShape {
+        directories: 24,
+        directory_path_bytes: 120,
+        entries: 25,
+    };
+
+    // A source far deeper than its trash, so undoing a refused tree costs more
+    // than the item holds once staged: what it needs and what it then takes
+    // differ.
+    const SHAPE: StagingShape = StagingShape {
+        source_parent: 240,
+        source_basename: 4,
+        destination_parent: 20,
+        destination_basename: 25,
+        filesystem_id: 16,
+        reclamation_id: Some(24),
+        recovery_anchor: Some(18),
+    };
+
+    fn planned(path: &str) -> Finding {
+        use degu_core::finding::{
+            FindingCandidate, FindingKind, FindingSource, Ownership, Recovery, RegenCost,
+            finalize_findings,
+        };
+        finalize_findings(
+            vec![FindingCandidate {
+                ecosystem: "test".to_owned(),
+                path: PathBuf::from(path),
+                kind: FindingKind::PackageCache,
+                bytes_apparent: 4096,
+                bytes_allocated: 4096,
+                age_days: Some(30),
+                bytes_hardlinked: 0,
+                inodes: 1,
+                skipped: 0,
+                truncated: false,
+                unvisited_dirs: 0,
+                shared_writable_dirs: 0,
+                parent_grants_foreign_mutation: false,
+                protected_boundaries: 0,
+                protected_credential_boundaries: 0,
+                recovery: Recovery::Regenerable {
+                    cost: RegenCost::Cheap,
+                },
+                ownership: Ownership::Standalone,
+                hazard: None,
+                rationale: "fixture".to_owned(),
+            }],
+            FindingSource::WellKnownRoot,
+        )
+        .pop()
+        .expect("one finalized finding")
+    }
+
+    fn assessed(path: &str) -> PreviewStagingAssessment {
+        PreviewStagingAssessment {
+            path: PathBuf::from(path),
+            purge_requested: false,
+            status: PreviewStagingStatus::TreePolicyAssessed {
+                regular_hard_links: HeldTreeRegularHardLinkTopology::default(),
+                regular_xattrs: HeldTreeRegularXattrTopology::default(),
+                directory_xattrs_block_purge: false,
+                tree: TREE,
+                wal_needed: None,
+            },
+        }
+    }
+
+    fn blocked() -> PreviewStagingStatus {
+        PreviewStagingStatus::Blocked {
+            kind: "policy",
+            category: "tree_policy",
+            relative_path: None,
+            reason: "refused".to_owned(),
+            exceeded: None,
+        }
+    }
+
+    /// A WAL that leaves `available`, beside some frames and some allowance.
+    fn room(available: u64) -> WalRoom {
+        WalRoom {
+            limit: available + 3000,
+            committed: 2000,
+            reserved: 1000,
+        }
+    }
+
+    fn wal_needed(assessment: &PreviewStagingAssessment) -> Option<u64> {
+        match assessment.status {
+            PreviewStagingStatus::TreePolicyAssessed { wal_needed, .. } => wal_needed,
+            _ => None,
+        }
+    }
+
+    fn wal_full_available(assessment: &PreviewStagingAssessment) -> Option<u64> {
+        match assessment.status {
+            PreviewStagingStatus::WalFull { available, .. } => Some(available),
+            _ => None,
+        }
+    }
+
+    /// Items are admitted in plan order, each into what the trash and the items
+    /// before it leave. A committed item leaves what it holds; a tree staging
+    /// refuses, or only the seal can walk, leaves the source parent's round
+    /// trip; an item staging never begins, or that cannot be sized, leaves
+    /// nothing. An exact fit is admitted, and an item that does not fit is
+    /// blocked with what it needed and what was left, and still leaves its
+    /// round trip.
+    #[test]
+    fn room_admits_in_order() {
+        let metadata = SHAPE.metadata().unwrap();
+        let begin = project_begin(&metadata).unwrap();
+        let tree = project_tree(&metadata, TREE).unwrap();
+        let needed = begin.forward + tree.needed();
+        let holds = begin.forward + tree.forward + tree.committed;
+        let round_trip = begin.needed();
+        let last = needed - holds;
+        assert!(needed > holds && last >= 2 * round_trip);
+
+        let paths = [
+            "/a",
+            "/refused",
+            "/deferred",
+            "/unavailable",
+            "/unsized",
+            "/b",
+            "/c",
+            "/d",
+        ];
+        let planned = paths.map(planned);
+        let mut assessments = paths.map(assessed);
+        assessments[1].status = blocked();
+        assessments[2].status = PreviewStagingStatus::DeferredUntilExecutionSeal {
+            kind: "deferred",
+            category: "execution_validation",
+            reason: "deferred".to_owned(),
+        };
+        assessments[3].status = PreviewStagingStatus::SealedPathUnavailable {
+            kind: "unavailable",
+            category: "race_or_io",
+            relative_path: None,
+            reason: "unavailable".to_owned(),
+        };
+        apply_wal_room(
+            &mut assessments,
+            &planned,
+            |finding| (finding.path() != Path::new("/unsized")).then_some(SHAPE),
+            room(holds + 2 * round_trip + needed),
+        );
+
+        assert_eq!(wal_needed(&assessments[0]), Some(needed));
+        assert!(assessments[1].is_blocked());
+        assert_eq!(wal_needed(&assessments[4]), None);
+        // What came before leaves exactly what `/b` needs.
+        assert_eq!(wal_needed(&assessments[5]), Some(needed));
+        assert!(matches!(
+            assessments[6].status,
+            PreviewStagingStatus::WalFull { needed: n, .. } if n == needed
+        ));
+        assert_eq!(wal_full_available(&assessments[6]), Some(last));
+        assert_eq!(wal_full_available(&assessments[7]), Some(last - round_trip));
+        assert_eq!(assessments[6].json()["kind"], "wal_full");
+        assert_eq!(assessments[6].json()["available"], last);
+    }
+
+    /// An item whose first check would already refuse it writes no frame, so
+    /// the next item finds the room it found.
+    #[test]
+    fn refused_begin_leaves_nothing() {
+        let metadata = SHAPE.metadata().unwrap();
+        let short = project_begin(&metadata).unwrap().needed() - 1;
+        let paths = ["/refused", "/full", "/next"];
+        let planned = paths.map(planned);
+        let mut assessments = paths.map(assessed);
+        assessments[0].status = blocked();
+        apply_wal_room(&mut assessments, &planned, |_| Some(SHAPE), room(short));
+
+        assert_eq!(wal_full_available(&assessments[1]), Some(short));
+        assert_eq!(wal_full_available(&assessments[2]), Some(short));
+    }
+
     #[test]
     fn json_status_labels_are_stable() {
         let path = PathBuf::from("/preview/item");
@@ -522,8 +826,18 @@ mod tests {
                     regular_hard_links: HeldTreeRegularHardLinkTopology::default(),
                     regular_xattrs: HeldTreeRegularXattrTopology::default(),
                     directory_xattrs_block_purge: false,
+                    tree: TREE,
+                    wal_needed: None,
                 },
                 "tree_policy_assessed",
+            ),
+            (
+                PreviewStagingStatus::WalFull {
+                    needed: 2,
+                    available: 1,
+                    reason: "full".to_owned(),
+                },
+                "blocked",
             ),
             (
                 PreviewStagingStatus::Blocked {

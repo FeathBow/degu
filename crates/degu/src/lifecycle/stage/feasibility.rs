@@ -60,6 +60,56 @@ pub(crate) fn probe(
     assess_held_tree_policy_metadata(evidence, basename).map_err(ProbeFailure::Assessment)
 }
 
+/// The lengths a staging of `finding` will be sized by, worked out the way
+/// staging works them out, from the same policy, but holding nothing staging
+/// holds: no captured identity, no reservation, no transaction.
+///
+/// Two lengths are bounds. A reservation's sequence is four digits until it
+/// outgrows them, so it is counted at the most a sequence can have; and the
+/// reclamation id names the process that cleans, which is not the one
+/// previewing, so its process id is counted at the most one can have. Both
+/// overstate by a few bytes a frame. The check staging makes under the lease
+/// measures the transaction itself.
+pub(crate) fn staging_shape(
+    ctx: &degu_core::ecosystem::DetectCtx,
+    finding: &degu_core::finding::Finding,
+) -> Result<degu_core::seal::wal::StagingShape, String> {
+    let source = super::policy::preview_source(finding)?;
+    let lexical_trash =
+        super::super::storage::resolve_existing_trash_dir(ctx, source.canonical_source())?;
+    let policy = super::policy::complete(source, lexical_trash)?;
+    let source_parent = policy
+        .canonical_source
+        .parent()
+        .ok_or_else(|| "sealed staging source has no canonical parent".to_string())?;
+    let source_parent_relative =
+        super::policy::confined_relative(&policy.recovery_anchor, source_parent)?;
+    let destination_parent_relative =
+        super::policy::confined_relative(&policy.recovery_anchor, &policy.trash_root)?;
+    let source_basename = policy
+        .canonical_source
+        .file_name()
+        .ok_or_else(|| "sealed staging source has no basename".to_string())?;
+    let anchor = degu_walk::resolve_trusted_directory(
+        &policy.recovery_anchor,
+        "sealed-staging mount-domain anchor",
+    )
+    .map_err(|error| format!("mount-domain anchor cannot be reopened safely: {error}"))?;
+    let filesystem_id = degu_core::staging::forward_filesystem_id(&anchor)
+        .map_err(|error| format!("failed to derive sealed staging filesystem identity: {error}"))?;
+    Ok(degu_core::seal::wal::StagingShape {
+        source_parent: source_parent_relative.as_os_str().len(),
+        source_basename: source_basename.len(),
+        destination_parent: destination_parent_relative.as_os_str().len(),
+        destination_basename: super::production::RESERVATION_DIGITS_BOUND
+            + 1
+            + source_basename.len(),
+        filesystem_id: filesystem_id.len(),
+        reclamation_id: Some(super::reclamation_id_bound()),
+        recovery_anchor: Some(policy.recovery_anchor.as_os_str().len()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

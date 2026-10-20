@@ -4026,14 +4026,19 @@ fn settled_entry_allowance() {
     assert_eq!(wal.remaining_allowance(transaction).unwrap(), purge);
 }
 
-/// The directories a fixture's plan holds, as the walk records them: the root
-/// as the empty path, the rest relative to it.
-fn planned_directories(deeper: bool) -> Vec<&'static Path> {
-    let mut directories = vec![Path::new(""), Path::new("child")];
+/// The shape of a fixture's tree as the walk plans it: the root as the empty
+/// path, `child`, and with `deeper` also `child/deeper`; and every one of them
+/// an entry, with `child/data`.
+fn planned(deeper: bool) -> crate::seal::wal::TreeShape {
+    let mut directories = vec!["", "child"];
     if deeper {
-        directories.push(Path::new("child/deeper"));
+        directories.push("child/deeper");
     }
-    directories
+    crate::seal::wal::TreeShape {
+        directories: directories.len() as u64,
+        directory_path_bytes: directories.iter().map(|path| path.len() as u64).sum(),
+        entries: directories.len() as u64 + 1,
+    }
 }
 
 /// Staging writes exactly what the admission projected for its forward path,
@@ -4050,17 +4055,8 @@ fn forward_matches_projection() {
 
     let wal = &ready.engine.wal;
     let metadata = wal.staging_metadata(transaction).unwrap().clone();
-    // The root, `child`, `child/data` and `child/deeper`.
-    let entry_count = 4;
-    let begin = wal.begin_projection(transaction, &metadata).unwrap();
-    let tree = wal
-        .tree_projection(
-            transaction,
-            &metadata,
-            planned_directories(true),
-            entry_count,
-        )
-        .unwrap();
+    let begin = crate::seal::wal::project_begin(&metadata).unwrap();
+    let tree = crate::seal::wal::project_tree(&metadata, planned(true)).unwrap();
     assert_eq!(written, begin.forward + tree.forward);
     assert_eq!(
         wal.remaining_allowance(transaction).unwrap(),
@@ -4091,18 +4087,8 @@ fn rollback_matches_projection() {
         Err(StagingRenameError::ConfirmedNotApplied(_))
     ));
     let metadata = engine.wal.staging_metadata(transaction).unwrap().clone();
-    // The root, `child` and `child/data`.
-    let entry_count = 3;
-    let begin = engine.wal.begin_projection(transaction, &metadata).unwrap();
-    let tree = engine
-        .wal
-        .tree_projection(
-            transaction,
-            &metadata,
-            planned_directories(false),
-            entry_count,
-        )
-        .unwrap();
+    let begin = crate::seal::wal::project_begin(&metadata).unwrap();
+    let tree = crate::seal::wal::project_tree(&metadata, planned(false)).unwrap();
     drop(engine);
 
     let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
@@ -4129,29 +4115,17 @@ impl Drop for WalLimit {
     }
 }
 
-/// What staging `binding` will need, measured the way admission measures it.
+/// What staging a fixture's tree will need, measured the way admission
+/// measures it.
 fn projections(
-    fixture: &Fixture,
-    transaction: TransactionId,
     metadata: &crate::seal::wal::StagingTransactionMetadata,
 ) -> (
     crate::seal::wal::BeginProjection,
     crate::seal::wal::TreeProjection,
 ) {
-    let (engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
-    // The root, `child` and `child/data`.
-    let entry_count = 3;
     (
-        engine.wal.begin_projection(transaction, metadata).unwrap(),
-        engine
-            .wal
-            .tree_projection(
-                transaction,
-                metadata,
-                planned_directories(false),
-                entry_count,
-            )
-            .unwrap(),
+        crate::seal::wal::project_begin(metadata).unwrap(),
+        crate::seal::wal::project_tree(metadata, planned(false)).unwrap(),
     )
 }
 
@@ -4165,7 +4139,7 @@ fn parent_room_refusal() {
     };
     let transaction = TransactionId([0x67; 16]);
     let parent_mode = mode(&fixture.source_parent);
-    let (begin, tree) = projections(&fixture, transaction, &fixture.prepare().metadata);
+    let (begin, tree) = projections(&fixture.prepare().metadata);
     let before = wal_len(&fixture);
 
     let limit = WalLimit::set(before + begin.needed() - 1);
@@ -4223,7 +4197,7 @@ fn tree_room_refusal() {
     };
     let transaction = TransactionId([0x68; 16]);
     let parent_mode = mode(&fixture.source_parent);
-    let (begin, tree) = projections(&fixture, transaction, &fixture.prepare().metadata);
+    let (begin, tree) = projections(&fixture.prepare().metadata);
     let before = wal_len(&fixture);
     let limit = before + begin.forward + tree.needed() - 1;
     let _limit = WalLimit::set(limit);
@@ -4277,7 +4251,7 @@ fn exact_room_lifecycle() {
         };
         let transaction = TransactionId([0x69 + short as u8; 16]);
         let (binding, _) = request().prepare().unwrap();
-        let (begin, tree) = projections(&fixture, transaction, &binding.metadata);
+        let (begin, tree) = projections(&binding.metadata);
         drop(binding);
         let limit = wal_len(&fixture) + begin.forward + tree.needed() - short;
         let _limit = WalLimit::set(limit);
@@ -4331,12 +4305,8 @@ fn committed_room_kept() {
     };
     let second = TransactionId([0x6c; 16]);
     let (binding, _) = request().prepare().unwrap();
-    let (engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
-    let begin = engine
-        .wal
-        .begin_projection(second, &binding.metadata)
-        .unwrap();
-    drop((engine, binding));
+    let begin = crate::seal::wal::project_begin(&binding.metadata).unwrap();
+    drop(binding);
     let before = wal_len(&fixture);
     let limit = before + reserved + begin.needed() - 1;
     let _limit = WalLimit::set(limit);
@@ -4381,17 +4351,9 @@ fn long_rollback_fits() {
     };
     let transaction = TransactionId([0x6d; 16]);
     let (binding, _) = request().prepare().unwrap();
-    let (engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
-    let begin = engine
-        .wal
-        .begin_projection(transaction, &binding.metadata)
-        .unwrap();
-    // The root, `child`, `child/data` and `child/deeper`.
-    let tree = engine
-        .wal
-        .tree_projection(transaction, &binding.metadata, planned_directories(true), 4)
-        .unwrap();
-    drop((engine, binding));
+    let begin = crate::seal::wal::project_begin(&binding.metadata).unwrap();
+    let tree = crate::seal::wal::project_tree(&binding.metadata, planned(true)).unwrap();
+    drop(binding);
     assert!(
         tree.rolled_back > tree.forward + tree.committed,
         "the fixture does not make the rollback the larger: {tree:?}"
@@ -4511,7 +4473,7 @@ fn parent_retry_room() {
         let request = || fixture.forward_request("root", "staged");
         let transaction = TransactionId([0x70 + short as u8; 16]);
         let (binding, _) = request().prepare().unwrap();
-        let (begin, tree) = projections(&fixture, transaction, &binding.metadata);
+        let (begin, tree) = projections(&binding.metadata);
         drop(binding);
 
         let mut ready = fixture.ready_engine();
@@ -4801,5 +4763,64 @@ fn unsettled_room_refused() {
             ))
         ),
         "{error:?}"
+    );
+}
+
+/// A preview knows a staging's lengths and not its content. Metadata of the
+/// same shape, with placeholder content, sizes every frame as the real
+/// metadata does, so the preview projects what staging will.
+#[test]
+fn shape_projects_alike() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    set_mode(&fixture.source_parent, 0o700);
+    let (binding, _) = fixture
+        .forward_request("root", "staged")
+        .with_production_association(ProductionAssociation::new("undo-group".into()).unwrap())
+        .with_recovery_anchor(fixture.base.clone())
+        .prepare()
+        .unwrap();
+    let real = binding.metadata.clone();
+    let shape = crate::seal::wal::StagingShape::of(&real);
+    let placeholder = shape.metadata().unwrap();
+    assert_eq!(crate::seal::wal::StagingShape::of(&placeholder), shape);
+    assert!(shape.reclamation_id.is_some() && shape.recovery_anchor.is_some());
+    assert_eq!(
+        crate::seal::wal::project_begin(&placeholder).unwrap(),
+        crate::seal::wal::project_begin(&real).unwrap()
+    );
+    for deeper in [false, true] {
+        assert_eq!(
+            crate::seal::wal::project_tree(&placeholder, planned(deeper)).unwrap(),
+            crate::seal::wal::project_tree(&real, planned(deeper)).unwrap()
+        );
+    }
+}
+
+/// The shape a preview measures with the assessment is the shape staging plans
+/// from the same tree, so the two project the same room.
+#[test]
+fn assessment_shape_matches() {
+    let Some(fixture) = deeper_fixture() else {
+        return;
+    };
+    let parent = crate::backend::certify_held_fd(
+        std::fs::File::open(&fixture.source_parent).unwrap().into(),
+    )
+    .unwrap();
+    let crate::backend::HeldTreePolicyAssessmentOutcome::TreePolicyAssessed { tree, .. } =
+        crate::backend::assess_held_tree_policy_metadata(parent, std::ffi::OsStr::new("root"))
+            .unwrap()
+    else {
+        panic!("the fixture's tree policy was not assessed");
+    };
+    assert_eq!(
+        crate::seal::wal::TreeShape {
+            directories: tree.directories,
+            directory_path_bytes: tree.directory_path_bytes,
+            entries: tree.entries,
+        },
+        planned(true)
     );
 }

@@ -977,17 +977,21 @@ impl VerifiedPurgeAuthorityMaterial {
                 "injected crash after durable purge claim",
             )));
         }
+        // Deletion writes nothing to the WAL until the whole tree, root included,
+        // is gone and the trash parent synced. The callback the deletion offers
+        // after each removal is where a test stops it part-way; nothing else.
+        let stop_point = |_removed: u64, _path: &Path| -> Result<(), AppendError> {
+            #[cfg(test)]
+            if PURGE_FAIL_PROGRESS_AT.with(|at| at.get() == Some(_removed)) {
+                return Err(AppendError::InvalidState(
+                    "injected crash part-way through a purge",
+                ));
+            }
+            Ok(())
+        };
         let removed = match tree {
             VerifiedPurgeTree::Resident(inventory) => inventory
-                .purge_postorder(|removed, path| {
-                    #[cfg(test)]
-                    if PURGE_FAIL_PROGRESS_AT.with(|at| at.get() == Some(removed)) {
-                        return Err(AppendError::InvalidState(
-                            "injected crash before durable purge progress",
-                        ));
-                    }
-                    wal.record_purge_progress(transaction, removed, path)
-                })
+                .purge_postorder(stop_point)
                 .map_err(|error| match error {
                     HeldTreePurgeError::Tree(error) => RecoveryRebindError::PurgeExecution(error),
                     HeldTreePurgeError::Journal(error) => RecoveryRebindError::Wal(error),
@@ -999,15 +1003,7 @@ impl VerifiedPurgeAuthorityMaterial {
                 } = *material;
                 while let Some(record) = plan.next().map_err(RecoveryRebindError::Sidecar)? {
                     purger
-                        .purge_plan_record(&record, |removed, path| {
-                            #[cfg(test)]
-                            if PURGE_FAIL_PROGRESS_AT.with(|at| at.get() == Some(removed)) {
-                                return Err(AppendError::InvalidState(
-                                    "injected crash before durable purge progress",
-                                ));
-                            }
-                            wal.record_purge_progress(transaction, removed, path)
-                        })
+                        .purge_plan_record(&record, stop_point)
                         .map_err(|error| match error {
                             HeldTreePurgeError::Tree(error) => {
                                 RecoveryRebindError::PurgeExecution(error)
@@ -1016,24 +1012,13 @@ impl VerifiedPurgeAuthorityMaterial {
                         })?;
                 }
                 plan.finish().map_err(RecoveryRebindError::Sidecar)?;
-                purger
-                    .finish(|removed, path| {
-                        #[cfg(test)]
-                        if PURGE_FAIL_PROGRESS_AT.with(|at| at.get() == Some(removed)) {
-                            return Err(AppendError::InvalidState(
-                                "injected crash before durable purge progress",
-                            ));
-                        }
-                        wal.record_purge_progress(transaction, removed, path)
-                    })
-                    .map_err(|error| match error {
-                        HeldTreePurgeError::Tree(error) => {
-                            RecoveryRebindError::PurgeExecution(error)
-                        }
-                        HeldTreePurgeError::Journal(error) => RecoveryRebindError::Wal(error),
-                    })?
+                purger.finish(stop_point).map_err(|error| match error {
+                    HeldTreePurgeError::Tree(error) => RecoveryRebindError::PurgeExecution(error),
+                    HeldTreePurgeError::Journal(error) => RecoveryRebindError::Wal(error),
+                })?
             }
         };
+        wal.record_purge_removed(transaction, removed)?;
         wal.record_purge_outcome(transaction)?;
         #[cfg(test)]
         if PURGE_FAIL_AFTER_OUTCOME.with(std::cell::Cell::get) {

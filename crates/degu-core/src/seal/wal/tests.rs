@@ -3240,6 +3240,248 @@ fn purgeable_has_only_the_explicit_v8_authorization_record() {
     ));
 }
 
+/// A committed transaction whose purge has been authorized and not yet claimed,
+/// as legacy v11 records: the history every purge replay test starts from.
+fn authorized_purge(
+    transaction: TransactionId,
+    metadata: &StagingTransactionMetadata,
+    manifest: DurableTreeManifest,
+) -> Vec<SealRecord> {
+    vec![
+        SealRecord::StagingBegin {
+            transaction,
+            metadata: metadata.clone(),
+        },
+        state(transaction, TransactionState::ParentSealIntent),
+        state(transaction, TransactionState::ParentSealed),
+        state(transaction, TransactionState::TreeSealIntent),
+        SealRecord::TreeManifestComplete {
+            transaction,
+            manifest,
+        },
+        state(transaction, TransactionState::TreeSealed),
+        SealRecord::RenameIntent { transaction },
+        SealRecord::RenameOutcome {
+            transaction,
+            outcome: DurableRenameOutcome::AppliedAndParentsSynced(metadata.root_identity()),
+        },
+        state(transaction, TransactionState::StagedUnverified),
+        state(transaction, TransactionState::StagedSealed),
+        state(transaction, TransactionState::SourceParentRestoreIntent),
+        state(transaction, TransactionState::SourceParentRestored),
+        state(transaction, TransactionState::VerifiedCommitted),
+        SealRecord::PurgeAuthorized {
+            transaction,
+            commitment: DurablePurgeCommitment::exact(metadata, manifest),
+        },
+    ]
+}
+
+/// A current purge records its progress once, after the whole tree and its root
+/// are gone: one frame, carrying the manifest's entry count and no path. The
+/// per-entry progress earlier versions wrote is refused in a current frame; the
+/// rule for those versions is unchanged, and the test below holds it.
+#[test]
+fn a_current_purge_records_its_progress_once() {
+    let transaction = tx(0xc8);
+    let metadata = staging_metadata().with_production_association(
+        ProductionAssociation::new("progress-group".to_string()).unwrap(),
+    );
+    let manifest = DurableTreeManifest {
+        schema_version: CONTENT_PROOF_MANIFEST_VERSION,
+        entry_count: 3,
+        sha256: [0x6c; 32],
+    };
+    let current = |record| VersionedRecord {
+        version: VERSION,
+        record,
+        frame: None,
+    };
+    let claim = || {
+        current(SealRecord::PurgeClaimed {
+            transaction,
+            commitment: DurablePurgeCommitment::exact(&metadata, manifest),
+        })
+    };
+    let progress = |removed_entries, last_path: &str| {
+        current(SealRecord::PurgeProgress {
+            transaction,
+            removed_entries,
+            last_path: PathBuf::from(last_path),
+        })
+    };
+    let outcome = || current(state(transaction, TransactionState::PurgeOutcome));
+    let history = |tail: Vec<VersionedRecord>| {
+        authorized_purge(transaction, &metadata, manifest)
+            .into_iter()
+            .map(IntoVersionedRecord::into_versioned)
+            .chain(tail)
+            .collect::<Vec<_>>()
+    };
+
+    // The one shape a current purge writes.
+    let replay = replay_unframed(history(vec![claim(), progress(3, ""), outcome()])).unwrap();
+    assert_eq!(
+        replay.transactions[&transaction].state,
+        TransactionState::PurgeOutcome
+    );
+
+    for (case, tail) in [
+        (
+            "per-entry progress",
+            vec![
+                claim(),
+                progress(1, "child/a"),
+                progress(2, "child"),
+                progress(3, ""),
+                outcome(),
+            ],
+        ),
+        // No outcome after it: the outcome refuses a short count on its own, and
+        // this case is about the count frame.
+        (
+            "a count short of the manifest",
+            vec![claim(), progress(2, "")],
+        ),
+        (
+            "a count that names a path",
+            vec![claim(), progress(3, "child"), outcome()],
+        ),
+        (
+            "the count twice",
+            vec![claim(), progress(3, ""), progress(3, ""), outcome()],
+        ),
+        (
+            "a count before the claim",
+            vec![progress(3, ""), claim(), outcome()],
+        ),
+        ("an outcome without a count", vec![claim(), outcome()]),
+    ] {
+        assert!(
+            matches!(
+                replay_unframed(history(tail)),
+                Err(ReplayError::InvalidHistory(_))
+            ),
+            "{case}"
+        );
+    }
+}
+
+/// A purge a v12 binary wrote keeps the rule it was written under: one
+/// progress frame per entry, each one past the last. The same frames written
+/// as v13 are refused, because v13 records the whole tree once.
+#[test]
+fn a_purge_written_before_v13_keeps_its_per_entry_progress() {
+    let transaction = tx(0xc9);
+    // Written as bytes, a production transaction carries its recovery anchor.
+    let metadata = staging_metadata()
+        .with_production_association(
+            ProductionAssociation::new("progress-group".to_string()).unwrap(),
+        )
+        .with_recovery_anchor(PathBuf::from("/mount-domain"))
+        .unwrap();
+    let manifest = DurableTreeManifest {
+        schema_version: CONTENT_PROOF_MANIFEST_VERSION,
+        entry_count: 3,
+        sha256: [0x6d; 32],
+    };
+    let progress = |removed_entries, last_path: &str| SealRecord::PurgeProgress {
+        transaction,
+        removed_entries,
+        last_path: PathBuf::from(last_path),
+    };
+    let purge = [
+        SealRecord::PurgeClaimed {
+            transaction,
+            commitment: DurablePurgeCommitment::exact(&metadata, manifest),
+        },
+        progress(1, "child/a"),
+        progress(2, "child"),
+        progress(3, ""),
+        state(transaction, TransactionState::PurgeOutcome),
+    ];
+    let written_at = |version| {
+        authorized_purge(transaction, &metadata, manifest)
+            .iter()
+            .flat_map(|record| legacy_frame(11, record))
+            .chain(
+                purge
+                    .iter()
+                    .flat_map(|record| legacy_frame(version, record)),
+            )
+            .collect::<Vec<_>>()
+    };
+
+    let replay = replay_bytes(&written_at(12));
+    let replayed = &replay.transactions[&transaction];
+    assert_eq!(replayed.state, TransactionState::PurgeOutcome);
+    assert_eq!(replayed.purge_removed_entries, 3);
+
+    let bytes = written_at(VERSION);
+    let refused = parse_frames(&bytes)
+        .and_then(|parsed| replay_records(parsed.records, &bytes))
+        .err();
+    assert!(
+        matches!(refused, Some(ReplayError::InvalidHistory(_))),
+        "{refused:?}"
+    );
+}
+
+/// The append side refuses what replay would: a count other than the
+/// manifest's, and a second count. Either would leave a WAL its own next
+/// replay refuses.
+#[test]
+fn a_purge_count_is_appended_once_and_whole() {
+    let transaction = tx(0xca);
+    // Written as bytes, a production transaction carries its recovery anchor.
+    let metadata = staging_metadata()
+        .with_production_association(
+            ProductionAssociation::new("progress-group".to_string()).unwrap(),
+        )
+        .with_recovery_anchor(PathBuf::from("/mount-domain"))
+        .unwrap();
+    let manifest = DurableTreeManifest {
+        schema_version: CONTENT_PROOF_MANIFEST_VERSION,
+        entry_count: 3,
+        sha256: [0x6e; 32],
+    };
+    let mut history = authorized_purge(transaction, &metadata, manifest);
+    history.push(SealRecord::PurgeClaimed {
+        transaction,
+        commitment: DurablePurgeCommitment::exact(&metadata, manifest),
+    });
+    let bytes = history
+        .iter()
+        .flat_map(|record| legacy_frame(11, record))
+        .collect::<Vec<_>>();
+    let replay = replay_bytes(&bytes);
+    let mut wal = SealWal::resume(
+        FaultWriter {
+            bytes,
+            ..FaultWriter::default()
+        },
+        replay,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        wal.record_purge_removed(transaction, 2),
+        Err(AppendError::InvalidState(_))
+    ));
+    wal.record_purge_removed(transaction, 3).unwrap();
+    assert!(matches!(
+        wal.record_purge_removed(transaction, 3),
+        Err(AppendError::InvalidState(_))
+    ));
+    wal.record_purge_outcome(transaction).unwrap();
+
+    let replay = replay_bytes(&wal.into_inner().bytes);
+    assert_eq!(
+        replay.transactions[&transaction].state,
+        TransactionState::PurgeOutcome
+    );
+}
+
 #[test]
 fn v10_purge_claim_and_progress_replay_fail_closed_on_every_invalid_shape() {
     let transaction = tx(0xc7);
@@ -3251,36 +3493,7 @@ fn v10_purge_claim_and_progress_replay_fail_closed_on_every_invalid_shape() {
         entry_count: 2,
         sha256: [0x6b; 32],
     };
-    let authorized = || {
-        vec![
-            SealRecord::StagingBegin {
-                transaction,
-                metadata: metadata.clone(),
-            },
-            state(transaction, TransactionState::ParentSealIntent),
-            state(transaction, TransactionState::ParentSealed),
-            state(transaction, TransactionState::TreeSealIntent),
-            SealRecord::TreeManifestComplete {
-                transaction,
-                manifest,
-            },
-            state(transaction, TransactionState::TreeSealed),
-            SealRecord::RenameIntent { transaction },
-            SealRecord::RenameOutcome {
-                transaction,
-                outcome: DurableRenameOutcome::AppliedAndParentsSynced(metadata.root_identity()),
-            },
-            state(transaction, TransactionState::StagedUnverified),
-            state(transaction, TransactionState::StagedSealed),
-            state(transaction, TransactionState::SourceParentRestoreIntent),
-            state(transaction, TransactionState::SourceParentRestored),
-            state(transaction, TransactionState::VerifiedCommitted),
-            SealRecord::PurgeAuthorized {
-                transaction,
-                commitment: DurablePurgeCommitment::exact(&metadata, manifest),
-            },
-        ]
-    };
+    let authorized = || authorized_purge(transaction, &metadata, manifest);
     let claim = || SealRecord::PurgeClaimed {
         transaction,
         commitment: DurablePurgeCommitment::exact(&metadata, manifest),

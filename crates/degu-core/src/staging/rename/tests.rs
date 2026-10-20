@@ -2531,6 +2531,12 @@ fn forward_verification_mismatch_quarantines_and_restores_seals() {
         ready.state(transaction),
         Some(TransactionState::Quarantined)
     );
+    // Its seals are all reversed, so all it may still write is the one frame a
+    // later open writes if its sidecar no longer verifies.
+    assert_eq!(
+        ready.engine.wal.remaining_allowance(transaction).unwrap(),
+        38
+    );
     assert!(!fixture.source_root.exists());
     assert!(fixture.destination_root.is_dir());
     assert_eq!(mode(&fixture.source_parent), 0o770);
@@ -3893,4 +3899,527 @@ fn two_hardlink_groups_in_one_tree_are_counted_apart() {
         );
     }
     assert!(!fixture.destination_root.exists());
+}
+
+fn wal_len(fixture: &Fixture) -> u64 {
+    std::fs::metadata(
+        fixture
+            .base
+            .join("wal-store")
+            .join(crate::seal::store::WAL_FILE_NAME),
+    )
+    .unwrap()
+    .len()
+}
+
+/// A fixture with one more level of directory, so the tree seals an undo
+/// reverses have suffixes of three lengths under a root whose name and parent
+/// both differ in length between source and destination.
+fn deeper_fixture() -> Option<Fixture> {
+    let fixture = Fixture::new()?;
+    let deeper = fixture.source_root.join("child/deeper");
+    std::fs::create_dir(&deeper).unwrap();
+    set_mode(&deeper, 0o770);
+    Some(fixture)
+}
+
+/// The allowance for an undo is what the undo then writes, byte for byte. Each
+/// inverse is re-rooted under the destination, so a measure taken from the
+/// seals' own sizes would be off by the difference in root lengths per seal.
+#[test]
+fn a_verified_undo_writes_exactly_its_allowance() {
+    let Some(fixture) = deeper_fixture() else {
+        return;
+    };
+    let transaction = TransactionId([0x61; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let allowance = ready.engine.wal.undo_allowance(transaction).unwrap();
+    let before = wal_len(&fixture);
+
+    let token = ready
+        .verified_undo_token(transaction, "undo-group")
+        .unwrap();
+    ready
+        .undo_verified(token, verified_undo_request(&fixture))
+        .unwrap();
+
+    assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+    assert_eq!(wal_len(&fixture) - before, allowance);
+}
+
+/// The allowance for a purge is what the purge then writes, byte for byte, and
+/// once it is authorized what is left is the rest of it.
+#[test]
+fn a_verified_purge_writes_exactly_its_allowance() {
+    let Some(fixture) = deeper_fixture() else {
+        return;
+    };
+    let transaction = TransactionId([0x62; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let allowance = ready.engine.wal.purge_allowance(transaction, true).unwrap();
+    let before = wal_len(&fixture);
+
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    let authorized = wal_len(&fixture) - before;
+    assert_eq!(
+        ready
+            .engine
+            .wal
+            .purge_allowance(transaction, false)
+            .unwrap(),
+        allowance - authorized
+    );
+    ready.execute_verified_purge(authority).unwrap();
+
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purged));
+    assert_eq!(wal_len(&fixture) - before, allowance);
+}
+
+/// A committed entry may go either way, so it holds room for the larger of the
+/// two; an authorized one can only be purged; a finished one holds nothing.
+#[test]
+#[allow(clippy::disallowed_methods)] // flattens a fixture tree before it is staged
+fn a_settled_entry_holds_room_for_every_path_its_state_leaves_open() {
+    let Some(fixture) = deeper_fixture() else {
+        return;
+    };
+    let transaction = TransactionId([0x63; 16]);
+    let mut ready = stage_production(&fixture, transaction);
+    let wal = &ready.engine.wal;
+    let undo = wal.undo_allowance(transaction).unwrap();
+    let purge = wal.purge_allowance(transaction, true).unwrap();
+    assert_eq!(
+        wal.remaining_allowance(transaction).unwrap(),
+        undo.max(purge)
+    );
+
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    let wal = &ready.engine.wal;
+    assert_eq!(
+        wal.remaining_allowance(transaction).unwrap(),
+        wal.purge_allowance(transaction, false).unwrap()
+    );
+    ready.execute_verified_purge(authority).unwrap();
+    assert_eq!(
+        ready.engine.wal.remaining_allowance(transaction).unwrap(),
+        0
+    );
+
+    // With a single sealed directory the purge is the larger of the two, so the
+    // committed entry's allowance is set by the other side.
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    std::fs::remove_file(fixture.source_root.join("child/data")).unwrap();
+    std::fs::remove_dir(fixture.source_root.join("child")).unwrap();
+    std::fs::write(fixture.source_root.join("data"), b"flat").unwrap();
+    let transaction = TransactionId([0x64; 16]);
+    let ready = stage_production(&fixture, transaction);
+    let wal = &ready.engine.wal;
+    let undo = wal.undo_allowance(transaction).unwrap();
+    let purge = wal.purge_allowance(transaction, true).unwrap();
+    assert!(purge > undo, "purge {purge} does not outweigh undo {undo}");
+    assert_eq!(wal.remaining_allowance(transaction).unwrap(), purge);
+}
+
+/// The directories a fixture's plan holds, as the walk records them: the root
+/// as the empty path, the rest relative to it.
+fn planned_directories(deeper: bool) -> Vec<&'static Path> {
+    let mut directories = vec![Path::new(""), Path::new("child")];
+    if deeper {
+        directories.push(Path::new("child/deeper"));
+    }
+    directories
+}
+
+/// Staging writes exactly what the admission projected for its forward path,
+/// and the committed entry then holds exactly what the projection set aside.
+#[test]
+fn staging_writes_exactly_its_projected_forward_path() {
+    let Some(fixture) = deeper_fixture() else {
+        return;
+    };
+    let transaction = TransactionId([0x65; 16]);
+    let before = wal_len(&fixture);
+    let ready = stage_production(&fixture, transaction);
+    let written = wal_len(&fixture) - before;
+
+    let wal = &ready.engine.wal;
+    let metadata = wal.staging_metadata(transaction).unwrap().clone();
+    // The root, `child`, `child/data` and `child/deeper`.
+    let entry_count = 4;
+    let begin = wal.begin_projection(transaction, &metadata).unwrap();
+    let tree = wal
+        .tree_projection(
+            transaction,
+            &metadata,
+            planned_directories(true),
+            entry_count,
+        )
+        .unwrap();
+    assert_eq!(written, begin.forward + tree.forward);
+    assert_eq!(
+        wal.remaining_allowance(transaction).unwrap(),
+        tree.committed
+    );
+}
+
+/// The latest stop that is rolled back rather than committed is a rename
+/// confirmed not applied. Staging up to it and the rollback after it write
+/// exactly what the projection set aside for that end.
+#[test]
+fn a_rolled_back_staging_writes_exactly_its_projected_rollback() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let binding = fixture.prepare();
+    let destination = fixture.destination_root.clone();
+    BEFORE_RENAME.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::fs::create_dir(&destination).unwrap();
+        }));
+    });
+    let transaction = TransactionId([0x66; 16]);
+    let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let before = wal_len(&fixture);
+    assert!(matches!(
+        engine.stage_prepared_root(transaction, binding),
+        Err(StagingRenameError::ConfirmedNotApplied(_))
+    ));
+    let metadata = engine.wal.staging_metadata(transaction).unwrap().clone();
+    // The root, `child` and `child/data`.
+    let entry_count = 3;
+    let begin = engine.wal.begin_projection(transaction, &metadata).unwrap();
+    let tree = engine
+        .wal
+        .tree_projection(
+            transaction,
+            &metadata,
+            planned_directories(false),
+            entry_count,
+        )
+        .unwrap();
+    drop(engine);
+
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let (ready, _) = engine
+        .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+        .unwrap();
+    assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+    assert_eq!(wal_len(&fixture) - before, begin.forward + tree.rolled_back);
+}
+
+/// Holds a thread's resumed-WAL limit for the life of a test, and drops it.
+struct WalLimit;
+
+impl WalLimit {
+    fn set(limit: u64) -> Self {
+        crate::seal::wal::WAL_LIMIT_FOR_TEST.with(|cell| cell.set(Some(limit)));
+        Self
+    }
+}
+
+impl Drop for WalLimit {
+    fn drop(&mut self) {
+        crate::seal::wal::WAL_LIMIT_FOR_TEST.with(|cell| cell.set(None));
+    }
+}
+
+/// What staging `binding` will need, measured the way admission measures it.
+fn projections(
+    fixture: &Fixture,
+    transaction: TransactionId,
+    metadata: &crate::seal::wal::StagingTransactionMetadata,
+) -> (
+    crate::seal::wal::BeginProjection,
+    crate::seal::wal::TreeProjection,
+) {
+    let (engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+    // The root, `child` and `child/data`.
+    let entry_count = 3;
+    (
+        engine.wal.begin_projection(transaction, metadata).unwrap(),
+        engine
+            .wal
+            .tree_projection(
+                transaction,
+                metadata,
+                planned_directories(false),
+                entry_count,
+            )
+            .unwrap(),
+    )
+}
+
+/// One byte short of the room to seal the source parent and undo that seal,
+/// staging writes no frame and changes nothing. With that byte it starts, and
+/// the next check is the tree's.
+#[test]
+fn staging_without_room_to_seal_its_parent_writes_nothing() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0x67; 16]);
+    let parent_mode = mode(&fixture.source_parent);
+    let (begin, tree) = projections(&fixture, transaction, &fixture.prepare().metadata);
+    let before = wal_len(&fixture);
+
+    let limit = WalLimit::set(before + begin.needed() - 1);
+    let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let error = engine
+        .stage_prepared_root(transaction, fixture.prepare())
+        .err()
+        .expect("staging was admitted");
+    assert!(
+        matches!(
+            error,
+            StagingRenameError::WalFull { needed, available }
+                if needed == begin.needed() && available == needed - 1
+        ),
+        "{error:?}"
+    );
+    assert_eq!(engine.state(transaction), None);
+    assert_eq!(wal_len(&fixture), before);
+    assert_eq!(mode(&fixture.source_parent), parent_mode);
+    drop((engine, limit));
+
+    // With exactly that room it starts, the tree's own check refuses it, and
+    // the undo of the parent's seal fits in what was set aside for it.
+    let limit = before + begin.needed();
+    let _limit = WalLimit::set(limit);
+    let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let error = engine
+        .stage_prepared_root(transaction, fixture.prepare())
+        .err()
+        .expect("staging was admitted");
+    assert!(
+        matches!(
+            error,
+            StagingRenameError::WalFull { needed, .. } if needed == tree.needed()
+        ),
+        "{error:?}"
+    );
+    drop(engine);
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let (ready, _) = engine
+        .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+        .unwrap();
+    assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+    assert_eq!(mode(&fixture.source_parent), parent_mode);
+    assert!(wal_len(&fixture) <= limit);
+}
+
+/// One byte short of the room the planned tree needs, staging stops before
+/// its first tree seal, and the room the first check set aside is enough for
+/// recovery to undo the source parent's seal.
+#[test]
+fn a_tree_without_room_stops_before_its_first_seal_and_rolls_back_within_the_limit() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0x68; 16]);
+    let parent_mode = mode(&fixture.source_parent);
+    let (begin, tree) = projections(&fixture, transaction, &fixture.prepare().metadata);
+    let before = wal_len(&fixture);
+    let limit = before + begin.forward + tree.needed() - 1;
+    let _limit = WalLimit::set(limit);
+
+    let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let error = engine
+        .stage_prepared_root(transaction, fixture.prepare())
+        .err()
+        .expect("staging was admitted");
+    assert!(
+        matches!(
+            error,
+            StagingRenameError::WalFull { needed, available }
+                if needed == tree.needed() && available == needed - 1
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        engine.state(transaction),
+        Some(TransactionState::ParentSealed)
+    );
+    assert_eq!(wal_len(&fixture), before + begin.forward);
+    drop(engine);
+
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let (ready, _) = engine
+        .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+        .unwrap();
+    assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+    assert_eq!(mode(&fixture.source_parent), parent_mode);
+    assert!(fixture.source_root.join("child/data").is_file());
+    assert!(wal_len(&fixture) <= limit);
+}
+
+/// Given exactly the room admission asks for, a staging transaction commits
+/// and its entry is then undone, every frame of it inside the limit. One byte
+/// less and it never seals a directory: it is refused and rolled back at once.
+#[test]
+fn an_entry_admitted_with_exactly_its_room_lives_its_whole_life_within_it() {
+    let association = || ProductionAssociation::new("undo-group".into()).unwrap();
+    for short in [1, 0] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        set_mode(&fixture.source_parent, 0o700);
+        let request = || {
+            fixture
+                .forward_request("root", "staged")
+                .with_production_association(association())
+                .with_recovery_anchor(fixture.base.clone())
+        };
+        let transaction = TransactionId([0x69 + short as u8; 16]);
+        let (binding, _) = request().prepare().unwrap();
+        let (begin, tree) = projections(&fixture, transaction, &binding.metadata);
+        drop(binding);
+        let limit = wal_len(&fixture) + begin.forward + tree.needed() - short;
+        let _limit = WalLimit::set(limit);
+
+        let mut ready = fixture.ready_engine();
+        let staged = ready.stage_to_verified_commit(transaction, request());
+        if short == 1 {
+            let error = staged.unwrap_err();
+            assert_eq!(
+                error.disposition(),
+                ForwardFailureDisposition::Terminal(TransactionState::Restored),
+                "{error}"
+            );
+            assert!(fixture.source_root.join("child/data").is_file());
+        } else {
+            staged.unwrap();
+            let token = ready
+                .verified_undo_token(transaction, "undo-group")
+                .unwrap();
+            ready
+                .undo_verified(token, verified_undo_request(&fixture))
+                .unwrap();
+            assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+        }
+        assert!(wal_len(&fixture) <= limit);
+    }
+}
+
+/// A committed entry's room is held for it. A second staging that would fit
+/// only by taking that room is refused before it writes a frame, and the first
+/// entry is then undone inside the limit.
+#[test]
+fn a_committed_entry_keeps_its_room_from_a_later_staging() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let first = TransactionId([0x6b; 16]);
+    let ready = stage_production(&fixture, first);
+    let reserved = ready.engine.wal.remaining_allowance(first).unwrap();
+    drop(ready);
+
+    let second_root = fixture.source_parent.join("second");
+    std::fs::create_dir(&second_root).unwrap();
+    std::fs::write(second_root.join("data"), b"second").unwrap();
+    set_mode(&second_root, 0o770);
+    let request = || {
+        fixture
+            .forward_request("second", "staged-second")
+            .with_production_association(ProductionAssociation::new("undo-group".into()).unwrap())
+            .with_recovery_anchor(fixture.base.clone())
+    };
+    let second = TransactionId([0x6c; 16]);
+    let (binding, _) = request().prepare().unwrap();
+    let (engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let begin = engine
+        .wal
+        .begin_projection(second, &binding.metadata)
+        .unwrap();
+    drop((engine, binding));
+    let before = wal_len(&fixture);
+    let limit = before + reserved + begin.needed() - 1;
+    let _limit = WalLimit::set(limit);
+
+    let mut ready = fixture.ready_engine();
+    let error = ready
+        .stage_to_verified_commit(second, request())
+        .unwrap_err();
+    assert_eq!(
+        error.disposition(),
+        ForwardFailureDisposition::NotStarted,
+        "{error}"
+    );
+    assert_eq!(wal_len(&fixture), before);
+
+    let token = ready.verified_undo_token(first, "undo-group").unwrap();
+    ready
+        .undo_verified(token, verified_undo_request(&fixture))
+        .unwrap();
+    assert_eq!(ready.state(first), Some(TransactionState::Restored));
+    assert!(wal_len(&fixture) <= limit);
+}
+
+/// When the source root's name is much longer than the destination's, undoing
+/// a rollback's seals where they were made costs more than undoing a committed
+/// entry's seals where the undo finds them, and the rollback is what admission
+/// has to make room for. A rename confirmed not applied is the latest stop that
+/// is rolled back; with exactly the admitted room, that rollback still fits.
+#[test]
+fn a_rollback_longer_than_any_commit_still_fits_its_admitted_room() {
+    let Some(fixture) = deeper_fixture() else {
+        return;
+    };
+    set_mode(&fixture.source_parent, 0o700);
+    let long = "r".repeat(200);
+    std::fs::rename(&fixture.source_root, fixture.source_parent.join(&long)).unwrap();
+    let request = || {
+        fixture
+            .forward_request(&long, "s")
+            .with_production_association(ProductionAssociation::new("undo-group".into()).unwrap())
+            .with_recovery_anchor(fixture.base.clone())
+    };
+    let transaction = TransactionId([0x6d; 16]);
+    let (binding, _) = request().prepare().unwrap();
+    let (engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let begin = engine
+        .wal
+        .begin_projection(transaction, &binding.metadata)
+        .unwrap();
+    // The root, `child`, `child/data` and `child/deeper`.
+    let tree = engine
+        .wal
+        .tree_projection(transaction, &binding.metadata, planned_directories(true), 4)
+        .unwrap();
+    drop((engine, binding));
+    assert!(
+        tree.rolled_back > tree.forward + tree.committed,
+        "the fixture does not make the rollback the larger: {tree:?}"
+    );
+    let limit = wal_len(&fixture) + begin.forward + tree.needed();
+    let _limit = WalLimit::set(limit);
+
+    let destination = fixture.destination_parent.join("s");
+    BEFORE_RENAME.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::fs::create_dir(&destination).unwrap();
+        }));
+    });
+    let mut ready = fixture.ready_engine();
+    let error = ready
+        .stage_to_verified_commit(transaction, request())
+        .unwrap_err();
+    assert_eq!(
+        error.disposition(),
+        ForwardFailureDisposition::Terminal(TransactionState::Restored),
+        "{error}"
+    );
+    assert!(
+        fixture
+            .source_parent
+            .join(&long)
+            .join("child/data")
+            .is_file()
+    );
+    assert!(wal_len(&fixture) <= limit);
 }

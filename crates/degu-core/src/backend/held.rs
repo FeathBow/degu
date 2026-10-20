@@ -1225,6 +1225,13 @@ pub(crate) struct PreSealDirectoryPlanRecord {
     evidence: DirectoryEvidence,
 }
 
+impl PreSealDirectoryPlanRecord {
+    /// The directory's path relative to the tree's root, which is empty.
+    pub(crate) fn relative_path(&self) -> &Path {
+        &self.evidence.relative_path
+    }
+}
+
 /// Allocation-bounded digest state for substituting the exact WAL-applied
 /// directory modes into an authenticated pre-seal manifest.
 pub(crate) struct PostSealExpectationBuilder {

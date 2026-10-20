@@ -23,7 +23,11 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod allowance;
 mod permission_ledger;
+pub(crate) use allowance::AllowanceError;
+#[cfg(test)]
+pub(crate) use allowance::{BeginProjection, TreeProjection};
 pub use permission_ledger::PermissionWorkload;
 use permission_ledger::{PermissionLedger, PhaseTally, SealCoverage};
 
@@ -34,6 +38,23 @@ const CONTENT_PROOF_MANIFEST_VERSION: u16 = 3;
 const HEADER_LEN: usize = 20;
 const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 const MAX_WAL_LEN: u64 = 64 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Lowers the append limit of every WAL this thread resumes, so a test can
+    /// meet a nearly full WAL without writing 64 MiB to reach one.
+    pub(crate) static WAL_LIMIT_FOR_TEST: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The append limit a resumed WAL is held to.
+fn resumed_wal_limit() -> u64 {
+    #[cfg(test)]
+    if let Some(limit) = WAL_LIMIT_FOR_TEST.with(std::cell::Cell::get) {
+        return limit;
+    }
+    MAX_WAL_LEN
+}
 /// How much a compaction must reclaim before its rewrite pays for itself.
 const COMPACTION_MIN_RECLAIMED_BYTES: u64 = 1024 * 1024;
 /// ...and what share of the file, as a divisor, so a long-lived store is not
@@ -871,7 +892,7 @@ impl<W: DurableWrite> SealWal<W> {
             mut ledgers,
             ..
         } = replay;
-        let mut wal = Self::from_validated(writer, actual_len, MAX_WAL_LEN);
+        let mut wal = Self::from_validated(writer, actual_len, resumed_wal_limit());
         for transaction_id in &transaction_order {
             let transaction = transactions
                 .get(transaction_id)

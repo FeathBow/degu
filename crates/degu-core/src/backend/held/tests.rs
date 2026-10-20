@@ -70,6 +70,9 @@ fn unwrap_tree_assessment(
     }
 }
 
+/// The prove walk stops where it crosses the directory limit and the assessment
+/// counts on, so for directories the two agree on the limit and only the
+/// assessment knows the size.
 fn assert_same_admission_error(
     prove: Result<HeldTreeInventory, HeldTreeError>,
     assessed: Result<HeldTreeAdmissionAssessment, HeldTreeError>,
@@ -80,6 +83,16 @@ fn assert_same_admission_error(
             HeldTreeError::Limit { kind: a, limit: x },
             HeldTreeError::Limit { kind: b, limit: y },
         ) => assert_eq!((a, x), (b, y)),
+        (
+            HeldTreeError::Limit {
+                kind: HeldTreeLimit::Directories,
+                limit: x,
+            },
+            HeldTreeError::DirectoryCount { limit: y, observed },
+        ) => {
+            assert_eq!(x, y);
+            assert!(observed > y);
+        }
         (
             HeldTreeError::ExternalOrUnenumeratedHardLink(a),
             HeldTreeError::ExternalOrUnenumeratedHardLink(b),
@@ -266,18 +279,238 @@ fn production_boundary_accepts_1023_total_directories_and_rejects_1024() {
     assert_eq!(legacy.directories.len() as u64, MAX_TREE_DIRECTORIES);
 
     std::fs::create_dir(root.join("boundary-over-limit")).unwrap();
-    for error in [
+    assert!(matches!(
         collect(&temp, vec![], HeldTreeLimits::default()).unwrap_err(),
+        HeldTreeError::Limit {
+            kind: HeldTreeLimit::Directories,
+            limit: MAX_TREE_DIRECTORIES,
+        }
+    ));
+    assert!(matches!(
         assess(&temp, vec![], HeldTreeLimits::default()).unwrap_err(),
-    ] {
-        assert!(matches!(
+        HeldTreeError::DirectoryCount {
+            limit: MAX_TREE_DIRECTORIES,
+            observed: HARD_DIRECTORY_CAP,
+        }
+    ));
+}
+
+/// The assessment refuses a tree over the directory limit with the size it
+/// counted, not with the point where it crossed the limit.
+///
+/// Six directories against a limit of two. A walk that stopped at the crossing
+/// would have seen three, so six is the whole tree and nothing less. The walks
+/// whose result is acted on still stop at the crossing: they are the ones that
+/// go on to seal what they walked.
+#[test]
+fn the_assessment_counts_the_whole_tree_it_refuses_for_directories() {
+    let (temp, root) = setup_tree();
+    // setup_tree holds root, a and a/b. Three more, one of them past a/b, so
+    // the count has to descend below the level where the limit was crossed.
+    for name in ["c", "d", "a/b/e"] {
+        std::fs::create_dir(root.join(name)).unwrap();
+    }
+    let limits = HeldTreeLimits {
+        max_directories: 2,
+        ..HeldTreeLimits::default()
+    };
+
+    let error = assess(&temp, vec![], limits).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            HeldTreeError::DirectoryCount {
+                limit: 2,
+                observed: 6
+            }
+        ),
+        "{error:?}"
+    );
+
+    let proven = HeldTreeInventory::collect_for_schema(
+        certify_held_fd(open_directory(temp.path())).unwrap(),
+        OsStr::new("root"),
+        vec![],
+        limits,
+        CONTENT_PROOF_VERSION,
+    )
+    .unwrap_err();
+    for error in [collect(&temp, vec![], limits).unwrap_err(), proven] {
+        assert!(
+            matches!(
+                error,
+                HeldTreeError::Limit {
+                    kind: HeldTreeLimit::Directories,
+                    limit: 2
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    // The same tree under a limit it meets is admitted, with the same count.
+    let (tree, _) = unwrap_tree_assessment(
+        assess(
+            &temp,
+            vec![],
+            HeldTreeLimits {
+                max_directories: 6,
+                ..HeldTreeLimits::default()
+            },
+        )
+        .unwrap(),
+    );
+    assert_eq!(tree.directories, 6);
+}
+
+/// Past the crossing the walk only counts. Whatever stops it there is answered
+/// with the refusal the crossing earned, in the form a walk that stopped at the
+/// crossing gives it, so the report gains a count and loses nothing else.
+///
+/// The limit is crossed while the root's children are read, before any of
+/// their own children are, so everything planted below is met only past it.
+#[test]
+fn a_refusal_past_the_directory_limit_is_refused_for_the_limit() {
+    let (temp, root) = setup_tree();
+    std::fs::create_dir(root.join("c")).unwrap();
+    let limits = HeldTreeLimits {
+        max_directories: 2,
+        ..HeldTreeLimits::default()
+    };
+    let crossed = |error: &HeldTreeError| {
+        matches!(
             error,
             HeldTreeError::Limit {
                 kind: HeldTreeLimit::Directories,
-                limit: MAX_TREE_DIRECTORIES,
+                limit: 2,
             }
-        ));
+        )
+    };
+
+    // Left alone, the walk reaches its end and counts all four.
+    let error = assess(&temp, vec![], limits).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            HeldTreeError::DirectoryCount {
+                limit: 2,
+                observed: 4
+            }
+        ),
+        "{error:?}"
+    );
+
+    // Another refusal past the crossing.
+    std::fs::write(root.join("a/b/.secret"), b"").unwrap();
+    let error = assess(&temp, vec![OsString::from(".secret")], limits).unwrap_err();
+    assert!(crossed(&error), "{error:?}");
+}
+
+/// A failed read past the crossing, reported as itself, would be an I/O
+/// failure. The preview files that as unavailable rather than refused, and a
+/// surface offering a plan reads unavailable as worth trying, so a tree the
+/// limit already refused would be offered again.
+#[test]
+fn a_failed_read_past_the_directory_limit_is_refused_for_the_limit() {
+    if rustix::process::geteuid().is_root() {
+        return;
     }
+    let (temp, root) = setup_tree();
+    std::fs::create_dir(root.join("c")).unwrap();
+    let limits = HeldTreeLimits {
+        max_directories: 2,
+        ..HeldTreeLimits::default()
+    };
+    let unreadable = root.join("a/b/unreadable");
+    std::fs::create_dir(&unreadable).unwrap();
+    std::fs::set_permissions(&unreadable, Permissions::from_mode(0o000)).unwrap();
+    let past = assess(&temp, vec![], limits).unwrap_err();
+    // Four directories are counted when the read fails: the root, `a`, `c`
+    // and `a/b`. A limit of four is met, not crossed.
+    let at_limit = assess(
+        &temp,
+        vec![],
+        HeldTreeLimits {
+            max_directories: 4,
+            ..HeldTreeLimits::default()
+        },
+    )
+    .unwrap_err();
+    std::fs::set_permissions(&unreadable, Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        matches!(
+            past,
+            HeldTreeError::Limit {
+                kind: HeldTreeLimit::Directories,
+                limit: 2,
+            }
+        ),
+        "{past:?}"
+    );
+    // The same failure with the walk at the limit is still reported as itself.
+    assert!(matches!(at_limit, HeldTreeError::Io { .. }), "{at_limit:?}");
+}
+
+/// A count is reported only for the tree still bound to the name it was asked
+/// about. A root swapped while the walk was counting gets the refusal the
+/// crossing earned, without a count.
+///
+/// The walk checks the binding each time it reopens a directory, so the swap
+/// has to land after the last reopen to reach the end of the walk at all. The
+/// only regular file sits in the deepest directory, which is the last one a
+/// breadth-first walk reads, and the swap happens as that file is observed.
+#[test]
+fn a_root_swapped_while_it_was_counted_gets_no_count() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    for directory in ["a/b/e", "c", "d"] {
+        std::fs::create_dir_all(root.join(directory)).unwrap();
+    }
+    std::fs::write(root.join("a/b/e/file"), b"one").unwrap();
+    std::fs::set_permissions(temp.path(), Permissions::from_mode(0o700)).unwrap();
+    let limits = HeldTreeLimits {
+        max_directories: 2,
+        ..HeldTreeLimits::default()
+    };
+
+    // Left alone, the walk reaches its end and counts all six.
+    let error = assess(&temp, vec![], limits).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            HeldTreeError::DirectoryCount {
+                limit: 2,
+                observed: 6
+            }
+        ),
+        "{error:?}"
+    );
+
+    let fired = Rc::new(Cell::new(false));
+    let hook_fired = Rc::clone(&fired);
+    let hook_root = root.clone();
+    let swapped = temp.path().join("swapped");
+    let _hook = install_regular_link_observation_test_hook(move |path| {
+        if path == Path::new("a/b/e/file") && !hook_fired.replace(true) {
+            std::fs::rename(&hook_root, &swapped).unwrap();
+            std::fs::create_dir(&hook_root).unwrap();
+        }
+    });
+    let error = assess(&temp, vec![], limits).unwrap_err();
+    assert!(fired.get(), "the swap did not happen");
+    assert!(
+        matches!(
+            error,
+            HeldTreeError::Limit {
+                kind: HeldTreeLimit::Directories,
+                limit: 2,
+            }
+        ),
+        "{error:?}"
+    );
 }
 
 #[test]

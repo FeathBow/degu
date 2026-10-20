@@ -33,8 +33,15 @@ fn preview_blocks_1024_tree_directories_before_any_production_mutation() {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     assert_eq!(count_directories(&fixture.cache), 1_024);
-    fixture.assert_preview_blocked("directory_limit_exceeded", "directory limit exceeded");
-    fixture.assert_production_rejects("directory limit exceeded");
+    let report = fixture.assert_preview_blocked(
+        "directory_limit_exceeded",
+        "directory limit exceeded (observed 1024, limit 1023)",
+    );
+    // The size is a field of its own, so nothing has to parse it out of a reason.
+    let preflight = &report["staging_preflight"][0];
+    assert_eq!(preflight["limit"], 1_023, "{report:#}");
+    assert_eq!(preflight["observed"], 1_024, "{report:#}");
+    fixture.assert_production_rejects("directory limit exceeded (observed 1024, limit 1023)");
     assert_eq!(count_directories(&fixture.cache), 1_024);
     assert!(fixture.cache.join("wheel.whl").is_file());
 }
@@ -982,7 +989,8 @@ impl Fixture {
         self.assert_no_activation_or_created_lifecycle_state();
     }
 
-    fn assert_preview_blocked(&self, kind: &str, reason: &str) {
+    /// Returns the JSON report it checked, for a caller with more to check in it.
+    fn assert_preview_blocked(&self, kind: &str, reason: &str) -> serde_json::Value {
         let parent = self.cache.parent().unwrap();
         let parent_mode = std::fs::metadata(parent).unwrap().mode();
         self.assert_no_activation_or_created_lifecycle_state();
@@ -1030,6 +1038,7 @@ impl Fixture {
         assert_eq!(std::fs::metadata(parent).unwrap().mode(), parent_mode);
         self.assert_no_activation_or_created_lifecycle_state();
         assert!(self.cache.is_dir());
+        report
     }
 
     // This is intentionally a mutation/activation assertion, not a claim that

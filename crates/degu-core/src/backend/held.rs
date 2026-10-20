@@ -296,6 +296,13 @@ pub(crate) enum HeldTreeError {
     InvalidDirectoryLimit,
     #[error("held tree exceeded its {kind:?} limit of {limit}")]
     Limit { kind: HeldTreeLimit, limit: u64 },
+    /// More directories than the limit, counted over the whole tree.
+    ///
+    /// [`Self::Limit`] is returned where a walk crosses a bound, so it knows the
+    /// bound and nothing about the size. This one is returned by a walk that kept
+    /// counting to the end, which only the assessment does.
+    #[error("held tree has {observed} directories, over its limit of {limit}")]
+    DirectoryCount { limit: u64, observed: u64 },
     #[error("source parent policy rejects sealing by this process")]
     ParentPolicyRejected,
     #[error("source parent identity, backend, or mode changed")]
@@ -962,6 +969,15 @@ struct TraversalConfiguration {
 trait V2Traversal {
     type Entry;
 
+    /// Whether crossing `max_directories` ends the walk, or is refused once the
+    /// whole tree has been counted.
+    ///
+    /// Only the assessment counts on. It reads metadata and nothing else, so the
+    /// rest of the walk costs it no more than a tree of the same entries under
+    /// the limit would, and what that buys is the size its refusal reports. A
+    /// walk whose result goes on to be sealed stops at the crossing.
+    const COUNTS_PAST_DIRECTORY_LIMIT: bool;
+
     fn make_root(inspected: Inspection) -> Self::Entry;
     fn inspect_entry(
         parent: &HeldLocalBackendEvidence,
@@ -990,6 +1006,7 @@ struct AssessTraversal;
 
 impl V2Traversal for ProveTraversal {
     type Entry = ProvedEntry;
+    const COUNTS_PAST_DIRECTORY_LIMIT: bool = false;
 
     fn make_root(inspected: Inspection) -> Self::Entry {
         ProvedEntry {
@@ -1058,6 +1075,7 @@ impl V2Traversal for ProveTraversal {
 
 impl V2Traversal for AssessTraversal {
     type Entry = AssessedEntry;
+    const COUNTS_PAST_DIRECTORY_LIMIT: bool = true;
 
     fn make_root(inspected: Inspection) -> Self::Entry {
         AssessedEntry {
@@ -1421,7 +1439,7 @@ fn traverse_v2_with_sink<M: V2Traversal, E>(
     let root_entry = M::make_root(opened);
     let mut budget = Budget::new(limits, configuration.manifest_schema);
     budget.add_path(M::path(&root_entry), 0)?;
-    budget.add_directory()?;
+    budget.add_walked_directory::<M>()?;
     if let Some(entry) = M::manifest_entry(&root_entry) {
         emit_entry(entry).map_err(TraversalSinkError::Emit)?;
     }
@@ -1452,13 +1470,39 @@ fn traverse_v2_with_sink<M: V2Traversal, E>(
         regular_hard_links: RegularHardLinkTopology::default(),
         regular_xattrs: RegularXattrTopology::default(),
     };
+    if let Err(error) = finish_v2_walk(&mut walked, configuration, &mut emit_entry) {
+        // Past the crossing the walk is only counting, so whatever stops it there
+        // -- another refusal, a failed read, a swapped root -- is answered with
+        // the refusal the crossing already earned, exactly as a walk that stopped
+        // at the crossing would have answered. Reporting the later failure
+        // instead would trade a certain refusal for however that failure is
+        // classified, and a failed read is classified as worth trying again.
+        return Err(walked
+            .budget
+            .directory_limit_crossed()
+            .map_or(error, Into::into));
+    }
+    // A walk that counted past the directory limit refuses here rather than at
+    // the crossing, and only after the root is known to still be the tree that
+    // was named, so the count it reports is of that tree.
+    walked.budget.check_counted_directories()?;
+    Ok(walked)
+}
+
+/// The rest of a v2 walk once its root is held: every directory below it, then
+/// the checks that the root is still the one that was named.
+fn finish_v2_walk<M: V2Traversal, E>(
+    walked: &mut V2Walk<M>,
+    configuration: TraversalConfiguration,
+    emit_entry: &mut impl FnMut(&ManifestEntry) -> Result<(), E>,
+) -> Result<(), TraversalSinkError<E>> {
     let mut index = 0;
     while index < walked.directories.len() {
         read_v2_children_with_sink::<M, E>(
-            &mut walked,
+            walked,
             index,
             configuration.retain_entries,
-            &mut emit_entry,
+            emit_entry,
         )?;
         index += 1;
     }
@@ -1493,7 +1537,7 @@ fn traverse_v2_with_sink<M: V2Traversal, E>(
     ) {
         return Err(HeldTreeError::RootBindingChanged.into());
     }
-    Ok(walked)
+    Ok(())
 }
 
 fn traverse_v2<M: V2Traversal>(
@@ -1923,7 +1967,7 @@ fn read_v2_children_with_sink<M: V2Traversal, E>(
         }
         walked.budget.add_path(M::path(&result), depth)?;
         if child.is_some() {
-            walked.budget.add_directory()?;
+            walked.budget.add_walked_directory::<M>()?;
         }
         if let Some(entry) = M::manifest_entry(&result) {
             emit_entry(entry).map_err(TraversalSinkError::Emit)?;
@@ -7220,6 +7264,40 @@ impl Budget {
             self.limits.max_directories,
             HeldTreeLimit::Directories,
         )
+    }
+
+    /// One directory of a v2 walk, held to the limit the way that walk holds it.
+    fn add_walked_directory<M: V2Traversal>(&mut self) -> Result<(), HeldTreeError> {
+        if M::COUNTS_PAST_DIRECTORY_LIMIT {
+            self.directories = self.directories.saturating_add(1);
+            Ok(())
+        } else {
+            self.add_directory()
+        }
+    }
+
+    /// The refusal a walk earned when it crossed the directory limit, if it did,
+    /// in the form a walk that stopped at the crossing gives it.
+    fn directory_limit_crossed(&self) -> Option<HeldTreeError> {
+        (self.directories > self.limits.max_directories).then_some(HeldTreeError::Limit {
+            kind: HeldTreeLimit::Directories,
+            limit: self.limits.max_directories,
+        })
+    }
+
+    /// The refusal a walk that counted past the directory limit owes at its end.
+    ///
+    /// A walk that stops at the crossing never gets here over the limit, so for
+    /// it this always passes.
+    fn check_counted_directories(&self) -> Result<(), HeldTreeError> {
+        if self.directories <= self.limits.max_directories {
+            Ok(())
+        } else {
+            Err(HeldTreeError::DirectoryCount {
+                limit: self.limits.max_directories,
+                observed: self.directories,
+            })
+        }
     }
 }
 

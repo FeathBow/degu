@@ -363,29 +363,31 @@ fn the_assessment_counts_the_whole_tree_it_refuses_for_directories() {
     assert_eq!(tree.directories, 6);
 }
 
-/// Counting past the limit is the same walk, not a cheaper one: every other
-/// refusal still applies to the directories beyond it, and the first of those
-/// is what the assessment reports.
+/// Past the crossing the walk only counts. Whatever stops it there is answered
+/// with the refusal the crossing earned, in the form a walk that stopped at the
+/// crossing gives it, so the report gains a count and loses nothing else.
 ///
 /// The limit is crossed while the root's children are read, before any of
-/// their own children are, so the protected name below is met only past it.
+/// their own children are, so everything planted below is met only past it.
 #[test]
-fn a_refusal_past_the_directory_limit_is_the_one_reported() {
+fn a_refusal_past_the_directory_limit_is_refused_for_the_limit() {
     let (temp, root) = setup_tree();
     std::fs::create_dir(root.join("c")).unwrap();
-    std::fs::write(root.join("a/b/.secret"), b"").unwrap();
     let limits = HeldTreeLimits {
         max_directories: 2,
         ..HeldTreeLimits::default()
     };
+    let crossed = |error: &HeldTreeError| {
+        matches!(
+            error,
+            HeldTreeError::Limit {
+                kind: HeldTreeLimit::Directories,
+                limit: 2,
+            }
+        )
+    };
 
-    let error = assess(&temp, vec![OsString::from(".secret")], limits).unwrap_err();
-    assert!(
-        matches!(&error, HeldTreeError::ProtectedName(path) if path == Path::new("a/b/.secret")),
-        "{error:?}"
-    );
-
-    // Without the protected name the same walk reaches the end and counts.
+    // Left alone, the walk reaches its end and counts all four.
     let error = assess(&temp, vec![], limits).unwrap_err();
     assert!(
         matches!(
@@ -397,17 +399,68 @@ fn a_refusal_past_the_directory_limit_is_the_one_reported() {
         ),
         "{error:?}"
     );
+
+    // Another refusal past the crossing.
+    std::fs::write(root.join("a/b/.secret"), b"").unwrap();
+    let error = assess(&temp, vec![OsString::from(".secret")], limits).unwrap_err();
+    assert!(crossed(&error), "{error:?}");
+}
+
+/// A failed read past the crossing, reported as itself, would be an I/O
+/// failure. The preview files that as unavailable rather than refused, and a
+/// surface offering a plan reads unavailable as worth trying, so a tree the
+/// limit already refused would be offered again.
+#[test]
+fn a_failed_read_past_the_directory_limit_is_refused_for_the_limit() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let (temp, root) = setup_tree();
+    std::fs::create_dir(root.join("c")).unwrap();
+    let limits = HeldTreeLimits {
+        max_directories: 2,
+        ..HeldTreeLimits::default()
+    };
+    let unreadable = root.join("a/b/unreadable");
+    std::fs::create_dir(&unreadable).unwrap();
+    std::fs::set_permissions(&unreadable, Permissions::from_mode(0o000)).unwrap();
+    let past = assess(&temp, vec![], limits).unwrap_err();
+    // Four directories are counted when the read fails: the root, `a`, `c`
+    // and `a/b`. A limit of four is met, not crossed.
+    let at_limit = assess(
+        &temp,
+        vec![],
+        HeldTreeLimits {
+            max_directories: 4,
+            ..HeldTreeLimits::default()
+        },
+    )
+    .unwrap_err();
+    std::fs::set_permissions(&unreadable, Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        matches!(
+            past,
+            HeldTreeError::Limit {
+                kind: HeldTreeLimit::Directories,
+                limit: 2,
+            }
+        ),
+        "{past:?}"
+    );
+    // The same failure with the walk at the limit is still reported as itself.
+    assert!(matches!(at_limit, HeldTreeError::Io { .. }), "{at_limit:?}");
 }
 
 /// A count is reported only for the tree still bound to the name it was asked
-/// about. A root swapped while the walk was counting is refused as swapped.
+/// about. A root swapped while the walk was counting gets the refusal the
+/// crossing earned, without a count.
 ///
 /// The walk checks the binding each time it reopens a directory, so the swap
 /// has to land after the last reopen to reach the end of the walk at all. The
 /// only regular file sits in the deepest directory, which is the last one a
 /// breadth-first walk reads, and the swap happens as that file is observed.
 #[test]
-fn a_root_swapped_while_it_was_counted_is_refused_as_swapped() {
+fn a_root_swapped_while_it_was_counted_gets_no_count() {
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -449,7 +502,13 @@ fn a_root_swapped_while_it_was_counted_is_refused_as_swapped() {
     let error = assess(&temp, vec![], limits).unwrap_err();
     assert!(fired.get(), "the swap did not happen");
     assert!(
-        matches!(error, HeldTreeError::RootBindingChanged),
+        matches!(
+            error,
+            HeldTreeError::Limit {
+                kind: HeldTreeLimit::Directories,
+                limit: 2,
+            }
+        ),
         "{error:?}"
     );
 }

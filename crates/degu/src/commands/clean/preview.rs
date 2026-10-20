@@ -60,7 +60,8 @@ pub(super) enum PreviewStagingStatus {
     },
 }
 
-/// Why staging admission would refuse this tree, or `None` when it would not.
+/// Why staging admission would refuse each tree of a plan, or `None` for one it
+/// would admit, asked in the order the plan runs.
 ///
 /// The same assessment a dry-run preview reports, asked one finding at a time so a
 /// surface that offers a plan can say what the plan would hit before it is run. It
@@ -72,13 +73,41 @@ pub(super) enum PreviewStagingStatus {
 /// rejects the whole batch on any other answer, so a tree whose assessment could
 /// not finish is a refusal here, although the preview, which reports rather than
 /// offers, files it as unavailable rather than blocked.
-pub(crate) fn staging_refusal(finding: &Finding) -> Option<String> {
-    match PreviewStagingAssessment::assess(finding, false, true).status {
-        PreviewStagingStatus::TreePolicyAssessed { .. } => None,
-        PreviewStagingStatus::Blocked { reason, .. }
-        | PreviewStagingStatus::WalFull { reason, .. }
-        | PreviewStagingStatus::DeferredUntilExecutionSeal { reason, .. }
-        | PreviewStagingStatus::SealedPathUnavailable { reason, .. } => Some(reason),
+///
+/// A tree whose policy was assessed is then sized against `room`, the seal WAL's
+/// room when it could be read, beside what the trees admitted before it will
+/// leave there. A refused tree is left out of the plan it is asked for, so it
+/// spends nothing.
+pub(crate) fn plan_refusals(
+    ctx: degu_core::ecosystem::DetectCtx,
+    room: Option<WalRoom>,
+) -> impl FnMut(&Finding) -> Option<String> {
+    refusals_with(
+        |finding| PreviewStagingAssessment::assess(finding, false, true).status,
+        move |finding| crate::lifecycle::feasibility::staging_shape(&ctx, finding).ok(),
+        room,
+    )
+}
+
+fn refusals_with(
+    assess: impl Fn(&Finding) -> PreviewStagingStatus,
+    mut shape_of: impl FnMut(&Finding) -> Option<StagingShape>,
+    room: Option<WalRoom>,
+) -> impl FnMut(&Finding) -> Option<String> {
+    let mut budget = room.map(WalBudget::new);
+    move |finding| {
+        let tree = match assess(finding) {
+            PreviewStagingStatus::TreePolicyAssessed { tree, .. } => tree,
+            PreviewStagingStatus::Blocked { reason, .. }
+            | PreviewStagingStatus::WalFull { reason, .. }
+            | PreviewStagingStatus::DeferredUntilExecutionSeal { reason, .. }
+            | PreviewStagingStatus::SealedPathUnavailable { reason, .. } => return Some(reason),
+        };
+        let budget = budget.as_mut()?;
+        match budget.admit(shape_of(finding)?, tree) {
+            WalAdmission::Full { needed, available } => Some(wal_full_reason(needed, available)),
+            WalAdmission::Fits { .. } | WalAdmission::Unsized => None,
+        }
     }
 }
 
@@ -410,24 +439,97 @@ fn assess_path(path: &Path) -> PreviewStagingStatus {
     }
 }
 
+/// The room the seal WAL leaves for new staging, spent in plan order on what
+/// each item's staging would leave there.
+///
+/// Staging checks the same room under the lease twice: before its first frame,
+/// for the source parent's seal and its undo, and once the tree is planned, for
+/// the rest of the item's life. What an item needs here is never less than
+/// either check asks, and its shape rounds the reservation number and the
+/// reclamation id up to their widest, so an item admitted here is admitted
+/// there unless the trash changed in between. One refused here may still just
+/// fit there.
+struct WalBudget {
+    available: u64,
+}
+
+enum WalAdmission {
+    /// Its whole life fits, and what a commit leaves it holding is spent.
+    Fits { needed: u64 },
+    /// Its whole life does not fit in what is left. Nothing is spent.
+    Full { needed: u64, available: u64 },
+    /// It cannot be sized. Nothing is spent.
+    Unsized,
+}
+
+impl WalBudget {
+    fn new(room: WalRoom) -> Self {
+        Self {
+            available: room.available(),
+        }
+    }
+
+    /// Admits an item whose tree was assessed, if its whole life fits. What a
+    /// commit leaves it holding is the frames it wrote and the allowance its
+    /// entry then keeps, which is never less than a purge writes, so a
+    /// `--purge` run is measured no more loosely.
+    fn admit(&mut self, shape: StagingShape, tree: TreeShape) -> WalAdmission {
+        let Some(metadata) = shape.metadata() else {
+            return WalAdmission::Unsized;
+        };
+        let (Ok(begin), Ok(projection)) = (project_begin(&metadata), project_tree(&metadata, tree))
+        else {
+            return WalAdmission::Unsized;
+        };
+        let needed = begin.forward.saturating_add(projection.needed());
+        if needed > self.available {
+            return WalAdmission::Full {
+                needed,
+                available: self.available,
+            };
+        }
+        self.available = self.available.saturating_sub(
+            begin
+                .forward
+                .saturating_add(projection.forward)
+                .saturating_add(projection.committed),
+        );
+        WalAdmission::Fits { needed }
+    }
+
+    /// Spends what staging leaves when it refuses a tree once it has begun:
+    /// the source parent's seal and its undo, or nothing when there is no room
+    /// even for that, because then it refuses before its first frame.
+    fn refuse(&mut self, shape: StagingShape) {
+        let Some(round_trip) = shape
+            .metadata()
+            .and_then(|metadata| project_begin(&metadata).ok())
+            .map(|begin| begin.needed())
+        else {
+            return;
+        };
+        if round_trip <= self.available {
+            self.available -= round_trip;
+        }
+    }
+}
+
+fn wal_full_reason(needed: u64, available: u64) -> String {
+    format!(
+        "the seal WAL needs {needed} bytes for this item's whole life but has {available} to give"
+    )
+}
+
 /// Sizes each assessed item's whole life in the seal WAL, in plan order, and
 /// blocks every one that does not fit beside what the trash already holds and
 /// what the items before it will have left there.
 ///
-/// Staging checks the same room under the lease twice: before its first frame,
-/// for the source parent's seal and its undo, and once the tree is planned, for
-/// the rest of the item's life. An item's need here is never less than either
-/// check asks, and its shape rounds the reservation number and the reclamation
-/// id up to their widest, so an item that fits here is admitted there unless
-/// the trash changed in between. One blocked here may still just fit there.
-///
-/// What an item leaves behind is charged as staging would leave it. One that
-/// commits holds the frames it wrote and the allowance its entry keeps, which
-/// is never less than a purge then writes. One whose tree staging refuses --
-/// for its policy, or for room -- has sealed its source parent first and
-/// rolled that back, so it leaves that round trip, or nothing when the first
-/// check refused it too. A tree only the seal can walk is not known here, so
-/// that round trip is all it is charged, which is the least it can leave.
+/// A clean attempts every planned item, so each is charged what its staging
+/// would leave. One that commits holds what [`WalBudget::admit`] spends. One
+/// whose tree staging refuses -- for its policy, or for room -- has sealed its
+/// source parent first and rolled that back. A tree only the seal can walk is
+/// not known here, so that round trip is all it is charged, which is the least
+/// it can leave. One staging cannot even hold leaves nothing.
 ///
 /// `shape_of` sizes an item from what preflight can see. An item it cannot
 /// size is left as assessed and counts for nothing: on a machine where nothing
@@ -439,7 +541,7 @@ pub(super) fn apply_wal_room(
     mut shape_of: impl FnMut(&Finding) -> Option<StagingShape>,
     room: WalRoom,
 ) {
-    let mut available = room.available();
+    let mut budget = WalBudget::new(room);
     for (assessment, finding) in assessments.iter_mut().zip(planned) {
         let tree = match &assessment.status {
             PreviewStagingStatus::TreePolicyAssessed { tree, .. } => Some(*tree),
@@ -448,43 +550,31 @@ pub(super) fn apply_wal_room(
             PreviewStagingStatus::WalFull { .. }
             | PreviewStagingStatus::SealedPathUnavailable { .. } => continue,
         };
-        let Some(metadata) = shape_of(finding).and_then(|shape| shape.metadata()) else {
+        let Some(shape) = shape_of(finding) else {
             continue;
         };
-        let Ok(begin) = project_begin(&metadata) else {
+        let Some(tree) = tree else {
+            budget.refuse(shape);
             continue;
         };
-        let round_trip = if begin.needed() <= available {
-            begin.needed()
-        } else {
-            0
-        };
-        let Some(projection) = tree.and_then(|tree| project_tree(&metadata, tree).ok()) else {
-            available -= round_trip;
-            continue;
-        };
-        let needed = begin.forward.saturating_add(projection.needed());
-        if needed > available {
-            assessment.status = PreviewStagingStatus::WalFull {
-                needed,
-                available,
-                reason: format!(
-                    "the seal WAL needs {needed} bytes for this item's whole life but has {available} to give"
-                ),
-            };
-            available -= round_trip;
-            continue;
+        match budget.admit(shape, tree) {
+            WalAdmission::Fits { needed } => {
+                if let PreviewStagingStatus::TreePolicyAssessed { wal_needed, .. } =
+                    &mut assessment.status
+                {
+                    *wal_needed = Some(needed);
+                }
+            }
+            WalAdmission::Full { needed, available } => {
+                assessment.status = PreviewStagingStatus::WalFull {
+                    needed,
+                    available,
+                    reason: wal_full_reason(needed, available),
+                };
+                budget.refuse(shape);
+            }
+            WalAdmission::Unsized => budget.refuse(shape),
         }
-        if let PreviewStagingStatus::TreePolicyAssessed { wal_needed, .. } = &mut assessment.status
-        {
-            *wal_needed = Some(needed);
-        }
-        available = available.saturating_sub(
-            begin
-                .forward
-                .saturating_add(projection.forward)
-                .saturating_add(projection.committed),
-        );
     }
 }
 
@@ -690,17 +780,21 @@ mod tests {
         .expect("one finalized finding")
     }
 
+    fn assessed_tree(tree: TreeShape) -> PreviewStagingStatus {
+        PreviewStagingStatus::TreePolicyAssessed {
+            regular_hard_links: HeldTreeRegularHardLinkTopology::default(),
+            regular_xattrs: HeldTreeRegularXattrTopology::default(),
+            directory_xattrs_block_purge: false,
+            tree,
+            wal_needed: None,
+        }
+    }
+
     fn assessed(path: &str) -> PreviewStagingAssessment {
         PreviewStagingAssessment {
             path: PathBuf::from(path),
             purge_requested: false,
-            status: PreviewStagingStatus::TreePolicyAssessed {
-                regular_hard_links: HeldTreeRegularHardLinkTopology::default(),
-                regular_xattrs: HeldTreeRegularXattrTopology::default(),
-                directory_xattrs_block_purge: false,
-                tree: TREE,
-                wal_needed: None,
-            },
+            status: assessed_tree(TREE),
         }
     }
 
@@ -815,6 +909,43 @@ mod tests {
 
         assert_eq!(wal_full_available(&assessments[1]), Some(short));
         assert_eq!(wal_full_available(&assessments[2]), Some(short));
+    }
+
+    /// A plan's trees are sized in the order it runs them, and a refused tree is
+    /// left out of the plan, so it spends nothing: the tree after it finds the
+    /// room it found. A tree refused for its policy keeps that reason, and with
+    /// no room to read, no tree is refused for room.
+    #[test]
+    fn refusals_spend_nothing() {
+        const BIG: TreeShape = TreeShape {
+            directories: 48,
+            directory_path_bytes: 240,
+            entries: 49,
+        };
+        let metadata = SHAPE.metadata().unwrap();
+        let begin = project_begin(&metadata).unwrap();
+        let tree = project_tree(&metadata, TREE).unwrap();
+        let needed = begin.forward + tree.needed();
+        let holds = begin.forward + tree.forward + tree.committed;
+        let big = begin.forward + project_tree(&metadata, BIG).unwrap().needed();
+        assert!(big > needed);
+
+        let assess = |finding: &Finding| match finding.path().to_str() {
+            Some("/policy") => blocked(),
+            Some("/big") => assessed_tree(BIG),
+            _ => assessed_tree(TREE),
+        };
+        let mut refusal = refusals_with(assess, |_| Some(SHAPE), Some(room(holds + needed)));
+        let mut ask = |path| refusal(&planned(path));
+        assert_eq!(ask("/a"), None);
+        assert_eq!(ask("/policy").as_deref(), Some("refused"));
+        assert_eq!(ask("/big"), Some(wal_full_reason(big, needed)));
+        assert_eq!(ask("/b"), None);
+        assert_eq!(ask("/c"), Some(wal_full_reason(needed, needed - holds)));
+
+        let mut unread = refusals_with(assess, |_| Some(SHAPE), None);
+        assert_eq!(unread(&planned("/big")), None);
+        assert_eq!(unread(&planned("/policy")).as_deref(), Some("refused"));
     }
 
     #[test]

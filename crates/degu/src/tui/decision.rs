@@ -49,8 +49,10 @@ impl Decisions {
     /// `assess` says why sealed staging would refuse a tree, or `None` when it would
     /// not. Passed in rather than called here: it walks the tree's metadata, which is
     /// work for the caller that already waits on a scan, and only the findings that
-    /// would start in the plan are worth asking about.
-    pub fn new(cache: &[Finding], assess: impl Fn(&Finding) -> Option<String>) -> Self {
+    /// would start in the plan are worth asking about. It is asked in the order the
+    /// scan reported them, which is the order a clean runs them, because whether a
+    /// tree fits in the seal WAL depends on the trees admitted before it.
+    pub fn new(cache: &[Finding], mut assess: impl FnMut(&Finding) -> Option<String>) -> Self {
         let eligible = || {
             cache
                 .iter()

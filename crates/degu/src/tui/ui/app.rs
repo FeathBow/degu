@@ -80,7 +80,7 @@ impl App {
         home: std::path::PathBuf,
         blocked: bool,
         advisories: crate::advisory::Advisories,
-        assess: impl Fn(&degu_core::finding::Finding) -> Option<String>,
+        assess: impl FnMut(&degu_core::finding::Finding) -> Option<String>,
     ) -> Self {
         let decisions = Decisions::new(report.section(Section::Cache), assess);
         let browser = Browser::new(report);

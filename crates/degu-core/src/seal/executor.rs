@@ -11,7 +11,8 @@ use crate::backend::{
 };
 use crate::seal::wal::{
     AppendError, ApplicationStatus, DurablePermission, DurableWrite, MutationAppendError,
-    PermissionIntent, PermissionResolution, ResolveError, SealWal, TransactionId,
+    PermissionIntent, PermissionReadError, PermissionResolution, ResolveError, SealWal,
+    TransactionId,
 };
 use std::io;
 use std::path::PathBuf;
@@ -109,6 +110,10 @@ pub enum LocalModeExecutionError {
     InvalidSealOrInverse(#[source] AppendError),
     #[error("applied seal lineage could not be retained: {0:?}")]
     SealLineage(LocalModeRevalidationFailure),
+    /// The WAL could not read back the seal a restore reverses, so it refused
+    /// the restore's intent before writing it and before the mode changed.
+    #[error("the seal this restore reverses could not be read back: {0}")]
+    OriginalSealUnreadable(#[source] PermissionReadError),
 }
 
 pub(crate) fn execute_local_mode_mutation<W: DurableWrite>(
@@ -280,6 +285,11 @@ fn execute_local_mode_mutation_inner<W: DurableWrite>(
             }
             other => Err(LocalModeExecutionError::IntentNotDurable(other)),
         },
+        // The seal is read back before the intent is written, so this refusal
+        // leaves no intent behind and the mutation never ran.
+        (Err(MutationAppendError::PermissionRecord(error)), None) => {
+            Err(LocalModeExecutionError::OriginalSealUnreadable(error))
+        }
         (Err(MutationAppendError::AppliedWal { source, .. }), Some(_)) => {
             held.invalidate_after_wal_uncertainty();
             Err(LocalModeExecutionError::AppliedRecordNotDurable { source })
@@ -394,6 +404,10 @@ mod tests {
         fn prepare_append(&mut self) -> io::Result<u64> {
             Ok(self.bytes.len() as u64)
         }
+
+        fn read_committed(&self, start: u64, into: &mut [u8]) -> io::Result<()> {
+            crate::seal::wal::read_committed_from_memory(&self.bytes, start, into)
+        }
     }
 
     #[test]
@@ -480,6 +494,139 @@ mod tests {
                 expected_mode
             );
         }
+    }
+
+    /// An in-memory WAL whose committed bytes can be made unreadable, to stand
+    /// for a file that fails underneath a lease that already indexed it.
+    struct UnreadableWriter {
+        bytes: Vec<u8>,
+        reads_fail: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl Write for UnreadableWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl DurableWrite for UnreadableWriter {
+        fn sync_record(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn prepare_append(&mut self) -> io::Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+
+        fn read_committed(&self, start: u64, into: &mut [u8]) -> io::Result<()> {
+            if self.reads_fail.get() {
+                return Err(io::Error::from_raw_os_error(5));
+            }
+            crate::seal::wal::read_committed_from_memory(&self.bytes, start, into)
+        }
+    }
+
+    /// The WAL reads the original seal back before it writes a restore's
+    /// intent. When that read fails nothing has been written and nothing has
+    /// moved, and the refusal has to say so: which seal, and why, rather than
+    /// that the WAL and the mode change disagreed about something neither did.
+    #[test]
+    fn a_restore_whose_seal_cannot_be_read_back_says_so() {
+        let temp = crate::secure_test_tempdir().unwrap();
+        let directory = temp.path().join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let fd = std::fs::File::open(&directory).unwrap().into();
+        let mut held = match certify_held_fd(fd) {
+            Ok(held) => held,
+            Err(CertificationError::UnsupportedFilesystem) => return,
+            Err(error) => panic!("unexpected certification failure: {error:?}"),
+        };
+        let reads_fail = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut wal = SealWal::new(UnreadableWriter {
+            bytes: Vec::new(),
+            reads_fail: reads_fail.clone(),
+        })
+        .unwrap();
+        let transaction = TransactionId([47; 16]);
+        wal.begin(transaction).unwrap();
+        wal.transition(transaction, TransactionState::ParentSealIntent)
+            .unwrap();
+        let request = |mutation_id, transform| LocalModeMutationRequest {
+            transaction,
+            mutation_id,
+            locator: RecoveryLocator::authority_neutral(PathBuf::from("directory"), None),
+            transform,
+        };
+        execute_local_mode_mutation(
+            &mut wal,
+            &mut held,
+            request(
+                1,
+                LocalModeTransform::Seal {
+                    acquire_owner_write_search: false,
+                },
+            ),
+        )
+        .unwrap();
+        wal.transition(transaction, TransactionState::ParentSealed)
+            .unwrap();
+        wal.transition(transaction, TransactionState::RestoreIntent)
+            .unwrap();
+        let original = wal
+            .permission_records(transaction)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        reads_fail.set(true);
+        let error = execute_local_mode_mutation(
+            &mut wal,
+            &mut held,
+            request(
+                2,
+                LocalModeTransform::Restore {
+                    original: original.clone(),
+                },
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                LocalModeExecutionError::OriginalSealUnreadable(PermissionReadError::Io {
+                    mutation_id: 1,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o7777,
+            0o750
+        );
+
+        // Nothing was written for mutation 2, so once the seal reads again the
+        // same restore goes through under the same id.
+        reads_fail.set(false);
+        assert_eq!(
+            execute_local_mode_mutation(
+                &mut wal,
+                &mut held,
+                request(2, LocalModeTransform::Restore { original }),
+            )
+            .unwrap(),
+            LocalModeMutationResult::Applied {
+                pre_mode: 0o750,
+                applied_mode: 0o770,
+            }
+        );
     }
 
     #[test]
@@ -599,13 +746,23 @@ mod tests {
         let replay = recovery.replay_and_repair().unwrap();
         let recovered = &replay.transactions[&transaction];
         assert_eq!(recovered.state, TransactionState::Restored);
-        assert_eq!(replay.permission_records(transaction).len(), 2);
+        // The records are the frames, so the decision reads them from the file
+        // the replay was built from.
+        let frames = std::fs::read(store_path.join(crate::seal::store::WAL_FILE_NAME)).unwrap();
+        assert_eq!(
+            replay
+                .permission_records(transaction, &frames)
+                .unwrap()
+                .len(),
+            2
+        );
         assert!(matches!(
             decide_recovery(
                 recovered,
-                || replay.permission_records(transaction),
+                || replay.permission_records(transaction, &frames),
                 |_| panic!("restored work needs no identity probe")
-            ),
+            )
+            .unwrap(),
             RecoveryWork::Nothing
         ));
     }

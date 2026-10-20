@@ -140,6 +140,8 @@ pub(crate) enum RecoveryRebindError {
     Io(#[source] io::Error),
     #[error("recovery WAL transition failed: {0}")]
     Wal(#[from] AppendError),
+    #[error("durable permission record could not be read back: {0}")]
+    PermissionRecord(#[from] crate::seal::wal::PermissionReadError),
     #[error("uncertain staging permission could not be resolved: {0}")]
     Resolution(#[from] ResolveError),
     #[error("held recovery mutation failed: {0}")]
@@ -1185,7 +1187,7 @@ impl VerifiedUndoRecoverySession<'_> {
             // original, so the set is extended in step rather than re-read.
             let mut restored: BTreeSet<u64> = self
                 .wal
-                .permission_records(transaction)
+                .permission_records(transaction)?
                 .iter()
                 .filter(|permission| {
                     permission.application == ApplicationStatus::Applied
@@ -1655,7 +1657,7 @@ pub(crate) fn prepare_startup_recovery<'a>(
             &snapshot,
             || wal.permission_records(transaction),
             |_| crate::seal::wal::RecoveryIdentity::Reestablished,
-        );
+        )?;
         // Preserve the typed RenameIntent+missing-outcome ambiguity. Repeated
         // attempts must never turn it into a generic state that permits lookup.
         if recovery_lookup_is_forbidden(&work) {
@@ -1799,7 +1801,7 @@ pub(crate) fn prepare_verified_undo<'a>(
         .ok_or(RecoveryRebindError::TransactionMismatch)?;
     let work = RecoveryWork::ResumeVerifiedUndo {
         transaction,
-        permissions: wal.permission_records(transaction),
+        permissions: wal.permission_records(transaction)?,
     };
     match rebind_work(
         &metadata,
@@ -1847,7 +1849,7 @@ pub(crate) fn prepare_verified_purge<'a>(
     }
     let work = RecoveryWork::ResumeVerifiedUndo {
         transaction,
-        permissions: wal.permission_records(transaction),
+        permissions: wal.permission_records(transaction)?,
     };
     match rebind_work(
         &metadata,
@@ -1919,7 +1921,7 @@ fn resolve_uncertain_permissions(
     if wal.transaction_state(transaction).is_none() {
         return Err(RecoveryRebindError::TransactionMismatch);
     }
-    let records = wal.permission_records(transaction);
+    let records = wal.permission_records(transaction)?;
     for permission in permissions {
         let (anchor, path) =
             uncertain_permission_location(&permission, &records, metadata, anchors)?;

@@ -64,6 +64,9 @@ pub(crate) enum CompactionDamage {
 std::thread_local! {
     pub(crate) static DAMAGE_COMPACTION: std::cell::Cell<Option<CompactionDamage>> =
         const { std::cell::Cell::new(None) };
+    /// How many syncs this thread's opens of an existing store have made.
+    pub(crate) static EXISTING_STORE_SYNCS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Where a compaction assembles the next WAL before it replaces the live one.
@@ -154,11 +157,26 @@ impl SealWalStore {
     /// This is the only safe discovery operation after whole-store activation.
     pub(crate) fn open_existing(path: &Path) -> Result<Self, StoreError> {
         Self::open_with_sync(path, false, |fd| {
+            #[cfg(test)]
+            EXISTING_STORE_SYNCS.with(|syncs| syncs.set(syncs.get() + 1));
             rustix::fs::fsync(fd).map_err(io::Error::from)
         })
         .map_err(|error| match error {
             // Any absent component makes the exact recorded whole-store locator
             // absent. Normalize it before activation classifies state.
+            StoreError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
+                StoreError::MissingStore {
+                    path: path.to_path_buf(),
+                }
+            }
+            error => error,
+        })
+    }
+
+    /// Opens already-published store authority without recreating it and
+    /// without syncing anything, for a read-only look that changes nothing.
+    pub(crate) fn open_existing_unsynced(path: &Path) -> Result<Self, StoreError> {
+        Self::open_with_sync(path, false, |_| Ok(())).map_err(|error| match error {
             StoreError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
                 StoreError::MissingStore {
                     path: path.to_path_buf(),

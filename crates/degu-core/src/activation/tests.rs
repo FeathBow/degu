@@ -720,7 +720,7 @@ fn authority_guard_drop_unlocks_an_inherited_open_file_description() {
     let fixture = Fixture::new();
     drop(activate_or_resume_store(&fixture.anchor, &fixture.store).unwrap());
     let held = open_activation_anchor(&fixture.anchor).unwrap();
-    let inherited = held._lock.as_file().try_clone().unwrap();
+    let inherited = held._lock.as_ref().unwrap().as_file().try_clone().unwrap();
 
     drop(held);
     assert_eq!(
@@ -1399,4 +1399,57 @@ fn account_home_handoff_cannot_declare_a_different_locator() {
         }) if observed_expected == expected && observed_actual == actual
     ));
     assert!(require_current_self_path_with(&expected, || Ok(expected.clone())).is_ok());
+}
+
+/// A look at the room neither waits on a clean nor makes one wait. While a
+/// mutation session holds the anchor, another exclusive selection is refused,
+/// but the look still finds the store and measures it; it syncs nothing on the
+/// way, so a sync set to fail is never reached; and while a look is open, a
+/// mutation session can still take the anchor.
+#[test]
+fn room_look_holds_nothing() {
+    let fixture = Fixture::new();
+    let held = activate_store_for_mutation(&fixture.anchor, &fixture.store).unwrap();
+    assert!(matches!(
+        selection_for_locator(&fixture.anchor),
+        Err(StoreActivationError::Io { .. })
+    ));
+    let store_syncs = || crate::seal::store::EXISTING_STORE_SYNCS.with(std::cell::Cell::get);
+    let before = store_syncs();
+    inject_sync_failure(Some(0));
+    let look = selection_for_locator_with(&fixture.anchor, AnchorAccess::ReadOnly);
+    inject_sync_failure(None);
+    assert_eq!(store_syncs(), before, "the look synced the store it opened");
+    let room = room_from(look.unwrap()).unwrap();
+    assert_eq!(room, crate::seal::wal::WalRoom::empty());
+    drop(held);
+
+    let look = selection_for_locator_with(&fixture.anchor, AnchorAccess::ReadOnly).unwrap();
+    let before = store_syncs();
+    assert!(selection_for_locator(&fixture.anchor).is_ok());
+    assert!(
+        store_syncs() > before,
+        "an exclusive selection no longer syncs the store"
+    );
+    drop(look);
+}
+
+/// A self-managed anchor nobody has claimed has to be initialized before
+/// anything is staged. Readiness refuses it, and the room does too, rather than
+/// offering all of a WAL that cannot be written yet. A system anchor never
+/// activated is simply empty.
+#[test]
+fn unclaimed_room_refused() {
+    let fixture = SelectorFixture::new(false, true);
+    assert!(matches!(
+        room_from(fixture.select().unwrap()),
+        Err(WalRoomInspectionError::Activation(
+            StoreActivationError::SelfInitializationRequired
+        ))
+    ));
+    let fixture = SelectorFixture::new(true, false);
+    assert_eq!(
+        room_from(fixture.select().unwrap()).unwrap(),
+        crate::seal::wal::WalRoom::empty()
+    );
 }

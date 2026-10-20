@@ -1234,7 +1234,7 @@ fn keyed_purge_plan_tamper_after_preflight_unlinks_nothing() {
 }
 
 #[test]
-fn later_keyed_purge_plan_tamper_preserves_canonical_progress_prefix() {
+fn later_keyed_purge_plan_tamper_stops_after_the_canonical_prefix() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -1255,16 +1255,16 @@ fn later_keyed_purge_plan_tamper_preserves_canonical_progress_prefix() {
         ready.state(transaction),
         Some(TransactionState::PurgeIntent)
     );
+    // The record before the tampered one was carried out, and nothing after it.
     assert!(!fixture.destination_root.join("child/data").exists());
     assert!(fixture.destination_root.join("child").is_dir());
     drop(ready);
+    // Progress is recorded once, for the whole tree, so a purge stopped part-way
+    // has none: the claim alone says the namespace may be partial.
     let mut lease = fixture.store.try_lease().unwrap();
     let replay = lease.replay_and_repair().unwrap();
-    assert_eq!(replay.transactions[&transaction].purge_removed_entries, 1);
-    assert_eq!(
-        replay.transactions[&transaction].purge_last_path.as_deref(),
-        Some(Path::new("child/data"))
-    );
+    assert_eq!(replay.transactions[&transaction].purge_removed_entries, 0);
+    assert_eq!(replay.transactions[&transaction].purge_last_path, None);
 }
 
 #[test]
@@ -1516,6 +1516,16 @@ fn verified_purge_consumes_exact_tree_without_following_symlinks_and_reaches_pur
     assert_eq!(std::fs::read(outside).unwrap(), b"retain me");
     drop(ready);
 
+    // One progress frame, for the whole tree, and none per entry.
+    let mut lease = fixture.store.try_lease().unwrap();
+    lease.replay_and_repair().unwrap();
+    let frames = lease.committed_frames().unwrap();
+    assert_eq!(
+        crate::seal::wal::purge_progress_frames(&frames, transaction).unwrap(),
+        [(4, std::path::PathBuf::new())]
+    );
+    drop(lease);
+
     let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
     assert!(report.is_empty());
     let (ready, _) = engine
@@ -1548,17 +1558,14 @@ fn purge_partial_unlink_failure_stays_at_intent_and_restart_fails_closed() {
         ready.state(transaction),
         Some(TransactionState::PurgeIntent)
     );
-    assert!(fixture.destination_root.exists());
+    // Depth-descending: the one removal that happened is the deepest entry.
+    assert!(!fixture.destination_root.join("child/data").exists());
+    assert!(fixture.destination_root.join("child").is_dir());
     drop(ready);
 
     let mut lease = fixture.store.try_lease().unwrap();
     let replay = lease.replay_and_repair().unwrap();
-    assert_eq!(replay.transactions[&transaction].purge_removed_entries, 1);
-    assert_eq!(
-        replay.transactions[&transaction].purge_last_path.as_deref(),
-        Some(std::path::Path::new("child/data")),
-        "streamed purge must preserve historical depth-descending reverse-path progress"
-    );
+    assert_eq!(replay.transactions[&transaction].purge_removed_entries, 0);
     drop(lease);
 
     let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
@@ -1596,15 +1603,11 @@ fn purge_parent_fsync_failure_records_no_outcome_or_purged_guess() {
     drop(ready);
     let mut lease = fixture.store.try_lease().unwrap();
     let replay = lease.replay_and_repair().unwrap();
+    // The whole tree is gone, but the count is recorded only once the trash
+    // parent is synced, so a failed sync leaves the claim and nothing after it.
     let snapshot = &replay.transactions[&transaction];
-    assert_eq!(
-        snapshot.purge_removed_entries,
-        snapshot.tree_manifest.unwrap().entry_count
-    );
-    assert_eq!(
-        snapshot.purge_last_path.as_deref(),
-        Some(std::path::Path::new(""))
-    );
+    assert_eq!(snapshot.purge_removed_entries, 0);
+    assert_eq!(snapshot.purge_last_path, None);
 }
 
 #[test]
@@ -3427,16 +3430,15 @@ fn every_postorder_progress_boundary_stops_without_outcome_or_replacement_deleti
         );
         drop(ready);
 
+        // Stopped after any removal, the root's included, a purge has recorded
+        // no progress: the count is written once the whole tree is gone.
         let mut lease = fixture.store.try_lease().unwrap();
         let replay = lease.replay_and_repair().unwrap();
-        assert_eq!(
-            replay.transactions[&transaction].purge_removed_entries,
-            progress - 1
-        );
+        assert_eq!(replay.transactions[&transaction].purge_removed_entries, 0);
         drop(lease);
 
-        // Even when the root unlink happened before the failed final progress
-        // sync, startup never treats absence or a newly planted name as proof.
+        // Even when the root unlink happened before the purge stopped, startup
+        // never treats absence or a newly planted name as proof.
         if !fixture.destination_root.exists() {
             std::fs::create_dir(&fixture.destination_root).unwrap();
             std::fs::write(fixture.destination_root.join("replacement"), b"retain").unwrap();

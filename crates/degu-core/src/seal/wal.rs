@@ -28,7 +28,7 @@ pub use permission_ledger::PermissionWorkload;
 use permission_ledger::{PermissionLedger, PhaseTally, SealCoverage};
 
 const MAGIC: &[u8; 4] = b"DSWL";
-const VERSION: u16 = 12;
+const VERSION: u16 = 13;
 const LEGACY_CONTENT_PROOF_MANIFEST_VERSION: u16 = 2;
 const CONTENT_PROOF_MANIFEST_VERSION: u16 = 3;
 const HEADER_LEN: usize = 20;
@@ -490,8 +490,11 @@ pub enum SealRecord {
         transaction: TransactionId,
         commitment: DurablePurgeCommitment,
     },
-    /// Monotonic postorder deletion progress. A frame is synced after every
-    /// successful unlink/rmdir; paths are diagnostics, never replay authority.
+    /// Deletion progress. From v13, one frame per purge, written once the whole
+    /// tree and its root are gone, carrying the manifest's entry count and an
+    /// empty path. Before v13, one frame per unlink or rmdir in postorder, each
+    /// one past the last, whose paths are diagnostics and never replay
+    /// authority.
     PurgeProgress {
         transaction: TransactionId,
         removed_entries: u64,
@@ -1269,40 +1272,43 @@ impl<W: DurableWrite> SealWal<W> {
         Ok(())
     }
 
-    pub(crate) fn record_purge_progress(
+    /// Records that a purge removed its whole tree, once, after the root is gone
+    /// and the retained trash parent is synced.
+    ///
+    /// The count is the manifest's entry count or nothing is written. Before v13
+    /// a purge recorded one frame per entry it unlinked, but nothing read them:
+    /// an interrupted purge is `RecoveryRequired` whatever its progress, and the
+    /// outcome needed only the count. Those frames cost a sync per entry and,
+    /// for a large tree, a share of the WAL that no other step of its life does.
+    pub(crate) fn record_purge_removed(
         &mut self,
         transaction: TransactionId,
         removed_entries: u64,
-        last_path: &std::path::Path,
     ) -> Result<(), AppendError> {
         if self.transaction_state(transaction) != Some(TransactionState::PurgeIntent) {
             return Err(AppendError::InvalidState(
                 "purge progress requires PurgeIntent",
             ));
         }
-        let limit = self
+        let expected = self
             .manifests
             .get(&transaction)
             .map(|m| m.entry_count)
             .ok_or(AppendError::InvalidState(
                 "purge progress lacks durable manifest",
             ))?;
-        let previous = self.purge_progress.get(&transaction).map_or(0, |v| v.0);
-        if removed_entries != previous.saturating_add(1)
-            || removed_entries > limit
-            || !purge_progress_path_is_confined(last_path)
-        {
+        if self.purge_progress.contains_key(&transaction) || removed_entries != expected {
             return Err(AppendError::InvalidState(
-                "purge progress is not exact and monotonic",
+                "purge progress is recorded once, for the whole tree",
             ));
         }
         self.append_synced(&SealRecord::PurgeProgress {
             transaction,
             removed_entries,
-            last_path: last_path.to_path_buf(),
+            last_path: PathBuf::new(),
         })?;
         self.purge_progress
-            .insert(transaction, (removed_entries, last_path.to_path_buf()));
+            .insert(transaction, (removed_entries, PathBuf::new()));
         Ok(())
     }
 
@@ -2829,8 +2835,8 @@ pub enum RecoveryRequiredReason {
         version: u16,
     },
     /// Purge may have partially removed the bounded tree. No pathname-side
-    /// inference is permitted; recovery must use durable progress
-    /// evidence or quarantine the remainder.
+    /// inference is permitted, and no durable record says how far it got, so
+    /// recovery fails closed rather than guess.
     InterruptedPurge,
 }
 
@@ -3188,7 +3194,10 @@ fn check_frame(bytes: &[u8], offset: usize) -> Result<Option<CheckedFrame<'_>>, 
         });
     }
     let version = u16::from_le_bytes([header[4], header[5]]);
-    if !matches!(version, 1 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | VERSION) {
+    if !matches!(
+        version,
+        1 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | VERSION
+    ) {
         return Err(ReplayError::UnsupportedLegacyVersion {
             offset: offset as u64,
             version,
@@ -3219,6 +3228,29 @@ fn check_frame(bytes: &[u8], offset: usize) -> Result<Option<CheckedFrame<'_>>, 
         });
     }
     Ok(Some(CheckedFrame { version, payload }))
+}
+
+/// Every purge progress frame these bytes hold for one transaction, in order.
+///
+/// Test-only: a purge's tests drive the real deletion and then need to see what
+/// it wrote, which a replay folds into one count.
+#[cfg(test)]
+pub(crate) fn purge_progress_frames(
+    bytes: &[u8],
+    transaction: TransactionId,
+) -> Result<Vec<(u64, PathBuf)>, ReplayError> {
+    Ok(parse_frames(bytes)?
+        .records
+        .into_iter()
+        .filter_map(|versioned| match versioned.record {
+            SealRecord::PurgeProgress {
+                transaction: framed,
+                removed_entries,
+                last_path,
+            } if framed == transaction => Some((removed_entries, last_path)),
+            _ => None,
+        })
+        .collect())
 }
 
 fn parse_frames(bytes: &[u8]) -> Result<ParsedFrames, ReplayError> {
@@ -3458,11 +3490,18 @@ fn replay_records<R: IntoVersionedRecord>(
                         "purge progress lacks a durable manifest",
                     ))?
                     .entry_count;
-                if tx.state != Some(TransactionState::PurgeIntent)
-                    || removed_entries != tx.purge_removed_entries.saturating_add(1)
-                    || removed_entries > limit
-                    || !purge_progress_path_is_confined(&last_path)
-                {
+                // From v13 a purge records its progress once, for the whole tree;
+                // before it, once per entry, each one step past the last.
+                let exact = if versioned.version >= 13 {
+                    tx.purge_removed_entries == 0
+                        && removed_entries == limit
+                        && last_path.as_os_str().is_empty()
+                } else {
+                    removed_entries == tx.purge_removed_entries.saturating_add(1)
+                        && removed_entries <= limit
+                        && purge_progress_path_is_confined(&last_path)
+                };
+                if tx.state != Some(TransactionState::PurgeIntent) || !exact {
                     return Err(ReplayError::InvalidHistory(
                         "purge progress is not exact, bounded, and monotonic",
                     ));
@@ -4180,7 +4219,7 @@ pub enum FrameError {
     FieldTooLarge,
     #[error("record payload exceeds {limit} bytes")]
     PayloadTooLarge { limit: usize },
-    #[error("legacy tree-manifest tag 6 cannot be emitted by WAL v12")]
+    #[error("legacy tree-manifest tag 6 cannot be emitted by WAL v12 or later")]
     LegacyTreeManifest,
 }
 

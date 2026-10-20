@@ -3927,7 +3927,7 @@ fn deeper_fixture() -> Option<Fixture> {
 /// inverse is re-rooted under the destination, so a measure taken from the
 /// seals' own sizes would be off by the difference in root lengths per seal.
 #[test]
-fn a_verified_undo_writes_exactly_its_allowance() {
+fn undo_matches_allowance() {
     let Some(fixture) = deeper_fixture() else {
         return;
     };
@@ -3950,7 +3950,7 @@ fn a_verified_undo_writes_exactly_its_allowance() {
 /// The allowance for a purge is what the purge then writes, byte for byte, and
 /// once it is authorized what is left is the rest of it.
 #[test]
-fn a_verified_purge_writes_exactly_its_allowance() {
+fn purge_matches_allowance() {
     let Some(fixture) = deeper_fixture() else {
         return;
     };
@@ -3981,7 +3981,7 @@ fn a_verified_purge_writes_exactly_its_allowance() {
 /// two; an authorized one can only be purged; a finished one holds nothing.
 #[test]
 #[allow(clippy::disallowed_methods)] // flattens a fixture tree before it is staged
-fn a_settled_entry_holds_room_for_every_path_its_state_leaves_open() {
+fn settled_entry_allowance() {
     let Some(fixture) = deeper_fixture() else {
         return;
     };
@@ -4039,7 +4039,7 @@ fn planned_directories(deeper: bool) -> Vec<&'static Path> {
 /// Staging writes exactly what the admission projected for its forward path,
 /// and the committed entry then holds exactly what the projection set aside.
 #[test]
-fn staging_writes_exactly_its_projected_forward_path() {
+fn forward_matches_projection() {
     let Some(fixture) = deeper_fixture() else {
         return;
     };
@@ -4072,7 +4072,7 @@ fn staging_writes_exactly_its_projected_forward_path() {
 /// confirmed not applied. Staging up to it and the rollback after it write
 /// exactly what the projection set aside for that end.
 #[test]
-fn a_rolled_back_staging_writes_exactly_its_projected_rollback() {
+fn rollback_matches_projection() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -4159,7 +4159,7 @@ fn projections(
 /// staging writes no frame and changes nothing. With that byte it starts, and
 /// the next check is the tree's.
 #[test]
-fn staging_without_room_to_seal_its_parent_writes_nothing() {
+fn parent_room_refusal() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -4217,7 +4217,7 @@ fn staging_without_room_to_seal_its_parent_writes_nothing() {
 /// its first tree seal, and the room the first check set aside is enough for
 /// recovery to undo the source parent's seal.
 #[test]
-fn a_tree_without_room_stops_before_its_first_seal_and_rolls_back_within_the_limit() {
+fn tree_room_refusal() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -4262,7 +4262,7 @@ fn a_tree_without_room_stops_before_its_first_seal_and_rolls_back_within_the_lim
 /// and its entry is then undone, every frame of it inside the limit. One byte
 /// less and it never seals a directory: it is refused and rolled back at once.
 #[test]
-fn an_entry_admitted_with_exactly_its_room_lives_its_whole_life_within_it() {
+fn exact_room_lifecycle() {
     let association = || ProductionAssociation::new("undo-group".into()).unwrap();
     for short in [1, 0] {
         let Some(fixture) = Fixture::new() else {
@@ -4310,7 +4310,7 @@ fn an_entry_admitted_with_exactly_its_room_lives_its_whole_life_within_it() {
 /// only by taking that room is refused before it writes a frame, and the first
 /// entry is then undone inside the limit.
 #[test]
-fn a_committed_entry_keeps_its_room_from_a_later_staging() {
+fn committed_room_kept() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -4366,7 +4366,7 @@ fn a_committed_entry_keeps_its_room_from_a_later_staging() {
 /// has to make room for. A rename confirmed not applied is the latest stop that
 /// is rolled back; with exactly the admitted room, that rollback still fits.
 #[test]
-fn a_rollback_longer_than_any_commit_still_fits_its_admitted_room() {
+fn long_rollback_fits() {
     let Some(fixture) = deeper_fixture() else {
         return;
     };
@@ -4422,4 +4422,22 @@ fn a_rollback_longer_than_any_commit_still_fits_its_admitted_room() {
             .is_file()
     );
     assert!(wal_len(&fixture) <= limit);
+}
+
+/// Admission asks every settled entry for its allowance, twice for each new
+/// staging. The records an allowance is built from are read once; asking again
+/// while the entry stays in the same state reads none of them.
+#[test]
+fn allowance_measured_once() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let ready = stage_production(&fixture, TransactionId([0x75; 16]));
+    let reads = || crate::seal::wal::PERMISSION_RECORD_READS.with(std::cell::Cell::get);
+    let before = reads();
+    let first = ready.engine.wal.headroom(None).unwrap();
+    let measured = reads();
+    assert!(measured > before, "the first measure read no records");
+    assert_eq!(ready.engine.wal.headroom(None).unwrap(), first);
+    assert_eq!(reads(), measured, "a second measure read the records again");
 }

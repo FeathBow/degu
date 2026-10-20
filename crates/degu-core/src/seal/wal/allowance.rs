@@ -61,6 +61,33 @@ impl<W: DurableWrite> SealWal<W> {
         let Some(&state) = self.states.get(&transaction) else {
             return Ok(0);
         };
+        // Measured once per state. Admission asks every settled entry twice for
+        // each new staging, and measuring reads its records back; without
+        // this, staging N entries in one session would read the earlier ones'
+        // records on the order of N squared times.
+        //
+        // The state is all a measure depends on that can change. A settled
+        // transaction gains no permission record while it stays settled: an
+        // undo writes `UndoIntent` before its first inverse, a purge writes no
+        // permission record, and a quarantine is settled only once nothing is
+        // left to reverse. An unsettled one is an error, and is not kept.
+        if let Some(&(measured, allowance)) = self.allowances.borrow().get(&transaction)
+            && measured == state
+        {
+            return Ok(allowance);
+        }
+        let allowance = self.measure_allowance(transaction, state)?;
+        self.allowances
+            .borrow_mut()
+            .insert(transaction, (state, allowance));
+        Ok(allowance)
+    }
+
+    fn measure_allowance(
+        &self,
+        transaction: TransactionId,
+        state: TransactionState,
+    ) -> Result<u64, AllowanceError> {
         match state {
             TransactionState::VerifiedCommitted => Ok(self
                 .undo_allowance(transaction)?

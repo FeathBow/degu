@@ -45,6 +45,9 @@ thread_local! {
     /// meet a nearly full WAL without writing 64 MiB to reach one.
     pub(crate) static WAL_LIMIT_FOR_TEST: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
+    /// How many permission records this thread has read back out of a WAL.
+    pub(crate) static PERMISSION_RECORD_READS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// The append limit a resumed WAL is held to.
@@ -784,6 +787,9 @@ pub struct SealWal<W> {
     transaction_order: Vec<TransactionId>,
     committed_len: u64,
     max_wal_len: u64,
+    /// Each settled transaction's allowance, with the state it was measured
+    /// in. See [`SealWal::remaining_allowance`].
+    allowances: std::cell::RefCell<HashMap<TransactionId, (TransactionState, u64)>>,
 }
 
 impl<W: DurableWrite> SealWal<W> {
@@ -814,6 +820,7 @@ impl<W: DurableWrite> SealWal<W> {
             transaction_order: Vec::new(),
             committed_len,
             max_wal_len,
+            allowances: std::cell::RefCell::default(),
         }
     }
 
@@ -1049,6 +1056,8 @@ impl<W: DurableWrite> SealWal<W> {
         let extent = entry
             .frame
             .ok_or(PermissionReadError::Unframed { mutation_id })?;
+        #[cfg(test)]
+        PERMISSION_RECORD_READS.with(|reads| reads.set(reads.get() + 1));
         let mut frame = vec![0; extent.len()];
         self.writer
             .read_committed(extent.start(), &mut frame)

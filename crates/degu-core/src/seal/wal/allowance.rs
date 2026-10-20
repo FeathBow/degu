@@ -452,7 +452,14 @@ impl<W: DurableWrite> SealWal<W> {
 
 impl<W: DurableWrite> SealWal<W> {
     /// The room a transaction needs to retry reversing its seals, beside the
-    /// room it has, once an inverse of it has been refused; `None` before.
+    /// room it has, while one of its seals still in force has had an inverse
+    /// refused; `None` otherwise.
+    ///
+    /// A refusal a later attempt already put right is not a retry still owed.
+    /// A source parent whose restore was refused once and then applied commits
+    /// like any other entry, and its first undo runs in the room admission set
+    /// aside for it; asking that undo for room to retry would fail it closed
+    /// for want of a frame it is not going to write.
     ///
     /// Admission set room aside for one attempt at each inverse. A refused one
     /// is tried again at the next open, and every attempt writes a frame pair
@@ -470,9 +477,16 @@ impl<W: DurableWrite> SealWal<W> {
             return Ok(None);
         };
         let records = self.permission_records(transaction)?;
+        let reversed = records
+            .iter()
+            .filter(|permission| permission.application == ApplicationStatus::Applied)
+            .filter_map(|permission| permission.reverses_mutation_id)
+            .collect::<std::collections::BTreeSet<_>>();
         if !records.iter().any(|permission| {
-            permission.reverses_mutation_id.is_some()
-                && permission.application == ApplicationStatus::ConfirmedNotApplied
+            permission.application == ApplicationStatus::ConfirmedNotApplied
+                && permission
+                    .reverses_mutation_id
+                    .is_some_and(|original| !reversed.contains(&original))
         }) {
             return Ok(None);
         }
@@ -493,11 +507,6 @@ impl<W: DurableWrite> SealWal<W> {
             transaction,
             mutation_id: ANY_MUTATION_ID,
         })?;
-        let reversed = records
-            .iter()
-            .filter(|permission| permission.application == ApplicationStatus::Applied)
-            .filter_map(|permission| permission.reverses_mutation_id)
-            .collect::<std::collections::BTreeSet<_>>();
         let mut needed = 0;
         for seal in records.iter().filter(|permission| {
             permission.reverses_mutation_id.is_none()

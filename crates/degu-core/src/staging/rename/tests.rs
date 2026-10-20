@@ -4665,3 +4665,59 @@ fn quarantine_retry_room() {
         TransactionState::Quarantined,
     );
 }
+
+/// A refusal that a retry already put right is not a retry still owed. The
+/// source parent's restore here is refused once and then applied, and the
+/// entry commits; its first undo must run in the room admission left for it,
+/// with nothing added for a retry it is not making.
+#[test]
+fn settled_refusal_not_retry() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    // Group-writable, so the parent's seal changes its mode and its interrupted
+    // inverse is found not applied.
+    let request = || {
+        fixture
+            .forward_request("root", "staged")
+            .with_production_association(ProductionAssociation::new("undo-group".into()).unwrap())
+            .with_recovery_anchor(fixture.base.clone())
+    };
+    let transaction = TransactionId([0x76; 16]);
+    let mut ready = fixture.ready_engine();
+    crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(Some("inverse-intent")));
+    assert!(
+        ready
+            .stage_to_verified_commit(transaction, request())
+            .is_err()
+    );
+    crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(None));
+    drop(ready);
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let (ready, _) = engine
+        .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+        .unwrap();
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    let undo = ready.engine.wal.undo_allowance(transaction).unwrap();
+    drop(ready);
+    // An undo refuses a source parent other writers could change.
+    set_mode(&fixture.source_parent, 0o700);
+
+    let limit = wal_len(&fixture) + undo;
+    let _limit = WalLimit::set(limit);
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let (mut ready, _) = engine
+        .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+        .unwrap();
+    let token = ready
+        .verified_undo_token(transaction, "undo-group")
+        .unwrap();
+    ready
+        .undo_verified(token, verified_undo_request(&fixture))
+        .unwrap();
+    assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+    assert!(wal_len(&fixture) <= limit);
+}

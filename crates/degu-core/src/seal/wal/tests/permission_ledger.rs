@@ -264,3 +264,14 @@ fn replay_with_record(
     bytes.extend_from_slice(&encode_frame(&record).unwrap());
     replay_records(parse_frames(&bytes).unwrap().records, &bytes)
 }
+
+/// The list is allocated once, at the ledger's length, which the bound on the
+/// WAL written at `permission_records` assumes. Grown by doubling, six records
+/// would sit in room for eight.
+#[test]
+fn records_allocated_once() {
+    let wal = restored_wal(&[(0, 10), (1, 11), (2, 12)]);
+    let records = wal.permission_records(TRANSACTION).unwrap();
+    assert_eq!(records.len(), 6);
+    assert_eq!(records.capacity(), records.len());
+}

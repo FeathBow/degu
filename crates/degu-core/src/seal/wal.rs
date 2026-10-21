@@ -70,10 +70,6 @@ const COMPACTION_MIN_RECLAIMED_SHARE: u64 = 4;
 /// Above this length the share rule is dropped. The file is close enough to
 /// refusing every append that any reclaimable byte is worth the rewrite.
 const COMPACTION_PRESSURE_LEN: u64 = MAX_WAL_LEN / 4 * 3;
-/// Maximum permission mutations that startup recovery may need to resolve or
-/// reverse for one transaction. Forward staging reserves one operation for the
-/// source-parent seal; every tree-directory seal consumes one more.
-pub(crate) const RECOVERY_MAX_ACTIVE_PERMISSIONS: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TransactionId(pub [u8; 16]);
@@ -1086,6 +1082,15 @@ impl<W: DurableWrite> SealWal<W> {
     /// A record that cannot be read back is an error rather than an omission:
     /// a caller handed a short list would read it as a transaction holding
     /// fewer permissions than it does.
+    ///
+    /// This list is what a transaction's records cost to act on, and the WAL
+    /// bounds it rather than a count. Each record is an intent frame, and
+    /// replay refuses a WAL longer than [`MAX_WAL_LEN`]. A record holds
+    /// `size_of::<DurablePermission>()` bytes, 128, besides its path and
+    /// filesystem id; its frame carries 80 besides the same two. So the list
+    /// is at most 1.6 times the WAL bytes its intents take, and never above
+    /// 1.6 × 64 MiB. It is allocated once, at the ledger's length: collected
+    /// through a `Result`, it doubled as it grew and could hold twice that.
     pub(crate) fn permission_records(
         &self,
         transaction: TransactionId,
@@ -1093,12 +1098,11 @@ impl<W: DurableWrite> SealWal<W> {
         let Some(ledger) = self.ledgers.get(&transaction) else {
             return Ok(Vec::new());
         };
-        ledger
-            .entries()
-            .map(|(mutation_id, entry)| {
-                self.read_permission_record(transaction, mutation_id, entry)
-            })
-            .collect()
+        let mut records = Vec::with_capacity(ledger.permissions.len());
+        for (mutation_id, entry) in ledger.entries() {
+            records.push(self.read_permission_record(transaction, mutation_id, entry)?);
+        }
+        Ok(records)
     }
 
     /// This transaction's applied tree seals, indexed by the path each one names.
@@ -4101,13 +4105,6 @@ pub(crate) fn permission_workload_by_scan<'a>(
 ) -> PermissionWorkload {
     let permissions = permissions.collect::<Vec<_>>();
     PermissionWorkload {
-        recorded: permissions.len() as u64,
-        unresolved: permissions
-            .iter()
-            .filter(|permission| {
-                permission.application == ApplicationStatus::IntentDurableApplicationUnknown
-            })
-            .count() as u64,
         active_seals: active_permission_seals_by_scan(&permissions) as u64,
         deepest_path_components: permissions
             .iter()

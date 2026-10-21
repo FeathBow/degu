@@ -21,9 +21,9 @@ use crate::seal::sidecar::{
 };
 use crate::seal::store::{SealWalStore, StoreError};
 use crate::seal::wal::{
-    AppendError, PermissionReadError, ProductionAssociation, RECOVERY_MAX_ACTIVE_PERMISSIONS,
-    RecoveryIdentity, RecoverySession, RecoveryWork, ReplayError, ReplayedTransaction, SealWal,
-    StagingTransactionMetadata, StrongObjectIdentity, TransactionId, decide_recovery,
+    AppendError, PermissionReadError, ProductionAssociation, RecoveryIdentity, RecoverySession,
+    RecoveryWork, ReplayError, ReplayedTransaction, SealWal, StagingTransactionMetadata,
+    StrongObjectIdentity, TransactionId, decide_recovery,
     quarantined_transaction_retains_active_permission_seals,
 };
 use crate::staging::recovery::{
@@ -51,7 +51,6 @@ std::thread_local! {
 }
 const MAX_RECOVERY_STEPS_PER_TRANSACTION: usize = 4;
 const MAX_RECOVERY_TRANSACTIONS: usize = 64;
-const MAX_RECOVERY_PERMISSION_RECORDS: usize = 4096;
 const MAX_RECOVERY_PATH_COMPONENTS: usize = 128;
 const MAX_RECOVERY_PATH_BYTES: usize = 64 * 1024;
 
@@ -1309,21 +1308,12 @@ fn recovery_work_requires_candidate(work: &RecoveryWork) -> bool {
 /// Every limit here is read off the measurements the WAL took as it admitted
 /// the frames, so the cost of validating a transaction does not grow with the
 /// number of records it holds. Recovery validation runs once per candidate.
+///
+/// None of them is a count. How many records a transaction holds is bounded by
+/// the WAL they are frames in, and so is what reading them back costs; see
+/// [`SealWal::permission_records`].
 fn validate_recovery_workload(snapshot: &ReplayedTransaction) -> io::Result<()> {
     let workload = snapshot.permission_workload;
-    if workload.recorded > MAX_RECOVERY_PERMISSION_RECORDS as u64 {
-        return Err(io::Error::other(format!(
-            "transaction contains {} permission records, above the limit of {MAX_RECOVERY_PERMISSION_RECORDS}",
-            workload.recorded
-        )));
-    }
-    if workload.unresolved > RECOVERY_MAX_ACTIVE_PERMISSIONS as u64
-        || workload.active_seals > RECOVERY_MAX_ACTIVE_PERMISSIONS as u64
-    {
-        return Err(io::Error::other(format!(
-            "transaction exceeds the {RECOVERY_MAX_ACTIVE_PERMISSIONS}-operation permission recovery limit"
-        )));
-    }
     let validate_path = |path: &Path| -> io::Result<()> {
         validate_path_extremes(path.components().count(), path.as_os_str().as_bytes().len())
     };

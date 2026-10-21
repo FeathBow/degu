@@ -472,37 +472,17 @@ fn tree_seal_at(
     }
 }
 
-/// Seals paired with their own applied inverses, so the active count stays at
-/// one and this is the only limit the workload can reach.
+/// Recovery refuses no transaction for how many permissions it holds; the WAL
+/// that holds them bounds them. Far past the counts it once refused, 4,096
+/// records and 1,024 live seals, a workload whose paths are in bounds passes.
 #[test]
-fn a_transaction_above_the_record_limit_is_refused() {
-    let half = MAX_RECOVERY_PERMISSION_RECORDS as u64 / 2;
-    let mut records: Vec<DurablePermission> =
-        (0..=half).map(|index| tree_seal(index * 2, None)).collect();
-    records.extend((0..half).map(|index| tree_seal(index * 2 + 1, Some(index * 2))));
-    assert_eq!(records.len(), MAX_RECOVERY_PERMISSION_RECORDS + 1);
-    assert_eq!(
-        permission_workload_by_scan(records.iter()).active_seals,
-        1,
-        "the fixture must clear the operation limit by a margin"
-    );
-    assert!(validate_recovery_workload(&workload_snapshot(records.clone())).is_err());
-    records.pop();
-    assert!(
-        validate_recovery_workload(&workload_snapshot(records)).is_ok(),
-        "the exact 4,096-record recovery envelope must remain accepted"
-    );
-}
-
-#[test]
-fn a_transaction_above_the_active_permission_limit_is_refused() {
-    let seal = tree_seal(1, None);
-    let workload = |count: usize| workload_snapshot(vec![seal.clone(); count]);
-    assert!(
-        validate_recovery_workload(&workload(RECOVERY_MAX_ACTIVE_PERMISSIONS)).is_ok(),
-        "the exact 1,024-operation recovery envelope must remain accepted"
-    );
-    assert!(validate_recovery_workload(&workload(RECOVERY_MAX_ACTIVE_PERMISSIONS + 1)).is_err());
+fn record_counts_pass() {
+    let records = (0..10_000)
+        .map(|index| tree_seal(index, None))
+        .collect::<Vec<_>>();
+    let snapshot = workload_snapshot(records);
+    assert_eq!(snapshot.permission_workload.active_seals, 10_000);
+    assert!(validate_recovery_workload(&snapshot).is_ok());
 }
 
 /// A path can be too deep without being too long, so each bound needs a record

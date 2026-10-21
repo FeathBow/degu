@@ -372,41 +372,43 @@ impl StagingShape {
 
     /// Metadata of this shape with placeholder content. Its frames are the
     /// size the real transaction's will be, since every field that is not
-    /// placeholder text is fixed width.
+    /// placeholder text is fixed width. The source and the destination are
+    /// filled with different bytes, so they stay two names at any lengths, as a
+    /// real staging's are.
     ///
     /// `None` for a shape no staging could have: an empty name or filesystem
-    /// id, or a recovery anchor too short to be an absolute path.
+    /// id, or an empty recovery anchor.
     pub fn metadata(&self) -> Option<StagingTransactionMetadata> {
-        let filler = |bytes: usize| "x".repeat(bytes);
+        let filler = |byte: &str, bytes: usize| byte.repeat(bytes);
         let identity = |inode| {
             StrongObjectIdentity::new_with_mount(1, inode, ObjectIncarnation::new(inode), 1)
         };
-        let filesystem_id = filler(self.filesystem_id);
+        let filesystem_id = filler("x", self.filesystem_id);
         let mut metadata = StagingTransactionMetadata::new(
             StagingLocator::new(
-                PathBuf::from(filler(self.source_parent)),
+                PathBuf::from(filler("s", self.source_parent)),
                 filesystem_id.clone(),
             )?,
             identity(1),
-            filler(self.source_basename).into(),
+            filler("s", self.source_basename).into(),
             identity(2),
             StagingLocator::new(
-                PathBuf::from(filler(self.destination_parent)),
+                PathBuf::from(filler("d", self.destination_parent)),
                 filesystem_id,
             )?,
             identity(3),
-            filler(self.destination_basename).into(),
+            filler("d", self.destination_basename).into(),
             crate::backend::CertifiedLocalBackend::Ext4,
             DurableSourceParentStrategy::PermissionSeal,
         )?;
         if let Some(bytes) = self.reclamation_id {
-            metadata =
-                metadata.with_production_association(ProductionAssociation::new(filler(bytes))?);
+            metadata = metadata
+                .with_production_association(ProductionAssociation::new(filler("x", bytes))?);
         }
         if let Some(bytes) = self.recovery_anchor {
             metadata = metadata.with_recovery_anchor(PathBuf::from(format!(
                 "/{}",
-                filler(bytes.checked_sub(2)? + 1)
+                filler("x", bytes.checked_sub(1)?)
             )))?;
         }
         Some(metadata)

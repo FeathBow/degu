@@ -2269,6 +2269,69 @@ fn permission_seal_staging_metadata() -> StagingTransactionMetadata {
     metadata
 }
 
+/// Metadata naming the given source and destination, as production stages it:
+/// a sealed source parent, a reclamation id and a recovery anchor.
+fn named_metadata(
+    source: (&str, &str),
+    destination: (&str, &str),
+    anchor: &str,
+) -> StagingTransactionMetadata {
+    let locator = |path: &str| StagingLocator::new(PathBuf::from(path), "fs-1".into()).unwrap();
+    StagingTransactionMetadata::new(
+        locator(source.0),
+        strong(1, 10, 100),
+        source.1.into(),
+        strong(1, 11, 101),
+        locator(destination.0),
+        strong(1, 12, 102),
+        destination.1.into(),
+        CertifiedLocalBackend::Ext4,
+        DurableSourceParentStrategy::PermissionSeal,
+    )
+    .unwrap()
+    .with_production_association(ProductionAssociation::new("undo-group".into()).unwrap())
+    .with_recovery_anchor(PathBuf::from(anchor))
+    .unwrap()
+}
+
+/// Placeholder metadata of `real`'s shape exists, has that shape, and projects
+/// what `real` does at both admission checks.
+fn assert_shape_projects(real: &StagingTransactionMetadata) {
+    let shape = StagingShape::of(real);
+    let placeholder = shape.metadata().expect("a valid shape has no placeholder");
+    assert_eq!(StagingShape::of(&placeholder), shape);
+    assert_eq!(
+        project_begin(&placeholder).unwrap(),
+        project_begin(real).unwrap()
+    );
+    let tree = TreeShape {
+        directories: 3,
+        directory_path_bytes: 9,
+        entries: 5,
+    };
+    assert_eq!(
+        project_tree(&placeholder, tree).unwrap(),
+        project_tree(real, tree).unwrap()
+    );
+}
+
+/// The mount domain can be `/` itself, an anchor one byte long.
+#[test]
+fn root_anchor_shape() {
+    assert_shape_projects(&named_metadata(
+        ("source-parent", "root"),
+        ("trash-parent", "staged-root"),
+        "/",
+    ));
+}
+
+/// A source and a destination of the same lengths are still two names, and
+/// their placeholders have to be as well.
+#[test]
+fn equal_lengths_shape() {
+    assert_shape_projects(&named_metadata(("src", "a"), ("dst", "b"), "/mnt"));
+}
+
 fn staging_tree_evidence(path: &str, inode: u64) -> PersistentRecoveryEvidence {
     PersistentRecoveryEvidence::new(
         PathBuf::from(path),

@@ -47,7 +47,8 @@ fn preview_blocks_1024_tree_directories_before_any_production_mutation() {
 }
 
 /// A dry run says what room the seal WAL leaves and what each item's whole
-/// life needs from it. Staging the item then takes no more than that.
+/// life needs from it. Staging the item then takes no more than that, on an
+/// account that has never cleaned as well as on one with an entry in the trash.
 #[test]
 fn preview_room_bounds_staging() {
     let Some(fixture) = Fixture::new() else {
@@ -86,15 +87,22 @@ fn preview_room_bounds_staging() {
         crate::common::make_tree_non_shared_writable(fixture.home.path()).unwrap();
     };
 
+    let needed = |report: &serde_json::Value| {
+        report["staging_preflight"][0]["wal_needed"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{report:#}"))
+    };
     let fresh = preview();
     assert_eq!(held(&fresh), 0, "{fresh:#}");
+    let needed_fresh = needed(&fresh);
     stage();
     let before = preview();
     let held_before = held(&before);
-    assert!(held_before > 0, "{before:#}");
-    let needed = before["staging_preflight"][0]["wal_needed"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("{before:#}"));
+    assert!(
+        0 < held_before && held_before <= needed_fresh,
+        "the first staging took {held_before} bytes of the {needed_fresh} the preview set aside"
+    );
+    let needed = needed(&before);
     stage();
     let grown = held(&preview()) - held_before;
     assert!(

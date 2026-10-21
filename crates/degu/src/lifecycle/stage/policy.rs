@@ -72,10 +72,21 @@ pub(super) fn complete(
     source: PreparedSource,
     lexical_trash: PathBuf,
 ) -> Result<PreparedPolicy, String> {
+    complete_with(source, lexical_trash, storage::existing_directory)
+}
+
+/// [`complete`] with the trash parent resolved by `resolve`, which a preview
+/// passes as [`storage::prospective_directory`] for a parent a clean has yet to
+/// create.
+pub(super) fn complete_with(
+    source: PreparedSource,
+    lexical_trash: PathBuf,
+    resolve: storage::DirectoryResolution,
+) -> Result<PreparedPolicy, String> {
     let lexical_parent = lexical_trash
         .parent()
         .ok_or_else(|| "trash root has no parent".to_string())?;
-    let canonical_parent = std::fs::canonicalize(lexical_parent)
+    let (canonical_parent, destination_mount) = resolve(lexical_parent)
         .map_err(|error| format!("failed to canonicalize prospective trash parent: {error}"))?;
     let trash_name = lexical_trash
         .file_name()
@@ -83,7 +94,6 @@ pub(super) fn complete(
     let trash_root = canonical_parent.join(trash_name);
 
     let source_mount = storage::path_mount_id(&source.canonical_source)?;
-    let destination_mount = storage::path_mount_id(&canonical_parent)?;
     require_same_mount(source_mount, destination_mount)?;
     let mount_owner_anchor =
         storage::resolve_mount_owner_anchor(&source.canonical_source, source_mount)?;

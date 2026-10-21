@@ -76,8 +76,12 @@ pub(crate) fn staging_shape(
 ) -> Result<degu_core::seal::wal::StagingShape, String> {
     let source = super::policy::preview_source(finding)?;
     let lexical_trash =
-        super::super::storage::resolve_existing_trash_dir(ctx, source.canonical_source())?;
-    let policy = super::policy::complete(source, lexical_trash)?;
+        super::super::storage::resolve_prospective_trash_dir(ctx, source.canonical_source())?;
+    let policy = super::policy::complete_with(
+        source,
+        lexical_trash,
+        super::super::storage::prospective_directory,
+    )?;
     let source_parent = policy
         .canonical_source
         .parent()

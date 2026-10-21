@@ -2,8 +2,9 @@
 use super::path_mount_id;
 use super::{
     TRASHROOTS_FILE, ensure_managed_trash_root, ensure_managed_trash_root_with_sync,
-    is_state_trash_root, read_registered_trash_roots, register_trash_root,
-    register_trash_root_with_sync, resolve_mount_owner_anchor_with, trash_dir_state, trash_roots,
+    existing_directory, is_state_trash_root, prospective_directory, read_registered_trash_roots,
+    register_trash_root, register_trash_root_with_sync, resolve_existing_trash_dir,
+    resolve_mount_owner_anchor_with, resolve_prospective_trash_dir, trash_dir_state, trash_roots,
 };
 use degu_core::ecosystem::DetectCtx;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -685,5 +686,60 @@ fn registry_parent_sync_failure_retries_without_duplicate_record() {
     assert_eq!(
         read_registered_trash_roots(&state.join(TRASHROOTS_FILE)).unwrap(),
         vec![root]
+    );
+}
+
+/// A directory that exists resolves as it would for staging.
+#[test]
+fn prospective_existing_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    assert_eq!(
+        prospective_directory(temp.path()).unwrap(),
+        existing_directory(temp.path()).unwrap()
+    );
+}
+
+/// A directory a clean has yet to make resolves to where making it puts it:
+/// under its nearest existing ancestor's canonical path, through any symlink on
+/// the way there, and on that ancestor's mount.
+#[test]
+fn prospective_missing_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let real = temp.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = temp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let (resolved, mount) = prospective_directory(&link.join("state/degu")).unwrap();
+    let (real, real_mount) = existing_directory(&real).unwrap();
+    assert_eq!(resolved, real.join("state/degu"));
+    assert_eq!(mount, real_mount);
+}
+
+/// A missing name that is not a plain component is refused rather than
+/// guessed at.
+#[test]
+fn prospective_parent_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    assert!(prospective_directory(&temp.path().join("missing/..")).is_err());
+}
+
+/// A preview on an account whose state home a clean has yet to create routes
+/// the trash where that clean will, once it has made the state home.
+#[test]
+fn prospective_trash_routing() {
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join("cache");
+    std::fs::create_dir(&source).unwrap();
+    let state = home.path().join("missing/state");
+    let ctx = DetectCtx::for_test(
+        home.path().to_path_buf(),
+        [("XDG_STATE_HOME".to_owned(), state.as_os_str().to_owned())],
+    );
+    let prospective = resolve_prospective_trash_dir(&ctx, &source).unwrap();
+    assert!(resolve_existing_trash_dir(&ctx, &source).is_err());
+    std::fs::create_dir_all(&state).unwrap();
+    assert_eq!(
+        prospective,
+        resolve_existing_trash_dir(&ctx, &source).unwrap()
     );
 }

@@ -27,8 +27,9 @@ mod allowance;
 mod permission_ledger;
 mod room;
 pub use allowance::AllowanceError;
-#[cfg(test)]
-pub(crate) use allowance::{BeginProjection, TreeProjection};
+pub use allowance::{
+    BeginProjection, StagingShape, TreeProjection, TreeShape, project_begin, project_tree,
+};
 pub use permission_ledger::PermissionWorkload;
 use permission_ledger::{PermissionLedger, PhaseTally, SealCoverage};
 pub(crate) use room::room_in;

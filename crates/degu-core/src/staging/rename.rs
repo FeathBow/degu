@@ -479,9 +479,7 @@ pub(crate) fn execute_prepared_rename<'a>(
     // Admission, before the first frame: room to seal the source parent and to
     // undo that seal if the tree is then refused. The rest is measured once the
     // tree is planned, because only the walk says what the tree is.
-    let needed = wal
-        .begin_projection(transaction, &binding.metadata)?
-        .needed();
+    let needed = crate::seal::wal::project_begin(&binding.metadata)?.needed();
     let available = wal.headroom(None)?;
     if needed > available {
         return Err(StagingRenameError::WalFull { needed, available });
@@ -705,13 +703,14 @@ pub(crate) fn execute_prepared_rename<'a>(
         }
     });
     let mut plan_records = 0_u64;
-    let mut planned_directories = Vec::new();
+    let mut directory_path_bytes = 0_u64;
     let plan_validation = directory_plan.for_each_forward(|record| {
         let record = decode_pre_seal_directory_plan_record(record)
             .map_err(HeldTreeV3CollectError::<std::convert::Infallible>::Codec)?;
         tree.validate_directory_plan_record(&record, plan_records)
             .map_err(HeldTreeV3CollectError::Tree)?;
-        planned_directories.push(record.relative_path().to_path_buf());
+        directory_path_bytes =
+            directory_path_bytes.saturating_add(record.relative_path().as_os_str().len() as u64);
         plan_records = plan_records
             .checked_add(1)
             .ok_or(HeldTreeV3CollectError::Tree(HeldTreeError::PostChanged(
@@ -748,14 +747,15 @@ pub(crate) fn execute_prepared_rename<'a>(
     // transaction's life, whichever way it ends. Nothing in the tree is sealed
     // yet, so a refusal leaves only the source parent's seal for recovery to
     // undo, and the first check set the room for that aside.
-    let admission = wal
-        .tree_projection(
-            transaction,
-            &binding.metadata,
-            planned_directories.iter().map(PathBuf::as_path),
-            pre_seal_manifest.entry_count,
-        )
-        .and_then(|projection| Ok((projection.needed(), wal.headroom(Some(transaction))?)));
+    let admission = crate::seal::wal::project_tree(
+        &binding.metadata,
+        crate::seal::wal::TreeShape {
+            directories: plan_records,
+            directory_path_bytes,
+            entries: pre_seal_manifest.entry_count,
+        },
+    )
+    .and_then(|projection| Ok((projection.needed(), wal.headroom(Some(transaction))?)));
     match admission {
         Ok((needed, available)) if needed <= available => {}
         Ok((needed, available)) => {
@@ -767,7 +767,6 @@ pub(crate) fn execute_prepared_rename<'a>(
             return Err(StagingRenameError::Allowance(error));
         }
     }
-    drop(planned_directories);
     if let Err(error) =
         wal.transition_staging_foundation(transaction, TransactionState::TreeSealIntent)
     {

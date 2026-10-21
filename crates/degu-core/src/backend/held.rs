@@ -596,6 +596,7 @@ impl RegularHardLinkTopology {
 pub(crate) struct HeldTreePolicyAssessment {
     pub(crate) entries: u64,
     pub(crate) directories: u64,
+    pub(crate) directory_path_bytes: u64,
     pub(crate) path_bytes: u64,
     pub(crate) manifest_bytes: u64,
     pub(crate) content_bytes: u64,
@@ -694,6 +695,7 @@ pub(crate) fn assess_tree_admission(
         tree: HeldTreePolicyAssessment {
             entries: walked.budget.entries,
             directories: walked.budget.directories,
+            directory_path_bytes: walked.budget.directory_path_bytes,
             path_bytes: walked.budget.path_bytes,
             manifest_bytes: walked.budget.manifest_bytes,
             content_bytes: walked.budget.content_bytes,
@@ -1975,6 +1977,10 @@ fn read_v2_children_with_sink<M: V2Traversal, E>(
         walked.budget.add_path(M::path(&result), depth)?;
         if child.is_some() {
             walked.budget.add_walked_directory::<M>()?;
+            walked.budget.directory_path_bytes = walked
+                .budget
+                .directory_path_bytes
+                .saturating_add(path.as_os_str().len() as u64);
         }
         if let Some(entry) = M::manifest_entry(&result) {
             emit_entry(entry).map_err(TraversalSinkError::Emit)?;
@@ -7174,6 +7180,10 @@ struct Budget {
     manifest_entry_bytes: u64,
     entries: u64,
     directories: u64,
+    /// Bytes of every directory's path relative to the root, the root's empty.
+    /// A staging seals each directory under a name that long plus its root, so
+    /// this and the count size every seal it will write.
+    directory_path_bytes: u64,
     path_bytes: u64,
     manifest_bytes: u64,
     /// Regular-file and symlink bytes plus ordinary xattr value bytes. This
@@ -7199,6 +7209,7 @@ impl Budget {
             manifest_entry_bytes,
             entries: 0,
             directories: 0,
+            directory_path_bytes: 0,
             path_bytes: 0,
             manifest_bytes: 0,
             content_bytes: 0,

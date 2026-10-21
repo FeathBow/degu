@@ -268,6 +268,9 @@ pub enum HeldTreePolicyAssessmentOutcome {
 pub struct HeldTreePolicySummary {
     pub entries: u64,
     pub directories: u64,
+    /// Bytes of every directory's path relative to the root, the root's empty:
+    /// with `directories`, what a staging's seals of this tree are sized by.
+    pub directory_path_bytes: u64,
     pub path_bytes: u64,
     pub manifest_bytes: u64,
     pub content_bytes_from_metadata: u64,
@@ -587,6 +590,7 @@ fn map_tree_assessment(a: held::HeldTreeAdmissionAssessment) -> HeldTreePolicyAs
             tree: HeldTreePolicySummary {
                 entries: tree.entries,
                 directories: tree.directories,
+                directory_path_bytes: tree.directory_path_bytes,
                 path_bytes: tree.path_bytes,
                 manifest_bytes: tree.manifest_bytes,
                 content_bytes_from_metadata: tree.content_bytes,

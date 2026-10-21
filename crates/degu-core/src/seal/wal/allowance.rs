@@ -286,170 +286,264 @@ impl<W: DurableWrite> SealWal<W> {
                 Ok(total.saturating_add(self.remaining_allowance(transaction)?))
             })
     }
+}
 
-    /// What a staging transaction writes from its first frame until its source
-    /// parent is sealed, and what undoing that seal writes if the tree it finds
-    /// there is refused.
-    pub(crate) fn begin_projection(
-        &self,
-        transaction: TransactionId,
-        metadata: &StagingTransactionMetadata,
-    ) -> Result<BeginProjection, AllowanceError> {
-        let parent = metadata.source_parent().relative_path().to_path_buf();
-        let filesystem_id = metadata.filesystem_id();
-        let resolution = frame_len(&SealRecord::PermissionApplied {
+/// Any transaction id: every frame carries one at the same fixed width.
+const ANY_TRANSACTION: TransactionId = TransactionId([0; 16]);
+
+/// What a staging transaction writes from its first frame until its source
+/// parent is sealed, and what undoing that seal writes if the tree it finds
+/// there is refused.
+pub fn project_begin(
+    metadata: &StagingTransactionMetadata,
+) -> Result<BeginProjection, AllowanceError> {
+    let transaction = ANY_TRANSACTION;
+    let parent = metadata.source_parent().relative_path().to_path_buf();
+    let filesystem_id = metadata.filesystem_id();
+    let resolution = frame_len(&SealRecord::PermissionApplied {
+        transaction,
+        mutation_id: ANY_MUTATION_ID,
+    })?;
+    Ok(BeginProjection {
+        forward: frame_len(&SealRecord::StagingBegin {
             transaction,
-            mutation_id: ANY_MUTATION_ID,
-        })?;
-        Ok(BeginProjection {
-            forward: frame_len(&SealRecord::StagingBegin {
-                transaction,
-                metadata: metadata.clone(),
-            })? + states_len(
-                transaction,
-                &[
-                    TransactionState::ParentSealIntent,
-                    TransactionState::ParentSealed,
-                ],
-            )? + staging_intent_len(transaction, parent.clone(), filesystem_id, None)?
-                + resolution,
-            rolled_back: states_len(
-                transaction,
-                &[TransactionState::RestoreIntent, TransactionState::Restored],
-            )? + staging_intent_len(
-                transaction,
-                parent,
-                filesystem_id,
-                Some(ANY_MUTATION_ID),
-            )? + resolution,
-        })
+            metadata: metadata.clone(),
+        })? + states_len(
+            transaction,
+            &[
+                TransactionState::ParentSealIntent,
+                TransactionState::ParentSealed,
+            ],
+        )? + staging_intent_len(transaction, parent.clone(), filesystem_id, None)?
+            + resolution,
+        rolled_back: states_len(
+            transaction,
+            &[TransactionState::RestoreIntent, TransactionState::Restored],
+        )? + staging_intent_len(
+            transaction,
+            parent,
+            filesystem_id,
+            Some(ANY_MUTATION_ID),
+        )? + resolution,
+    })
+}
+
+/// The lengths a staging transaction's frames are sized by, for a preview that
+/// has no transaction to measure yet.
+///
+/// Every other field its frames carry is fixed width: identities, modes,
+/// counts, the mount backend. Production staging always seals its source
+/// parent, so the shape carries no other strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagingShape {
+    /// Bytes of the source parent's path, relative to the mount domain.
+    pub source_parent: usize,
+    pub source_basename: usize,
+    /// Bytes of the trash parent's path, relative to the mount domain.
+    pub destination_parent: usize,
+    pub destination_basename: usize,
+    pub filesystem_id: usize,
+    pub reclamation_id: Option<usize>,
+    /// Bytes of the mount domain's absolute path.
+    pub recovery_anchor: Option<usize>,
+}
+
+impl StagingShape {
+    /// The shape of a transaction that already has its metadata.
+    pub fn of(metadata: &StagingTransactionMetadata) -> Self {
+        Self {
+            source_parent: metadata.source_parent().relative_path().as_os_str().len(),
+            source_basename: metadata.source_basename().len(),
+            destination_parent: metadata
+                .destination_parent()
+                .relative_path()
+                .as_os_str()
+                .len(),
+            destination_basename: metadata.destination_basename().len(),
+            filesystem_id: metadata.filesystem_id().len(),
+            reclamation_id: metadata
+                .production_association()
+                .map(|association| association.reclamation_id().len()),
+            recovery_anchor: metadata
+                .recovery_anchor()
+                .map(|anchor| anchor.as_os_str().len()),
+        }
     }
 
-    /// The most a staging transaction may still write once its source parent
-    /// is sealed and its tree is planned. See [`TreeProjection`] for the ends
-    /// it measures.
-    pub(crate) fn tree_projection<'a>(
-        &self,
-        transaction: TransactionId,
-        metadata: &StagingTransactionMetadata,
-        directories: impl IntoIterator<Item = &'a Path>,
-        entry_count: u64,
-    ) -> Result<TreeProjection, AllowanceError> {
-        let filesystem_id = metadata.filesystem_id();
-        let source_root = metadata
-            .source_parent()
-            .relative_path()
-            .join(metadata.source_basename());
-        let destination_root = metadata
-            .destination_parent()
-            .relative_path()
-            .join(metadata.destination_basename());
-        let parent = metadata.source_parent().relative_path().to_path_buf();
-        let resolution = frame_len(&SealRecord::PermissionApplied {
-            transaction,
-            mutation_id: ANY_MUTATION_ID,
-        })?;
-        let (mut seals, mut rollback, mut undo) = (0_u64, 0_u64, 0_u64);
-        for relative in directories {
-            let sealed = source_root.join(relative);
-            seals +=
-                staging_intent_len(transaction, sealed.clone(), filesystem_id, None)? + resolution;
-            rollback +=
-                staging_intent_len(transaction, sealed, filesystem_id, Some(ANY_MUTATION_ID))?
-                    + resolution;
-            undo += staging_intent_len(
-                transaction,
-                destination_root.join(relative),
+    /// Metadata of this shape with placeholder content. Its frames are the
+    /// size the real transaction's will be, since every field that is not
+    /// placeholder text is fixed width. The source and the destination are
+    /// filled with different bytes, so they stay two names at any lengths, as a
+    /// real staging's are.
+    ///
+    /// `None` for a shape no staging could have: an empty name or filesystem
+    /// id, or an empty recovery anchor.
+    pub fn metadata(&self) -> Option<StagingTransactionMetadata> {
+        let filler = |byte: &str, bytes: usize| byte.repeat(bytes);
+        let identity = |inode| {
+            StrongObjectIdentity::new_with_mount(1, inode, ObjectIncarnation::new(inode), 1)
+        };
+        let filesystem_id = filler("x", self.filesystem_id);
+        let mut metadata = StagingTransactionMetadata::new(
+            StagingLocator::new(
+                PathBuf::from(filler("s", self.source_parent)),
+                filesystem_id.clone(),
+            )?,
+            identity(1),
+            filler("s", self.source_basename).into(),
+            identity(2),
+            StagingLocator::new(
+                PathBuf::from(filler("d", self.destination_parent)),
                 filesystem_id,
-                Some(ANY_MUTATION_ID),
-            )? + resolution;
+            )?,
+            identity(3),
+            filler("d", self.destination_basename).into(),
+            crate::backend::CertifiedLocalBackend::Ext4,
+            DurableSourceParentStrategy::PermissionSeal,
+        )?;
+        if let Some(bytes) = self.reclamation_id {
+            metadata = metadata
+                .with_production_association(ProductionAssociation::new(filler("x", bytes))?);
         }
-        let parent_inverse =
-            staging_intent_len(transaction, parent, filesystem_id, Some(ANY_MUTATION_ID))?
-                + resolution;
-        let manifest = sized_manifest(entry_count);
+        if let Some(bytes) = self.recovery_anchor {
+            metadata = metadata.with_recovery_anchor(PathBuf::from(format!(
+                "/{}",
+                filler("x", bytes.checked_sub(1)?)
+            )))?;
+        }
+        Some(metadata)
+    }
+}
 
-        // Everything up to the rename's outcome is written whichever way the
-        // transaction then goes.
-        let to_rename = seals
-            + frame_len(&SealRecord::TreeManifestSidecarComplete {
+/// The shape of a planned tree: what its frames are sized by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeShape {
+    /// Directories, the root included: one seal each.
+    pub directories: u64,
+    /// Bytes of every directory's path relative to the root, the root's empty.
+    pub directory_path_bytes: u64,
+    /// Entries in the manifest, the root included.
+    pub entries: u64,
+}
+
+/// The most a staging transaction may still write once its source parent is
+/// sealed and its tree is planned. See [`TreeProjection`] for the ends it
+/// measures.
+///
+/// A directory's seal names `root.join(relative)`, which is the root, one
+/// separator and the relative path, so a seal is as long as one naming an
+/// empty relative path, plus that path's bytes. Summed over the tree, that is
+/// the count of directories times the first, plus every relative path's bytes:
+/// the shape is enough, and no seal is built per directory.
+pub fn project_tree(
+    metadata: &StagingTransactionMetadata,
+    tree: TreeShape,
+) -> Result<TreeProjection, AllowanceError> {
+    let transaction = ANY_TRANSACTION;
+
+    let filesystem_id = metadata.filesystem_id();
+    let source_root = metadata
+        .source_parent()
+        .relative_path()
+        .join(metadata.source_basename());
+    let destination_root = metadata
+        .destination_parent()
+        .relative_path()
+        .join(metadata.destination_basename());
+    let parent = metadata.source_parent().relative_path().to_path_buf();
+    let resolution = frame_len(&SealRecord::PermissionApplied {
+        transaction,
+        mutation_id: ANY_MUTATION_ID,
+    })?;
+    let per_tree = |root: &Path, reverses| -> Result<u64, AllowanceError> {
+        let one = staging_intent_len(transaction, root.join(""), filesystem_id, reverses)?;
+        Ok(tree.directories * (one + resolution) + tree.directory_path_bytes)
+    };
+    let seals = per_tree(&source_root, None)?;
+    let rollback = per_tree(&source_root, Some(ANY_MUTATION_ID))?;
+    let undo = per_tree(&destination_root, Some(ANY_MUTATION_ID))?;
+    let parent_inverse =
+        staging_intent_len(transaction, parent, filesystem_id, Some(ANY_MUTATION_ID))? + resolution;
+    let manifest = sized_manifest(tree.entries);
+
+    // Everything up to the rename's outcome is written whichever way the
+    // transaction then goes.
+    let to_rename = seals
+        + frame_len(&SealRecord::TreeManifestSidecarComplete {
+            transaction,
+            manifest,
+            commitment: TreeSidecarCommitment {
                 transaction,
-                manifest,
-                commitment: TreeSidecarCommitment {
-                    transaction,
-                    segment_count: 0,
-                    record_count: 0,
-                    payload_bytes: 0,
-                    file_bytes: 0,
-                    root_sha256: [0; 32],
-                },
-            })?
-            + frame_len(&SealRecord::RenameIntent { transaction })?
-            + frame_len(&SealRecord::RenameOutcome {
-                transaction,
-                outcome: DurableRenameOutcome::AppliedAndParentsSynced(metadata.root_identity()),
-            })?
-            + states_len(
-                transaction,
-                &[
-                    TransactionState::TreeSealIntent,
-                    TransactionState::TreeSealed,
-                ],
-            )?;
-        let forward = to_rename
+                segment_count: 0,
+                record_count: 0,
+                payload_bytes: 0,
+                file_bytes: 0,
+                root_sha256: [0; 32],
+            },
+        })?
+        + frame_len(&SealRecord::RenameIntent { transaction })?
+        + frame_len(&SealRecord::RenameOutcome {
+            transaction,
+            outcome: DurableRenameOutcome::AppliedAndParentsSynced(metadata.root_identity()),
+        })?
+        + states_len(
+            transaction,
+            &[
+                TransactionState::TreeSealIntent,
+                TransactionState::TreeSealed,
+            ],
+        )?;
+    let forward = to_rename
+        + parent_inverse
+        + states_len(
+            transaction,
+            &[
+                TransactionState::StagedUnverified,
+                TransactionState::StagedSealed,
+                TransactionState::SourceParentRestoreIntent,
+                TransactionState::SourceParentRestored,
+                TransactionState::VerifiedCommitted,
+            ],
+        )?;
+    let committed_undo =
+        undo + states_len(
+            transaction,
+            &[
+                TransactionState::UndoIntent,
+                TransactionState::UndoModesRestored,
+                TransactionState::UndoRenameIntent,
+                TransactionState::Restored,
+            ],
+        )? + frame_len(&SealRecord::UndoRenameOutcome {
+            transaction,
+            outcome: DurableUndoRenameOutcome::AppliedAndParentsSynced(metadata.root_identity()),
+        })?;
+    let commitment = DurablePurgeCommitment::exact(metadata, manifest);
+    let committed_purge = frame_len(&SealRecord::PurgeAuthorized {
+        transaction,
+        commitment: commitment.clone(),
+    })? + frame_len(&SealRecord::PurgeClaimed {
+        transaction,
+        commitment,
+    })? + frame_len(&SealRecord::PurgeProgress {
+        transaction,
+        removed_entries: tree.entries,
+        last_path: PathBuf::new(),
+    })? + states_len(
+        transaction,
+        &[TransactionState::PurgeOutcome, TransactionState::Purged],
+    )?;
+    Ok(TreeProjection {
+        forward,
+        committed: committed_undo.max(committed_purge),
+        rolled_back: to_rename
+            + rollback
             + parent_inverse
             + states_len(
                 transaction,
-                &[
-                    TransactionState::StagedUnverified,
-                    TransactionState::StagedSealed,
-                    TransactionState::SourceParentRestoreIntent,
-                    TransactionState::SourceParentRestored,
-                    TransactionState::VerifiedCommitted,
-                ],
-            )?;
-        let committed_undo =
-            undo + states_len(
-                transaction,
-                &[
-                    TransactionState::UndoIntent,
-                    TransactionState::UndoModesRestored,
-                    TransactionState::UndoRenameIntent,
-                    TransactionState::Restored,
-                ],
-            )? + frame_len(&SealRecord::UndoRenameOutcome {
-                transaction,
-                outcome: DurableUndoRenameOutcome::AppliedAndParentsSynced(
-                    metadata.root_identity(),
-                ),
-            })?;
-        let commitment = DurablePurgeCommitment::exact(metadata, manifest);
-        let committed_purge = frame_len(&SealRecord::PurgeAuthorized {
-            transaction,
-            commitment: commitment.clone(),
-        })? + frame_len(&SealRecord::PurgeClaimed {
-            transaction,
-            commitment,
-        })? + frame_len(&SealRecord::PurgeProgress {
-            transaction,
-            removed_entries: entry_count,
-            last_path: PathBuf::new(),
-        })? + states_len(
-            transaction,
-            &[TransactionState::PurgeOutcome, TransactionState::Purged],
-        )?;
-        Ok(TreeProjection {
-            forward,
-            committed: committed_undo.max(committed_purge),
-            rolled_back: to_rename
-                + rollback
-                + parent_inverse
-                + states_len(
-                    transaction,
-                    &[TransactionState::RestoreIntent, TransactionState::Restored],
-                )?,
-        })
-    }
+                &[TransactionState::RestoreIntent, TransactionState::Restored],
+            )?,
+    })
 }
 
 impl<W: DurableWrite> SealWal<W> {
@@ -577,16 +671,16 @@ impl<W: DurableWrite> SealWal<W> {
 
 /// What a staging transaction writes before it walks its tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BeginProjection {
+pub struct BeginProjection {
     /// From its first frame until its source parent is sealed.
-    pub(crate) forward: u64,
+    pub forward: u64,
     /// Undoing that seal, if the tree is then refused.
-    pub(crate) rolled_back: u64,
+    pub rolled_back: u64,
 }
 
 impl BeginProjection {
     /// The room it needs before it writes its first frame.
-    pub(crate) fn needed(self) -> u64 {
+    pub fn needed(self) -> u64 {
         self.forward + self.rolled_back
     }
 }
@@ -601,19 +695,19 @@ impl BeginProjection {
 /// the larger. A failure on either writes `RecoveryRequired` in place of a
 /// state frame the path would have written, so it needs no room of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TreeProjection {
+pub struct TreeProjection {
     /// From the tree's first seal until the entry is committed.
-    pub(crate) forward: u64,
+    pub forward: u64,
     /// What the committed entry then holds, before its `RecoveryRequired`.
-    pub(crate) committed: u64,
+    pub committed: u64,
     /// The latest stop that is rolled back rather than committed: every frame
     /// up to a rename's outcome, then every seal reversed.
-    pub(crate) rolled_back: u64,
+    pub rolled_back: u64,
 }
 
 impl TreeProjection {
     /// The room it needs before its first tree seal.
-    pub(crate) fn needed(self) -> u64 {
+    pub fn needed(self) -> u64 {
         (self.forward + self.committed).max(self.rolled_back)
     }
 }

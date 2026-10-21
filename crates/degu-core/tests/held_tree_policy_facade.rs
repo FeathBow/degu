@@ -1,8 +1,7 @@
 use degu_core::backend::{
     CertificationError, HeldLocalBackendEvidence, HeldTreeAssessmentFailureCategory,
-    HeldTreeAssessmentFailureKind, HeldTreeLimitExceeded, HeldTreePolicyAssessmentOutcome,
-    HeldTreePolicyDeferralReason, SourceParentSealAssessmentStatus,
-    assess_held_tree_policy_metadata, certify_held_fd,
+    HeldTreeAssessmentFailureKind, HeldTreePolicyAssessmentOutcome, HeldTreePolicyDeferralReason,
+    SourceParentSealAssessmentStatus, assess_held_tree_policy_metadata, certify_held_fd,
 };
 use rustix::fs::{Mode, OFlags};
 use std::ffi::OsStr;
@@ -75,13 +74,13 @@ fn public_clean_tree_is_assessed_but_never_claims_seal_validation() {
     std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+/// The public assessment counts a tree's directories, and above the 1,023 it
+/// once refused, the default admits it: directories answer to the entry bound.
 #[test]
-fn public_default_directory_boundary_and_hardlink_are_structured() {
-    const MAX_TREE_DIRECTORIES: usize = 1_023;
-
+fn public_size_hardlinks() {
     let (temp, root) = setup();
-    // The root is included, so 1,022 children are exactly the production bound.
-    for index in 0..(MAX_TREE_DIRECTORIES - 1) {
+    // The root is included, so 1,099 children make 1,100 directories.
+    for index in 0..1_099 {
         std::fs::create_dir(root.join(format!("d{index:04}"))).unwrap();
     }
     let Some(parent) = certified(temp.path()) else {
@@ -89,38 +88,9 @@ fn public_default_directory_boundary_and_hardlink_are_structured() {
     };
     let outcome = assess_held_tree_policy_metadata(parent, OsStr::new("root")).unwrap();
     let HeldTreePolicyAssessmentOutcome::TreePolicyAssessed { tree, .. } = outcome else {
-        panic!("searchable boundary tree assessment unexpectedly deferred")
+        panic!("searchable wide tree assessment unexpectedly deferred")
     };
-    assert_eq!(tree.directories, MAX_TREE_DIRECTORIES as u64);
-
-    // One more child makes 1,024 total tree directories. Recovery also needs
-    // one source-parent permission, so policy must reject this boundary.
-    std::fs::create_dir(root.join("over-limit")).unwrap();
-    let Some(parent) = certified(temp.path()) else {
-        return;
-    };
-    let error = assess_held_tree_policy_metadata(parent, OsStr::new("root")).unwrap_err();
-    assert_eq!(
-        error.kind(),
-        HeldTreeAssessmentFailureKind::DirectoryLimitExceeded
-    );
-    assert_eq!(
-        error.category(),
-        HeldTreeAssessmentFailureCategory::ResourceLimit
-    );
-    assert!(error.relative_path().is_none());
-    // The refusal says how big the tree is, not only that it is too big.
-    assert_eq!(
-        error.exceeded(),
-        Some(HeldTreeLimitExceeded {
-            limit: MAX_TREE_DIRECTORIES as u64,
-            observed: MAX_TREE_DIRECTORIES as u64 + 1,
-        })
-    );
-    assert_eq!(
-        error.to_string(),
-        "held-tree assessment failed: directory limit exceeded (observed 1024, limit 1023)"
-    );
+    assert_eq!(tree.directories, 1_100);
 
     let (temp, root) = setup();
     std::fs::hard_link(root.join("file"), root.join("other")).unwrap();

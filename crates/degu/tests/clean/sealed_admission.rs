@@ -7,8 +7,6 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-const MAX_TREE_DIRECTORIES: usize = 1_023;
-
 #[test]
 fn clean_tree_preview_assessment_does_not_activate_or_create_lifecycle_state() {
     let Some(fixture) = Fixture::new() else {
@@ -17,33 +15,67 @@ fn clean_tree_preview_assessment_does_not_activate_or_create_lifecycle_state() {
     fixture.assert_preview_assessed();
 }
 
+/// A tree above the 1,023 directories the walk once refused goes through its
+/// whole life: a preview that assesses it, staging, an undo by a fresh process
+/// that restores every directory's mode, a preview that sizes its purge in the
+/// seal WAL, and the purge.
 #[test]
-fn preview_blocks_1024_tree_directories_before_any_production_mutation() {
+fn wide_tree_lifecycle() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
-    // The inventory counts its root. Root + 1,023 children is 1,024 tree
-    // directories and would require 1,025 active recovery permissions once the
-    // source-parent seal is included. Reject it before any lifecycle mutation.
-    for index in 0..MAX_TREE_DIRECTORIES {
+    // The cache root counts, so 1,099 children make 1,100 directories.
+    for index in 0..1_099 {
         let dir = fixture.cache.join(format!("dir-{index:04}"));
         std::fs::create_dir(&dir).unwrap();
         // Group-writable trees are deliberately demoted by classification, so
         // pin the fixture mode instead of inheriting the ambient umask.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    assert_eq!(count_directories(&fixture.cache), 1_024);
-    let report = fixture.assert_preview_blocked(
-        "directory_limit_exceeded",
-        "directory limit exceeded (observed 1024, limit 1023)",
-    );
-    // The size is a field of its own, so nothing has to parse it out of a reason.
-    let preflight = &report["staging_preflight"][0];
-    assert_eq!(preflight["limit"], 1_023, "{report:#}");
-    assert_eq!(preflight["observed"], 1_024, "{report:#}");
-    fixture.assert_production_rejects("directory limit exceeded (observed 1024, limit 1023)");
-    assert_eq!(count_directories(&fixture.cache), 1_024);
+    assert_eq!(count_directories(&fixture.cache), 1_100);
+    let path = fixture.cache.to_str().unwrap();
+
+    let preview = |purge: bool| -> serde_json::Value {
+        let args: &[&str] = if purge {
+            &["clean", "-n", "--purge", "--json"]
+        } else {
+            &["clean", "-n", "--json"]
+        };
+        let output = fixture.run(args);
+        assert_output_success(&output);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let assessed = &report["staging_preflight"][0];
+        assert_eq!(assessed["status"], "tree_policy_assessed", "{report:#}");
+        report
+    };
+    preview(false);
+
+    let clean = fixture.run(&["clean", "--yes", "--json", "--path", path]);
+    assert_output_success(&clean);
+    let report: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    assert_eq!(report["executed"][0]["state"], "staged", "{report:#}");
+    assert!(!fixture.cache.exists());
+
+    let undo = fixture.run(&["undo", "--json"]);
+    assert_output_success(&undo);
+    assert_eq!(count_directories(&fixture.cache), 1_100);
+    for index in [0, 549, 1_098] {
+        let dir = fixture.cache.join(format!("dir-{index:04}"));
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o755, "{}", dir.display());
+    }
     assert!(fixture.cache.join("wheel.whl").is_file());
+
+    let report = preview(true);
+    let needed = report["staging_preflight"][0]["wal_needed"].as_u64();
+    let available = report["wal_room"]["available"].as_u64();
+    assert!(needed > Some(0) && needed <= available, "{report:#}");
+
+    let purge = fixture.run(&["clean", "--purge", "--yes", "--json", "--path", path]);
+    assert_output_success(&purge);
+    let report: serde_json::Value = serde_json::from_slice(&purge.stdout).unwrap();
+    assert_eq!(report["executed"][0]["purged"], true, "{report:#}");
+    assert!(!fixture.cache.exists());
 }
 
 /// A dry run says what room the seal WAL leaves and what each item's whole
@@ -1129,42 +1161,6 @@ impl Fixture {
         ] {
             assert!(!self.anchor.join(name).exists(), "dry-run created {name}");
         }
-    }
-
-    fn assert_production_rejects(&self, expected: &str) {
-        let first = self.run(&[
-            "clean",
-            "--yes",
-            "--json",
-            "--path",
-            self.cache.to_str().unwrap(),
-        ]);
-        assert_rejected(&first, expected);
-        assert!(self.cache.is_dir(), "rejected source was moved or deleted");
-        assert_activation_and_wal(&self.anchor, self.state.path());
-        let store = self.state.path().join("degu/sealed-staging");
-        let wal = store.join("seal.wal");
-        // Activation and the first CLI session's recovery may initialize or
-        // advance store bookkeeping. Establish the no-mutation baseline only
-        // after that recovery boundary; the next atomic preflight must not
-        // advance it.
-        let wal_len_before = std::fs::metadata(&wal).unwrap().len();
-        assert!(!self.state.path().join("degu/trash").exists());
-        assert!(!store.join(".claims").exists());
-
-        // A new CLI session must reach the same data-only admission decision
-        // without adding a transaction frame or creating staging destinations.
-        let second = self.run(&[
-            "clean",
-            "--yes",
-            "--json",
-            "--path",
-            self.cache.to_str().unwrap(),
-        ]);
-        assert_rejected(&second, expected);
-        assert!(self.cache.is_dir());
-        assert_eq!(std::fs::metadata(wal).unwrap().len(), wal_len_before);
-        assert!(!self.state.path().join("degu/trash").exists());
     }
 }
 

@@ -36,11 +36,6 @@ const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
-/// The most directories a walk admits, the root included. It was recovery's
-/// operation limit less the source parent's seal. Recovery has no such limit
-/// now, and a tree's directories are among its entries, which `max_entries`
-/// already bounds; this stands only until the walk is held to that alone.
-pub(crate) const MAX_TREE_DIRECTORIES: u64 = 1_023;
 const MANIFEST_DOMAIN_V1: &[u8] = b"degu-held-tree-manifest-v1\0";
 const MANIFEST_DOMAIN_V2: &[u8] = b"degu-held-tree-manifest-v2-content\0";
 const MANIFEST_DOMAIN_V3: &[u8] = b"degu-held-tree-manifest-v3-content-xattr\0";
@@ -225,8 +220,9 @@ fn fire_reopener_test_hook(phase: ReopenerTestPhase, path: &Path) {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HeldTreeLimits {
+    /// Entries, the root and every directory among them. A tree has no
+    /// directory that is not one of its entries, so this bounds those too.
     pub max_entries: u64,
-    pub max_directories: u64,
     pub max_depth: u32,
     pub max_path_bytes: u64,
     pub max_manifest_bytes: u64,
@@ -253,7 +249,6 @@ impl Default for HeldTreeLimits {
     fn default() -> Self {
         Self {
             max_entries: 100_000,
-            max_directories: MAX_TREE_DIRECTORIES,
             max_depth: MANIFEST_PATH_DEPTH_LIMIT,
             max_path_bytes: 16 * 1024 * 1024,
             max_manifest_bytes: 64 * 1024 * 1024,
@@ -266,7 +261,6 @@ impl Default for HeldTreeLimits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HeldTreeLimit {
     Entries,
-    Directories,
     Depth,
     PathBytes,
     ManifestBytes,
@@ -291,17 +285,8 @@ pub(crate) enum HeldTreeError {
     InvalidRoot,
     #[error("directory evidence path contains a non-normal relative component at {0}")]
     InvalidDirectoryPath(PathBuf),
-    #[error("requested tree directory limit exceeds 1023 total directories (including the root)")]
-    InvalidDirectoryLimit,
     #[error("held tree exceeded its {kind:?} limit of {limit}")]
     Limit { kind: HeldTreeLimit, limit: u64 },
-    /// More directories than the limit, counted over the whole tree.
-    ///
-    /// [`Self::Limit`] is returned where a walk crosses a bound, so it knows the
-    /// bound and nothing about the size. This one is returned by a walk that kept
-    /// counting to the end, which only the assessment does.
-    #[error("held tree has {observed} directories, over its limit of {limit}")]
-    DirectoryCount { limit: u64, observed: u64 },
     #[error("source parent policy rejects sealing by this process")]
     ParentPolicyRejected,
     #[error("source parent identity, backend, or mode changed")]
@@ -667,7 +652,7 @@ pub(crate) fn assess_tree_admission(
     protected_names: Vec<OsString>,
     limits: HeldTreeLimits,
 ) -> Result<HeldTreeAdmissionAssessment, HeldTreeError> {
-    validate_v2_inputs(root_name, &protected_names, limits)?;
+    validate_v2_inputs(root_name, &protected_names)?;
     let projected = projected_parent_seal(&parent)?;
     let source_parent_seal = SourceParentSealProjection {
         original_mode: projected.original_mode,
@@ -752,10 +737,10 @@ pub(crate) fn directory_xattrs_block_purge(
             });
         }
         examined = examined.saturating_add(1);
-        if examined > limits.max_directories {
+        if examined > limits.max_entries {
             return Err(HeldTreeError::Limit {
-                kind: HeldTreeLimit::Directories,
-                limit: limits.max_directories,
+                kind: HeldTreeLimit::Entries,
+                limit: limits.max_entries,
             });
         }
         let opened = if relative.as_os_str().is_empty() {
@@ -970,15 +955,6 @@ struct TraversalConfiguration {
 trait V2Traversal {
     type Entry;
 
-    /// Whether crossing `max_directories` ends the walk, or is refused once the
-    /// whole tree has been counted.
-    ///
-    /// Only the assessment counts on. It reads metadata and nothing else, so the
-    /// rest of the walk costs it no more than a tree of the same entries under
-    /// the limit would, and what that buys is the size its refusal reports. A
-    /// walk whose result goes on to be sealed stops at the crossing.
-    const COUNTS_PAST_DIRECTORY_LIMIT: bool;
-
     fn make_root(inspected: Inspection) -> Self::Entry;
     fn inspect_entry(
         parent: &HeldLocalBackendEvidence,
@@ -1007,7 +983,6 @@ struct AssessTraversal;
 
 impl V2Traversal for ProveTraversal {
     type Entry = ProvedEntry;
-    const COUNTS_PAST_DIRECTORY_LIMIT: bool = false;
 
     fn make_root(inspected: Inspection) -> Self::Entry {
         ProvedEntry {
@@ -1076,7 +1051,6 @@ impl V2Traversal for ProveTraversal {
 
 impl V2Traversal for AssessTraversal {
     type Entry = AssessedEntry;
-    const COUNTS_PAST_DIRECTORY_LIMIT: bool = true;
 
     fn make_root(inspected: Inspection) -> Self::Entry {
         AssessedEntry {
@@ -1345,13 +1319,9 @@ pub(crate) struct PendingV3Finalizer {
 fn validate_v2_inputs(
     root_name: &OsStr,
     protected_names: &[OsString],
-    limits: HeldTreeLimits,
 ) -> Result<(), HeldTreeError> {
     require_one_component(root_name)?;
     validate_policy(protected_names)?;
-    if limits.max_directories > MAX_TREE_DIRECTORIES {
-        return Err(HeldTreeError::InvalidDirectoryLimit);
-    }
     if protected_names.iter().any(|name| name == root_name) {
         return Err(HeldTreeError::ProtectedName(PathBuf::new()));
     }
@@ -1417,7 +1387,7 @@ fn traverse_v2_with_sink<M: V2Traversal, E>(
     configuration: TraversalConfiguration,
     mut emit_entry: impl FnMut(&ManifestEntry) -> Result<(), E>,
 ) -> Result<V2Walk<M>, TraversalSinkError<E>> {
-    validate_v2_inputs(root_name, &protected_names, limits)?;
+    validate_v2_inputs(root_name, &protected_names)?;
     let backend = parent.backend();
     require_parent_admission(&parent, backend, configuration.parent_admission)?;
     let euid = rustix::process::geteuid().as_raw();
@@ -1447,7 +1417,7 @@ fn traverse_v2_with_sink<M: V2Traversal, E>(
     let root_entry = M::make_root(opened);
     let mut budget = Budget::new(limits, configuration.manifest_schema);
     budget.add_path(M::path(&root_entry), 0)?;
-    budget.add_walked_directory::<M>()?;
+    budget.add_directory();
     if let Some(entry) = M::manifest_entry(&root_entry) {
         emit_entry(entry).map_err(TraversalSinkError::Emit)?;
     }
@@ -1478,22 +1448,7 @@ fn traverse_v2_with_sink<M: V2Traversal, E>(
         regular_hard_links: RegularHardLinkTopology::default(),
         regular_xattrs: RegularXattrTopology::default(),
     };
-    if let Err(error) = finish_v2_walk(&mut walked, configuration, &mut emit_entry) {
-        // Past the crossing the walk is only counting, so whatever stops it there
-        // -- another refusal, a failed read, a swapped root -- is answered with
-        // the refusal the crossing already earned, exactly as a walk that stopped
-        // at the crossing would have answered. Reporting the later failure
-        // instead would trade a certain refusal for however that failure is
-        // classified, and a failed read is classified as worth trying again.
-        return Err(walked
-            .budget
-            .directory_limit_crossed()
-            .map_or(error, Into::into));
-    }
-    // A walk that counted past the directory limit refuses here rather than at
-    // the crossing, and only after the root is known to still be the tree that
-    // was named, so the count it reports is of that tree.
-    walked.budget.check_counted_directories()?;
+    finish_v2_walk(&mut walked, configuration, &mut emit_entry)?;
     Ok(walked)
 }
 
@@ -1975,7 +1930,7 @@ fn read_v2_children_with_sink<M: V2Traversal, E>(
         }
         walked.budget.add_path(M::path(&result), depth)?;
         if child.is_some() {
-            walked.budget.add_walked_directory::<M>()?;
+            walked.budget.add_directory();
             walked.budget.directory_path_bytes = walked
                 .budget
                 .directory_path_bytes
@@ -2151,10 +2106,7 @@ fn traverse_forward_v3_directory<E>(
             .add_path(&proved.manifest.path, child_depth)
             .map_err(HeldTreeV3CollectError::Tree)?;
         if child.is_some() {
-            state
-                .budget
-                .add_directory()
-                .map_err(HeldTreeV3CollectError::Tree)?;
+            state.budget.add_directory();
         }
         emit_forward_v3_record(&proved.manifest, state.record, emit_record)?;
         if let Some(child) = child {
@@ -2186,8 +2138,7 @@ impl PendingV3Inventory {
         limits: HeldTreeLimits,
         mut emit_record: impl FnMut(&[u8]) -> Result<(), E>,
     ) -> Result<Self, HeldTreeV3CollectError<E>> {
-        validate_v2_inputs(root_name, &protected_names, limits)
-            .map_err(HeldTreeV3CollectError::Tree)?;
+        validate_v2_inputs(root_name, &protected_names).map_err(HeldTreeV3CollectError::Tree)?;
         let backend = parent.backend();
         require_parent_admission(&parent, backend, ParentAdmission::CurrentExclusive)
             .map_err(HeldTreeV3CollectError::Tree)?;
@@ -2232,8 +2183,8 @@ impl PendingV3Inventory {
         let mut budget = Budget::new(limits, CONTENT_PROOF_VERSION);
         budget
             .add_path(&root_entry.manifest.path, 0)
-            .and_then(|()| budget.add_directory())
             .map_err(HeldTreeV3CollectError::Tree)?;
+        budget.add_directory();
         let root = HeldDirectory::new(held, PathBuf::new(), 0, root_identity);
         let mount_id = root.held.mount_id();
         let mut record = Vec::with_capacity(MANIFEST_V3_MAX_SEGMENT_PAYLOAD);
@@ -2451,13 +2402,7 @@ impl PendingPreSealV3Finalizer {
         emit_hardlink: &mut dyn FnMut(&[u8]) -> Result<(), E>,
     ) -> Result<(), HeldTreeV3CollectError<E>> {
         if record.kind == ManifestV3RecordKind::Directory {
-            self.observed_directories =
-                self.observed_directories
-                    .checked_add(1)
-                    .ok_or(HeldTreeV3CollectError::Tree(HeldTreeError::Limit {
-                        kind: HeldTreeLimit::Directories,
-                        limit: self.pending.context.limits.max_directories,
-                    }))?;
+            self.observed_directories = self.observed_directories.saturating_add(1);
         }
         self.pending.observe(record, emit_hardlink)
     }
@@ -2849,9 +2794,7 @@ fn traverse_forward_structure_directory<E>(
             .add_path(&value.path, child_depth)
             .map_err(HeldTreeV3CollectError::Tree)?;
         if child.is_some() {
-            budget
-                .add_directory()
-                .map_err(HeldTreeV3CollectError::Tree)?;
+            budget.add_directory();
         }
         emit_structure_record(&value, encoded, emit_record)?;
         if let Some(child) = child {
@@ -3230,13 +3173,7 @@ impl PostSealExpectationBuilder {
                     limit: inventory.tree.context.limits.max_entries,
                 })?;
         let mode = if record.kind == ManifestV3RecordKind::Directory {
-            self.observed_directories =
-                self.observed_directories
-                    .checked_add(1)
-                    .ok_or(HeldTreeError::Limit {
-                        kind: HeldTreeLimit::Directories,
-                        limit: inventory.tree.context.limits.max_directories,
-                    })?;
+            self.observed_directories = self.observed_directories.saturating_add(1);
             let path = Path::new(OsStr::from_bytes(record.path));
             directory_mode(path, record.device, record.inode, record.incarnation)
                 .ok_or_else(|| HeldTreeError::PostChanged(path.to_path_buf()))?
@@ -3315,8 +3252,8 @@ impl StreamedV3Inventory {
             .map_err(HeldTreeV3CollectError::Tree)?;
         budget
             .add_path(&root.path, 0)
-            .and_then(|()| budget.add_directory())
             .map_err(HeldTreeV3CollectError::Tree)?;
+        budget.add_directory();
         emit_structure_record(&root, &mut encoded, &mut emit_record)?;
         let root_stream = duplicate_held_directory(&self.context.root.held, Path::new(""))
             .map_err(HeldTreeV3CollectError::Tree)?;
@@ -4010,9 +3947,6 @@ impl HeldTreeInventory {
         }
         require_one_component(root_name)?;
         validate_policy(&protected_names)?;
-        if limits.max_directories > MAX_TREE_DIRECTORIES {
-            return Err(HeldTreeError::InvalidDirectoryLimit);
-        }
         if protected_names.iter().any(|name| name == root_name) {
             return Err(HeldTreeError::ProtectedName(PathBuf::new()));
         }
@@ -4049,7 +3983,7 @@ impl HeldTreeInventory {
         let root_entry = opened.into_manifest(PathBuf::new(), root_content);
         let mut budget = Budget::new(limits, manifest_schema);
         budget.add_path(&root_entry.path, 0)?;
-        budget.add_directory()?;
+        budget.add_directory();
         let root = HeldDirectory::new(held, PathBuf::new(), 0, root_identity);
         let root_evidence = root.evidence.clone();
         let mut tree = Self {
@@ -4491,7 +4425,7 @@ impl HeldTreeInventory {
         let root = inspect_held(reopened_root.held(), Path::new(""))?;
         let root = root.structure_evidence(PathBuf::new(), self.manifest_schema)?;
         budget.add_path(&root.path, 0)?;
-        budget.add_directory()?;
+        budget.add_directory();
         actual.push(root);
 
         for directory in &self.directories {
@@ -4531,7 +4465,7 @@ impl HeldTreeInventory {
                     };
                 budget.add_path(&value.path, directory.depth.saturating_add(1))?;
                 if value.identity.kind == NodeKind::Directory {
-                    budget.add_directory()?;
+                    budget.add_directory();
                 }
                 actual.push(value);
             }
@@ -4585,7 +4519,7 @@ impl HeldTreeInventory {
         let root = inspect_held(reopened_root.held(), Path::new(""))?
             .into_manifest(PathBuf::new(), root_content);
         budget.add_path(&root.path, 0)?;
-        budget.add_directory()?;
+        budget.add_directory();
         actual.insert(PathBuf::new(), root);
         for directory in &self.directories {
             let reopened = self.reopen_directory(&directory.relative_path)?;
@@ -4618,7 +4552,7 @@ impl HeldTreeInventory {
                 let value = inspected.into_manifest(path.clone(), content);
                 budget.add_path(&value.path, directory.depth.saturating_add(1))?;
                 if value.identity.kind == NodeKind::Directory {
-                    budget.add_directory()?;
+                    budget.add_directory();
                 }
                 if !baseline.contains_key(&path) {
                     return Err(HeldTreeError::PostAdded(path));
@@ -4735,7 +4669,7 @@ impl HeldTreeInventory {
             let manifest = inspected.into_manifest(path.clone(), content);
             budget.add_path(&manifest.path, depth)?;
             if child.is_some() {
-                budget.add_directory()?;
+                budget.add_directory();
             }
             let evidence = child.as_ref().map(|held| DirectoryEvidence {
                 relative_path: path.clone(),
@@ -6712,9 +6646,6 @@ impl ManifestV3Decoder {
             return Err(ManifestV3CodecError::Limit(HeldTreeLimit::ManifestBytes));
         }
         if kind == ManifestV3RecordKind::Directory {
-            if self.decoded_directories >= self.limits.max_directories {
-                return Err(ManifestV3CodecError::Limit(HeldTreeLimit::Directories));
-            }
             self.decoded_directories = self
                 .decoded_directories
                 .checked_add(1)
@@ -7274,47 +7205,10 @@ impl Budget {
         )
     }
 
-    fn add_directory(&mut self) -> Result<(), HeldTreeError> {
+    /// Counts a directory for the tree's shape. Its directories are among its
+    /// entries, so `add_path` has already held it to a bound.
+    fn add_directory(&mut self) {
         self.directories = self.directories.saturating_add(1);
-        check(
-            self.directories,
-            self.limits.max_directories,
-            HeldTreeLimit::Directories,
-        )
-    }
-
-    /// One directory of a v2 walk, held to the limit the way that walk holds it.
-    fn add_walked_directory<M: V2Traversal>(&mut self) -> Result<(), HeldTreeError> {
-        if M::COUNTS_PAST_DIRECTORY_LIMIT {
-            self.directories = self.directories.saturating_add(1);
-            Ok(())
-        } else {
-            self.add_directory()
-        }
-    }
-
-    /// The refusal a walk earned when it crossed the directory limit, if it did,
-    /// in the form a walk that stopped at the crossing gives it.
-    fn directory_limit_crossed(&self) -> Option<HeldTreeError> {
-        (self.directories > self.limits.max_directories).then_some(HeldTreeError::Limit {
-            kind: HeldTreeLimit::Directories,
-            limit: self.limits.max_directories,
-        })
-    }
-
-    /// The refusal a walk that counted past the directory limit owes at its end.
-    ///
-    /// A walk that stops at the crossing never gets here over the limit, so for
-    /// it this always passes.
-    fn check_counted_directories(&self) -> Result<(), HeldTreeError> {
-        if self.directories <= self.limits.max_directories {
-            Ok(())
-        } else {
-            Err(HeldTreeError::DirectoryCount {
-                limit: self.limits.max_directories,
-                observed: self.directories,
-            })
-        }
     }
 }
 

@@ -734,6 +734,55 @@ send "q"
     );
 }
 
+/// A cache above the 1,023 directories sealed staging once refused starts in the
+/// plan, and the review stages it.
+#[test]
+fn wide_tree_cleans() {
+    let home = tempfile::tempdir().unwrap();
+    let Some(_backend) = common::require_sealed_fixture_backend(home.path()) else {
+        return;
+    };
+    let state = tempfile::tempdir_in(home.path()).unwrap();
+    let config = config_home_with_roots(&[]);
+    let cache = common::platform_cache_dir(home.path(), "pip");
+    // The cache root counts, so 1,099 children make 1,100 directories.
+    for index in 0..1_099 {
+        std::fs::create_dir_all(cache.join(format!("http-{index:04}"))).unwrap();
+    }
+    std::fs::write(cache.join("http-0000/blob"), vec![0u8; 4096]).unwrap();
+    let anchor = state.path().join("degu-integration-activation-anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o700)).unwrap();
+    common::make_tree_non_shared_writable(home.path()).unwrap();
+    let anchor = std::fs::canonicalize(&anchor).unwrap();
+
+    let out = run_pty_sealed(
+        PtyRun {
+            body: r#"
+spawn -noecho sh -c {stty rows 24 columns 80; exec "$DEGU_BIN" --color never tui}
+expect -ex "\033\[?1049h"
+sleep 1
+send "c"
+expect "Proceed?"
+send "y\r"
+set timeout 120
+"#,
+            home: home.path(),
+            config_home: config.path(),
+            state_home: state.path(),
+            extra_env: &[],
+        },
+        &anchor,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        !cache.exists(),
+        "the review did not stage the cache: {stdout}"
+    );
+    assert_eq!(staged_entry_names(home.path(), state.path()).len(), 1);
+}
+
 /// The review builds an explicit-path batch, and the batch preflight rejects the
 /// whole batch on any item whose assessment did not complete -- not only on one it
 /// refused. A tree with a file the assessment cannot open is not refused, it is

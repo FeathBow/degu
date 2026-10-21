@@ -25,11 +25,14 @@ use std::sync::Arc;
 
 mod allowance;
 mod permission_ledger;
-pub(crate) use allowance::AllowanceError;
+mod room;
+pub use allowance::AllowanceError;
 #[cfg(test)]
 pub(crate) use allowance::{BeginProjection, TreeProjection};
 pub use permission_ledger::PermissionWorkload;
 use permission_ledger::{PermissionLedger, PhaseTally, SealCoverage};
+pub(crate) use room::room_in;
+pub use room::{WalRoom, WalRoomError};
 
 const MAGIC: &[u8; 4] = b"DSWL";
 const VERSION: u16 = 13;
@@ -37,7 +40,7 @@ const LEGACY_CONTENT_PROOF_MANIFEST_VERSION: u16 = 2;
 const CONTENT_PROOF_MANIFEST_VERSION: u16 = 3;
 const HEADER_LEN: usize = 20;
 const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
-const MAX_WAL_LEN: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_WAL_LEN: u64 = 64 * 1024 * 1024;
 
 #[cfg(test)]
 thread_local! {
@@ -716,9 +719,9 @@ pub trait DurableWrite: Write {
     fn read_committed(&self, start: u64, into: &mut [u8]) -> io::Result<()>;
 }
 
-/// Reads `extent` out of `bytes`, for the fixture writers that keep the WAL in
-/// memory. [`File`] and [`RecoverySession`] are the only production writers.
-#[cfg(test)]
+/// Reads `extent` out of `bytes`, for the writers that keep the WAL in memory:
+/// the read-only view a room is measured on, and the fixtures. [`File`] and
+/// [`RecoverySession`] are the only writers that append.
 pub(crate) fn read_committed_from_memory(
     bytes: &[u8],
     start: u64,

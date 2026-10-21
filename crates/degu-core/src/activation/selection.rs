@@ -170,7 +170,14 @@ pub fn current_euid_system_authority() -> Result<Option<PathBuf>, StoreActivatio
 pub(super) fn open_authority_candidate(
     locator: &ActivationAnchorLocator,
 ) -> Result<Option<AuthorityCandidate>, StoreActivationError> {
-    let authority = match open_activation_anchor(locator) {
+    open_authority_candidate_with(locator, AnchorAccess::Exclusive)
+}
+
+fn open_authority_candidate_with(
+    locator: &ActivationAnchorLocator,
+    access: AnchorAccess,
+) -> Result<Option<AuthorityCandidate>, StoreActivationError> {
+    let authority = match open_activation_anchor_with(locator, access) {
         Ok(authority) => authority,
         Err(StoreActivationError::AnchorNotProvisioned { .. }) => return Ok(None),
         Err(error) => return Err(error),
@@ -260,15 +267,24 @@ fn claimed_authority_choice(
     Ok(Some(choice))
 }
 
+#[cfg(test)]
 pub(super) fn select_authority_pair(
     system_locator: ActivationAnchorLocator,
     self_locator: ActivationAnchorLocator,
 ) -> Result<AuthoritySelection, StoreActivationError> {
+    select_authority_pair_with(system_locator, self_locator, AnchorAccess::Exclusive)
+}
+
+fn select_authority_pair_with(
+    system_locator: ActivationAnchorLocator,
+    self_locator: ActivationAnchorLocator,
+    access: AnchorAccess,
+) -> Result<AuthoritySelection, StoreActivationError> {
     // Every selector acquires the system anchor first and the self anchor
     // second. Holding both locks through the mutation session prevents two
     // selector users from publishing competing activation evidence.
-    let system = open_authority_candidate(&system_locator)?;
-    let self_managed = open_authority_candidate(&self_locator)?;
+    let system = open_authority_candidate_with(&system_locator, access)?;
+    let self_managed = open_authority_candidate_with(&self_locator, access)?;
     if system.is_none() && self_managed.is_none() {
         return Err(StoreActivationError::NoAuthority {
             system: system_locator.path,
@@ -329,9 +345,16 @@ pub(super) fn select_authority_pair(
 }
 
 pub(super) fn select_current_euid_authority() -> Result<AuthoritySelection, StoreActivationError> {
-    select_authority_pair(
+    select_current_euid_authority_with(AnchorAccess::Exclusive)
+}
+
+fn select_current_euid_authority_with(
+    access: AnchorAccess,
+) -> Result<AuthoritySelection, StoreActivationError> {
+    select_authority_pair_with(
         ActivationAnchorLocator::for_current_euid()?,
         ActivationAnchorLocator::for_current_euid_self()?,
+        access,
     )
 }
 
@@ -555,6 +578,49 @@ pub fn check_current_euid_authority_readiness()
 /// Where nothing redirects the anchor the two answers are identical, which is
 /// every real account; they part only under the mutation seam, and answering
 /// from the account database there refuses work that would have succeeded.
+/// Why the room in the current EUID's seal WAL could not be measured.
+#[derive(Debug, thiserror::Error)]
+pub enum WalRoomInspectionError {
+    #[error(transparent)]
+    Activation(#[from] StoreActivationError),
+    /// The store is part way through activation, lost, or replaced, so there
+    /// is no WAL to measure and staging would be refused before reaching one.
+    #[error("the sealed-staging store is {0:?}, so its room cannot be measured")]
+    Unavailable(StoreActivationKind),
+    #[error(transparent)]
+    Room(#[from] crate::seal::wal::WalRoomError),
+}
+
+/// The room the current EUID's seal WAL leaves for a new staging, for a
+/// preview that must not change anything to learn it.
+///
+/// The store is found the way readiness finds it, but read-only: no anchor is
+/// locked and nothing is synced, so a clean running alongside never sees the
+/// anchor or the store as busy because a preview was looking. The WAL is then
+/// measured without a lease. A store never activated holds nothing yet, and
+/// its room is all of it, except where readiness would refuse first: a
+/// self-managed anchor with no authority claimed has to be initialized before
+/// anything is staged, and the room is no answer to that.
+pub fn current_euid_wal_room() -> Result<crate::seal::wal::WalRoom, WalRoomInspectionError> {
+    room_from(production_authority_selection_with(AnchorAccess::ReadOnly)?)
+}
+
+pub(super) fn room_from(
+    selection: AuthoritySelection,
+) -> Result<crate::seal::wal::WalRoom, WalRoomInspectionError> {
+    match &selection.selected.state {
+        StoreActivationState::Activated(activated) => Ok(activated.store.room()?),
+        StoreActivationState::NeverActivated
+            if selection.mode == ActivationAuthorityMode::SelfManaged
+                && selection.selected.claim.is_none() =>
+        {
+            Err(StoreActivationError::SelfInitializationRequired.into())
+        }
+        StoreActivationState::NeverActivated => Ok(crate::seal::wal::WalRoom::empty()),
+        other => Err(WalRoomInspectionError::Unavailable(other.kind())),
+    }
+}
+
 pub fn check_current_euid_mutation_readiness()
 -> Result<CurrentEuidAuthorityReadiness, StoreActivationError> {
     readiness_from(production_authority_selection()?)
@@ -585,11 +651,19 @@ fn readiness_from(
     })
 }
 
-#[cfg(any(test, feature = "integration-test-anchor"))]
+#[cfg(test)]
 pub(super) fn selection_for_locator(
     locator: &ActivationAnchorLocator,
 ) -> Result<AuthoritySelection, StoreActivationError> {
-    let authority = open_activation_anchor(locator)?;
+    selection_for_locator_with(locator, AnchorAccess::Exclusive)
+}
+
+#[cfg(any(test, feature = "integration-test-anchor"))]
+pub(super) fn selection_for_locator_with(
+    locator: &ActivationAnchorLocator,
+    access: AnchorAccess,
+) -> Result<AuthoritySelection, StoreActivationError> {
+    let authority = open_activation_anchor_with(locator, access)?;
     let claim = read_optional_authority(&authority).map_err(store_error_from_record_read)?;
     let state = discover_with_authority(&authority)?;
     Ok(AuthoritySelection {
@@ -604,14 +678,23 @@ pub(super) fn selection_for_locator(
 }
 
 pub(super) fn production_authority_selection() -> Result<AuthoritySelection, StoreActivationError> {
+    production_authority_selection_with(AnchorAccess::Exclusive)
+}
+
+fn production_authority_selection_with(
+    access: AnchorAccess,
+) -> Result<AuthoritySelection, StoreActivationError> {
     #[cfg(feature = "integration-test-anchor")]
     if let Some(path) = std::env::var_os(INTEGRATION_TEST_ANCHOR_ENV) {
-        return selection_for_locator(&ActivationAnchorLocator {
-            path: PathBuf::from(path),
-            kind: AnchorKind::IntegrationTest,
-        });
+        return selection_for_locator_with(
+            &ActivationAnchorLocator {
+                path: PathBuf::from(path),
+                kind: AnchorKind::IntegrationTest,
+            },
+            access,
+        );
     }
-    select_current_euid_authority()
+    select_current_euid_authority_with(access)
 }
 
 /// Select the fixed current-account authority and activate or resume

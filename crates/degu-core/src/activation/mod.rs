@@ -77,15 +77,16 @@ use selection::{
 pub use selection::{
     ActivationAuthorityMode, AuthorityClaimPublicationState, CurrentEuidAuthorityReadiness,
     SelfAuthorityInitializationError, SelfAuthorityInitializationOutcome,
-    SelfAuthorityInitializationPostProvisionError, activate_current_euid_store,
-    check_current_euid_authority_readiness, check_current_euid_mutation_readiness,
-    current_euid_system_authority, initialize_current_euid_self_authority,
+    SelfAuthorityInitializationPostProvisionError, WalRoomInspectionError,
+    activate_current_euid_store, check_current_euid_authority_readiness,
+    check_current_euid_mutation_readiness, current_euid_system_authority, current_euid_wal_room,
+    initialize_current_euid_self_authority,
 };
 #[cfg(test)]
 use selection::{
     AuthorityChoice, choose_authority, complete_provisioned_self_authority_with,
     ensure_authority_claim_observed, open_authority_candidate, require_current_self_path_with,
-    select_authority_pair, selection_for_locator,
+    room_from, select_authority_pair, selection_for_locator, selection_for_locator_with,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +308,7 @@ struct AuthorityLease {
 
 struct AuthorityRoot {
     kind: AnchorKind,
+    access: AnchorAccess,
     _provisioning_lock: Option<ExclusiveFileLock>,
     parent: OwnedFd,
     name: OsString,
@@ -314,7 +316,20 @@ struct AuthorityRoot {
     path: PathBuf,
     identity: StrongObjectIdentity,
     backend: ActivationAnchorBackend,
-    _lock: ExclusiveFileLock,
+    /// Held through every mutation session; `None` only for a read-only look.
+    _lock: Option<ExclusiveFileLock>,
+}
+
+/// How an activation anchor is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AnchorAccess {
+    /// Locked, and made durable again: what every mutation and every readiness
+    /// check takes, so two of them cannot publish competing evidence.
+    Exclusive,
+    /// Neither locked nor synced, for a look that must not make a concurrent
+    /// clean see the anchor as busy. It reads the same records and runs the
+    /// same checks on them; it only holds nothing while it does.
+    ReadOnly,
 }
 
 /// Read the one stable, pre-provisioned activation anchor.
@@ -486,7 +501,7 @@ fn activate_or_resume_with_authorities(
             if classify_preparing(&authority, &record)?.kind() != StoreActivationKind::Preparing {
                 return Err(StoreActivationError::NotResumable);
             }
-            let store = match open_recorded_store(&record.store_locator)? {
+            let store = match open_recorded_store(&record.store_locator, authority.access)? {
                 RecordedStore::Open(store) => store,
                 RecordedStore::Lost | RecordedStore::Corrupt => {
                     return Err(StoreActivationError::NotResumable);
@@ -613,8 +628,15 @@ enum RecordedStore {
     Corrupt,
 }
 
-fn open_recorded_store(locator: &Path) -> Result<RecordedStore, StoreActivationError> {
-    match SealWalStore::open_existing(locator) {
+fn open_recorded_store(
+    locator: &Path,
+    access: AnchorAccess,
+) -> Result<RecordedStore, StoreActivationError> {
+    let opened = match access {
+        AnchorAccess::Exclusive => SealWalStore::open_existing(locator),
+        AnchorAccess::ReadOnly => SealWalStore::open_existing_unsynced(locator),
+    };
+    match opened {
         Ok(store) => Ok(RecordedStore::Open(store)),
         Err(StoreError::MissingStore { .. }) => Ok(RecordedStore::Lost),
         // These are deterministic evidence that an object exists at the bound
@@ -694,7 +716,7 @@ fn classify_preparing(
     {
         return Ok(StoreActivationState::CorruptOrReplaced);
     }
-    let store = match open_recorded_store(&prepare.store_locator)? {
+    let store = match open_recorded_store(&prepare.store_locator, authority.access)? {
         RecordedStore::Open(store) => store,
         RecordedStore::Lost => return Ok(StoreActivationState::Lost),
         RecordedStore::Corrupt => return Ok(StoreActivationState::CorruptOrReplaced),
@@ -717,7 +739,7 @@ fn validate_activated(
     {
         return Ok(StoreActivationState::CorruptOrReplaced);
     }
-    let store = match open_recorded_store(&active.prepare.store_locator)? {
+    let store = match open_recorded_store(&active.prepare.store_locator, authority.access)? {
         RecordedStore::Open(store) => store,
         RecordedStore::Lost => return Ok(StoreActivationState::Lost),
         RecordedStore::Corrupt => return Ok(StoreActivationState::CorruptOrReplaced),
@@ -754,13 +776,36 @@ fn validate_activated(
         authority.backend,
         authority.kind,
     )?;
-    sync_fd(store.directory_fd(), "activated store directory")?;
-    sync_fd(&authority.directory, "activation anchor directory")?;
+    if authority.access == AnchorAccess::Exclusive {
+        sync_fd(store.directory_fd(), "activated store directory")?;
+        sync_fd(&authority.directory, "activation anchor directory")?;
+    }
     Ok(StoreActivationState::Activated(ActivatedSealWalStore {
         locator: active.prepare.store_locator,
         store,
         _authority: None,
     }))
+}
+
+/// Whether a committed provisioning left its lock beside the anchor, asked
+/// without taking it.
+fn provisioning_lock_exists(
+    locator: &ActivationAnchorLocator,
+) -> Result<bool, StoreActivationError> {
+    let product_root = locator
+        .path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or(StoreActivationError::InvalidLocator)?;
+    let lock_path = product_root.join(crate::provision::PROVISIONING_LOCK_NAME);
+    match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(StoreActivationError::Io {
+            path: lock_path,
+            source,
+        }),
+    }
 }
 
 fn lock_activation_provisioning(
@@ -852,16 +897,32 @@ fn lock_activation_provisioning(
     Ok(Some(lock))
 }
 
+#[cfg(test)]
 fn open_activation_anchor(
     locator: &ActivationAnchorLocator,
 ) -> Result<AuthorityRoot, StoreActivationError> {
+    open_activation_anchor_with(locator, AnchorAccess::Exclusive)
+}
+
+fn open_activation_anchor_with(
+    locator: &ActivationAnchorLocator,
+    access: AnchorAccess,
+) -> Result<AuthorityRoot, StoreActivationError> {
     // Provisioning publishes the leaf before its final account/binding/fsync
     // commit gate. Taking the flavor's separate provisioning lock first makes
-    // that interval invisible to runtime selection and activation.
-    let provisioning_lock = lock_activation_provisioning(locator)?;
+    // that interval invisible to runtime selection and activation. A read-only
+    // look cannot take it without making a provisioner see it as busy, so it
+    // asks only whether the lock is there, which is what a committed
+    // provisioning leaves behind.
+    let provisioning_lock = match access {
+        AnchorAccess::Exclusive => lock_activation_provisioning(locator)?,
+        AnchorAccess::ReadOnly => None,
+    };
+    let provisioned = provisioning_lock.is_some()
+        || (access == AnchorAccess::ReadOnly && provisioning_lock_exists(locator)?);
     let authority_path = locator.as_path();
     validate_absolute_locator(authority_path)?;
-    if provisioning_lock.is_none()
+    if !provisioned
         && matches!(
             std::fs::symlink_metadata(authority_path),
             Err(source) if source.kind() == io::ErrorKind::NotFound
@@ -926,7 +987,7 @@ fn open_activation_anchor(
             false
         }
     };
-    if provisioning_lock.is_none() && !lock_may_be_absent {
+    if !provisioned && !lock_may_be_absent {
         return Err(unsafe_anchor(
             authority_path,
             "activation anchor appeared without its provisioning commit lock",
@@ -938,10 +999,17 @@ fn open_activation_anchor(
         crate::backend::certify_held_fd_backend(&directory)
             .map_err(StoreActivationError::Backend)?,
     );
-    let lock = try_lock_directory(&directory).map_err(|source| StoreActivationError::Io {
-        path: authority_path.to_path_buf(),
-        source,
-    })?;
+    let lock = match access {
+        AnchorAccess::Exclusive => {
+            Some(
+                try_lock_directory(&directory).map_err(|source| StoreActivationError::Io {
+                    path: authority_path.to_path_buf(),
+                    source,
+                })?,
+            )
+        }
+        AnchorAccess::ReadOnly => None,
+    };
 
     validate_activation_anchor_binding(
         &parent,
@@ -953,12 +1021,16 @@ fn open_activation_anchor(
         locator.kind,
     )?;
     // The anchor is provisioned out of process. Re-establish durability of both
-    // its exact contents and its parent binding on every successful open/retry.
-    sync_fd(&directory, "activation anchor directory after validation")?;
-    sync_fd(&parent, "activation anchor parent after validation")?;
+    // its exact contents and its parent binding on every successful open/retry
+    // that may go on to change anything.
+    if access == AnchorAccess::Exclusive {
+        sync_fd(&directory, "activation anchor directory after validation")?;
+        sync_fd(&parent, "activation anchor parent after validation")?;
+    }
 
     Ok(AuthorityRoot {
         kind: locator.kind,
+        access,
         _provisioning_lock: provisioning_lock,
         parent,
         name,

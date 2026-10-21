@@ -21,7 +21,7 @@ const ANY_MUTATION_ID: u64 = 0;
 
 /// Why an allowance could not be measured.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum AllowanceError {
+pub enum AllowanceError {
     #[error("transaction is in {0:?}, which admission never meets")]
     Unsettled(TransactionState),
     #[error("transaction lacks the {0} its remaining frames are built from")]
@@ -270,19 +270,21 @@ impl<W: DurableWrite> SealWal<W> {
     /// left out of the sum; it is the transaction being measured, and part
     /// way through its own staging it has no settled allowance to give.
     pub(crate) fn headroom(&self, admitting: Option<TransactionId>) -> Result<u64, AllowanceError> {
-        let reserved = self
-            .states
-            .keys()
-            .filter(|&&transaction| Some(transaction) != admitting)
-            .try_fold(0_u64, |total, &transaction| {
-                Ok::<_, AllowanceError>(
-                    total.saturating_add(self.remaining_allowance(transaction)?),
-                )
-            })?;
         Ok(self
             .max_wal_len
             .saturating_sub(self.committed_len)
-            .saturating_sub(reserved))
+            .saturating_sub(self.reserved(admitting)?))
+    }
+
+    /// What every settled transaction but `admitting` holds for the rest of
+    /// its life.
+    pub(crate) fn reserved(&self, admitting: Option<TransactionId>) -> Result<u64, AllowanceError> {
+        self.states
+            .keys()
+            .filter(|&&transaction| Some(transaction) != admitting)
+            .try_fold(0_u64, |total, &transaction| {
+                Ok(total.saturating_add(self.remaining_allowance(transaction)?))
+            })
     }
 
     /// What a staging transaction writes from its first frame until its source

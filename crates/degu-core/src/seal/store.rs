@@ -13,7 +13,10 @@ use crate::backend::{
     HeldLocalBackendEvidence, certify_held_fd, certify_held_fd_backend, require_held_fd_acl_absent,
 };
 use crate::seal::sidecar::TreeSidecarStore;
-use crate::seal::wal::{CompactionPlan, ExclusiveFileLock, RecoveryLockError, RecoverySession};
+use crate::seal::wal::{
+    CompactionPlan, ExclusiveFileLock, MAX_WAL_LEN, RecoveryLockError, RecoverySession, WalRoom,
+    WalRoomError, room_in,
+};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{FileType, Mode, OFlags, RenameFlags};
 use std::ffi::OsString;
@@ -61,6 +64,9 @@ pub(crate) enum CompactionDamage {
 std::thread_local! {
     pub(crate) static DAMAGE_COMPACTION: std::cell::Cell<Option<CompactionDamage>> =
         const { std::cell::Cell::new(None) };
+    /// How many syncs this thread's opens of an existing store have made.
+    pub(crate) static EXISTING_STORE_SYNCS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Where a compaction assembles the next WAL before it replaces the live one.
@@ -75,6 +81,9 @@ const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 const OPEN_WAL: OFlags = OFlags::RDWR.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+const READ_WAL: OFlags = OFlags::RDONLY
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
 const MAX_INITIALIZER_NAMES: usize = 128;
 static NEXT_INITIALIZER_NAME: AtomicU64 = AtomicU64::new(1);
 
@@ -147,7 +156,9 @@ impl SealWalStore {
     /// Opens already-published store authority without ever recreating it.
     /// This is the only safe discovery operation after whole-store activation.
     pub(crate) fn open_existing(path: &Path) -> Result<Self, StoreError> {
-        Self::open_with_sync(path, false, |fd| {
+        Self::open_with_sync(path, Publication::Serialized { create: false }, |fd| {
+            #[cfg(test)]
+            EXISTING_STORE_SYNCS.with(|syncs| syncs.set(syncs.get() + 1));
             rustix::fs::fsync(fd).map_err(io::Error::from)
         })
         .map_err(|error| match error {
@@ -162,14 +173,32 @@ impl SealWalStore {
         })
     }
 
+    /// Opens already-published store authority without recreating it, without
+    /// syncing anything and without taking the parent's lock, for a read-only
+    /// look that changes nothing and makes nobody wait.
+    pub(crate) fn open_existing_unsynced(path: &Path) -> Result<Self, StoreError> {
+        Self::open_with_sync(path, Publication::Unlocked, |_| Ok(())).map_err(|error| match error {
+            StoreError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
+                StoreError::MissingStore {
+                    path: path.to_path_buf(),
+                }
+            }
+            error => error,
+        })
+    }
+
     fn open_or_create_with_sync<F>(path: &Path, sync: F) -> Result<Self, StoreError>
     where
         F: FnMut(&OwnedFd) -> io::Result<()>,
     {
-        Self::open_with_sync(path, true, sync)
+        Self::open_with_sync(path, Publication::Serialized { create: true }, sync)
     }
 
-    fn open_with_sync<F>(path: &Path, create: bool, mut sync: F) -> Result<Self, StoreError>
+    fn open_with_sync<F>(
+        path: &Path,
+        publication: Publication,
+        mut sync: F,
+    ) -> Result<Self, StoreError>
     where
         F: FnMut(&OwnedFd) -> io::Result<()>,
     {
@@ -177,8 +206,12 @@ impl SealWalStore {
         validate_parent_for_creation(&parent, &parent_path)?;
         // All protocol participants serialize publication through the held
         // parent. The final name is never visible until an exact WAL and its
-        // unpublished directory have both been synced.
-        let parent_lock = try_lock_directory(&parent)?;
+        // unpublished directory have both been synced, so a look, which opens
+        // only that name, has nothing to serialize with and takes no lock.
+        let (parent_lock, create) = match publication {
+            Publication::Serialized { create } => (Some(try_lock_directory(&parent)?), create),
+            Publication::Unlocked => (None, false),
+        };
         let directory = match rustix::fs::openat(&parent, &name, OPEN_DIRECTORY, Mode::empty()) {
             Ok(directory) => directory,
             Err(rustix::io::Errno::NOENT) if create => {
@@ -295,6 +328,45 @@ impl SealWalStore {
     /// Opens the mandatory exact WAL entry and acquires a nonblocking exclusive
     /// lock on that same descriptor. A missing entry in an existing store is
     /// lost authority, never permission to initialize an empty WAL.
+    /// The room this store's WAL leaves for a new staging, measured without a
+    /// lease: no lock is taken, no torn tail is repaired, nothing is compacted.
+    /// The WAL entry is read under the binding checks a lease applies, and
+    /// only its committed frames are measured.
+    ///
+    /// A process holding the lease may be appending as this reads. A frame it
+    /// has only begun is left out the way a torn tail is; one caught part way
+    /// through its bytes fails its checksum, which is an error here rather than
+    /// a guess. Either way the measure is advice, since staging measures again
+    /// under the lease before it writes anything.
+    pub fn room(&self) -> Result<WalRoom, WalRoomError> {
+        let wal_path = self.path.join(WAL_FILE_NAME);
+        let parent_path = self.path.parent().unwrap_or_else(|| Path::new("/"));
+        validate_store_binding(
+            &self.parent,
+            &self.name,
+            &self.directory,
+            self.backend,
+            self.device,
+            &self.path,
+            parent_path,
+        )?;
+        let fd = match rustix::fs::openat(&self.directory, WAL_FILE_NAME, READ_WAL, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => {
+                return Err(StoreError::MissingWal { path: wal_path }.into());
+            }
+            Err(error) => return Err(io_error(&wal_path, error.into()).into()),
+        };
+        validate_wal(&fd, self.backend, self.device, &wal_path)?;
+        validate_entry_binding(&self.directory, &fd, &wal_path)?;
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(
+            &mut io::Read::take(File::from(fd), MAX_WAL_LEN + 1),
+            &mut bytes,
+        )?;
+        room_in(bytes)
+    }
+
     pub(crate) fn try_lease(&self) -> Result<RecoverySession, StoreError> {
         let wal_path = self.path.join(WAL_FILE_NAME);
         let parent_path = self.path.parent().unwrap_or_else(|| Path::new("/"));
@@ -681,6 +753,16 @@ fn unpublished_initializer_exists(path: &Path) -> bool {
             .filter_map(Result::ok)
             .any(|entry| entry.file_name().as_bytes().starts_with(prefix) && entry.path().is_dir())
     })
+}
+
+/// How an open takes part in publishing a store.
+#[derive(Clone, Copy)]
+enum Publication {
+    /// Under the parent's lock, which every publisher and every open that may
+    /// complete one holds; and creating the store when `create` says so.
+    Serialized { create: bool },
+    /// Without the lock, opening only a name that is already published.
+    Unlocked,
 }
 
 fn try_lock_directory(directory: &OwnedFd) -> Result<ExclusiveFileLock, StoreError> {

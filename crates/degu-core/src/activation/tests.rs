@@ -1434,6 +1434,26 @@ fn room_look_holds_nothing() {
     drop(look);
 }
 
+/// A look opens only a store that is already published, so it takes no part
+/// in publication and leaves alone the lock on the store's parent that
+/// publishers and every exclusive open serialize on. While another process
+/// holds that lock, an exclusive selection is refused as busy and the look
+/// still measures the store.
+#[test]
+fn look_skips_store_lock() {
+    let fixture = Fixture::new();
+    drop(activate_store_for_mutation(&fixture.anchor, &fixture.store).unwrap());
+    let parent = std::fs::File::open(fixture.store.parent().unwrap()).unwrap();
+    parent.try_lock().unwrap();
+    assert!(matches!(
+        selection_for_locator(&fixture.anchor),
+        Err(StoreActivationError::Store(StoreError::Lease(_)))
+    ));
+    let look = selection_for_locator_with(&fixture.anchor, AnchorAccess::ReadOnly).unwrap();
+    assert_eq!(room_from(look).unwrap(), crate::seal::wal::WalRoom::empty());
+    parent.unlock().unwrap();
+}
+
 /// A self-managed anchor nobody has claimed has to be initialized before
 /// anything is staged. Readiness refuses it, and the room does too, rather than
 /// offering all of a WAL that cannot be written yet. A system anchor never

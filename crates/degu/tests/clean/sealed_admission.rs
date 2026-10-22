@@ -46,6 +46,71 @@ fn preview_blocks_1024_tree_directories_before_any_production_mutation() {
     assert!(fixture.cache.join("wheel.whl").is_file());
 }
 
+/// A dry run says what room the seal WAL leaves and what each item's whole
+/// life needs from it. Staging the item then takes no more than that, on an
+/// account that has never cleaned as well as on one with an entry in the trash.
+#[test]
+fn preview_room_bounds_staging() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let preview = || -> serde_json::Value {
+        let output = fixture.run(&["clean", "-n", "--json"]);
+        assert_output_success(&output);
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let held = |report: &serde_json::Value| {
+        let figure = |name| {
+            report["wal_room"][name]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{report:#}"))
+        };
+        assert_eq!(
+            figure("available"),
+            figure("limit") - figure("committed") - figure("reserved")
+        );
+        figure("committed") + figure("reserved")
+    };
+    let stage = || {
+        let output = fixture.run(&[
+            "clean",
+            "--yes",
+            "--json",
+            "--path",
+            fixture.cache.to_str().unwrap(),
+        ]);
+        assert_output_success(&output);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["executed"][0]["state"], "staged", "{report:#}");
+        std::fs::create_dir(&fixture.cache).unwrap();
+        std::fs::write(fixture.cache.join("wheel.whl"), [0u8; 2048]).unwrap();
+        crate::common::make_tree_non_shared_writable(fixture.home.path()).unwrap();
+    };
+
+    let needed = |report: &serde_json::Value| {
+        report["staging_preflight"][0]["wal_needed"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{report:#}"))
+    };
+    let fresh = preview();
+    assert_eq!(held(&fresh), 0, "{fresh:#}");
+    let needed_fresh = needed(&fresh);
+    stage();
+    let before = preview();
+    let held_before = held(&before);
+    assert!(
+        0 < held_before && held_before <= needed_fresh,
+        "the first staging took {held_before} bytes of the {needed_fresh} the preview set aside"
+    );
+    let needed = needed(&before);
+    stage();
+    let grown = held(&preview()) - held_before;
+    assert!(
+        0 < grown && grown <= needed,
+        "staging took {grown} bytes of the {needed} the preview set aside"
+    );
+}
+
 #[test]
 fn internal_hardlink_pair_previews_stages_and_fresh_process_undo_preserves_inode() {
     let Some(fixture) = Fixture::new() else {

@@ -168,3 +168,16 @@ fn reclamation_id() -> String {
         std::process::id()
     )
 }
+
+/// The longest reclamation id a clean starting now could take. The id names the
+/// process that cleans, which a preview is not, so the process id is counted at
+/// the most one can have.
+pub(super) fn reclamation_id_bound() -> usize {
+    format!("{}-{}", jiff::Timestamp::now().as_millisecond(), u32::MAX).len()
+}
+
+/// The shortest reclamation id a clean starting now could take: its process id
+/// has at least one digit.
+pub(super) fn reclamation_id_floor() -> usize {
+    format!("{}-{}", jiff::Timestamp::now().as_millisecond(), 0).len()
+}

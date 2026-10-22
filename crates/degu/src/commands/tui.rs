@@ -48,10 +48,8 @@ impl Review {
                 // the cheap-to-regenerate caches, because those are what `c` acts on
                 // with no further word from the reader. The seal WAL's room is read
                 // once for all of them, without its lease.
-                crate::commands::clean::plan_refusals(
-                    refusal_ctx,
-                    degu_core::activation::current_euid_wal_room().ok(),
-                ),
+                degu_core::activation::current_euid_wal_room().ok(),
+                crate::commands::clean::plan_assessment(refusal_ctx),
             ),
             filters: collected.filters,
             limits,

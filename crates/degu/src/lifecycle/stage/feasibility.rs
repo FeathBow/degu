@@ -60,20 +60,28 @@ pub(crate) fn probe(
     assess_held_tree_policy_metadata(evidence, basename).map_err(ProbeFailure::Assessment)
 }
 
-/// The lengths a staging of `finding` will be sized by, worked out the way
-/// staging works them out, from the same policy, but holding nothing staging
-/// holds: no captured identity, no reservation, no transaction.
+/// The narrowest and the widest shape a staging of one finding can take.
 ///
-/// Two lengths are bounds. A reservation's sequence is four digits until it
-/// outgrows them, so it is counted at the most a sequence can have; and the
-/// reclamation id names the process that cleans, which is not the one
-/// previewing, so its process id is counted at the most one can have. Both
-/// overstate by a few bytes a frame. The check staging makes under the lease
-/// measures the transaction itself.
-pub(crate) fn staging_shape(
+/// Two lengths are only known once staging runs, so they are bounded. A
+/// reservation's sequence is zero-padded to four digits and grows past them
+/// only as far as a `u64` goes; and the reclamation id names the process that
+/// cleans, which is not the one previewing, so its process id has at least
+/// one digit and at most as many as one can have. Every other length is the
+/// one staging will use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShapeBounds {
+    pub(crate) narrowest: degu_core::seal::wal::StagingShape,
+    pub(crate) widest: degu_core::seal::wal::StagingShape,
+}
+
+/// The shapes a staging of `finding` will be sized by, worked out the way
+/// staging works them out, from the same policy, but holding nothing staging
+/// holds: no captured identity, no reservation, no transaction. The check
+/// staging makes under the lease measures the transaction itself.
+pub(crate) fn staging_shapes(
     ctx: &degu_core::ecosystem::DetectCtx,
     finding: &degu_core::finding::Finding,
-) -> Result<degu_core::seal::wal::StagingShape, String> {
+) -> Result<ShapeBounds, String> {
     let source = super::policy::preview_source(finding)?;
     let lexical_trash =
         super::super::storage::resolve_prospective_trash_dir(ctx, source.canonical_source())?;
@@ -101,7 +109,7 @@ pub(crate) fn staging_shape(
     .map_err(|error| format!("mount-domain anchor cannot be reopened safely: {error}"))?;
     let filesystem_id = degu_core::staging::forward_filesystem_id(&anchor)
         .map_err(|error| format!("failed to derive sealed staging filesystem identity: {error}"))?;
-    Ok(degu_core::seal::wal::StagingShape {
+    let widest = degu_core::seal::wal::StagingShape {
         source_parent: source_parent_relative.as_os_str().len(),
         source_basename: source_basename.len(),
         destination_parent: destination_parent_relative.as_os_str().len(),
@@ -111,6 +119,14 @@ pub(crate) fn staging_shape(
         filesystem_id: filesystem_id.len(),
         reclamation_id: Some(super::reclamation_id_bound()),
         recovery_anchor: Some(policy.recovery_anchor.as_os_str().len()),
+    };
+    Ok(ShapeBounds {
+        narrowest: degu_core::seal::wal::StagingShape {
+            destination_basename: super::production::RESERVATION_WIDTH + 1 + source_basename.len(),
+            reclamation_id: Some(super::reclamation_id_floor()),
+            ..widest
+        },
+        widest,
     })
 }
 

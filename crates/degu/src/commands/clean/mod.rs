@@ -2,7 +2,7 @@ mod execution;
 mod output;
 mod preparation;
 mod preview;
-pub(crate) use preview::plan_refusals;
+pub(crate) use preview::{PlanAssessment, WalCost, plan_assessment, room_refusals};
 
 use crate::cli::CleanArgs;
 use crate::runtime::Ui;

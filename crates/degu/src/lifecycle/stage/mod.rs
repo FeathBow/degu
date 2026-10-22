@@ -175,3 +175,9 @@ fn reclamation_id() -> String {
 pub(super) fn reclamation_id_bound() -> usize {
     format!("{}-{}", jiff::Timestamp::now().as_millisecond(), u32::MAX).len()
 }
+
+/// The shortest reclamation id a clean starting now could take: its process id
+/// has at least one digit.
+pub(super) fn reclamation_id_floor() -> usize {
+    format!("{}-{}", jiff::Timestamp::now().as_millisecond(), 0).len()
+}

@@ -226,7 +226,7 @@ pub(super) fn prepare(args: CleanArgs, ui: Ui) -> Result<PreparedClean> {
         super::preview::apply_wal_room(
             assessments,
             &planned,
-            |finding| crate::lifecycle::feasibility::staging_shape(&ctx, finding).ok(),
+            |finding| crate::lifecycle::feasibility::staging_shapes(&ctx, finding).ok(),
             *room,
         );
     }

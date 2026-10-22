@@ -1,4 +1,4 @@
-use crate::lifecycle::feasibility::ProbeFailure;
+use crate::lifecycle::feasibility::{ProbeFailure, ShapeBounds};
 use crate::presentation::escape_terminal_text;
 use degu_core::backend::{
     CertificationError, HeldTreeAssessmentFailure, HeldTreeAssessmentFailureCategory,
@@ -6,8 +6,9 @@ use degu_core::backend::{
     HeldTreeRegularHardLinkTopology, HeldTreeRegularXattrTopology,
 };
 use degu_core::finding::Finding;
-use degu_core::seal::wal::{StagingShape, TreeShape, WalRoom, project_begin, project_tree};
+use degu_core::seal::wal::{TreeShape, WalRoom, project_begin, project_tree};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -60,8 +61,17 @@ pub(super) enum PreviewStagingStatus {
     },
 }
 
-/// Why staging admission would refuse each tree of a plan, or `None` for one it
-/// would admit, asked in the order the plan runs.
+/// What a review needs to know of one tree to say whether a plan holding it
+/// can be staged.
+pub(crate) enum PlanAssessment {
+    /// Staging refuses it whatever else the plan holds.
+    Refused(String),
+    /// Its policy admits it. Whether the seal WAL has room for it depends on
+    /// the trees planned before it; `None` when it cannot be sized.
+    Admitted(Option<WalCost>),
+}
+
+/// How staging admission would take each tree of a plan.
 ///
 /// The same assessment a dry-run preview reports, asked one finding at a time so a
 /// surface that offers a plan can say what the plan would hit before it is run. It
@@ -74,41 +84,55 @@ pub(super) enum PreviewStagingStatus {
 /// not finish is a refusal here, although the preview, which reports rather than
 /// offers, files it as unavailable rather than blocked.
 ///
-/// A tree whose policy was assessed is then sized against `room`, the seal WAL's
-/// room when it could be read, beside what the trees admitted before it will
-/// leave there. A refused tree is left out of the plan it is asked for, so it
-/// spends nothing.
-pub(crate) fn plan_refusals(
+/// A tree whose policy was assessed is sized as well, so that [`room_refusals`]
+/// can measure the plan's room again whenever the plan changes.
+pub(crate) fn plan_assessment(
     ctx: degu_core::ecosystem::DetectCtx,
-    room: Option<WalRoom>,
-) -> impl FnMut(&Finding) -> Option<String> {
-    refusals_with(
-        |finding| PreviewStagingAssessment::assess(finding, false, true).status,
-        move |finding| crate::lifecycle::feasibility::staging_shape(&ctx, finding).ok(),
-        room,
-    )
-}
-
-fn refusals_with(
-    assess: impl Fn(&Finding) -> PreviewStagingStatus,
-    mut shape_of: impl FnMut(&Finding) -> Option<StagingShape>,
-    room: Option<WalRoom>,
-) -> impl FnMut(&Finding) -> Option<String> {
-    let mut budget = room.map(WalBudget::new);
-    move |finding| {
-        let tree = match assess(finding) {
-            PreviewStagingStatus::TreePolicyAssessed { tree, .. } => tree,
-            PreviewStagingStatus::Blocked { reason, .. }
-            | PreviewStagingStatus::WalFull { reason, .. }
-            | PreviewStagingStatus::DeferredUntilExecutionSeal { reason, .. }
-            | PreviewStagingStatus::SealedPathUnavailable { reason, .. } => return Some(reason),
-        };
-        let budget = budget.as_mut()?;
-        match budget.admit(shape_of(finding)?, tree) {
-            WalAdmission::Full { needed, available } => Some(wal_full_reason(needed, available)),
-            WalAdmission::Fits { .. } | WalAdmission::Unsized => None,
+) -> impl Fn(&Finding) -> PlanAssessment {
+    move |finding| match PreviewStagingAssessment::assess(finding, false, true).status {
+        PreviewStagingStatus::TreePolicyAssessed { tree, .. } => PlanAssessment::Admitted(
+            crate::lifecycle::feasibility::staging_shapes(&ctx, finding)
+                .ok()
+                .and_then(|shapes| WalCost::of(shapes, Some(tree))),
+        ),
+        PreviewStagingStatus::Blocked { reason, .. }
+        | PreviewStagingStatus::WalFull { reason, .. }
+        | PreviewStagingStatus::DeferredUntilExecutionSeal { reason, .. }
+        | PreviewStagingStatus::SealedPathUnavailable { reason, .. } => {
+            PlanAssessment::Refused(reason)
         }
     }
+}
+
+/// Why the seal WAL would have no room for each of `trees`, given in the order
+/// a clean runs them, beside what the trees planned before it would leave.
+///
+/// `planned` says whether a tree is in the plan, told whether it fits. A tree
+/// left out is never attempted, so it spends nothing, but it is still asked
+/// what it would find were it put in. What a tree finds depends only on the
+/// trees before it.
+pub(crate) fn room_refusals<'a>(
+    room: WalRoom,
+    trees: impl IntoIterator<Item = (&'a Path, Option<WalCost>)>,
+    mut planned: impl FnMut(&Path, bool) -> bool,
+) -> BTreeMap<PathBuf, String> {
+    let mut budget = WalBudget::new(room);
+    let mut refusals = BTreeMap::new();
+    for (path, cost) in trees {
+        let full = match cost.and_then(|cost| budget.admits(cost)) {
+            Some(WalAdmission::Full { needed, available }) => {
+                refusals.insert(path.to_path_buf(), wal_full_reason(needed, available));
+                true
+            }
+            Some(WalAdmission::Fits { .. }) | None => false,
+        };
+        if planned(path, !full)
+            && let Some(cost) = cost
+        {
+            budget.spend(cost);
+        }
+    }
+    refusals
 }
 
 impl PreviewStagingAssessment {
@@ -439,27 +463,105 @@ fn assess_path(path: &Path) -> PreviewStagingStatus {
     }
 }
 
-/// The room the seal WAL leaves for new staging, spent in plan order on what
-/// each item's staging would leave there.
+/// The least and the most of one figure, at the narrowest and the widest
+/// shape an item's staging can take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Span {
+    least: u64,
+    most: u64,
+}
+
+/// An item's whole life in the seal WAL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Life {
+    /// The room it needs before its first frame, for both of staging's checks.
+    needed: Span,
+    /// The most a commit leaves it holding: the frames it wrote and the
+    /// allowance its entry then keeps, which is never less than a purge
+    /// writes, so a `--purge` run is measured no more loosely.
+    holds: u64,
+}
+
+/// What staging one item can leave in the seal WAL, worked out once from the
+/// narrowest and the widest shape it can take, so that a plan can be measured
+/// again without sizing its items again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WalCost {
+    /// The source parent's seal and its undo, which a tree refused once
+    /// staging has begun leaves behind.
+    round_trip: Span,
+    /// Its whole life, for an item whose tree was assessed and sized.
+    life: Option<Life>,
+}
+
+impl WalCost {
+    /// Sizes an item from its shapes and, if its policy was assessed, its
+    /// tree. `None` when not even its source parent's seal can be sized.
+    fn of(shapes: ShapeBounds, tree: Option<TreeShape>) -> Option<Self> {
+        let narrowest = shapes.narrowest.metadata()?;
+        let widest = shapes.widest.metadata()?;
+        let low = project_begin(&narrowest).ok()?;
+        let high = project_begin(&widest).ok()?;
+        let life = tree.and_then(|tree| {
+            let low_tree = project_tree(&narrowest, tree).ok()?;
+            let high_tree = project_tree(&widest, tree).ok()?;
+            Some(Life {
+                needed: Span {
+                    least: low.forward.saturating_add(low_tree.needed()),
+                    most: high.forward.saturating_add(high_tree.needed()),
+                },
+                holds: high
+                    .forward
+                    .saturating_add(high_tree.forward)
+                    .saturating_add(high_tree.committed),
+            })
+        });
+        Some(Self {
+            round_trip: Span {
+                least: low.needed(),
+                most: high.needed(),
+            },
+            life,
+        })
+    }
+
+    /// A cost whose shape is known exactly.
+    #[cfg(test)]
+    pub(crate) fn exact(needed: u64, holds: u64, round_trip: u64) -> Self {
+        Self {
+            round_trip: Span {
+                least: round_trip,
+                most: round_trip,
+            },
+            life: Some(Life {
+                needed: Span {
+                    least: needed,
+                    most: needed,
+                },
+                holds,
+            }),
+        }
+    }
+}
+
+/// The room the seal WAL leaves for new staging, spent in plan order on the
+/// most each item's staging can leave there.
 ///
 /// Staging checks the same room under the lease twice: before its first frame,
 /// for the source parent's seal and its undo, and once the tree is planned, for
 /// the rest of the item's life. What an item needs here is never less than
-/// either check asks, and its shape rounds the reservation number and the
-/// reclamation id up to their widest, so an item admitted here is admitted
-/// there unless the trash changed in between. One refused here may still just
-/// fit there.
+/// either check asks at its widest, so an item admitted here is admitted there
+/// unless the trash changed in between. One refused here may still fit there,
+/// at the lengths its sequence and reclamation id turn out to have, and commit.
 struct WalBudget {
     available: u64,
 }
 
 enum WalAdmission {
-    /// Its whole life fits, and what a commit leaves it holding is spent.
+    /// Its whole life fits at its widest.
     Fits { needed: u64 },
-    /// Its whole life does not fit in what is left. Nothing is spent.
+    /// Its whole life at its widest does not fit in what is left.
     Full { needed: u64, available: u64 },
-    /// It cannot be sized. Nothing is spent.
-    Unsized,
 }
 
 impl WalBudget {
@@ -469,48 +571,37 @@ impl WalBudget {
         }
     }
 
-    /// Admits an item whose tree was assessed, if its whole life fits. What a
-    /// commit leaves it holding is the frames it wrote and the allowance its
-    /// entry then keeps, which is never less than a purge writes, so a
-    /// `--purge` run is measured no more loosely.
-    fn admit(&mut self, shape: StagingShape, tree: TreeShape) -> WalAdmission {
-        let Some(metadata) = shape.metadata() else {
-            return WalAdmission::Unsized;
-        };
-        let (Ok(begin), Ok(projection)) = (project_begin(&metadata), project_tree(&metadata, tree))
-        else {
-            return WalAdmission::Unsized;
-        };
-        let needed = begin.forward.saturating_add(projection.needed());
-        if needed > self.available {
-            return WalAdmission::Full {
+    /// Whether an item's whole life fits in what is left, or `None` for an
+    /// item whose life was not sized. Nothing is spent.
+    fn admits(&self, cost: WalCost) -> Option<WalAdmission> {
+        let needed = cost.life?.needed.most;
+        Some(if needed <= self.available {
+            WalAdmission::Fits { needed }
+        } else {
+            WalAdmission::Full {
                 needed,
                 available: self.available,
-            };
-        }
-        self.available = self.available.saturating_sub(
-            begin
-                .forward
-                .saturating_add(projection.forward)
-                .saturating_add(projection.committed),
-        );
-        WalAdmission::Fits { needed }
+            }
+        })
     }
 
-    /// Spends what staging leaves when it refuses a tree once it has begun:
-    /// the source parent's seal and its undo, or nothing when there is no room
-    /// even for that, because then it refuses before its first frame.
-    fn refuse(&mut self, shape: StagingShape) {
-        let Some(round_trip) = shape
-            .metadata()
-            .and_then(|metadata| project_begin(&metadata).ok())
-            .map(|begin| begin.needed())
-        else {
-            return;
+    /// Spends the most staging can leave of an item it attempts: the larger of
+    /// what a commit leaves it holding, if its whole life fits at its
+    /// narrowest, and the source parent's round trip, which a refusal once
+    /// begun leaves, if that fits at its narrowest. Either way it leaves no
+    /// more than was left.
+    fn spend(&mut self, cost: WalCost) {
+        let available = self.available;
+        let committed = cost
+            .life
+            .filter(|life| life.needed.least <= available)
+            .map_or(0, |life| life.holds);
+        let refused = if cost.round_trip.least <= available {
+            cost.round_trip.most
+        } else {
+            0
         };
-        if round_trip <= self.available {
-            self.available -= round_trip;
-        }
+        self.available = available.saturating_sub(committed.max(refused));
     }
 }
 
@@ -524,21 +615,19 @@ fn wal_full_reason(needed: u64, available: u64) -> String {
 /// blocks every one that does not fit beside what the trash already holds and
 /// what the items before it will have left there.
 ///
-/// A clean attempts every planned item, so each is charged what its staging
-/// would leave. One that commits holds what [`WalBudget::admit`] spends. One
-/// whose tree staging refuses -- for its policy, or for room -- has sealed its
-/// source parent first and rolled that back. A tree only the seal can walk is
-/// not known here, so that round trip is all it is charged, which is the least
-/// it can leave. One staging cannot even hold leaves nothing.
+/// A clean attempts every planned item, so each is charged the most its
+/// staging can leave, as [`WalBudget::spend`] reckons it. A tree whose policy
+/// staging refuses is charged the round trip the refusal leaves. A tree only
+/// the seal can walk is not known here, so that round trip is all it is
+/// charged, which is the least it can leave.
 ///
-/// `shape_of` sizes an item from what preflight can see. An item it cannot
-/// size is left as assessed and counts for nothing: on a machine where nothing
-/// is staged yet the trash's parent may not exist to be sized from, and there
-/// the WAL is empty anyway. Staging's own check is the exact one.
+/// `shapes_of` sizes an item from what preflight can see. An item it cannot
+/// size is left as assessed and counts for nothing: staging needs the same
+/// lengths for its first frame. Staging's own check is the exact one.
 pub(super) fn apply_wal_room(
     assessments: &mut [PreviewStagingAssessment],
     planned: &[Finding],
-    mut shape_of: impl FnMut(&Finding) -> Option<StagingShape>,
+    mut shapes_of: impl FnMut(&Finding) -> Option<ShapeBounds>,
     room: WalRoom,
 ) {
     let mut budget = WalBudget::new(room);
@@ -550,31 +639,27 @@ pub(super) fn apply_wal_room(
             PreviewStagingStatus::WalFull { .. }
             | PreviewStagingStatus::SealedPathUnavailable { .. } => continue,
         };
-        let Some(shape) = shape_of(finding) else {
+        let Some(cost) = shapes_of(finding).and_then(|shapes| WalCost::of(shapes, tree)) else {
             continue;
         };
-        let Some(tree) = tree else {
-            budget.refuse(shape);
-            continue;
-        };
-        match budget.admit(shape, tree) {
-            WalAdmission::Fits { needed } => {
+        match budget.admits(cost) {
+            Some(WalAdmission::Fits { needed }) => {
                 if let PreviewStagingStatus::TreePolicyAssessed { wal_needed, .. } =
                     &mut assessment.status
                 {
                     *wal_needed = Some(needed);
                 }
             }
-            WalAdmission::Full { needed, available } => {
+            Some(WalAdmission::Full { needed, available }) => {
                 assessment.status = PreviewStagingStatus::WalFull {
                     needed,
                     available,
                     reason: wal_full_reason(needed, available),
                 };
-                budget.refuse(shape);
             }
-            WalAdmission::Unsized => budget.refuse(shape),
+            None => {}
         }
+        budget.spend(cost);
     }
 }
 
@@ -684,6 +769,7 @@ fn safe(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use degu_core::seal::wal::StagingShape;
 
     #[test]
     fn unavailable_reasons_are_terminal_safe() {
@@ -743,6 +829,45 @@ mod tests {
         filesystem_id: 16,
         reclamation_id: Some(24),
         recovery_anchor: Some(18),
+    };
+
+    /// `SHAPE` known exactly.
+    const EXACT: ShapeBounds = ShapeBounds {
+        narrowest: SHAPE,
+        widest: SHAPE,
+    };
+
+    /// `SHAPE` with a sequence of four digits rather than twenty, and a process
+    /// id of one digit rather than ten.
+    const NARROW: StagingShape = StagingShape {
+        destination_basename: 9,
+        reclamation_id: Some(15),
+        ..SHAPE
+    };
+
+    /// `SHAPE` as wide as it can be, and as narrow.
+    const BOUNDED: ShapeBounds = ShapeBounds {
+        narrowest: NARROW,
+        widest: SHAPE,
+    };
+
+    /// What an item costs at `NARROW`, known exactly.
+    fn narrow_cost(tree: Option<TreeShape>) -> WalCost {
+        WalCost::of(
+            ShapeBounds {
+                narrowest: NARROW,
+                widest: NARROW,
+            },
+            tree,
+        )
+        .unwrap()
+    }
+
+    /// Half of `TREE`.
+    const HALF: TreeShape = TreeShape {
+        directories: 12,
+        directory_path_bytes: 60,
+        entries: 13,
     };
 
     fn planned(path: &str) -> Finding {
@@ -876,7 +1001,7 @@ mod tests {
         apply_wal_room(
             &mut assessments,
             &planned,
-            |finding| (finding.path() != Path::new("/unsized")).then_some(SHAPE),
+            |finding| (finding.path() != Path::new("/unsized")).then_some(EXACT),
             room(holds + 2 * round_trip + needed),
         );
 
@@ -895,57 +1020,132 @@ mod tests {
         assert_eq!(assessments[6].json()["available"], last);
     }
 
-    /// An item whose first check would already refuse it writes no frame, so
-    /// the next item finds the room it found.
+    /// An item whose first check would refuse it even at its narrowest writes
+    /// no frame, so the next item finds the room it found.
     #[test]
     fn refused_begin_leaves_nothing() {
-        let metadata = SHAPE.metadata().unwrap();
-        let short = project_begin(&metadata).unwrap().needed() - 1;
+        let short = narrow_cost(None).round_trip.most - 1;
         let paths = ["/refused", "/full", "/next"];
         let planned = paths.map(planned);
         let mut assessments = paths.map(assessed);
         assessments[0].status = blocked();
-        apply_wal_room(&mut assessments, &planned, |_| Some(SHAPE), room(short));
+        apply_wal_room(&mut assessments, &planned, |_| Some(BOUNDED), room(short));
 
         assert_eq!(wal_full_available(&assessments[1]), Some(short));
         assert_eq!(wal_full_available(&assessments[2]), Some(short));
     }
 
-    /// A plan's trees are sized in the order it runs them, and a refused tree is
-    /// left out of the plan, so it spends nothing: the tree after it finds the
-    /// room it found. A tree refused for its policy keeps that reason, and with
-    /// no room to read, no tree is refused for room.
+    /// A refused tree whose source parent's round trip fits at its narrowest
+    /// may be begun and rolled back, and then leaves that round trip at up to
+    /// its widest: the next item finds nothing left when only the narrowest
+    /// fits, and what the widest leaves when that fits too.
     #[test]
-    fn refusals_spend_nothing() {
+    fn refusal_may_begin() {
+        let narrowest = narrow_cost(None).round_trip.most;
+        let widest = WalCost::of(EXACT, None).unwrap().round_trip.most;
+        assert!(widest > narrowest);
+        for (available, left) in [(narrowest, 0), (2 * widest, widest)] {
+            let paths = ["/refused", "/next"];
+            let mut assessments = paths.map(assessed);
+            assessments[0].status = blocked();
+            apply_wal_room(
+                &mut assessments,
+                &paths.map(planned),
+                |_| Some(BOUNDED),
+                room(available),
+            );
+
+            assert_eq!(wal_full_available(&assessments[1]), Some(left));
+        }
+    }
+
+    /// An item that does not fit at its widest may still fit at the lengths
+    /// its sequence and reclamation id turn out to have, and then it commits.
+    /// It is blocked, and the item after it is measured as if it had
+    /// committed: that item would fit beside the first one's refusal, but not
+    /// beside its commit.
+    #[test]
+    fn full_may_commit() {
+        let widest = WalCost::of(EXACT, Some(TREE)).unwrap();
+        let life = widest.life.unwrap();
+        let available = narrow_cost(Some(TREE)).life.unwrap().needed.most;
+        let half = WalCost::of(EXACT, Some(HALF))
+            .unwrap()
+            .life
+            .unwrap()
+            .needed
+            .most;
+        assert!(life.needed.most > available);
+        assert!(available - widest.round_trip.most >= half);
+        assert!(available.saturating_sub(life.holds) < half);
+
+        let paths = ["/bounded", "/half"];
+        let mut assessments = paths.map(assessed);
+        assessments[1].status = assessed_tree(HALF);
+        apply_wal_room(
+            &mut assessments,
+            &paths.map(planned),
+            |finding| {
+                Some(if finding.path() == Path::new("/bounded") {
+                    BOUNDED
+                } else {
+                    EXACT
+                })
+            },
+            room(available),
+        );
+
+        assert!(matches!(
+            assessments[0].status,
+            PreviewStagingStatus::WalFull { needed, .. } if needed == life.needed.most
+        ));
+        assert_eq!(wal_full_available(&assessments[0]), Some(available));
+        assert_eq!(
+            wal_full_available(&assessments[1]),
+            Some(available.saturating_sub(life.holds))
+        );
+    }
+
+    /// A review's trees are measured in the order a clean runs them, and a
+    /// tree left out of the plan spends nothing: the tree after it finds the
+    /// room it found. A tree kept in the plan that does not fit still spends
+    /// what its refusal leaves.
+    #[test]
+    fn refusals_follow_plan() {
         const BIG: TreeShape = TreeShape {
             directories: 48,
             directory_path_bytes: 240,
             entries: 49,
         };
-        let metadata = SHAPE.metadata().unwrap();
-        let begin = project_begin(&metadata).unwrap();
-        let tree = project_tree(&metadata, TREE).unwrap();
-        let needed = begin.forward + tree.needed();
-        let holds = begin.forward + tree.forward + tree.committed;
-        let big = begin.forward + project_tree(&metadata, BIG).unwrap().needed();
-        assert!(big > needed);
+        let cost = WalCost::of(EXACT, Some(TREE)).unwrap();
+        let big = WalCost::of(EXACT, Some(BIG)).unwrap();
+        let life = cost.life.unwrap();
+        let (needed, holds) = (life.needed.most, life.holds);
+        let big_needed = big.life.unwrap().needed.most;
+        assert!(big_needed > needed);
+        let trees = [("/a", cost), ("/big", big), ("/b", cost), ("/c", cost)]
+            .map(|(path, cost)| (Path::new(path), Some(cost)));
+        let available = holds + needed;
 
-        let assess = |finding: &Finding| match finding.path().to_str() {
-            Some("/policy") => blocked(),
-            Some("/big") => assessed_tree(BIG),
-            _ => assessed_tree(TREE),
-        };
-        let mut refusal = refusals_with(assess, |_| Some(SHAPE), Some(room(holds + needed)));
-        let mut ask = |path| refusal(&planned(path));
-        assert_eq!(ask("/a"), None);
-        assert_eq!(ask("/policy").as_deref(), Some("refused"));
-        assert_eq!(ask("/big"), Some(wal_full_reason(big, needed)));
-        assert_eq!(ask("/b"), None);
-        assert_eq!(ask("/c"), Some(wal_full_reason(needed, needed - holds)));
+        let fitting = room_refusals(room(available), trees, |_, fits| fits);
+        assert_eq!(
+            fitting,
+            BTreeMap::from([
+                (PathBuf::from("/big"), wal_full_reason(big_needed, needed)),
+                (PathBuf::from("/c"), wal_full_reason(needed, needed - holds)),
+            ])
+        );
 
-        let mut unread = refusals_with(assess, |_| Some(SHAPE), None);
-        assert_eq!(unread(&planned("/big")), None);
-        assert_eq!(unread(&planned("/policy")).as_deref(), Some("refused"));
+        let all = room_refusals(room(available), trees, |_, _| true);
+        let after_big = needed - cost.round_trip.most;
+        assert_eq!(
+            all.get(Path::new("/b")),
+            Some(&wal_full_reason(needed, after_big))
+        );
+        assert_eq!(
+            all.get(Path::new("/c")),
+            Some(&wal_full_reason(needed, after_big - cost.round_trip.most))
+        );
     }
 
     #[test]

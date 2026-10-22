@@ -180,7 +180,8 @@ mod tests {
             std::path::PathBuf::from("/home/user"),
             true,
             crate::advisory::Advisories::disabled_for_test(),
-            |_| None,
+            None,
+            |_| crate::commands::clean::PlanAssessment::Admitted(None),
         )
     }
 

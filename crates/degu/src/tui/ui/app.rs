@@ -80,9 +80,10 @@ impl App {
         home: std::path::PathBuf,
         blocked: bool,
         advisories: crate::advisory::Advisories,
-        assess: impl FnMut(&degu_core::finding::Finding) -> Option<String>,
+        room: Option<degu_core::seal::wal::WalRoom>,
+        assess: impl FnMut(&degu_core::finding::Finding) -> crate::commands::clean::PlanAssessment,
     ) -> Self {
-        let decisions = Decisions::new(report.section(Section::Cache), assess);
+        let decisions = Decisions::new(report.section(Section::Cache), room, assess);
         let browser = Browser::new(report);
         let document = Derived::new(browser.selection(), || {
             document(&browser, &home, &advisories, &decisions)

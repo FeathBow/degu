@@ -74,7 +74,10 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    # ubuntu-latest now resolves to 26.04, whose /tmp is on a backend degu does not
+    # certify, and the tests that stage a tree need their temporary directory on one
+    # it does. The matrix keeps the name the required check is registered under.
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && 'ubuntu-24.04' || matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:

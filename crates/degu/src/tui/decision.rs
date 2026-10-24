@@ -333,14 +333,15 @@ mod tests {
     /// Whether the seal WAL has room for a tree depends on the trees planned before
     /// it, so it is measured again whenever the plan changes. `/a` and `/b` each fit
     /// alone but not together, so `/b` starts out and says why; once `/a` is taken
-    /// out, `/b` fits. A tree kept in the plan that does not fit still leaves what
-    /// its refusal does, so `/c`, which fits after `/a` alone, no longer fits once
-    /// `/b` is in the plan too. With no room read, nothing is refused for room.
+    /// out, `/b` fits. A tree kept in the plan that does not fit may still run, as
+    /// `/a` may fail before its first frame, so `/c`, which fits after `/a` alone,
+    /// no longer fits once `/b` is in the plan too. With no room read, nothing is
+    /// refused for room.
     #[test]
     fn room_follows_plan() {
         let findings = [ready("/a"), ready("/b"), ready("/c")];
-        let tree = WalCost::exact(100, 60, 10);
-        let small = WalCost::exact(85, 5, 1);
+        let tree = WalCost::exact(100, 10);
+        let small = WalCost::exact(45, 1);
         let assess = |finding: &Finding| {
             PlanAssessment::Admitted(Some(if finding.path() == Path::new("/c") {
                 small
@@ -365,7 +366,7 @@ mod tests {
         assert!(decisions.is_chosen(&findings[0]));
         assert!(!decisions.is_chosen(&findings[1]));
         assert!(decisions.is_chosen(&findings[2]));
-        assert_eq!(refused(&decisions, "/b").as_deref(), Some("90 to give"));
+        assert_eq!(refused(&decisions, "/b").as_deref(), Some("50 to give"));
 
         decisions.toggle(&findings[0], Section::Cache);
         assert_eq!(refused(&decisions, "/b"), None);
@@ -373,8 +374,8 @@ mod tests {
         assert_eq!(refused(&decisions, "/a"), None);
         assert_eq!(refused(&decisions, "/c"), None);
         decisions.toggle(&findings[0], Section::Cache);
-        assert_eq!(refused(&decisions, "/b").as_deref(), Some("90 to give"));
-        assert_eq!(refused(&decisions, "/c").as_deref(), Some("80 to give"));
+        assert_eq!(refused(&decisions, "/b").as_deref(), Some("50 to give"));
+        assert_eq!(refused(&decisions, "/c").as_deref(), Some("0 to give"));
 
         let unread = Decisions::new(&findings, None, assess);
         for finding in &findings {

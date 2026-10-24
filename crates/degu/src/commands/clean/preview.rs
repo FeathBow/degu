@@ -110,7 +110,7 @@ pub(crate) fn plan_assessment(
 /// `planned` says whether a tree is in the plan, told whether it fits. A tree
 /// left out is never attempted, so it spends nothing, but it is still asked
 /// what it would find were it put in. What a tree finds depends only on the
-/// trees before it. A review's clean stages and does not purge.
+/// trees before it.
 pub(crate) fn room_refusals<'a>(
     room: WalRoom,
     trees: impl IntoIterator<Item = (&'a Path, Option<WalCost>)>,
@@ -129,7 +129,7 @@ pub(crate) fn room_refusals<'a>(
         if planned(path, !full)
             && let Some(cost) = cost
         {
-            budget.spend(cost, false);
+            budget.spend(cost);
         }
     }
     refusals
@@ -463,26 +463,12 @@ fn assess_path(path: &Path) -> PreviewStagingStatus {
     }
 }
 
-/// The least and the most one figure can come to.
+/// The least and the most of one figure, at the narrowest and the widest
+/// shape an item's staging can take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Span {
     least: u64,
     most: u64,
-}
-
-/// An item's whole life in the seal WAL, at the narrowest and the widest
-/// shape its staging can take.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Life {
-    /// The room it needs before its first frame, for both of staging's checks.
-    needed: Span,
-    /// What a commit leaves it holding: the frames it wrote and the allowance
-    /// its entry then keeps, which is never less than a purge writes, so a
-    /// `--purge` run is measured no more loosely.
-    holds: Span,
-    /// The frames a commit writes, at its narrowest: all a commit is sure to
-    /// leave once a purge in the same run has spent its allowance.
-    writes: u64,
 }
 
 /// What staging one item can leave in the seal WAL, worked out once from the
@@ -491,10 +477,14 @@ struct Life {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WalCost {
     /// The source parent's seal and its undo, which a tree refused once
-    /// staging has begun leaves behind, at its narrowest and its widest.
+    /// staging has begun leaves behind.
     round_trip: Span,
-    /// Its whole life, for an item whose tree was assessed and sized.
-    life: Option<Life>,
+    /// The room its whole life needs before its first frame, for both of
+    /// staging's checks, for an item whose tree was assessed and sized. That
+    /// is also the most the life can leave: it is the larger of what a commit
+    /// holds, its frames and the allowance its entry keeps, and what a
+    /// rollback leaves, its frames and their undo.
+    needed: Option<Span>,
 }
 
 impl WalCost {
@@ -505,25 +495,12 @@ impl WalCost {
         let widest = shapes.widest.metadata()?;
         let low = project_begin(&narrowest).ok()?;
         let high = project_begin(&widest).ok()?;
-        let life = tree.and_then(|tree| {
+        let needed = tree.and_then(|tree| {
             let low_tree = project_tree(&narrowest, tree).ok()?;
             let high_tree = project_tree(&widest, tree).ok()?;
-            Some(Life {
-                needed: Span {
-                    least: low.forward.saturating_add(low_tree.needed()),
-                    most: high.forward.saturating_add(high_tree.needed()),
-                },
-                holds: Span {
-                    least: low
-                        .forward
-                        .saturating_add(low_tree.forward)
-                        .saturating_add(low_tree.committed),
-                    most: high
-                        .forward
-                        .saturating_add(high_tree.forward)
-                        .saturating_add(high_tree.committed),
-                },
-                writes: low.forward.saturating_add(low_tree.forward),
+            Some(Span {
+                least: low.forward.saturating_add(low_tree.needed()),
+                most: high.forward.saturating_add(high_tree.needed()),
             })
         });
         Some(Self {
@@ -531,51 +508,47 @@ impl WalCost {
                 least: low.needed(),
                 most: high.needed(),
             },
-            life,
+            needed,
         })
     }
 
-    /// A cost whose shape is known exactly, and whose commit holds no more
-    /// than it writes.
+    /// A cost whose shape is known exactly.
     #[cfg(test)]
-    pub(crate) fn exact(needed: u64, holds: u64, round_trip: u64) -> Self {
+    pub(crate) fn exact(needed: u64, round_trip: u64) -> Self {
         Self {
             round_trip: Span {
                 least: round_trip,
                 most: round_trip,
             },
-            life: Some(Life {
-                needed: Span {
-                    least: needed,
-                    most: needed,
-                },
-                holds: Span {
-                    least: holds,
-                    most: holds,
-                },
-                writes: holds,
+            needed: Some(Span {
+                least: needed,
+                most: needed,
             }),
         }
     }
 }
 
-/// The room the seal WAL leaves for new staging, spent in plan order on what
-/// each item's staging can leave there.
+/// The room the seal WAL leaves for new staging, spent in plan order on the
+/// most each item's staging can leave there.
 ///
 /// Staging checks the same room under the lease twice: before its first frame,
 /// for the source parent's seal and its undo, and once the tree is planned, for
 /// the rest of the item's life. What an item needs here is never less than
 /// either check asks at its widest, so an item admitted here is admitted there
 /// unless the trash changed in between. One refused here may still fit there
-/// and commit: at the lengths its sequence and reclamation id turn out to
-/// have, beside items before it that turned out narrower, or in what the
-/// lease's compaction took back before the first item.
-///
-/// So the room left is known only between two figures. The least is what
-/// admits an item. The most is what says whether an item that was not
-/// admitted may still begin, or commit.
+/// and run: at the lengths its sequence and reclamation id turn out to have,
+/// in what the lease's compaction took back before the first item, or in room
+/// the items before it did not take. Any of them may fail before its first
+/// frame, for a reason other than room, and leave nothing, and the run goes on
+/// to the next. So no item is sure to spend anything, and whether an item may
+/// run is asked of the most room any item can find.
 struct WalBudget {
-    left: Span,
+    /// The least room left: what the trash leaves, less the most each item
+    /// before can leave.
+    available: u64,
+    /// The most room any item can find: what the trash leaves once the
+    /// lease has compacted it.
+    ceiling: u64,
 }
 
 enum WalAdmission {
@@ -588,66 +561,36 @@ enum WalAdmission {
 impl WalBudget {
     fn new(room: WalRoom) -> Self {
         Self {
-            left: Span {
-                least: room.available(),
-                most: room.available_once_compacted(),
-            },
+            available: room.available(),
+            ceiling: room.available_once_compacted(),
         }
     }
 
-    /// Whether an item's whole life fits in the least that is left, or `None`
-    /// for an item whose life was not sized. Nothing is spent.
+    /// Whether an item's whole life fits in what is left, or `None` for an
+    /// item whose life was not sized. Nothing is spent.
     fn admits(&self, cost: WalCost) -> Option<WalAdmission> {
-        let needed = cost.life?.needed.most;
-        Some(if needed <= self.left.least {
+        let needed = cost.needed?.most;
+        Some(if needed <= self.available {
             WalAdmission::Fits { needed }
         } else {
             WalAdmission::Full {
                 needed,
-                available: self.left.least,
+                available: self.available,
             }
         })
     }
 
-    /// Spends what staging can leave of an item it attempts.
-    ///
-    /// The least left loses the most the item can leave: the larger of what a
-    /// commit leaves it holding, if its whole life fits at its narrowest in
-    /// the most left, and the source parent's round trip, which a refusal once
-    /// begun leaves, if that fits there at its narrowest.
-    ///
-    /// The most left loses the least the item is sure to leave. One admitted
-    /// commits, and holds at least what it holds at its narrowest, or under
-    /// `purge` the frames it writes. One sure to begin leaves at least the
-    /// round trip at its narrowest: a refusal leaves just that, and a commit
-    /// restores the source parent as the undo would, among more. Any other
-    /// may be refused before its first frame, and leave nothing.
-    fn spend(&mut self, cost: WalCost, purge: bool) {
-        let Span { least, most } = self.left;
-        let committed = cost
-            .life
-            .filter(|life| life.needed.least <= most)
-            .map_or(0, |life| life.holds.most);
-        let refused = if cost.round_trip.least <= most {
-            cost.round_trip.most
-        } else {
-            0
-        };
-        let kept = match cost.life {
-            Some(life) if life.needed.most <= least => {
-                if purge {
-                    life.writes
-                } else {
-                    life.holds.least
-                }
-            }
-            _ if cost.round_trip.most <= least => cost.round_trip.least,
+    /// Spends the most staging can leave of an item it attempts: its whole
+    /// life at its widest, if that may fit at its narrowest in the most room
+    /// any item can find, or else the source parent's round trip at its
+    /// widest, if that may. Either way it leaves no more than was left.
+    fn spend(&mut self, cost: WalCost) {
+        let leaves = match cost.needed {
+            Some(needed) if needed.least <= self.ceiling => needed.most,
+            _ if cost.round_trip.least <= self.ceiling => cost.round_trip.most,
             _ => 0,
         };
-        self.left = Span {
-            least: least.saturating_sub(committed.max(refused)),
-            most: most.saturating_sub(kept),
-        };
+        self.available = self.available.saturating_sub(leaves);
     }
 }
 
@@ -664,8 +607,8 @@ fn wal_full_reason(needed: u64, available: u64) -> String {
 /// A clean attempts every planned item, so each is charged the most its
 /// staging can leave, as [`WalBudget::spend`] reckons it. A tree whose policy
 /// staging refuses is charged the round trip the refusal leaves. A tree only
-/// the seal can walk is not known here, so that round trip is all it is
-/// charged, which is the least it can leave.
+/// the seal can walk is not known here, so it is charged that round trip and
+/// no more, though it may commit and leave more.
 ///
 /// `shapes_of` sizes an item from what preflight can see. An item it cannot
 /// size is left as assessed and counts for nothing: staging needs the same
@@ -688,7 +631,6 @@ pub(super) fn apply_wal_room(
         let Some(cost) = shapes_of(finding).and_then(|shapes| WalCost::of(shapes, tree)) else {
             continue;
         };
-        let purge = assessment.purge_requested;
         match budget.admits(cost) {
             Some(WalAdmission::Fits { needed }) => {
                 if let PreviewStagingStatus::TreePolicyAssessed { wal_needed, .. } =
@@ -706,7 +648,7 @@ pub(super) fn apply_wal_room(
             }
             None => {}
         }
-        budget.spend(cost, purge);
+        budget.spend(cost);
     }
 }
 
@@ -898,28 +840,6 @@ mod tests {
         widest: SHAPE,
     };
 
-    /// A cost whose round trip and whole life lie between the figures given,
-    /// and whose commit holds `holds`, all of it frames it wrote.
-    fn cost(round_trip: (u64, u64), needed: (u64, u64), holds: u64) -> WalCost {
-        WalCost {
-            round_trip: Span {
-                least: round_trip.0,
-                most: round_trip.1,
-            },
-            life: Some(Life {
-                needed: Span {
-                    least: needed.0,
-                    most: needed.1,
-                },
-                holds: Span {
-                    least: holds,
-                    most: holds,
-                },
-                writes: holds,
-            }),
-        }
-    }
-
     /// What an item costs at `NARROW`, known exactly.
     fn narrow_cost(tree: Option<TreeShape>) -> WalCost {
         WalCost::of(
@@ -1027,22 +947,22 @@ mod tests {
     }
 
     /// Items are admitted in plan order, each into what the trash and the items
-    /// before it leave. A committed item leaves what it holds; a tree staging
+    /// before it leave, and each is charged at its widest. An admitted item
+    /// may leave as much as its whole life needs, which here is more than a
+    /// commit holds: the source is deep against a shallow trash, so a rollback
+    /// leaves more. A tree staging
     /// refuses, or only the seal can walk, leaves the source parent's round
-    /// trip; an item staging never begins, or that cannot be sized, leaves
-    /// nothing. An exact fit is admitted, and an item that does not fit is
-    /// blocked with what it needed and what was left, and still leaves its
-    /// round trip.
+    /// trip; an item that is unavailable or cannot be sized leaves nothing. An
+    /// exact fit is admitted, and an item that does not fit is blocked with
+    /// what it needed and what was left.
     #[test]
     fn admits_in_order() {
         let metadata = SHAPE.metadata().unwrap();
         let begin = project_begin(&metadata).unwrap();
         let tree = project_tree(&metadata, TREE).unwrap();
         let needed = begin.forward + tree.needed();
-        let holds = begin.forward + tree.forward + tree.committed;
         let round_trip = begin.needed();
-        let last = needed - holds;
-        assert!(needed > holds && last >= 2 * round_trip);
+        assert!(tree.rolled_back > tree.forward + tree.committed);
 
         let paths = [
             "/a",
@@ -1052,7 +972,6 @@ mod tests {
             "/unsized",
             "/b",
             "/c",
-            "/d",
         ];
         let planned = paths.map(planned);
         let mut assessments = paths.map(assessed);
@@ -1071,28 +990,26 @@ mod tests {
         apply_wal_room(
             &mut assessments,
             &planned,
-            |finding| (finding.path() != Path::new("/unsized")).then_some(EXACT),
-            room(holds + 2 * round_trip + needed),
+            |finding| (finding.path() != Path::new("/unsized")).then_some(BOUNDED),
+            room(2 * needed + 3 * round_trip),
         );
 
         assert_eq!(wal_needed(&assessments[0]), Some(needed));
         assert!(assessments[1].is_blocked());
         assert_eq!(wal_needed(&assessments[4]), None);
-        // What came before leaves exactly what `/b` needs.
+        // What came before leaves `/b` what it needs and a round trip more.
         assert_eq!(wal_needed(&assessments[5]), Some(needed));
         assert!(matches!(
             assessments[6].status,
             PreviewStagingStatus::WalFull { needed: n, .. } if n == needed
         ));
-        assert_eq!(wal_full_available(&assessments[6]), Some(last));
-        assert_eq!(wal_full_available(&assessments[7]), Some(last - round_trip));
+        assert_eq!(wal_full_available(&assessments[6]), Some(round_trip));
         assert_eq!(assessments[6].json()["kind"], "wal_full");
-        assert_eq!(assessments[6].json()["available"], last);
+        assert_eq!(assessments[6].json()["available"], round_trip);
     }
 
     /// An item whose first check would refuse it even at its narrowest writes
-    /// no frame, so the next item finds the room it found, and, admitted, is
-    /// charged the commit it makes there.
+    /// no frame, so the next item finds the room it found.
     #[test]
     fn unbegun_leaves_nothing() {
         let short = narrow_cost(None).round_trip.most - 1;
@@ -1104,41 +1021,6 @@ mod tests {
 
         assert_eq!(wal_full_available(&assessments[1]), Some(short));
         assert_eq!(wal_full_available(&assessments[2]), Some(short));
-
-        let trees = [
-            ("/unbegun", cost((5000, 5000), (9000, 9000), 9000)),
-            ("/admitted", cost((50, 50), (3000, 3000), 2500)),
-            ("/next", cost((50, 50), (2000, 2000), 1000)),
-        ]
-        .map(|(path, cost)| (Path::new(path), Some(cost)));
-        assert_eq!(
-            room_refusals(room(4000), trees, |_, _| true),
-            BTreeMap::from([
-                (PathBuf::from("/unbegun"), wal_full_reason(9000, 4000)),
-                (PathBuf::from("/next"), wal_full_reason(2000, 1500)),
-            ])
-        );
-    }
-
-    /// A tree sure to begin but not to fit is sure to leave only its round
-    /// trip at its narrowest. Here that may leave the next tree, blocked in
-    /// the least, the room to commit, so the third is measured as if it had.
-    #[test]
-    fn refusal_leaves_least() {
-        let trees = [
-            ("/first", cost((100, 300), (5000, 5000), 3000)),
-            ("/second", cost((50, 50), (3800, 3800), 3000)),
-            ("/third", cost((50, 50), (1000, 1000), 500)),
-        ]
-        .map(|(path, cost)| (Path::new(path), Some(cost)));
-        assert_eq!(
-            room_refusals(room(4000), trees, |_, _| true),
-            BTreeMap::from([
-                (PathBuf::from("/first"), wal_full_reason(5000, 4000)),
-                (PathBuf::from("/second"), wal_full_reason(3800, 3700)),
-                (PathBuf::from("/third"), wal_full_reason(1000, 700)),
-            ])
-        );
     }
 
     /// A refused tree whose source parent's round trip fits at its narrowest
@@ -1166,25 +1048,19 @@ mod tests {
     }
 
     /// An item that does not fit at its widest may still fit at the lengths
-    /// its sequence and reclamation id turn out to have, and then it commits.
-    /// It is blocked, and the item after it is measured as if it had
-    /// committed: that item would fit beside the first one's refusal, but not
-    /// beside its commit. The first may as well be refused and leave only its
-    /// round trip, and then the second commits, so the third is measured as if
-    /// it had.
+    /// its sequence and reclamation id turn out to have, and then it runs. It
+    /// is blocked, and the item after it is measured as if it had run: that
+    /// item would fit beside the first one's refusal, but not beside its life.
     #[test]
     fn full_may_commit() {
         let widest = WalCost::of(EXACT, Some(TREE)).unwrap();
-        let life = widest.life.unwrap();
-        let available = narrow_cost(Some(TREE)).life.unwrap().needed.most;
-        let half_life = WalCost::of(EXACT, Some(HALF)).unwrap().life.unwrap();
-        let half = half_life.needed.most;
-        assert!(life.needed.most > available);
+        let needed = widest.needed.unwrap().most;
+        let available = narrow_cost(Some(TREE)).needed.unwrap().most;
+        let half = WalCost::of(EXACT, Some(HALF)).unwrap().needed.unwrap().most;
+        assert!(needed > available);
         assert!(available - widest.round_trip.most >= half);
-        assert!(available.saturating_sub(life.holds.most) < half);
-        assert!(available - life.holds.most <= half_life.holds.most);
 
-        let paths = ["/bounded", "/half", "/third"];
+        let paths = ["/bounded", "/half"];
         let mut assessments = paths.map(assessed);
         assessments[1].status = assessed_tree(HALF);
         apply_wal_room(
@@ -1202,173 +1078,110 @@ mod tests {
 
         assert!(matches!(
             assessments[0].status,
-            PreviewStagingStatus::WalFull { needed, .. } if needed == life.needed.most
+            PreviewStagingStatus::WalFull { needed: n, .. } if n == needed
         ));
         assert_eq!(wal_full_available(&assessments[0]), Some(available));
+        assert_eq!(wal_full_available(&assessments[1]), Some(0));
+    }
+
+    /// An admitted item may still fail before its first frame, for a reason
+    /// other than room, and leave nothing, and the run goes on. The next item,
+    /// which does not fit beside the first even at its narrowest, may then
+    /// run, so the third is measured as if it had: it would fit beside the
+    /// second one's refusal, but not beside its life.
+    #[test]
+    fn admitted_may_fail() {
+        const QUARTER: TreeShape = TreeShape {
+            directories: 6,
+            directory_path_bytes: 30,
+            entries: 7,
+        };
+        let cost = WalCost::of(EXACT, Some(TREE)).unwrap();
+        let needed = cost.needed.unwrap().most;
+        let round_trip = cost.round_trip.most;
+        let quarter = WalCost::of(EXACT, Some(QUARTER))
+            .unwrap()
+            .needed
+            .unwrap()
+            .most;
+        // Room for one life and half of another.
+        let available = needed + needed / 2;
+        assert!(available - needed - round_trip >= quarter);
+
+        let paths = ["/first", "/second", "/third"];
+        let mut assessments = paths.map(assessed);
+        assessments[2].status = assessed_tree(QUARTER);
+        apply_wal_room(
+            &mut assessments,
+            &paths.map(planned),
+            |_| Some(EXACT),
+            room(available),
+        );
+
+        assert_eq!(wal_needed(&assessments[0]), Some(needed));
         assert_eq!(
             wal_full_available(&assessments[1]),
-            Some(available.saturating_sub(life.holds.most))
+            Some(available - needed)
         );
         assert_eq!(wal_full_available(&assessments[2]), Some(0));
     }
 
     /// A review's trees are measured in the order a clean runs them, and a
     /// tree left out of the plan spends nothing: the tree after it finds the
-    /// room it found. A tree kept in the plan that does not fit still spends
-    /// what its refusal leaves.
+    /// room it found. A tree kept in the plan that could never fit still
+    /// spends what its refusal leaves.
     #[test]
     fn refusals_follow_plan() {
         const BIG: TreeShape = TreeShape {
-            directories: 48,
-            directory_path_bytes: 240,
-            entries: 49,
+            directories: 120,
+            directory_path_bytes: 600,
+            entries: 121,
         };
         let cost = WalCost::of(EXACT, Some(TREE)).unwrap();
         let big = WalCost::of(EXACT, Some(BIG)).unwrap();
-        let life = cost.life.unwrap();
-        let (needed, holds) = (life.needed.most, life.holds.most);
-        let big_needed = big.life.unwrap().needed.most;
-        assert!(big_needed > needed);
+        let needed = cost.needed.unwrap().most;
+        let big_needed = big.needed.unwrap().most;
+        let round_trip = cost.round_trip.most;
+        let available = 2 * needed + round_trip;
+        assert!(big_needed > available);
         let trees = [("/a", cost), ("/big", big), ("/b", cost), ("/c", cost)]
             .map(|(path, cost)| (Path::new(path), Some(cost)));
-        let available = holds + needed;
+        let big_refused = (
+            PathBuf::from("/big"),
+            wal_full_reason(big_needed, needed + round_trip),
+        );
 
-        let fitting = room_refusals(room(available), trees, |_, fits| fits);
         assert_eq!(
-            fitting,
+            room_refusals(room(available), trees, |_, fits| fits),
             BTreeMap::from([
-                (PathBuf::from("/big"), wal_full_reason(big_needed, needed)),
-                (PathBuf::from("/c"), wal_full_reason(needed, needed - holds)),
+                big_refused.clone(),
+                (PathBuf::from("/c"), wal_full_reason(needed, round_trip)),
             ])
         );
-
-        let all = room_refusals(room(available), trees, |_, _| true);
-        let after_big = needed - cost.round_trip.most;
         assert_eq!(
-            all.get(Path::new("/b")),
-            Some(&wal_full_reason(needed, after_big))
+            room_refusals(room(available), trees, |_, _| true),
+            BTreeMap::from([
+                big_refused,
+                (PathBuf::from("/c"), wal_full_reason(needed, 0)),
+            ])
         );
-        assert_eq!(
-            all.get(Path::new("/c")),
-            Some(&wal_full_reason(needed, after_big - cost.round_trip.most))
-        );
-    }
-
-    /// An admitted item may turn out narrower than its widest and leave more
-    /// than the least. The next item, blocked in the least, may then commit
-    /// beside it, so the item after is measured as if it had. Here both fit
-    /// at their narrowest, and the third does not fit beside them.
-    #[test]
-    fn full_after_commit() {
-        let cost = WalCost::of(BOUNDED, Some(TREE)).unwrap();
-        let narrow = narrow_cost(Some(TREE)).life.unwrap();
-        let life = WalCost::of(EXACT, Some(TREE)).unwrap().life.unwrap();
-        let half = WalCost::of(EXACT, Some(HALF))
-            .unwrap()
-            .life
-            .unwrap()
-            .needed
-            .most;
-        // Halfway between the second fitting beside the first at its narrowest
-        // and at its widest.
-        let available = narrow.needed.most + (narrow.holds.most + life.holds.most) / 2;
-        let after = available - life.holds.most;
-        assert!(life.needed.most > after);
-        assert!(narrow.needed.most <= available - narrow.holds.most);
-        assert!(after - cost.round_trip.most >= half);
-        assert!(after - life.holds.most < half);
-
-        let paths = ["/a", "/b", "/c"];
-        let mut assessments = paths.map(assessed);
-        assessments[2].status = assessed_tree(HALF);
-        apply_wal_room(
-            &mut assessments,
-            &paths.map(planned),
-            |_| Some(BOUNDED),
-            room(available),
-        );
-
-        assert_eq!(wal_needed(&assessments[0]), Some(life.needed.most));
-        assert_eq!(wal_full_available(&assessments[1]), Some(after));
-        assert_eq!(
-            wal_full_available(&assessments[2]),
-            Some(after - life.holds.most)
-        );
-    }
-
-    /// A purge in the same run spends a committed item's allowance on less
-    /// than it was, so under `--purge` an admitted item is sure to leave only
-    /// the frames it wrote. The next item, blocked in the least, may then
-    /// commit where beside a commit that keeps its allowance it could not, and
-    /// the item after is measured as if it had.
-    #[test]
-    fn purge_gives_back() {
-        let cost = WalCost::of(BOUNDED, Some(TREE)).unwrap();
-        let narrow = narrow_cost(Some(TREE)).life.unwrap();
-        let life = WalCost::of(EXACT, Some(TREE)).unwrap().life.unwrap();
-        let half = WalCost::of(EXACT, Some(HALF))
-            .unwrap()
-            .life
-            .unwrap()
-            .needed
-            .most;
-        // Halfway between the second fitting beside the first's frames at
-        // their narrowest and at their widest, and so short of fitting beside
-        // all the first holds.
-        let available = narrow.needed.most + (narrow.writes + life.writes) / 2;
-        let after = available - life.holds.most;
-        assert!(narrow.needed.most > available - narrow.holds.most);
-        assert!(narrow.needed.most <= available - narrow.writes);
-        assert!(narrow.needed.most > available - life.writes);
-        assert!(after - cost.round_trip.most >= half);
-        assert!(after.saturating_sub(life.holds.most) < half);
-
-        for purge in [false, true] {
-            let paths = ["/a", "/b", "/c"];
-            let mut assessments = paths.map(assessed);
-            assessments[2].status = assessed_tree(HALF);
-            for assessment in &mut assessments {
-                assessment.purge_requested = purge;
-            }
-            apply_wal_room(
-                &mut assessments,
-                &paths.map(planned),
-                |_| Some(BOUNDED),
-                room(available),
-            );
-
-            assert_eq!(wal_full_available(&assessments[1]), Some(after));
-            if purge {
-                assert_eq!(
-                    wal_full_available(&assessments[2]),
-                    Some(after.saturating_sub(life.holds.most))
-                );
-            } else {
-                assert_eq!(wal_needed(&assessments[2]), Some(half));
-            }
-        }
     }
 
     /// A clean's lease may compact the WAL before its first item, so an item
-    /// that does not fit in the room measured may commit, or begin and be
+    /// that does not fit in the room measured may run, or begin and be
     /// refused, in the room compacted, and the next item is measured as if it
     /// had. With nothing to take back it could do neither.
     #[test]
     fn room_once_compacted() {
         let cost = WalCost::of(EXACT, Some(TREE)).unwrap();
-        let life = cost.life.unwrap();
+        let needed = cost.needed.unwrap().most;
         let round_trip = cost.round_trip.most;
-        let half = WalCost::of(EXACT, Some(HALF))
-            .unwrap()
-            .life
-            .unwrap()
-            .needed
-            .most;
+        let half = WalCost::of(EXACT, Some(HALF)).unwrap().needed.unwrap().most;
         // Short of the tree's life by its round trip, and then of the round
         // trip by half of it.
-        let short = life.needed.most - round_trip;
+        let short = needed - round_trip;
         let shorter = round_trip / 2;
-        assert!(short - round_trip >= half && short - life.holds.most < half);
+        assert!(short - round_trip >= half);
         let compactable = |available: u64, reclaimable: u64| WalRoom {
             limit: available + reclaimable + 1000,
             committed: reclaimable,
@@ -1388,10 +1201,7 @@ mod tests {
             );
             assert_eq!(wal_full_available(&assessments[0]), Some(short));
             if compacted {
-                assert_eq!(
-                    wal_full_available(&assessments[1]),
-                    Some(short - life.holds.most)
-                );
+                assert_eq!(wal_full_available(&assessments[1]), Some(0));
             } else {
                 assert_eq!(wal_needed(&assessments[1]), Some(half));
             }

@@ -47,6 +47,7 @@ pub(crate) fn print(
                     "committed": room.committed,
                     "reserved": room.reserved,
                     "available": room.available(),
+                    "reclaimable": room.reclaimable,
                 }),
                 Err(reason) => serde_json::json!({ "unavailable": reason }),
             };

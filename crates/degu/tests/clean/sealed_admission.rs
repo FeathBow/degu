@@ -69,6 +69,8 @@ fn room_bounds_staging() {
             figure("available"),
             figure("limit") - figure("committed") - figure("reserved")
         );
+        // Nothing staged here has finished, so a lease has nothing to compact.
+        assert_eq!(figure("reclaimable"), 0);
         figure("committed") + figure("reserved")
     };
     let stage = || {

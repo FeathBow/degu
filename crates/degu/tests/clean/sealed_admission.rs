@@ -50,7 +50,7 @@ fn preview_blocks_1024_tree_directories_before_any_production_mutation() {
 /// life needs from it. Staging the item then takes no more than that, on an
 /// account that has never cleaned as well as on one with an entry in the trash.
 #[test]
-fn preview_room_bounds_staging() {
+fn room_bounds_staging() {
     let Some(fixture) = Fixture::new() else {
         return;
     };

@@ -2,9 +2,9 @@
 use super::path_mount_id;
 use super::{
     TRASHROOTS_FILE, ensure_managed_trash_root, ensure_managed_trash_root_with_sync,
-    existing_directory, is_state_trash_root, prospective_directory, read_registered_trash_roots,
-    register_trash_root, register_trash_root_with_sync, resolve_existing_trash_dir,
-    resolve_mount_owner_anchor_with, resolve_prospective_trash_dir, trash_dir_state, trash_roots,
+    existing_directory, is_state_trash_root, prospective_directory, prospective_trash_dir,
+    read_registered_trash_roots, register_trash_root, register_trash_root_with_sync,
+    resolve_existing_trash_dir, resolve_mount_owner_anchor_with, trash_dir_state, trash_roots,
 };
 use degu_core::ecosystem::DetectCtx;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -735,7 +735,7 @@ fn prospective_trash_routing() {
         home.path().to_path_buf(),
         [("XDG_STATE_HOME".to_owned(), state.as_os_str().to_owned())],
     );
-    let prospective = resolve_prospective_trash_dir(&ctx, &source).unwrap();
+    let prospective = prospective_trash_dir(&ctx, &source).unwrap();
     assert!(resolve_existing_trash_dir(&ctx, &source).is_err());
     std::fs::create_dir_all(&state).unwrap();
     assert_eq!(

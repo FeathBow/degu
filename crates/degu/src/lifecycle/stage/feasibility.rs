@@ -84,7 +84,7 @@ pub(crate) fn staging_shapes(
 ) -> Result<ShapeBounds, String> {
     let source = super::policy::preview_source(finding)?;
     let lexical_trash =
-        super::super::storage::resolve_prospective_trash_dir(ctx, source.canonical_source())?;
+        super::super::storage::prospective_trash_dir(ctx, source.canonical_source())?;
     let policy = super::policy::complete_with(
         source,
         lexical_trash,

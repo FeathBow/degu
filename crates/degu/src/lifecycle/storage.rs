@@ -89,7 +89,7 @@ pub(crate) fn resolve_existing_trash_dir(
 
 /// The trash a clean would route `path` to, for a preview on an account whose
 /// state directory a clean has yet to create. See [`prospective_directory`].
-pub(crate) fn resolve_prospective_trash_dir(
+pub(crate) fn prospective_trash_dir(
     ctx: &DetectCtx,
     path: &Path,
 ) -> std::result::Result<PathBuf, String> {

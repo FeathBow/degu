@@ -964,7 +964,7 @@ mod tests {
     /// blocked with what it needed and what was left, and still leaves its
     /// round trip.
     #[test]
-    fn room_admits_in_order() {
+    fn admits_in_order() {
         let metadata = SHAPE.metadata().unwrap();
         let begin = project_begin(&metadata).unwrap();
         let tree = project_tree(&metadata, TREE).unwrap();
@@ -1023,7 +1023,7 @@ mod tests {
     /// An item whose first check would refuse it even at its narrowest writes
     /// no frame, so the next item finds the room it found.
     #[test]
-    fn refused_begin_leaves_nothing() {
+    fn unbegun_leaves_nothing() {
         let short = narrow_cost(None).round_trip.most - 1;
         let paths = ["/refused", "/full", "/next"];
         let planned = paths.map(planned);

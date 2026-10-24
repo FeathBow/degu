@@ -111,7 +111,12 @@ jobs:
       - name: Install quota support
         run: |
           sudo apt-get update
-          sudo apt-get install -y quota "linux-modules-extra-$(uname -r)"
+          sudo apt-get install -y quota
+          # Older Azure kernels keep quota_v2 in a separate extra-modules package;
+          # 7.0 ships it with the kernel's own modules and has no such package.
+          if ! modinfo quota_v2 >/dev/null 2>&1; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+          fi
           sudo modprobe quota_v2
       - name: Create quota-enabled ext4 fixture
         run: |

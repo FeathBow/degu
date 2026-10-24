@@ -1391,6 +1391,94 @@ fn compaction_pays_for_its_rewrite_only_at_the_stated_thresholds() {
     );
 }
 
+/// A measured room counts what a lease's compaction would take back, and only
+/// when the lease would take it: once compacted, the WAL leaves exactly the
+/// room the measure said it could, and a reclaim too small to pay for its
+/// rewrite is not counted. The survivor is a committed entry, which a measure
+/// can settle and a compaction keeps.
+#[test]
+fn room_counts_compaction() {
+    for (seals, compacts) in [(4_000, true), (10, false)] {
+        let kept = tx(80);
+        let restored = tx(81);
+        let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+        wal.begin_staging(kept, staging_metadata()).unwrap();
+        advance_to_tree_intent(&mut wal, kept);
+        wal.complete_tree_manifest(
+            kept,
+            DurableTreeManifest {
+                schema_version: CONTENT_PROOF_MANIFEST_VERSION,
+                entry_count: 1,
+                sha256: [0xa3; 32],
+            },
+        )
+        .unwrap();
+        wal.transition_staging(kept, TransactionState::TreeSealed)
+            .unwrap();
+        wal.record_rename_intent(kept).unwrap();
+        wal.record_applied_rename_for_test(kept).unwrap();
+        for state in [
+            TransactionState::StagedUnverified,
+            TransactionState::StagedSealed,
+            TransactionState::SourceParentRestoreIntent,
+            TransactionState::SourceParentRestored,
+            TransactionState::VerifiedCommitted,
+        ] {
+            wal.transition_staging(kept, state).unwrap();
+        }
+        wal.begin(restored).unwrap();
+        wal.transition(restored, TransactionState::ParentSealIntent)
+            .unwrap();
+        for id in 1..=seals {
+            wal.apply_permission_mutation(
+                PermissionIntent {
+                    transaction: restored,
+                    mutation_id: id,
+                    evidence: evidence(&format!("sealed-{id}")),
+                    pre_mode: 0o770,
+                    expected_mode: 0o500,
+                    reverses_mutation_id: None,
+                },
+                || Ok(()),
+            )
+            .unwrap();
+        }
+        wal.transition(restored, TransactionState::RestoreIntent)
+            .unwrap();
+        for id in 1..=seals {
+            wal.apply_permission_mutation(
+                PermissionIntent {
+                    transaction: restored,
+                    mutation_id: seals + id,
+                    evidence: evidence_mode(&format!("sealed-{id}"), 0o770),
+                    pre_mode: 0o500,
+                    expected_mode: 0o770,
+                    reverses_mutation_id: Some(id),
+                },
+                || Ok(()),
+            )
+            .unwrap();
+        }
+        wal.transition(restored, TransactionState::Restored)
+            .unwrap();
+
+        let bytes = wal.into_inner().bytes;
+        let room = room_in(bytes.clone()).unwrap();
+        let replay = replay_bytes(&bytes);
+        let dropped = compaction_dropped_transactions(&replay);
+        assert_eq!(dropped, HashSet::from([restored]));
+        let plan = plan_compaction_from(&bytes, &replay, &dropped).unwrap();
+        assert_eq!(plan.is_some(), compacts, "{seals} seals");
+        let compacted = plan.map_or_else(|| bytes.clone(), |plan| plan.bytes);
+        assert_eq!(
+            room.available_once_compacted(),
+            room_in(compacted).unwrap().available(),
+            "{seals} seals"
+        );
+        assert_eq!(room.reclaimable > 0, compacts, "{seals} seals");
+    }
+}
+
 /// The measurement that decides a rewrite is exact, and it says no well below
 /// the floor. That the decision also happens before any copying is held by
 /// `compaction_decides_without_reading_the_wal_again`, which can observe it;

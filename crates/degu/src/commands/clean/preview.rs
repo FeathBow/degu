@@ -939,6 +939,7 @@ mod tests {
             limit: available + 3000,
             committed: 2000,
             reserved: 1000,
+            reclaimable: 0,
         }
     }
 

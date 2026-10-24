@@ -5,7 +5,8 @@
 //! to compaction. So the measure here works on bytes already read. Only the
 //! committed frames count, exactly as a replay counts them: a tail that a crash
 //! cut short, or that another process is writing now, is left out, and nothing
-//! is truncated to leave it out.
+//! is truncated to leave it out. What the lease's compaction would take back is
+//! measured from the same bytes, and nothing is compacted.
 
 use super::*;
 
@@ -18,6 +19,10 @@ pub struct WalRoom {
     pub committed: u64,
     /// What its settled entries hold for the rest of their lives.
     pub reserved: u64,
+    /// What a lease's compaction would take back from `committed` before a
+    /// clean stages anything. The rewrite may still be abandoned, so a clean
+    /// finds between [`Self::available`] and [`Self::available_once_compacted`].
+    pub reclaimable: u64,
 }
 
 impl WalRoom {
@@ -27,6 +32,7 @@ impl WalRoom {
             limit: MAX_WAL_LEN,
             committed: 0,
             reserved: 0,
+            reclaimable: 0,
         }
     }
 
@@ -34,6 +40,13 @@ impl WalRoom {
     pub fn available(self) -> u64 {
         self.limit
             .saturating_sub(self.committed)
+            .saturating_sub(self.reserved)
+    }
+
+    /// What a new staging may use once a lease has compacted the WAL.
+    pub fn available_once_compacted(self) -> u64 {
+        self.limit
+            .saturating_sub(self.committed.saturating_sub(self.reclaimable))
             .saturating_sub(self.reserved)
     }
 }
@@ -91,13 +104,17 @@ pub(crate) fn room_in(mut bytes: Vec<u8>) -> Result<WalRoom, WalRoomError> {
     }
     let parsed = parse_frames(&bytes)?;
     let committed = parsed.committed_len;
+    let frame_bytes = frame_bytes(&parsed.spans);
     let mut replay = replay_records(parsed.records, &bytes)?;
     replay.committed_len = committed as u64;
+    replay.frame_bytes = frame_bytes;
+    let reclaimable = compaction_reclaim(&replay, &compaction_dropped_transactions(&replay));
     bytes.truncate(committed);
     let wal = SealWal::resume(CommittedFrames { bytes }, replay)?;
     Ok(WalRoom {
         limit: wal.max_wal_len,
         committed: wal.committed_len,
         reserved: wal.reserved(None)?,
+        reclaimable,
     })
 }

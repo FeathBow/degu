@@ -352,6 +352,7 @@ mod tests {
             limit: 150,
             committed: 0,
             reserved: 0,
+            reclaimable: 0,
         };
         let refused = |decisions: &Decisions, path: &str| {
             decisions.refusal(Path::new(path)).map(|reason| {

@@ -1233,28 +1233,6 @@ impl VerifiedUndoRecoverySession<'_> {
                     restored.insert(reversed_mutation_id);
                 }
             }
-            let restored_modes = self
-                .undo
-                .tree_seals
-                .iter()
-                .map(|plan| {
-                    let target = plan
-                        .chain
-                        .last()
-                        .ok_or(RecoveryRebindError::InvalidLocator)?;
-                    Ok((target.identity, plan.permission.pre_mode))
-                })
-                .collect::<Result<Vec<_>, RecoveryRebindError>>()?;
-            for plan in &mut self.undo.tree_seals {
-                for evidence in &mut plan.chain {
-                    if let Some((_, mode)) = restored_modes
-                        .iter()
-                        .find(|(identity, _)| *identity == evidence.identity)
-                    {
-                        evidence.mode = *mode;
-                    }
-                }
-            }
             self.wal.record_undo_modes_restored(transaction)?;
             #[cfg(test)]
             AFTER_UNDO_MODES_RESTORED.with(|hook| {

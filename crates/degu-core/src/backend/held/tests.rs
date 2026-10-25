@@ -70,9 +70,7 @@ fn unwrap_tree_assessment(
     }
 }
 
-/// The prove walk stops where it crosses the directory limit and the assessment
-/// counts on, so for directories the two agree on the limit and only the
-/// assessment knows the size.
+/// The prove walk and the assessment refuse a tree for the same reason.
 fn assert_same_admission_error(
     prove: Result<HeldTreeInventory, HeldTreeError>,
     assessed: Result<HeldTreeAdmissionAssessment, HeldTreeError>,
@@ -83,16 +81,6 @@ fn assert_same_admission_error(
             HeldTreeError::Limit { kind: a, limit: x },
             HeldTreeError::Limit { kind: b, limit: y },
         ) => assert_eq!((a, x), (b, y)),
-        (
-            HeldTreeError::Limit {
-                kind: HeldTreeLimit::Directories,
-                limit: x,
-            },
-            HeldTreeError::DirectoryCount { limit: y, observed },
-        ) => {
-            assert_eq!(x, y);
-            assert!(observed > y);
-        }
         (
             HeldTreeError::ExternalOrUnenumeratedHardLink(a),
             HeldTreeError::ExternalOrUnenumeratedHardLink(b),
@@ -215,7 +203,6 @@ fn set_symlink_test_xattr(path: &Path) -> io::Result<()> {
 #[test]
 fn default_tree_limits() {
     let limits = HeldTreeLimits::default();
-    assert_eq!(limits.max_directories, MAX_TREE_DIRECTORIES);
     assert_eq!(limits.max_entries, 100_000);
     assert_eq!(limits.max_depth, 128);
     assert_eq!(limits.max_path_bytes, 16 * 1024 * 1024);
@@ -224,288 +211,55 @@ fn default_tree_limits() {
     assert_eq!(limits.max_xattr_bytes, 1024 * 1024 * 1024);
 }
 
+/// The walks once refused a tree above 1,023 directories, the root included.
+/// A tree's directories are among its entries, which is the bound they answer
+/// to now: every traversal admits 1,100 of them and counts each, and refuses
+/// the same tree for its entries once those are held below that.
 #[test]
-fn every_traversal_rejects_an_explicit_1024_directory_request() {
-    let (temp, _) = setup_tree();
-    let limits = HeldTreeLimits {
-        max_directories: MAX_TREE_DIRECTORIES + 1,
-        ..HeldTreeLimits::default()
-    };
-    let v2 = collect(&temp, vec![], limits).unwrap_err();
-    let assessment = assess(&temp, vec![], limits).unwrap_err();
-    let legacy = HeldTreeInventory::collect_for_schema(
-        certify_held_fd(open_directory(temp.path())).unwrap(),
-        OsStr::new("root"),
-        vec![],
-        limits,
-        1,
-    )
-    .unwrap_err();
-
-    for error in [v2, assessment, legacy] {
-        assert!(matches!(error, HeldTreeError::InvalidDirectoryLimit));
-        assert_eq!(
-            error.to_string(),
-            "requested tree directory limit exceeds 1023 total directories (including the root)"
-        );
-    }
-}
-
-#[test]
-fn production_boundary_accepts_1023_total_directories_and_rejects_1024() {
+fn old_ceiling_admitted() {
     let (temp, root) = setup_tree();
-    // setup_tree contains root, a, and a/b. Add 1,020 siblings for 1,023 total.
-    for index in 0..(MAX_TREE_DIRECTORIES - 3) {
-        std::fs::create_dir(root.join(format!("boundary-{index:04}"))).unwrap();
+    // setup_tree contains root, a, and a/b.
+    for index in 0..1_097 {
+        std::fs::create_dir(root.join(format!("wide-{index:04}"))).unwrap();
     }
-    let inventory = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
-    assert_eq!(inventory.directories.len() as u64, MAX_TREE_DIRECTORIES);
-    let (assessment, _) =
-        unwrap_tree_assessment(assess(&temp, vec![], HeldTreeLimits::default()).unwrap());
-    assert_eq!(assessment.directories, MAX_TREE_DIRECTORIES);
-    let legacy = HeldTreeInventory::collect_for_schema(
-        certify_held_fd(open_directory(temp.path())).unwrap(),
-        OsStr::new("root"),
-        vec![],
-        HeldTreeLimits::default(),
-        1,
-    )
-    .unwrap();
-    assert_eq!(legacy.directories.len() as u64, MAX_TREE_DIRECTORIES);
-
-    std::fs::create_dir(root.join("boundary-over-limit")).unwrap();
-    assert!(matches!(
-        collect(&temp, vec![], HeldTreeLimits::default()).unwrap_err(),
-        HeldTreeError::Limit {
-            kind: HeldTreeLimit::Directories,
-            limit: MAX_TREE_DIRECTORIES,
-        }
-    ));
-    assert!(matches!(
-        assess(&temp, vec![], HeldTreeLimits::default()).unwrap_err(),
-        HeldTreeError::DirectoryCount {
-            limit: MAX_TREE_DIRECTORIES,
-            observed,
-        } if observed == MAX_TREE_DIRECTORIES + 1
-    ));
-}
-
-/// The assessment refuses a tree over the directory limit with the size it
-/// counted, not with the point where it crossed the limit.
-///
-/// Six directories against a limit of two. A walk that stopped at the crossing
-/// would have seen three, so six is the whole tree and nothing less. The walks
-/// whose result is acted on still stop at the crossing: they are the ones that
-/// go on to seal what they walked.
-#[test]
-fn the_assessment_counts_the_whole_tree_it_refuses_for_directories() {
-    let (temp, root) = setup_tree();
-    // setup_tree holds root, a and a/b. Three more, one of them past a/b, so
-    // the count has to descend below the level where the limit was crossed.
-    for name in ["c", "d", "a/b/e"] {
-        std::fs::create_dir(root.join(name)).unwrap();
-    }
-    let limits = HeldTreeLimits {
-        max_directories: 2,
-        ..HeldTreeLimits::default()
+    let legacy = |limits| {
+        HeldTreeInventory::collect_for_schema(
+            certify_held_fd(open_directory(temp.path())).unwrap(),
+            OsStr::new("root"),
+            vec![],
+            limits,
+            1,
+        )
     };
-
-    let error = assess(&temp, vec![], limits).unwrap_err();
-    assert!(
-        matches!(
-            error,
-            HeldTreeError::DirectoryCount {
-                limit: 2,
-                observed: 6
-            }
-        ),
-        "{error:?}"
+    let limits = HeldTreeLimits::default();
+    assert_eq!(
+        collect(&temp, vec![], limits).unwrap().directories.len(),
+        1_100
     );
+    let (assessment, _) = unwrap_tree_assessment(assess(&temp, vec![], limits).unwrap());
+    assert_eq!(assessment.directories, 1_100);
+    assert_eq!(legacy(limits).unwrap().directories.len(), 1_100);
 
-    let proven = HeldTreeInventory::collect_for_schema(
-        certify_held_fd(open_directory(temp.path())).unwrap(),
-        OsStr::new("root"),
-        vec![],
-        limits,
-        CONTENT_PROOF_VERSION,
-    )
-    .unwrap_err();
-    for error in [collect(&temp, vec![], limits).unwrap_err(), proven] {
+    let limits = HeldTreeLimits {
+        max_entries: 1_050,
+        ..HeldTreeLimits::default()
+    };
+    for error in [
+        collect(&temp, vec![], limits).unwrap_err(),
+        assess(&temp, vec![], limits).unwrap_err(),
+        legacy(limits).unwrap_err(),
+    ] {
         assert!(
             matches!(
                 error,
                 HeldTreeError::Limit {
-                    kind: HeldTreeLimit::Directories,
-                    limit: 2
+                    kind: HeldTreeLimit::Entries,
+                    limit: 1_050,
                 }
             ),
             "{error:?}"
         );
     }
-
-    // The same tree under a limit it meets is admitted, with the same count.
-    let (tree, _) = unwrap_tree_assessment(
-        assess(
-            &temp,
-            vec![],
-            HeldTreeLimits {
-                max_directories: 6,
-                ..HeldTreeLimits::default()
-            },
-        )
-        .unwrap(),
-    );
-    assert_eq!(tree.directories, 6);
-}
-
-/// Past the crossing the walk only counts. Whatever stops it there is answered
-/// with the refusal the crossing earned, in the form a walk that stopped at the
-/// crossing gives it, so the report gains a count and loses nothing else.
-///
-/// The limit is crossed while the root's children are read, before any of
-/// their own children are, so everything planted below is met only past it.
-#[test]
-fn a_refusal_past_the_directory_limit_is_refused_for_the_limit() {
-    let (temp, root) = setup_tree();
-    std::fs::create_dir(root.join("c")).unwrap();
-    let limits = HeldTreeLimits {
-        max_directories: 2,
-        ..HeldTreeLimits::default()
-    };
-    let crossed = |error: &HeldTreeError| {
-        matches!(
-            error,
-            HeldTreeError::Limit {
-                kind: HeldTreeLimit::Directories,
-                limit: 2,
-            }
-        )
-    };
-
-    // Left alone, the walk reaches its end and counts all four.
-    let error = assess(&temp, vec![], limits).unwrap_err();
-    assert!(
-        matches!(
-            error,
-            HeldTreeError::DirectoryCount {
-                limit: 2,
-                observed: 4
-            }
-        ),
-        "{error:?}"
-    );
-
-    // Another refusal past the crossing.
-    std::fs::write(root.join("a/b/.secret"), b"").unwrap();
-    let error = assess(&temp, vec![OsString::from(".secret")], limits).unwrap_err();
-    assert!(crossed(&error), "{error:?}");
-}
-
-/// A failed read past the crossing, reported as itself, would be an I/O
-/// failure. The preview files that as unavailable rather than refused, and a
-/// surface offering a plan reads unavailable as worth trying, so a tree the
-/// limit already refused would be offered again.
-#[test]
-fn a_failed_read_past_the_directory_limit_is_refused_for_the_limit() {
-    if rustix::process::geteuid().is_root() {
-        return;
-    }
-    let (temp, root) = setup_tree();
-    std::fs::create_dir(root.join("c")).unwrap();
-    let limits = HeldTreeLimits {
-        max_directories: 2,
-        ..HeldTreeLimits::default()
-    };
-    let unreadable = root.join("a/b/unreadable");
-    std::fs::create_dir(&unreadable).unwrap();
-    std::fs::set_permissions(&unreadable, Permissions::from_mode(0o000)).unwrap();
-    let past = assess(&temp, vec![], limits).unwrap_err();
-    // Four directories are counted when the read fails: the root, `a`, `c`
-    // and `a/b`. A limit of four is met, not crossed.
-    let at_limit = assess(
-        &temp,
-        vec![],
-        HeldTreeLimits {
-            max_directories: 4,
-            ..HeldTreeLimits::default()
-        },
-    )
-    .unwrap_err();
-    std::fs::set_permissions(&unreadable, Permissions::from_mode(0o700)).unwrap();
-    assert!(
-        matches!(
-            past,
-            HeldTreeError::Limit {
-                kind: HeldTreeLimit::Directories,
-                limit: 2,
-            }
-        ),
-        "{past:?}"
-    );
-    // The same failure with the walk at the limit is still reported as itself.
-    assert!(matches!(at_limit, HeldTreeError::Io { .. }), "{at_limit:?}");
-}
-
-/// A count is reported only for the tree still bound to the name it was asked
-/// about. A root swapped while the walk was counting gets the refusal the
-/// crossing earned, without a count.
-///
-/// The walk checks the binding each time it reopens a directory, so the swap
-/// has to land after the last reopen to reach the end of the walk at all. The
-/// only regular file sits in the deepest directory, which is the last one a
-/// breadth-first walk reads, and the swap happens as that file is observed.
-#[test]
-fn a_root_swapped_while_it_was_counted_gets_no_count() {
-    use std::cell::Cell;
-    use std::rc::Rc;
-
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("root");
-    for directory in ["a/b/e", "c", "d"] {
-        std::fs::create_dir_all(root.join(directory)).unwrap();
-    }
-    std::fs::write(root.join("a/b/e/file"), b"one").unwrap();
-    std::fs::set_permissions(temp.path(), Permissions::from_mode(0o700)).unwrap();
-    let limits = HeldTreeLimits {
-        max_directories: 2,
-        ..HeldTreeLimits::default()
-    };
-
-    // Left alone, the walk reaches its end and counts all six.
-    let error = assess(&temp, vec![], limits).unwrap_err();
-    assert!(
-        matches!(
-            error,
-            HeldTreeError::DirectoryCount {
-                limit: 2,
-                observed: 6
-            }
-        ),
-        "{error:?}"
-    );
-
-    let fired = Rc::new(Cell::new(false));
-    let hook_fired = Rc::clone(&fired);
-    let hook_root = root.clone();
-    let swapped = temp.path().join("swapped");
-    let _hook = install_regular_link_observation_test_hook(move |path| {
-        if path == Path::new("a/b/e/file") && !hook_fired.replace(true) {
-            std::fs::rename(&hook_root, &swapped).unwrap();
-            std::fs::create_dir(&hook_root).unwrap();
-        }
-    });
-    let error = assess(&temp, vec![], limits).unwrap_err();
-    assert!(fired.get(), "the swap did not happen");
-    assert!(
-        matches!(
-            error,
-            HeldTreeError::Limit {
-                kind: HeldTreeLimit::Directories,
-                limit: 2,
-            }
-        ),
-        "{error:?}"
-    );
 }
 
 #[test]
@@ -815,7 +569,6 @@ fn syntactic_root_policy_and_tree_request_cap_errors_precede_tree_policy_deferra
     let (temp, _) = setup_tree();
     let invalid_root = certify_held_fd(open_directory(temp.path())).unwrap();
     let protected_root = certify_held_fd(open_directory(temp.path())).unwrap();
-    let excessive_cap = certify_held_fd(open_directory(temp.path())).unwrap();
     std::fs::set_permissions(temp.path(), Permissions::from_mode(0o400)).unwrap();
 
     assert!(matches!(
@@ -835,18 +588,6 @@ fn syntactic_root_policy_and_tree_request_cap_errors_precede_tree_policy_deferra
             HeldTreeLimits::default(),
         ),
         Err(HeldTreeError::ProtectedName(path)) if path.as_os_str().is_empty()
-    ));
-    assert!(matches!(
-        assess_named(
-            excessive_cap,
-            OsStr::new("root"),
-            vec![],
-            HeldTreeLimits {
-                max_directories: MAX_TREE_DIRECTORIES + 1,
-                ..HeldTreeLimits::default()
-            },
-        ),
-        Err(HeldTreeError::InvalidDirectoryLimit)
     ));
     std::fs::set_permissions(temp.path(), Permissions::from_mode(0o700)).unwrap();
 }
@@ -902,7 +643,7 @@ fn unsearchable_parent_does_not_claim_non_directory_or_special_content_was_check
 }
 
 #[test]
-fn assessment_and_prove_share_hardlink_protected_special_and_directory_cap_rejections() {
+fn prove_assessment_parity() {
     let (temp, root) = setup_tree();
     std::fs::hard_link(root.join("a/file"), root.join("a/other")).unwrap();
     let inventory = collect(&temp, vec![], HeldTreeLimits::default()).unwrap();
@@ -933,15 +674,6 @@ fn assessment_and_prove_share_hardlink_protected_special_and_directory_cap_rejec
     let fifo = CString::new(root.join("a/fifo").as_os_str().as_bytes()).unwrap();
     // SAFETY: fifo is a fresh NUL-terminated fixture path.
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-    assert_same_admission_error(
-        collect(&temp, vec![], HeldTreeLimits::default()),
-        assess(&temp, vec![], HeldTreeLimits::default()),
-    );
-
-    let (temp, root) = setup_tree();
-    for index in 0..MAX_TREE_DIRECTORIES {
-        std::fs::create_dir(root.join(format!("d{index:04}"))).unwrap();
-    }
     assert_same_admission_error(
         collect(&temp, vec![], HeldTreeLimits::default()),
         assess(&temp, vec![], HeldTreeLimits::default()),
@@ -2390,13 +2122,6 @@ fn collect_enforces_directory_depth_path_and_manifest_bounds() {
     for (limits, expected) in [
         (
             HeldTreeLimits {
-                max_directories: 1,
-                ..HeldTreeLimits::default()
-            },
-            HeldTreeLimit::Directories,
-        ),
-        (
-            HeldTreeLimits {
                 max_depth: 0,
                 ..HeldTreeLimits::default()
             },
@@ -3323,7 +3048,6 @@ fn v3_decoder_ancestor_stack_preserves_component_ordered_parents() {
         }
         assert!(decoder.directory_ancestor_ends.len() <= entry.path.as_os_str().len() + 1);
     }
-    assert_eq!(decoder.decoded_directories, 6);
     assert_eq!(decoder.finish().unwrap().sha256, expected.sha256);
 
     let raw_order = [
@@ -3356,33 +3080,7 @@ fn v3_decoder_ancestor_stack_memory_is_independent_of_sibling_directory_count() 
         decoder.push_segment(1, &encoded_v3_record(&entry)).unwrap();
         assert_eq!(decoder.directory_ancestor_ends.len(), 2);
     }
-    assert_eq!(decoder.decoded_directories, siblings + 1);
     assert_eq!(decoder.finish().unwrap().entry_count, siblings + 1);
-}
-
-#[test]
-fn v3_decoder_directory_limit_counts_popped_sibling_ancestors() {
-    let limits = HeldTreeLimits {
-        max_directories: 2,
-        ..HeldTreeLimits::default()
-    };
-    let manifest = [
-        v3_directory_entry(b"", 1),
-        v3_directory_entry(b"a", 2),
-        v3_directory_entry(b"b", 3),
-    ];
-    let mut decoder = ManifestV3Decoder::with_limits(3, limits).unwrap();
-    decoder
-        .push_segment(1, &encoded_v3_record(&manifest[0]))
-        .unwrap();
-    decoder
-        .push_segment(1, &encoded_v3_record(&manifest[1]))
-        .unwrap();
-    assert_eq!(decoder.directory_ancestor_ends, [0, 1]);
-    assert_eq!(
-        decoder.push_segment(1, &encoded_v3_record(&manifest[2])),
-        Err(ManifestV3CodecError::Limit(HeldTreeLimit::Directories))
-    );
 }
 
 #[test]

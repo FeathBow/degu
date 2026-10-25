@@ -4824,3 +4824,82 @@ fn assessment_shape_matches() {
         planned(true)
     );
 }
+
+/// Recovery takes a tree above the 1,024 live seals it once refused. A process
+/// that dies with all 1,100 directories sealed is rolled back at the next open,
+/// and an undo that stops at its first inverse is finished there.
+#[test]
+fn wide_recovery() {
+    for crash_in_undo in [false, true] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        // The root and `child` make two; these make 1,100.
+        for index in 0..1_098 {
+            let dir = fixture.source_root.join(format!("wide-{index:04}"));
+            std::fs::create_dir(&dir).unwrap();
+            set_mode(&dir, 0o770);
+        }
+        let transaction = TransactionId([0x90 + u8::from(crash_in_undo); 16]);
+        // What the source parent goes back to: its own mode when staging is
+        // rolled back, and what staging handed it back as when an undo is.
+        let parent_mode = if crash_in_undo {
+            let mut ready = stage_production(&fixture, transaction);
+            let parent_mode = mode(&fixture.source_parent);
+            let token = ready
+                .verified_undo_token(transaction, "undo-group")
+                .unwrap();
+            crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(Some("inverse-fchmod")));
+            let error = ready
+                .undo_verified(token, verified_undo_request(&fixture))
+                .unwrap_err();
+            crate::staging::recovery::UNDO_FAIL_STEP.with(|slot| slot.set(None));
+            assert_eq!(
+                error.disposition(),
+                VerifiedUndoFailureDisposition::RecoveryBlocked
+            );
+            parent_mode
+        } else {
+            let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+            AFTER_PRE_SEAL_DIRECTORY_SEALS.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|| panic!("simulated crash")));
+            });
+            let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = engine.stage_prepared_root(transaction, fixture.prepare());
+            }));
+            assert!(crashed.is_err());
+            0o770
+        };
+
+        let mut lease = fixture.store.try_lease().unwrap();
+        lease.replay_and_repair().unwrap();
+        let replay = lease.take_replay().unwrap();
+        let active = replay.transactions[&transaction]
+            .permission_workload
+            .active_seals;
+        assert!(active > 1_024, "{active} live seals");
+        drop(lease);
+
+        let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+        assert_eq!(report.candidates().len(), 1);
+        let (ready, summary) = engine
+            .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+            .unwrap();
+        assert_eq!(summary.recovered.len(), 1);
+        assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+        assert_eq!(mode(&fixture.source_parent), parent_mode);
+        assert_eq!(mode(&fixture.source_root), 0o770);
+        for index in [0, 549, 1_097] {
+            assert_eq!(
+                mode(&fixture.source_root.join(format!("wide-{index:04}"))),
+                0o770
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(&fixture.source_root).unwrap().count(),
+            1_099
+        );
+        assert!(fixture.source_root.join("child/data").is_file());
+        assert!(!fixture.destination_root.exists());
+    }
+}

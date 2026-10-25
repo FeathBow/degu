@@ -108,15 +108,21 @@ fn assert_purge(fixture: &Lifecycle, trash_entry: &str) {
     assert!(visible_trash_entries(&fixture.state.path().join("degu/trash")).is_empty());
 }
 
+/// A tree above the 1,023 directories the walk once refused goes through its
+/// whole life, each step a fresh process under a descriptor ceiling of 64: a
+/// preview that assesses it, staging, an undo that restores every directory's
+/// mode and every file's contents, a preview that sizes its purge in the seal
+/// WAL, and the purge.
+///
 /// This is deliberately a debug integration test: the test-built CLI alone
 /// recognizes the temporary activation anchor. Release builds reject that
 /// feature at compile time, so production binaries cannot acquire authority
 /// from an ambient test variable.
 #[test]
 fn production_sealed_staging_cli_clean_undo_and_direct_purge() {
-    // The held-tree inventory includes the cache root: root + 1,022 siblings is
-    // the exact 1,023-total production boundary.
-    const SIBLING_DIRECTORIES: usize = 1_022;
+    // The held-tree inventory includes the cache root, so 1,099 siblings make
+    // 1,100 directories.
+    const SIBLING_DIRECTORIES: usize = 1_099;
     const TOTAL_DIRECTORIES: usize = SIBLING_DIRECTORIES + 1;
     const CHILD_NOFILE_LIMIT: libc::rlim_t = 64;
 
@@ -141,7 +147,7 @@ fn production_sealed_staging_cli_clean_undo_and_direct_purge() {
     assert_eq!(
         count_directories(&cache),
         TOTAL_DIRECTORIES,
-        "fixture is not the exact root-inclusive production boundary"
+        "fixture does not have its 1,100 directories"
     );
     // A sealed purge refuses a staged tree whose regular files carry any extended
     // attribute, and this fixture is regular files on purpose -- the undo half reads
@@ -204,6 +210,20 @@ fn production_sealed_staging_cli_clean_undo_and_direct_purge() {
         }
         command.output().unwrap()
     };
+    let preview = |purge: bool| -> serde_json::Value {
+        let args: &[&str] = if purge {
+            &["clean", "-n", "--purge", "--json"]
+        } else {
+            &["clean", "-n", "--json"]
+        };
+        let output = run(args);
+        assert_output_success(&output);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let assessed = &report["staging_preflight"][0];
+        assert_eq!(assessed["status"], "tree_policy_assessed", "{report:#}");
+        report
+    };
+    preview(false);
 
     let clean = run(&["clean", "--yes", "--json"]);
     assert_output_success(&clean);
@@ -241,16 +261,17 @@ fn production_sealed_staging_cli_clean_undo_and_direct_purge() {
     assert_eq!(
         count_directories(&cache),
         TOTAL_DIRECTORIES,
-        "undo did not restore the complete 1,023-directory inventory"
+        "undo did not restore all 1,100 directories"
     );
     for index in 0..SIBLING_DIRECTORIES {
+        let directory = cache.join(format!("sibling-{index:04}"));
+        let mode = std::fs::metadata(&directory).unwrap().permissions().mode() & 0o7777;
         assert_eq!(
-            std::fs::read_to_string(
-                cache
-                    .join(format!("sibling-{index:04}"))
-                    .join("payload.bin")
-            )
-            .unwrap(),
+            mode, 0o755,
+            "undo did not restore the mode of sibling {index}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("payload.bin")).unwrap(),
             format!("bounded-fd-payload-{index:04}"),
             "undo did not restore regular payload {index}"
         );
@@ -273,6 +294,11 @@ fn production_sealed_staging_cli_clean_undo_and_direct_purge() {
     );
     assert_eq!(restore_record["trash_entry"], first_trash);
     assert_eq!(restore_record["reclamation_id"], first_reclamation);
+
+    let report = preview(true);
+    let needed = report["staging_preflight"][0]["wal_needed"].as_u64();
+    let available = report["wal_room"]["available"].as_u64();
+    assert!(needed > Some(0) && needed <= available, "{report:#}");
 
     let purge = run(&["clean", "--purge", "--yes", "--json"]);
     assert_output_success(&purge);

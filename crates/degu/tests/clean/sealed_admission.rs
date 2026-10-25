@@ -7,43 +7,12 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-const MAX_TREE_DIRECTORIES: usize = 1_023;
-
 #[test]
 fn clean_tree_preview_assessment_does_not_activate_or_create_lifecycle_state() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
     fixture.assert_preview_assessed();
-}
-
-#[test]
-fn preview_blocks_1024_tree_directories_before_any_production_mutation() {
-    let Some(fixture) = Fixture::new() else {
-        return;
-    };
-    // The inventory counts its root. Root + 1,023 children is 1,024 tree
-    // directories and would require 1,025 active recovery permissions once the
-    // source-parent seal is included. Reject it before any lifecycle mutation.
-    for index in 0..MAX_TREE_DIRECTORIES {
-        let dir = fixture.cache.join(format!("dir-{index:04}"));
-        std::fs::create_dir(&dir).unwrap();
-        // Group-writable trees are deliberately demoted by classification, so
-        // pin the fixture mode instead of inheriting the ambient umask.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    assert_eq!(count_directories(&fixture.cache), 1_024);
-    let report = fixture.assert_preview_blocked(
-        "directory_limit_exceeded",
-        "directory limit exceeded (observed 1024, limit 1023)",
-    );
-    // The size is a field of its own, so nothing has to parse it out of a reason.
-    let preflight = &report["staging_preflight"][0];
-    assert_eq!(preflight["limit"], 1_023, "{report:#}");
-    assert_eq!(preflight["observed"], 1_024, "{report:#}");
-    fixture.assert_production_rejects("directory limit exceeded (observed 1024, limit 1023)");
-    assert_eq!(count_directories(&fixture.cache), 1_024);
-    assert!(fixture.cache.join("wheel.whl").is_file());
 }
 
 /// A dry run says what room the seal WAL leaves and what each item's whole
@@ -1130,42 +1099,6 @@ impl Fixture {
             assert!(!self.anchor.join(name).exists(), "dry-run created {name}");
         }
     }
-
-    fn assert_production_rejects(&self, expected: &str) {
-        let first = self.run(&[
-            "clean",
-            "--yes",
-            "--json",
-            "--path",
-            self.cache.to_str().unwrap(),
-        ]);
-        assert_rejected(&first, expected);
-        assert!(self.cache.is_dir(), "rejected source was moved or deleted");
-        assert_activation_and_wal(&self.anchor, self.state.path());
-        let store = self.state.path().join("degu/sealed-staging");
-        let wal = store.join("seal.wal");
-        // Activation and the first CLI session's recovery may initialize or
-        // advance store bookkeeping. Establish the no-mutation baseline only
-        // after that recovery boundary; the next atomic preflight must not
-        // advance it.
-        let wal_len_before = std::fs::metadata(&wal).unwrap().len();
-        assert!(!self.state.path().join("degu/trash").exists());
-        assert!(!store.join(".claims").exists());
-
-        // A new CLI session must reach the same data-only admission decision
-        // without adding a transaction frame or creating staging destinations.
-        let second = self.run(&[
-            "clean",
-            "--yes",
-            "--json",
-            "--path",
-            self.cache.to_str().unwrap(),
-        ]);
-        assert_rejected(&second, expected);
-        assert!(self.cache.is_dir());
-        assert_eq!(std::fs::metadata(wal).unwrap().len(), wal_len_before);
-        assert!(!self.state.path().join("degu/trash").exists());
-    }
 }
 
 fn assert_rejected(output: &std::process::Output, expected: &str) {
@@ -1241,14 +1174,6 @@ fn read_ordinary_xattr(path: &Path) -> Vec<u8> {
     };
     assert_eq!(read, size, "failed to read ordinary xattr");
     value
-}
-
-fn count_directories(root: &Path) -> usize {
-    1 + std::fs::read_dir(root)
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .count()
 }
 
 /// A plan holding both a purgeable hardlink group and a retained

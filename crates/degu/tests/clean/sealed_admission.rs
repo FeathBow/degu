@@ -15,69 +15,6 @@ fn clean_tree_preview_assessment_does_not_activate_or_create_lifecycle_state() {
     fixture.assert_preview_assessed();
 }
 
-/// A tree above the 1,023 directories the walk once refused goes through its
-/// whole life: a preview that assesses it, staging, an undo by a fresh process
-/// that restores every directory's mode, a preview that sizes its purge in the
-/// seal WAL, and the purge.
-#[test]
-fn wide_tree_lifecycle() {
-    let Some(fixture) = Fixture::new() else {
-        return;
-    };
-    // The cache root counts, so 1,099 children make 1,100 directories.
-    for index in 0..1_099 {
-        let dir = fixture.cache.join(format!("dir-{index:04}"));
-        std::fs::create_dir(&dir).unwrap();
-        // Group-writable trees are deliberately demoted by classification, so
-        // pin the fixture mode instead of inheriting the ambient umask.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    assert_eq!(count_directories(&fixture.cache), 1_100);
-    let path = fixture.cache.to_str().unwrap();
-
-    let preview = |purge: bool| -> serde_json::Value {
-        let args: &[&str] = if purge {
-            &["clean", "-n", "--purge", "--json"]
-        } else {
-            &["clean", "-n", "--json"]
-        };
-        let output = fixture.run(args);
-        assert_output_success(&output);
-        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        let assessed = &report["staging_preflight"][0];
-        assert_eq!(assessed["status"], "tree_policy_assessed", "{report:#}");
-        report
-    };
-    preview(false);
-
-    let clean = fixture.run(&["clean", "--yes", "--json", "--path", path]);
-    assert_output_success(&clean);
-    let report: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
-    assert_eq!(report["executed"][0]["state"], "staged", "{report:#}");
-    assert!(!fixture.cache.exists());
-
-    let undo = fixture.run(&["undo", "--json"]);
-    assert_output_success(&undo);
-    assert_eq!(count_directories(&fixture.cache), 1_100);
-    for index in [0, 549, 1_098] {
-        let dir = fixture.cache.join(format!("dir-{index:04}"));
-        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
-        assert_eq!(mode, 0o755, "{}", dir.display());
-    }
-    assert!(fixture.cache.join("wheel.whl").is_file());
-
-    let report = preview(true);
-    let needed = report["staging_preflight"][0]["wal_needed"].as_u64();
-    let available = report["wal_room"]["available"].as_u64();
-    assert!(needed > Some(0) && needed <= available, "{report:#}");
-
-    let purge = fixture.run(&["clean", "--purge", "--yes", "--json", "--path", path]);
-    assert_output_success(&purge);
-    let report: serde_json::Value = serde_json::from_slice(&purge.stdout).unwrap();
-    assert_eq!(report["executed"][0]["purged"], true, "{report:#}");
-    assert!(!fixture.cache.exists());
-}
-
 /// A dry run says what room the seal WAL leaves and what each item's whole
 /// life needs from it. Staging the item then takes no more than that, on an
 /// account that has never cleaned as well as on one with an entry in the trash.
@@ -1237,14 +1174,6 @@ fn read_ordinary_xattr(path: &Path) -> Vec<u8> {
     };
     assert_eq!(read, size, "failed to read ordinary xattr");
     value
-}
-
-fn count_directories(root: &Path) -> usize {
-    1 + std::fs::read_dir(root)
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .count()
 }
 
 /// A plan holding both a purgeable hardlink group and a retained

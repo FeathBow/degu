@@ -2303,6 +2303,33 @@ impl Replay {
     }
 }
 
+/// Committed frame bytes per transaction, from a parse.
+fn frame_bytes(spans: &[FrameSpan]) -> BTreeMap<TransactionId, u64> {
+    spans.iter().fold(BTreeMap::new(), |mut totals, span| {
+        *totals.entry(span.transaction).or_default() += (span.end - span.start) as u64;
+        totals
+    })
+}
+
+/// What a lease's compaction takes back from a replay that drops `dropped`:
+/// their frames, if that pays for the rewrite, and otherwise nothing.
+///
+/// Decided from the parse the replay already did. Reading and parsing the WAL
+/// again to answer "is this worth a rewrite?" measured at about the cost of
+/// the open itself, and on a store that is merely holding a few dead frames
+/// the answer is no every single time.
+fn compaction_reclaim(replay: &Replay, dropped: &HashSet<TransactionId>) -> u64 {
+    let reclaimed = dropped
+        .iter()
+        .filter_map(|id| replay.frame_bytes.get(id))
+        .sum();
+    if compaction_is_worthwhile(reclaimed, replay.committed_len) {
+        reclaimed
+    } else {
+        0
+    }
+}
+
 /// What a compacted WAL would hold, decided from the bytes and their replay
 /// alone. Separated from reading the file so the thresholds and the frame
 /// selection can be exercised without a store on disk.
@@ -2594,14 +2621,7 @@ impl RecoverySession {
             return Err(ReplayError::TooLarge { limit: MAX_WAL_LEN });
         }
         let parsed = parse_frames(&bytes)?;
-        let frame_bytes =
-            parsed
-                .spans
-                .iter()
-                .fold(BTreeMap::<TransactionId, u64>::new(), |mut totals, span| {
-                    *totals.entry(span.transaction).or_default() += (span.end - span.start) as u64;
-                    totals
-                });
+        let frame_bytes = frame_bytes(&parsed.spans);
         let mut replay = replay_records(parsed.records, &bytes)?;
         replay.frame_bytes = frame_bytes;
         if parsed.committed_len < bytes.len() {
@@ -2625,23 +2645,7 @@ impl RecoverySession {
             return Ok(None);
         };
         let dropped = compaction_dropped_transactions(replay);
-        if dropped.is_empty() {
-            return Ok(None);
-        }
-        // Decided from the parse the replay already did. Reading and parsing
-        // the WAL again to answer "is this worth a rewrite?" measured at about
-        // the cost of the open itself, and on a store that is merely holding a
-        // few dead frames the answer is no every single time.
-        let measured = MeasuredFrames {
-            reclaimed: dropped
-                .iter()
-                .filter_map(|id| replay.frame_bytes.get(id))
-                .sum(),
-            committed: replay.committed_len,
-        };
-        if measured.reclaimed == 0
-            || !compaction_is_worthwhile(measured.reclaimed, measured.committed)
-        {
+        if compaction_reclaim(replay, &dropped) == 0 {
             return Ok(None);
         }
         let file = self.lock.as_file();

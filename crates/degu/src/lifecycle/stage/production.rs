@@ -28,7 +28,10 @@ use super::{CapturedCleanPlan, EntryIdentity};
 
 const TRANSACTION_ID_ATTEMPTS: usize = 128;
 const RESERVATION_ATTEMPTS: u64 = 10_000;
-const RESERVATION_WIDTH: usize = 4;
+pub(super) const RESERVATION_WIDTH: usize = 4;
+/// The most digits a reservation's sequence can have: it is zero-padded to
+/// `RESERVATION_WIDTH` and grows past it only as far as a `u64` goes.
+pub(super) const RESERVATION_DIGITS_BOUND: usize = u64::MAX.ilog10() as usize + 1;
 const CREATE_RESERVATION: OFlags = OFlags::WRONLY
     .union(OFlags::CREATE)
     .union(OFlags::EXCL)
@@ -965,6 +968,103 @@ mod tests {
             .unwrap()
             .strip_prefix(recovery_anchor)
             .expect("recovery anchor must confine the source parent");
+    }
+
+    /// What a preview sizes a staging by is what the staging then records, but
+    /// for the two lengths it can only bound: the reservation's sequence and the
+    /// reclamation id, each between the narrowest and the widest the preview
+    /// allows. In an empty trash the sequence is the usual four digits, the
+    /// narrowest; in one that already holds a sequence past four digits, the
+    /// next one is longer.
+    #[test]
+    fn preview_shape_bounds() {
+        for (prior, staged) in [(None, "0001-cache"), (Some("99999-cache"), "100000-cache")] {
+            let home = tempfile::tempdir().unwrap();
+            let state = home.path().join("state");
+            std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::create_dir(&state).unwrap();
+            std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let state = state.canonicalize().unwrap();
+            let source = home.path().canonicalize().unwrap().join("cache");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("source"), b"source").unwrap();
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let ctx = DetectCtx::for_test(
+                home.path().canonicalize().unwrap(),
+                [("XDG_STATE_HOME", state.as_os_str())],
+            );
+            let trash_root = ctx.xdg_state().join("degu/trash");
+            std::fs::create_dir_all(&trash_root).unwrap();
+            if let Some(prior) = prior {
+                std::fs::create_dir(trash_root.join(prior)).unwrap();
+            }
+            for path in [ctx.xdg_state().join("degu"), trash_root.clone()] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let finding = super::super::tests::finding_for_test(source.clone(), 4096, 2);
+            let identity = EntryIdentity::capture(&source).unwrap();
+            let shapes = super::super::feasibility::staging_shapes(&ctx, &finding).unwrap();
+
+            let store = degu_core::seal::store::SealWalStore::open_or_create_for_integration_test(
+                &ctx.xdg_state().join("degu/sealed-staging"),
+            )
+            .unwrap();
+            let (engine, startup) =
+                degu_core::staging::SealedStagingEngine::open_for_integration_test(&store).unwrap();
+            let (mut ready, _) = engine
+                .recover_startup(startup, |_, _| {
+                    Err(io::Error::other("empty recovery must not request anchors"))
+                })
+                .unwrap();
+            let mut run = ProductionRun {
+                ctx: &ctx,
+                log: OperationLog::new(&ctx),
+                reclamation_id: super::super::reclamation_id(),
+                recheck: &|_| Ok(()),
+                engine: &mut ready,
+                purge: false,
+            };
+            let outcome = execute(&mut run, &finding, &identity);
+            assert_eq!(outcome.execution.state_label(), "staged");
+            assert_eq!(
+                outcome.execution.trash_entry(),
+                Some(trash_root.join(staged).as_path())
+            );
+
+            let entries = run.engine.production_entries();
+            let entry = &entries[0];
+            let written = degu_core::seal::wal::StagingShape {
+                source_parent: entry.source_parent().relative_path().as_os_str().len(),
+                source_basename: entry.source_basename().len(),
+                destination_parent: entry.destination_parent().relative_path().as_os_str().len(),
+                destination_basename: entry.destination_basename().len(),
+                filesystem_id: entry.source_parent().filesystem_id().len(),
+                reclamation_id: Some(entry.reclamation_id().len()),
+                recovery_anchor: entry
+                    .recovery_anchor()
+                    .map(|anchor| anchor.as_os_str().len()),
+            };
+            for shape in [shapes.narrowest, shapes.widest] {
+                assert_eq!(
+                    shape,
+                    degu_core::seal::wal::StagingShape {
+                        destination_basename: shape.destination_basename,
+                        reclamation_id: shape.reclamation_id,
+                        ..written
+                    }
+                );
+            }
+            assert!(shapes.narrowest.destination_basename <= written.destination_basename);
+            assert!(shapes.widest.destination_basename >= written.destination_basename);
+            assert!(shapes.narrowest.reclamation_id <= written.reclamation_id);
+            assert!(shapes.widest.reclamation_id >= written.reclamation_id);
+            if prior.is_none() {
+                assert_eq!(
+                    shapes.narrowest.destination_basename,
+                    written.destination_basename
+                );
+            }
+        }
     }
 
     #[test]

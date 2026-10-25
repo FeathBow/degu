@@ -37,6 +37,9 @@ pub(super) struct PreparedClean {
     /// Present only for dry-run previews and indexed exactly like `plan.items()`.
     /// These are display/API facts, never execution inputs.
     pub(super) staging_preflight: Option<Box<[PreviewStagingAssessment]>>,
+    /// Present only for dry-run previews: the room the seal WAL leaves for new
+    /// staging, measured without a lease, or why it could not be.
+    pub(super) wal_room: Option<std::result::Result<degu_core::seal::wal::WalRoom, String>>,
     pub(super) exclusions: CleanExclusions,
     pub(super) scan_status: ScanStatus,
     /// Protected-cause regions the completeness gate consulted and skipped;
@@ -202,7 +205,7 @@ pub(super) fn prepare(args: CleanArgs, ui: Ui) -> Result<PreparedClean> {
         request.scope.include_review(),
     )?;
     let (planned, unrepresentable) = partition_representable(planned);
-    let staging_preflight = request.settings.dry_run.then(|| {
+    let mut staging_preflight = request.settings.dry_run.then(|| {
         planned
             .iter()
             .map(|finding| {
@@ -215,6 +218,18 @@ pub(super) fn prepare(args: CleanArgs, ui: Ui) -> Result<PreparedClean> {
             .collect::<Vec<_>>()
             .into_boxed_slice()
     });
+    let wal_room = request
+        .settings
+        .dry_run
+        .then(|| degu_core::activation::current_euid_wal_room().map_err(|error| error.to_string()));
+    if let (Some(assessments), Some(Ok(room))) = (staging_preflight.as_deref_mut(), &wal_room) {
+        super::preview::apply_wal_room(
+            assessments,
+            &planned,
+            |finding| crate::lifecycle::feasibility::staging_shapes(&ctx, finding).ok(),
+            *room,
+        );
+    }
     let plan = capture_clean_plan(
         planned,
         &exclusions,
@@ -241,6 +256,7 @@ pub(super) fn prepare(args: CleanArgs, ui: Ui) -> Result<PreparedClean> {
         config,
         plan,
         staging_preflight,
+        wal_room,
         exclusions,
         scan_status,
         protected_regions_excluded,

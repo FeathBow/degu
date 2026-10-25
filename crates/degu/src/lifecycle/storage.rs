@@ -75,7 +75,7 @@ pub(crate) fn resolve_trash_dir(
             ctx.xdg_state().display()
         )
     })?;
-    resolve_trash_dir_with_state(ctx, path, &state_dir)
+    resolve_trash_dir_with_state(ctx, path, &state_dir, existing_directory)
 }
 
 /// Read-only trash routing for sealed admission after mutation-session
@@ -84,25 +84,73 @@ pub(crate) fn resolve_existing_trash_dir(
     ctx: &DetectCtx,
     path: &Path,
 ) -> std::result::Result<PathBuf, String> {
-    resolve_trash_dir_with_state(ctx, path, &ctx.xdg_state())
+    resolve_trash_dir_with_state(ctx, path, &ctx.xdg_state(), existing_directory)
+}
+
+/// The trash a clean would route `path` to, for a preview on an account whose
+/// state directory a clean has yet to create. See [`prospective_directory`].
+pub(crate) fn prospective_trash_dir(
+    ctx: &DetectCtx,
+    path: &Path,
+) -> std::result::Result<PathBuf, String> {
+    resolve_trash_dir_with_state(ctx, path, &ctx.xdg_state(), prospective_directory)
+}
+
+/// A directory's canonical path and the mount it is on. The caller says which
+/// directory failed to resolve; the error says why.
+pub(crate) type DirectoryResolution = fn(&Path) -> std::result::Result<(PathBuf, u64), String>;
+
+/// [`DirectoryResolution`] for a directory that has to exist.
+pub(crate) fn existing_directory(path: &Path) -> std::result::Result<(PathBuf, u64), String> {
+    let canonical = std::fs::canonicalize(path).map_err(|err| err.to_string())?;
+    let mount = path_mount_id(&canonical)?;
+    Ok((canonical, mount))
+}
+
+/// [`DirectoryResolution`] for a directory that may not exist yet: where it
+/// resolves once made, and the mount it will be on. That is its nearest
+/// existing ancestor, canonical, with the missing names appended, and that
+/// ancestor's mount, which is what creating the missing directories produces
+/// unless something is put in their way first. A name that is not a plain
+/// component is refused rather than resolved.
+pub(crate) fn prospective_directory(path: &Path) -> std::result::Result<(PathBuf, u64), String> {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(mut canonical) => {
+                let mount = path_mount_id(&canonical)?;
+                canonical.extend(missing.iter().rev());
+                return Ok((canonical, mount));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+                    return Err(err.to_string());
+                };
+                missing.push(name);
+                existing = parent;
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    }
 }
 
 fn resolve_trash_dir_with_state(
     ctx: &DetectCtx,
     path: &Path,
     state_dir: &Path,
+    resolve: DirectoryResolution,
 ) -> std::result::Result<PathBuf, String> {
     let canonical = std::fs::canonicalize(path)
         .map_err(|err| format!("failed to canonicalize {}: {err}", path.display()))?;
     let source_mount = path_mount_id(&canonical)?;
     let mount_owner_anchor = resolve_mount_owner_anchor(&canonical, source_mount)?;
-    let state_dir = std::fs::canonicalize(state_dir).map_err(|err| {
+    let (state_dir, state_mount) = resolve(state_dir).map_err(|err| {
         format!(
             "failed to canonicalize existing state dir {}: {err}",
             state_dir.display()
         )
     })?;
-    let state_mount = path_mount_id(&state_dir)?;
 
     if source_mount == state_mount && state_dir.starts_with(&mount_owner_anchor) {
         return Ok(trash_dir_state(ctx));

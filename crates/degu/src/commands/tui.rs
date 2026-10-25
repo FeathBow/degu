@@ -21,6 +21,7 @@ impl Review {
         let args = crate::cli::ScanArgs::from(args);
         let collected = crate::commands::scan::collect_for_review(args, ui)?;
         let ctx = collected.ctx;
+        let refusal_ctx = ctx.clone();
         // One read-only pass over the trash. Each row already carries whether
         // a confirmed clean would expire it, so asking the expiry planner as
         // well would re-read the operation log and capture execution-grade
@@ -45,8 +46,10 @@ impl Review {
                 // advisor above: each assessment walks a tree's metadata. The review
                 // asks it only of the findings that would start in the plan, which are
                 // the cheap-to-regenerate caches, because those are what `c` acts on
-                // with no further word from the reader.
-                crate::commands::clean::staging_refusal,
+                // with no further word from the reader. The seal WAL's room is read
+                // once for all of them, without its lease.
+                degu_core::activation::current_euid_wal_room().ok(),
+                crate::commands::clean::plan_assessment(refusal_ctx),
             ),
             filters: collected.filters,
             limits,

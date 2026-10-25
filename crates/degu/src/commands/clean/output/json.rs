@@ -40,6 +40,18 @@ pub(crate) fn print(
                 .map(|assessment| assessment.json())
                 .collect(),
         );
+        if let Some(room) = &prepared.wal_room {
+            report["wal_room"] = match room {
+                Ok(room) => serde_json::json!({
+                    "limit": room.limit,
+                    "committed": room.committed,
+                    "reserved": room.reserved,
+                    "available": room.available(),
+                    "reclaimable": room.reclaimable,
+                }),
+                Err(reason) => serde_json::json!({ "unavailable": reason }),
+            };
+        }
     }
     stdoutln!("{}", serde_json::to_string_pretty(&report)?)
 }

@@ -3048,7 +3048,6 @@ fn v3_decoder_ancestor_stack_preserves_component_ordered_parents() {
         }
         assert!(decoder.directory_ancestor_ends.len() <= entry.path.as_os_str().len() + 1);
     }
-    assert_eq!(decoder.decoded_directories, 6);
     assert_eq!(decoder.finish().unwrap().sha256, expected.sha256);
 
     let raw_order = [
@@ -3081,7 +3080,6 @@ fn v3_decoder_ancestor_stack_memory_is_independent_of_sibling_directory_count() 
         decoder.push_segment(1, &encoded_v3_record(&entry)).unwrap();
         assert_eq!(decoder.directory_ancestor_ends.len(), 2);
     }
-    assert_eq!(decoder.decoded_directories, siblings + 1);
     assert_eq!(decoder.finish().unwrap().entry_count, siblings + 1);
 }
 

@@ -6406,7 +6406,6 @@ pub(crate) struct ManifestV3Decoder {
     path_bytes: u64,
     manifest_bytes: u64,
     xattr_bytes: u64,
-    decoded_directories: u64,
     directory_ancestor_ends: Vec<usize>,
     previous_path: Option<Vec<u8>>,
     digest: Sha256,
@@ -6437,7 +6436,6 @@ impl ManifestV3Decoder {
             path_bytes: 0,
             manifest_bytes: 0,
             xattr_bytes: 0,
-            decoded_directories: 0,
             directory_ancestor_ends: Vec::new(),
             previous_path: None,
             digest,
@@ -6646,10 +6644,6 @@ impl ManifestV3Decoder {
             return Err(ManifestV3CodecError::Limit(HeldTreeLimit::ManifestBytes));
         }
         if kind == ManifestV3RecordKind::Directory {
-            self.decoded_directories = self
-                .decoded_directories
-                .checked_add(1)
-                .ok_or(ManifestV3CodecError::LengthOverflow)?;
             debug_assert!(
                 self.directory_ancestor_ends
                     .last()

@@ -21,8 +21,7 @@ use crate::seal::executor::{
 };
 use crate::seal::sidecar::AuthenticatedTreeManifest;
 use crate::seal::wal::{
-    DurableTreeManifest, DurableWrite, RECOVERY_MAX_ACTIVE_PERMISSIONS, SealWal,
-    StrongObjectIdentity, TransactionId,
+    DurableTreeManifest, DurableWrite, SealWal, StrongObjectIdentity, TransactionId,
 };
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use sha2::{Digest, Sha256};
@@ -37,11 +36,11 @@ const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
-/// Recovery may retain this many active permission operations internally.
-/// Tree requests must reserve one operation for the source-parent seal, so the
-/// root-inclusive request ceiling is one lower for every schema and traversal.
-const HARD_DIRECTORY_CAP: u64 = RECOVERY_MAX_ACTIVE_PERMISSIONS as u64;
-pub(crate) const MAX_TREE_DIRECTORIES: u64 = HARD_DIRECTORY_CAP - 1;
+/// The most directories a walk admits, the root included. It was recovery's
+/// operation limit less the source parent's seal. Recovery has no such limit
+/// now, and a tree's directories are among its entries, which `max_entries`
+/// already bounds; this stands only until the walk is held to that alone.
+pub(crate) const MAX_TREE_DIRECTORIES: u64 = 1_023;
 const MANIFEST_DOMAIN_V1: &[u8] = b"degu-held-tree-manifest-v1\0";
 const MANIFEST_DOMAIN_V2: &[u8] = b"degu-held-tree-manifest-v2-content\0";
 const MANIFEST_DOMAIN_V3: &[u8] = b"degu-held-tree-manifest-v3-content-xattr\0";

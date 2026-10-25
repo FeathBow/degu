@@ -109,10 +109,6 @@ impl SealCoverage {
 /// these from one implementation rather than two.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PermissionWorkload {
-    /// Durable permission intents this transaction admitted.
-    pub recorded: u64,
-    /// Intents whose application the WAL has resolved neither way.
-    pub unresolved: u64,
     /// Applied seals no applied inverse has reversed: what startup recovery
     /// would still have to undo.
     pub active_seals: u64,
@@ -266,8 +262,6 @@ impl PermissionLedger {
 
     pub(super) fn workload(&self) -> PermissionWorkload {
         PermissionWorkload {
-            recorded: self.recorded,
-            unresolved: self.recorded.saturating_sub(self.resolved),
             active_seals: self.coverage.active_seals(),
             deepest_path_components: self.deepest_path_components,
             longest_path_bytes: self.longest_path_bytes,

@@ -213,14 +213,9 @@ fn set_symlink_test_xattr(path: &Path) -> io::Result<()> {
 }
 
 #[test]
-fn production_directory_budget_fits_the_recovery_permission_envelope() {
+fn default_tree_limits() {
     let limits = HeldTreeLimits::default();
     assert_eq!(limits.max_directories, MAX_TREE_DIRECTORIES);
-    assert_eq!(MAX_TREE_DIRECTORIES + 1, HARD_DIRECTORY_CAP);
-    assert_eq!(
-        HARD_DIRECTORY_CAP,
-        crate::seal::wal::RECOVERY_MAX_ACTIVE_PERMISSIONS as u64
-    );
     assert_eq!(limits.max_entries, 100_000);
     assert_eq!(limits.max_depth, 128);
     assert_eq!(limits.max_path_bytes, 16 * 1024 * 1024);
@@ -233,7 +228,7 @@ fn production_directory_budget_fits_the_recovery_permission_envelope() {
 fn every_traversal_rejects_an_explicit_1024_directory_request() {
     let (temp, _) = setup_tree();
     let limits = HeldTreeLimits {
-        max_directories: HARD_DIRECTORY_CAP,
+        max_directories: MAX_TREE_DIRECTORIES + 1,
         ..HeldTreeLimits::default()
     };
     let v2 = collect(&temp, vec![], limits).unwrap_err();
@@ -290,8 +285,8 @@ fn production_boundary_accepts_1023_total_directories_and_rejects_1024() {
         assess(&temp, vec![], HeldTreeLimits::default()).unwrap_err(),
         HeldTreeError::DirectoryCount {
             limit: MAX_TREE_DIRECTORIES,
-            observed: HARD_DIRECTORY_CAP,
-        }
+            observed,
+        } if observed == MAX_TREE_DIRECTORIES + 1
     ));
 }
 
@@ -847,7 +842,7 @@ fn syntactic_root_policy_and_tree_request_cap_errors_precede_tree_policy_deferra
             OsStr::new("root"),
             vec![],
             HeldTreeLimits {
-                max_directories: HARD_DIRECTORY_CAP,
+                max_directories: MAX_TREE_DIRECTORIES + 1,
                 ..HeldTreeLimits::default()
             },
         ),

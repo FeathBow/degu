@@ -2403,6 +2403,27 @@ fn assert_shape_projects(real: &StagingTransactionMetadata) {
     );
 }
 
+/// [`SealWal::permission_records`] bounds its list by the WAL because a record
+/// holds no more than 1.6 times what its intent frame carries besides the path
+/// and filesystem id the two share. The smallest frame has a one-byte path and
+/// no filesystem id, generation or original.
+#[test]
+fn frames_bound_records() {
+    let intent = SealRecord::PermissionIntent {
+        transaction: tx(1),
+        mutation_id: 0,
+        evidence: PersistentRecoveryEvidence::new(PathBuf::from("a"), None, 1, 2, None, 0o500)
+            .unwrap(),
+        pre_mode: 0o700,
+        expected_mode: 0o500,
+        reverses_mutation_id: None,
+    };
+    let frame_overhead = frame(&intent).len() - 1;
+    let record_overhead = std::mem::size_of::<DurablePermission>();
+    assert_eq!((record_overhead, frame_overhead), (128, 80));
+    assert!(record_overhead * 5 <= frame_overhead * 8);
+}
+
 /// The mount domain can be `/` itself, an anchor one byte long.
 #[test]
 fn root_anchor_shape() {

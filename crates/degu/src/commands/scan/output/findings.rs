@@ -100,7 +100,7 @@ fn print_headline(report: &ScanReport) -> Result<()> {
     stdoutln!("{}", report.ui.headline(headline))
 }
 
-/// The headline with its " in <elapsed>" suffix while it fits the terminal
+/// The headline with its `" in <elapsed>"` suffix while it fits the terminal
 /// width; the duration is the most disposable field, so it is dropped
 /// before the label would wrap mid-phrase (the field-dropping strategy of
 /// the scan progress line). Piped output never carries the duration.

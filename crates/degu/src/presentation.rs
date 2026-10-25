@@ -154,7 +154,7 @@ pub(crate) enum Severity {
     Error,
 }
 
-/// One lowercase rustc-style "<severity>: <text>" note on stderr; a
+/// One lowercase rustc-style `"<severity>: <text>"` note on stderr; a
 /// multi-line text keeps its line structure, with every continuation line
 /// indented under the first. The crossterm color switch is process-global
 /// and normally holds the stdout policy, so it is flipped to the stderr
@@ -173,7 +173,7 @@ pub(crate) fn print_stderr_note(severity: Severity, text: &str, colors: OutputCo
     crossterm::style::force_color_output(colors.stdout);
 }
 
-/// Continuation lines sit under the note text, past the "<severity>: "
+/// Continuation lines sit under the note text, past the `"<severity>: "`
 /// prefix, so a multi-line sub-error reads as one indented block.
 fn indent_continuation_lines(text: &str, indent: usize) -> String {
     let margin = " ".repeat(indent);

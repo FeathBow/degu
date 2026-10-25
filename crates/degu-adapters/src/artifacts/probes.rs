@@ -92,7 +92,7 @@ fn named_artifact(path: &Path, name: &str, ctx: &DetectCtx) -> Probe {
 }
 
 /// Clean authority requires ALL of: a sibling manifest parsing as a real
-/// Cargo [package]/[workspace], a cargo-written build marker, AND a
+/// Cargo `[package]`/`[workspace]`, a cargo-written build marker, AND a
 /// signature-verified root CACHEDIR.TAG. A generic tag proves "cache
 /// storage", never "regenerable cargo output", so it grants nothing alone.
 /// Manifest+marker without the root tag is CLAIMED report-only, without
@@ -148,7 +148,7 @@ fn cargo_target_root(path: &Path, ctx: &DetectCtx) -> Probe {
 /// bounding the allocation; an over-cap manifest is indeterminate, not a match.
 const CARGO_MANIFEST_READ_CAP: usize = 1024 * 1024;
 
-/// Matches only valid TOML declaring [package] or [workspace]: an empty file
+/// Matches only valid TOML declaring `[package]` or `[workspace]`: an empty file
 /// parses as valid TOML, so bare parsing is insufficient. Non-regular,
 /// unparseable, or over-cap reads never match.
 fn cargo_manifest_probe(path: &Path, ctx: &DetectCtx) -> Probe {

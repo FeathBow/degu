@@ -114,7 +114,7 @@ pub(super) fn self_anchor_path_for_uid(
 /// held in LDAP, SSSD, or winbind reads as absent. That is not "no such user",
 /// and the two are indistinguishable at the libc call — musl reports a missing
 /// entry with a success status and a null result, never an errno. So a miss
-/// falls through to [`delegated_home_dir`], which puts the same question to the
+/// falls through to `delegated_home_dir`, which puts the same question to the
 /// host's own resolver in a separate process.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn passwd_home_dir(uid: libc::uid_t) -> Result<Option<PathBuf>, AccountBaseError> {

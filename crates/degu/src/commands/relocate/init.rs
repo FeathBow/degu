@@ -156,13 +156,13 @@ fn validate_subdirs(target: &Path, subdirs: &[PathBuf]) -> Result<Vec<(PathBuf, 
 ///
 /// Every directory the resolution touches — each lexical ancestor and each
 /// directory a followed symlink resolves through — must grant no foreign mutation
-/// authority (see [`require_trusted_namespace`]), so no foreign principal can
-/// rename a component or re-point a symlink to redirect the target after the
-/// fact. A symlink is followed only when it lives in such a namespace and is
-/// itself owned by the effective user or root, and its target chain is validated
-/// the same way. This admits root-managed system links (`/var`, `/tmp`) and
-/// admin- or user-managed scratch links while refusing anything reachable
-/// through a group-writable, non-sticky namespace.
+/// authority (see [`degu_walk::resolve_trusted_directory`]), so no foreign
+/// principal can rename a component or re-point a symlink to redirect the target
+/// after the fact. A symlink is followed only when it lives in such a namespace
+/// and is itself owned by the effective user or root, and its target chain is
+/// validated the same way. This admits root-managed system links (`/var`,
+/// `/tmp`) and admin- or user-managed scratch links while refusing anything
+/// reachable through a group-writable, non-sticky namespace.
 fn open_trusted_parent(target: &Path) -> Result<(OwnedFd, PathBuf, OsString)> {
     let name = target.file_name().ok_or_else(|| {
         anyhow::anyhow!(

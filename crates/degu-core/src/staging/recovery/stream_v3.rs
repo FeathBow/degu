@@ -61,36 +61,55 @@ fn destination_root(metadata: &StagingTransactionMetadata) -> PathBuf {
         .join(metadata.destination_basename())
 }
 
-/// Returns (freshly required current mode, sealed manifest mode) for exactly one
-/// durable tree-seal plan. A scan avoids creating another tree-sized index; WAL
-/// admission already bounds the descriptor-free plan vector.
-fn directory_modes(
-    plans: &[RecoveryPermissionPlan],
-    destination_root: &Path,
-    path: &Path,
-    modes_restored: bool,
-) -> Result<(u32, u32), RecoveryRebindError> {
-    let mut matched = None;
-    for plan in plans {
-        let suffix = plan
-            .relative_path
-            .strip_prefix(destination_root)
-            .map_err(|_| RecoveryRebindError::InvalidLocator)?;
-        if suffix != path {
-            continue;
+/// (freshly required current mode, sealed manifest mode) for each durable
+/// tree-seal plan, indexed by its path under the destination root. Each pass
+/// over the manifest asks once per directory, and scanning every plan for each
+/// made every pass quadratic in the number of sealed directories.
+struct DirectoryModes<'a> {
+    // `None` marks a path more than one plan names, which no query may match.
+    by_path: BTreeMap<&'a Path, Option<(u32, u32)>>,
+    // A plan outside the destination root fails every query, as the scan did.
+    misplaced: bool,
+}
+
+impl<'a> DirectoryModes<'a> {
+    fn new(
+        plans: &'a [RecoveryPermissionPlan],
+        destination_root: &Path,
+        modes_restored: bool,
+    ) -> Self {
+        let mut by_path = BTreeMap::new();
+        let mut misplaced = false;
+        for plan in plans {
+            let Ok(suffix) = plan.relative_path.strip_prefix(destination_root) else {
+                misplaced = true;
+                continue;
+            };
+            let sealed = plan.permission.expected_mode;
+            let current = if modes_restored {
+                plan.permission.pre_mode
+            } else {
+                sealed
+            };
+            by_path
+                .entry(suffix)
+                .and_modify(|modes| *modes = None)
+                .or_insert(Some((current, sealed)));
         }
-        if matched.is_some() {
-            return Err(RecoveryRebindError::UndoManifestChanged);
-        }
-        let sealed = plan.permission.expected_mode;
-        let current = if modes_restored {
-            plan.permission.pre_mode
-        } else {
-            sealed
-        };
-        matched = Some((current, sealed));
+        Self { by_path, misplaced }
     }
-    matched.ok_or(RecoveryRebindError::UndoManifestChanged)
+
+    /// Returns the modes of exactly one durable tree-seal plan.
+    fn get(&self, path: &Path) -> Result<(u32, u32), RecoveryRebindError> {
+        if self.misplaced {
+            return Err(RecoveryRebindError::InvalidLocator);
+        }
+        self.by_path
+            .get(path)
+            .copied()
+            .flatten()
+            .ok_or(RecoveryRebindError::UndoManifestChanged)
+    }
 }
 
 /// Rewrites only the directory mode field of one internally generated canonical
@@ -98,9 +117,7 @@ fn directory_modes(
 /// checked before normalization, so recovery cannot hide unexpected mode drift.
 fn normalize_collected_record(
     record: &[u8],
-    plans: &[RecoveryPermissionPlan],
-    destination_root: &Path,
-    modes_restored: bool,
+    modes: &DirectoryModes<'_>,
     normalized: &mut Vec<u8>,
     observed_directories: &mut u64,
 ) -> Result<(), RecoveryRebindError> {
@@ -141,8 +158,7 @@ fn normalize_collected_record(
                 .get(8..kind_offset)
                 .ok_or(RecoveryRebindError::UndoManifestChanged)?,
         ));
-        let (current_mode, sealed_mode) =
-            directory_modes(plans, destination_root, path, modes_restored)?;
+        let (current_mode, sealed_mode) = modes.get(path)?;
         if actual_mode != current_mode {
             return Err(RecoveryRebindError::UndoManifestChanged);
         }
@@ -268,6 +284,7 @@ pub(super) fn verify_rebound_v3(
         ));
     };
     let destination_root = destination_root(metadata);
+    let modes = DirectoryModes::new(plans, &destination_root, modes_restored);
     let produced =
         sidecars.build_sorted_manifest_scratch_with_output(wal, transaction, |emit_record| {
             let parent = rustix::io::dup(parent)
@@ -285,9 +302,7 @@ pub(super) fn verify_rebound_v3(
                 |record| {
                     normalize_collected_record(
                         record,
-                        plans,
-                        &destination_root,
-                        modes_restored,
+                        &modes,
                         &mut normalized,
                         &mut observed_directories,
                     )
@@ -397,7 +412,8 @@ pub(super) fn verify_rebound_v3(
                     let observed_mode = if record.kind == ManifestV3RecordKind::Directory {
                         let path = Path::new(OsStr::from_bytes(record.path));
                         Some(
-                            directory_modes(plans, &destination_root, path, modes_restored)
+                            modes
+                                .get(path)
                                 .map_err(|_| {
                                     HeldTreeV3CollectError::Tree(HeldTreeError::PostChanged(
                                         path.to_path_buf(),
@@ -485,9 +501,7 @@ pub(super) fn verify_rebound_v3(
         commitment,
         expected_manifest,
         &tree,
-        plans,
-        &destination_root,
-        modes_restored,
+        &modes,
     ) {
         return Err(authenticate_then_cleanup(
             wal,
@@ -603,9 +617,7 @@ impl StructureComparison {
         &mut self,
         cursor: &mut TreeStructureScratchCursor,
         expected: ManifestV3Record<'_>,
-        plans: &[RecoveryPermissionPlan],
-        destination_root: &Path,
-        modes_restored: bool,
+        modes: &DirectoryModes<'_>,
     ) {
         let mut expected = structure_evidence_from_v3_record(expected);
         loop {
@@ -641,12 +653,7 @@ impl StructureComparison {
                     // same-path kind swap. A kind mismatch stays a deterministic
                     // `PostChanged` through the inequality check below.
                     if expected.is_directory() && actual.is_directory() {
-                        match directory_modes(
-                            plans,
-                            destination_root,
-                            expected.path(),
-                            modes_restored,
-                        ) {
+                        match modes.get(expected.path()) {
                             Ok((current, sealed)) if actual.mode() == current => {
                                 actual.normalize_directory_mode(sealed);
                                 expected.normalize_directory_mode(sealed);
@@ -667,7 +674,6 @@ impl StructureComparison {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn rewalk_structure(
     wal: &mut SealWal<RecoverySession>,
     sidecars: &TreeSidecarStore,
@@ -675,9 +681,7 @@ fn rewalk_structure(
     commitment: TreeSidecarCommitment,
     manifest: DurableTreeManifest,
     tree: &StreamedV3Inventory,
-    plans: &[RecoveryPermissionPlan],
-    destination_root: &Path,
-    modes_restored: bool,
+    modes: &DirectoryModes<'_>,
 ) -> Result<(), RecoveryRebindError> {
     if let Err(error) = sidecars.verify(commitment) {
         let _ = sidecars.cleanup_unpublished(wal);
@@ -719,13 +723,7 @@ fn rewalk_structure(
     };
     let sidecar_result =
         sidecars.read_manifest_v3_fold(commitment, manifest, (), |(), expected| {
-            comparison.observe(
-                &mut cursor,
-                expected,
-                plans,
-                destination_root,
-                modes_restored,
-            );
+            comparison.observe(&mut cursor, expected, modes);
             Ok::<(), Infallible>(())
         });
     if let Err(error) = sidecar_result {
@@ -780,3 +778,6 @@ fn rewalk_structure(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

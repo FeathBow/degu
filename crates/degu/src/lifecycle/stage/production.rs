@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -142,6 +142,7 @@ fn preflight_tree_policy(
         ProbeFailure::Certification(error) => {
             format!("sealed staging source-parent certification failed: {error:?}")
         }
+        ProbeFailure::NameTooLong => super::feasibility::NAME_TOO_LONG.to_owned(),
         ProbeFailure::Assessment(error) => error.to_string(),
     })
 }
@@ -152,6 +153,20 @@ struct HeldReservation {
     claims: OwnedFd,
     claim_basename: OsString,
     claim_identity: ObjectIdentity,
+}
+
+/// The claim a reservation of `sequence` takes in `.claims`.
+pub(super) fn claim_name(sequence: u64) -> OsString {
+    OsString::from(format!("{sequence:0width$}", width = RESERVATION_WIDTH))
+}
+
+/// The name a reservation gives the source in the trash: its claim, a dash,
+/// and the source's own name.
+pub(super) fn destination_name(claim: &OsStr, source: &OsStr) -> OsString {
+    let mut name = claim.to_os_string();
+    name.push("-");
+    name.push(source);
+    name
 }
 
 impl HeldReservation {
@@ -168,11 +183,8 @@ impl HeldReservation {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source has no basename"))?;
         let mut sequence = next_sequence(&destination_parent)?;
         for _ in 0..RESERVATION_ATTEMPTS {
-            let claim_basename =
-                OsString::from(format!("{sequence:0width$}", width = RESERVATION_WIDTH));
-            let mut destination_basename = claim_basename.clone();
-            destination_basename.push("-");
-            destination_basename.push(source_name);
+            let claim_basename = claim_name(sequence);
+            let destination_basename = destination_name(&claim_basename, source_name);
             match rustix::fs::statat(
                 &destination_parent,
                 &destination_basename,

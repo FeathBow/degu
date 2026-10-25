@@ -21,7 +21,8 @@ use degu_core::backend::{
     CertificationError, HeldTreeAssessmentFailure, HeldTreePolicyAssessmentOutcome,
     assess_held_tree_policy_metadata, certify_held_fd,
 };
-use rustix::fs::{Mode, OFlags};
+use rustix::fd::OwnedFd;
+use rustix::fs::{AtFlags, Mode, OFlags};
 
 /// How degu opens a directory it intends to hold.
 ///
@@ -35,15 +36,21 @@ pub(crate) const OPEN_DIRECTORY: OFlags = OFlags::RDONLY
 
 /// Why the probe could not answer.
 ///
-/// Three kinds, because the readers separate them: a parent that could not be
+/// Four kinds, because the readers separate them: a parent that could not be
 /// held is a race or an I/O fault, a certification refusal names a backend the
-/// staging path will not use, and an assessment failure carries the tree policy
-/// that withheld the answer.
+/// staging path will not use, a name the trash cannot hold is refused whatever
+/// the tree holds, and an assessment failure carries the tree policy that
+/// withheld the answer.
 pub(crate) enum ProbeFailure {
     ParentUnavailable(rustix::io::Errno),
     Certification(CertificationError),
+    NameTooLong,
     Assessment(HeldTreeAssessmentFailure),
 }
+
+/// Why a source the trash cannot hold under its name is refused.
+pub(crate) const NAME_TOO_LONG: &str =
+    "the source's name is too long for the trash once a reservation's sequence is put before it";
 
 /// Look at one already-canonical parent and the basename beneath it.
 ///
@@ -56,8 +63,27 @@ pub(crate) fn probe(
 ) -> Result<HeldTreePolicyAssessmentOutcome, ProbeFailure> {
     let source_parent = rustix::fs::open(canonical_parent, OPEN_DIRECTORY, Mode::empty())
         .map_err(ProbeFailure::ParentUnavailable)?;
+    let name_fits = trash_holds(&source_parent, basename);
     let evidence = certify_held_fd(source_parent).map_err(ProbeFailure::Certification)?;
+    if !name_fits {
+        return Err(ProbeFailure::NameTooLong);
+    }
     assess_held_tree_policy_metadata(evidence, basename).map_err(ProbeFailure::Assessment)
+}
+
+/// Whether the trash can hold `basename` under the shortest name a reservation
+/// gives it, the first sequence's.
+///
+/// The trash is on the source's mount, so the source parent can answer, and
+/// the reservation's own first step, a no-follow lookup of that name, is how.
+/// The filesystem refuses a name it could never hold by its own measure, which
+/// on APFS is not a byte count. Any other answer is left to the reservation.
+fn trash_holds(source_parent: &OwnedFd, basename: &OsStr) -> bool {
+    let name = super::production::destination_name(&super::production::claim_name(1), basename);
+    !matches!(
+        rustix::fs::statat(source_parent, &name, AtFlags::SYMLINK_NOFOLLOW),
+        Err(rustix::io::Errno::NAMETOOLONG)
+    )
 }
 
 /// The narrowest and the widest shape a staging of one finding can take.
@@ -162,5 +188,24 @@ mod tests {
             !matches!(direct, Err(ProbeFailure::ParentUnavailable(_))),
             "the real parent could not be held either"
         );
+    }
+
+    /// The filesystem measures a name, not this probe. APFS does not count
+    /// bytes, so 250 three-byte characters fit behind a sequence that 251 do
+    /// not, though both are far past 255 bytes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apfs_measures_names() {
+        let root = tempfile::tempdir().expect("a directory");
+        let parent = root.path().canonicalize().expect("a canonical parent");
+        for (count, fits) in [(250, true), (251, false)] {
+            let name = "\u{4e2d}".repeat(count);
+            std::fs::create_dir(parent.join(&name)).expect("a source APFS holds");
+            let refused = matches!(
+                probe(&parent, OsStr::new(&name)),
+                Err(ProbeFailure::NameTooLong)
+            );
+            assert_eq!(refused, !fits, "{count} characters");
+        }
     }
 }

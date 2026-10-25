@@ -898,6 +898,87 @@ fn explicit_path_batch_rejects_before_any_item_mutates() {
     assert!(external_peer.is_file());
 }
 
+/// A reservation names a trash entry by its sequence, at least four digits, a
+/// dash and the source's own name. A source the trash cannot hold under that
+/// name is blocked in the preview and refused before a clean prepares any
+/// trash, alone or in an explicit batch. One byte shorter, it is staged.
+#[test]
+fn trash_name_limit() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let trash = fixture.state.path().join("degu/trash");
+    for (length, fits) in [(251, false), (250, true)] {
+        let cache = fixture
+            .home
+            .path()
+            .join("relocated")
+            .join("p".repeat(length));
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(
+            cache.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        std::fs::write(cache.join("wheel.whl"), [0u8; 2048]).unwrap();
+        strip_extended_attributes(fixture.home.path()).unwrap();
+        crate::common::make_tree_non_shared_writable(fixture.home.path()).unwrap();
+        let run = |args: &[&str]| -> serde_json::Value {
+            let output = fixture
+                .command(args)
+                .env("PIP_CACHE_DIR", &cache)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.success(), fits || args.contains(&"-n"));
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+                panic!("{}", String::from_utf8_lossy(&output.stderr));
+            })
+        };
+
+        let preview = run(&["clean", "-n", "--json"]);
+        let preflight = &preview["staging_preflight"][0];
+        assert_eq!(
+            preview["planned"].as_array().unwrap().len(),
+            1,
+            "{preview:#}"
+        );
+        if fits {
+            assert_eq!(preflight["status"], "tree_policy_assessed", "{preview:#}");
+            let staged = run(&["clean", "--yes", "--json"]);
+            assert_eq!(staged["executed"][0]["state"], "staged", "{staged:#}");
+            assert!(trash.join(format!("0001-{}", "p".repeat(length))).is_dir());
+            assert!(!cache.exists());
+            continue;
+        }
+        assert_eq!(preflight["status"], "blocked", "{preview:#}");
+        assert_eq!(preflight["kind"], "trash_name_too_long", "{preview:#}");
+        assert_eq!(preflight["category"], "resource_limit", "{preview:#}");
+        for args in [
+            &["clean", "--yes", "--json"][..],
+            &[
+                "clean",
+                "--yes",
+                "--json",
+                "--path",
+                cache.to_str().unwrap(),
+            ],
+        ] {
+            let refused = run(args);
+            let item = &refused["executed"][0];
+            assert_eq!(item["state"], "stage_failed", "{refused:#}");
+            assert!(
+                item["outcome"]["failed"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("too long for the trash"),
+                "{refused:#}"
+            );
+            assert!(cache.join("wheel.whl").is_file());
+            assert!(!trash.exists(), "a refused name prepared the trash");
+        }
+    }
+}
+
 fn assert_atomic_batch_rejected_without_source_mutation(
     output: &std::process::Output,
     eligible: &Path,
@@ -987,6 +1068,10 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> std::process::Output {
+        self.command(args).output().unwrap()
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(assert_cmd::cargo::cargo_bin("degu"));
         command
             .env_clear()
@@ -997,7 +1082,7 @@ impl Fixture {
             .env("DEGU_INTEGRATION_TEST_ANCHOR", &self.anchor)
             // Intentionally omit DEGU_INTEGRATION_TEST_LEGACY_CLEAN.
             .args(args);
-        command.output().unwrap()
+        command
     }
 
     fn assert_preview_assessed(&self) {

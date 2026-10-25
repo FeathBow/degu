@@ -425,6 +425,12 @@ fn assess_path(path: &Path) -> PreviewStagingStatus {
             &format!("failed to hold sealed staging source parent: {error}"),
         ),
         Err(ProbeFailure::Certification(error)) => certification_unavailable(error),
+        Err(ProbeFailure::NameTooLong) => PreviewStagingStatus::Blocked {
+            kind: "trash_name_too_long",
+            category: "resource_limit",
+            relative_path: None,
+            reason: crate::lifecycle::feasibility::NAME_TOO_LONG.to_owned(),
+        },
         Err(ProbeFailure::Assessment(error)) => assessment_failure_status(error),
         Ok(HeldTreePolicyAssessmentOutcome::TreePolicyAssessed { tree, .. }) => {
             PreviewStagingStatus::TreePolicyAssessed {

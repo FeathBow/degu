@@ -39,8 +39,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # Intra-doc links are invisible to clippy, and the `docs` job's link check
       # reads markdown only, so a link to a deleted or private item ships
-      # silently. This is the step that sees it.
-      - run: cargo doc --workspace --no-deps --locked
+      # silently. This is the step that sees it. Private items are documented too,
+      # or a broken link or stray HTML tag in their comments passes unread.
+      - run: cargo doc --workspace --no-deps --locked --document-private-items
         env:
           RUSTDOCFLAGS: -D warnings
 

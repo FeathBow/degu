@@ -121,7 +121,7 @@ pub(crate) fn execute_local_mode_mutation<W: DurableWrite>(
     held: &mut HeldLocalBackendEvidence,
     request: LocalModeMutationRequest,
 ) -> Result<LocalModeMutationResult, LocalModeExecutionError> {
-    execute_local_mode_mutation_inner(wal, held, request, false)
+    execute_local_mode_mutation_inner(wal, held, request, false, false)
 }
 
 /// Staging-bound entry: unlike the authority-neutral executor this may append
@@ -131,7 +131,18 @@ pub(crate) fn execute_staging_local_mode_mutation<W: DurableWrite>(
     held: &mut HeldLocalBackendEvidence,
     request: LocalModeMutationRequest,
 ) -> Result<LocalModeMutationResult, LocalModeExecutionError> {
-    execute_local_mode_mutation_inner(wal, held, request, true)
+    execute_local_mode_mutation_inner(wal, held, request, true, false)
+}
+
+/// [`execute_staging_local_mode_mutation`] for a directory reopened for this one
+/// mutation, inside [`SealWal::with_deferred_applied`]: its applied frame waits
+/// for the next sync.
+pub(crate) fn execute_deferred_mutation<W: DurableWrite>(
+    wal: &mut SealWal<W>,
+    held: &mut HeldLocalBackendEvidence,
+    request: LocalModeMutationRequest,
+) -> Result<LocalModeMutationResult, LocalModeExecutionError> {
+    execute_local_mode_mutation_inner(wal, held, request, true, true)
 }
 
 fn execute_local_mode_mutation_inner<W: DurableWrite>(
@@ -139,6 +150,7 @@ fn execute_local_mode_mutation_inner<W: DurableWrite>(
     held: &mut HeldLocalBackendEvidence,
     request: LocalModeMutationRequest,
     staging: bool,
+    defer_applied: bool,
 ) -> Result<LocalModeMutationResult, LocalModeExecutionError> {
     let (prepared, reverses_mutation_id, restore_original) = match &request.transform {
         LocalModeTransform::Seal {
@@ -257,7 +269,9 @@ fn execute_local_mode_mutation_inner<W: DurableWrite>(
             Err(io::Error::other("held mode mutation was not verified"))
         }
     };
-    let wal_result = if staging {
+    let wal_result = if defer_applied {
+        wal.apply_deferred_mutation(intent, mutate)
+    } else if staging {
         wal.apply_staging_permission_mutation(intent, mutate)
     } else {
         wal.apply_permission_mutation(intent, mutate)

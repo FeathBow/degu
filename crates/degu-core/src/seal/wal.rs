@@ -52,6 +52,9 @@ thread_local! {
     /// How many permission records this thread has read back out of a WAL.
     pub(crate) static PERMISSION_RECORD_READS: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
+    /// How many times a leased WAL has synced on this thread, for a frame or
+    /// for a replay.
+    pub(crate) static SESSION_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// The append limit a resumed WAL is held to.
@@ -769,12 +772,17 @@ pub enum AppendError {
     TotalSize { limit: u64 },
 }
 
-/// Append-only writer. Every successful append includes a durability sync.
-/// Any write/sync error poisons the handle so bytes after an uncertain tail are
-/// never appended in the same session.
+/// Append-only writer. Every successful append is synced before it returns,
+/// except a `PermissionApplied` frame inside `SealWal::with_deferred_applied`,
+/// which the next sync carries. Any write/sync error poisons the handle so bytes
+/// after an uncertain tail are never appended in the same session.
 pub struct SealWal<W> {
     writer: W,
     poisoned: bool,
+    /// Inside [`SealWal::with_deferred_applied`].
+    deferring: bool,
+    /// How much of `committed_len` the last sync carried.
+    synced_len: u64,
     states: HashMap<TransactionId, TransactionState>,
     staging_schema_versions: HashMap<TransactionId, u16>,
     ledgers: HashMap<TransactionId, PermissionLedger>,
@@ -808,6 +816,8 @@ impl<W: DurableWrite> SealWal<W> {
         Self {
             writer,
             poisoned: false,
+            deferring: false,
+            synced_len: committed_len,
             states: HashMap::new(),
             staging_schema_versions: HashMap::new(),
             ledgers: HashMap::new(),
@@ -843,6 +853,16 @@ impl<W: DurableWrite> SealWal<W> {
     /// the record itself. The extent is known exactly here and nowhere else --
     /// the frame starts at the length this append is committing from.
     fn append_synced_at(&mut self, record: &SealRecord) -> Result<FrameExtent, AppendError> {
+        self.append_at(record, true)
+    }
+
+    /// Writes `record` and leaves it for the next sync to carry. Only
+    /// [`Self::with_deferred_applied`] makes this reachable.
+    fn append_deferred(&mut self, record: &SealRecord) -> Result<(), AppendError> {
+        self.append_at(record, false).map(|_| ())
+    }
+
+    fn append_at(&mut self, record: &SealRecord, sync: bool) -> Result<FrameExtent, AppendError> {
         if self.poisoned {
             return Err(AppendError::Poisoned);
         }
@@ -868,16 +888,77 @@ impl<W: DurableWrite> SealWal<W> {
             .ok_or(AppendError::TotalSize {
                 limit: self.max_wal_len,
             })?;
-        let result = self
-            .writer
-            .write_all(&frame)
-            .and_then(|()| self.writer.sync_record());
+        let result = self.writer.write_all(&frame).and_then(|()| {
+            if sync {
+                self.writer.sync_record()
+            } else {
+                Ok(())
+            }
+        });
         if let Err(error) = result {
             self.poisoned = true;
             return Err(AppendError::Io(error));
         }
         self.committed_len = next_len;
+        // A sync carries every byte written before it, not only this frame's.
+        if sync {
+            self.synced_len = next_len;
+        }
         Ok(extent)
+    }
+
+    /// Syncs what [`Self::append_deferred`] left unsynced, if anything.
+    pub(crate) fn settle(&mut self) -> Result<(), AppendError> {
+        if self.synced_len == self.committed_len {
+            return Ok(());
+        }
+        if self.poisoned {
+            return Err(AppendError::Poisoned);
+        }
+        if let Err(error) = self.writer.sync_record() {
+            self.poisoned = true;
+            return Err(AppendError::Io(error));
+        }
+        self.synced_len = self.committed_len;
+        Ok(())
+    }
+
+    /// What a power loss now would leave of the WAL.
+    #[cfg(test)]
+    pub(crate) fn synced_len(&self) -> u64 {
+        self.synced_len
+    }
+
+    /// Runs `body` with the `PermissionApplied` frame of each mutation made
+    /// through [`Self::apply_deferred_mutation`] left for the next sync to
+    /// carry, then syncs what is left before returning `body`'s result with
+    /// that sync's.
+    ///
+    /// A mode change is applied only once its intent is synced, and that sync
+    /// carries the applied frame of the mutation before it. So a power loss
+    /// leaves a WAL that ends at an intent whose mode changed with no frame
+    /// saying so, which is the state a crash between `fchmod` and the applied
+    /// frame's own sync used to leave and which recovery settles by reading
+    /// the mode, or that ends past it. Nothing may change on disk inside
+    /// `body` but these mutations and the frames before them, and nothing
+    /// changes outside it until the settle, so no other step can come to
+    /// depend on an applied frame that a power loss took back. A process that
+    /// dies loses nothing, since the bytes are already in the file.
+    ///
+    /// What is wider is the tail a power loss can tear. The applied frame and
+    /// the next intent are written before one sync, so a filesystem that keeps
+    /// the later bytes and not the earlier ones leaves a frame that is fully
+    /// present but invalid inside the WAL, which replay refuses rather than
+    /// repairs, as it refuses a lone frame torn the same way.
+    pub(crate) fn with_deferred_applied<T>(
+        &mut self,
+        body: impl FnOnce(&mut Self) -> T,
+    ) -> (T, Result<(), AppendError>) {
+        let outer = std::mem::replace(&mut self.deferring, true);
+        let result = body(self);
+        self.deferring = outer;
+        let settled = if outer { Ok(()) } else { self.settle() };
+        (result, settled)
     }
 
     pub fn into_inner(self) -> W {
@@ -1790,7 +1871,7 @@ impl<W: DurableWrite> SealWal<W> {
                 "staging permission mutation requires the high-level engine",
             )));
         }
-        self.apply_permission_mutation_inner(intent, mutate)
+        self.apply_permission_mutation_inner(intent, mutate, false)
     }
 
     #[allow(dead_code)] // crate-private held-tree execution seam
@@ -1807,13 +1888,33 @@ impl<W: DurableWrite> SealWal<W> {
                 "transaction is not staged",
             )));
         }
-        self.apply_permission_mutation_inner(intent, mutate)
+        self.apply_permission_mutation_inner(intent, mutate, false)
+    }
+
+    /// [`Self::apply_staging_permission_mutation`], whose `PermissionApplied`
+    /// frame waits for the next sync inside [`Self::with_deferred_applied`].
+    /// Outside one it is synced as usual.
+    pub(crate) fn apply_deferred_mutation<F>(
+        &mut self,
+        intent: PermissionIntent,
+        mutate: F,
+    ) -> Result<(), MutationAppendError>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
+        if !self.staging.contains_key(&intent.transaction) {
+            return Err(MutationAppendError::IntentWal(AppendError::InvalidState(
+                "transaction is not staged",
+            )));
+        }
+        self.apply_permission_mutation_inner(intent, mutate, true)
     }
 
     fn apply_permission_mutation_inner<F>(
         &mut self,
         intent: PermissionIntent,
         mutate: F,
+        defer_applied: bool,
     ) -> Result<(), MutationAppendError>
     where
         F: FnOnce() -> io::Result<()>,
@@ -1957,10 +2058,15 @@ impl<W: DurableWrite> SealWal<W> {
             Some(frame),
         );
         mutate().map_err(MutationAppendError::Mutation)?;
-        self.append_synced(&SealRecord::PermissionApplied {
+        let applied = SealRecord::PermissionApplied {
             transaction,
             mutation_id,
-        })
+        };
+        if defer_applied && self.deferring {
+            self.append_deferred(&applied)
+        } else {
+            self.append_synced(&applied)
+        }
         .map_err(|source| MutationAppendError::AppliedWal {
             source,
             mutation_applied: true,
@@ -2610,9 +2716,9 @@ impl RecoverySession {
         self.lock.as_file()
     }
 
-    /// Reads committed frames and repairs only a physically partial final frame.
-    /// Fully present bad checksums, unknown versions, and malformed interior
-    /// records fail closed without truncation.
+    /// Reads committed frames, repairs only a physically partial final frame,
+    /// and syncs what it read. Fully present bad checksums, unknown versions,
+    /// and malformed interior records fail closed without truncation.
     pub fn replay_and_repair(&mut self) -> Result<&Replay, ReplayError> {
         let file = self.lock.as_file_mut();
         if file.metadata()?.len() > MAX_WAL_LEN {
@@ -2630,11 +2736,16 @@ impl RecoverySession {
         replay.frame_bytes = frame_bytes;
         if parsed.committed_len < bytes.len() {
             file.set_len(parsed.committed_len as u64)?;
-            file.sync_all()?;
             replay.tail_repair = Some(TailRepair {
                 truncated_bytes: (bytes.len() - parsed.committed_len) as u64,
             });
         }
+        // A process that died inside `SealWal::with_deferred_applied` left
+        // frames written but not synced, which this replay has read and its
+        // caller will act on, so they are made as durable as it takes them to be.
+        #[cfg(test)]
+        SESSION_SYNCS.with(|syncs| syncs.set(syncs.get() + 1));
+        file.sync_all()?;
         replay.committed_len = parsed.committed_len as u64;
         file.seek(SeekFrom::Start(parsed.committed_len as u64))?;
         self.replay = Some(replay);
@@ -2794,6 +2905,8 @@ impl SealWal<RecoverySession> {
 
 impl DurableWrite for RecoverySession {
     fn sync_record(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        SESSION_SYNCS.with(|syncs| syncs.set(syncs.get() + 1));
         self.lock.as_file().sync_all()
     }
 

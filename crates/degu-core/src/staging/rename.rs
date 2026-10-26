@@ -25,6 +25,8 @@ use crate::seal::executor::{
 use crate::seal::sidecar::TreeDirectoryPlan;
 #[cfg(test)]
 type DirectoryPlanTestCallback = Box<dyn FnOnce(&TreeDirectoryPlan)>;
+#[cfg(test)]
+type TreeSealTestCallback = Box<dyn FnMut(u64)>;
 use crate::seal::sidecar::{
     TreeManifestFoldError, TreeManifestScratchBuildError, TreeSidecarCommitment, TreeSidecarError,
     TreeSidecarFoldError, TreeSidecarStore, TreeStructureScratchCursor,
@@ -68,6 +70,9 @@ std::thread_local! {
     static RENAME_ERROR: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     static FAIL_WAL_STEP: std::cell::Cell<Option<&'static str>> =
         const { std::cell::Cell::new(None) };
+    /// Called after each tree seal with what a power loss would leave of the WAL.
+    static AFTER_TREE_SEAL: std::cell::RefCell<Option<TreeSealTestCallback>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -454,6 +459,12 @@ fn seal_chain_top(
         chain,
     )
     .map_err(StagingRenameError::TreeSeal)?;
+    #[cfg(test)]
+    AFTER_TREE_SEAL.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(wal.synced_len());
+        }
+    });
     chain.pop();
     *mutation_id = mutation_id
         .checked_add(1)
@@ -802,10 +813,34 @@ pub(crate) fn execute_prepared_rename<'a>(
     // not line up, so a malformed plan would seal against a chain that merely looked
     // consistent.
     let mut chain = Vec::new();
-    let seal_pass = directory_plan.for_each_forward(|encoded| {
-        let record = decode_pre_seal_directory_plan_record(encoded)
-            .map_err(StagingRenameError::ManifestCodec)?;
-        while !chain.is_empty() && !directory_plan_chain_holds_parent(&chain, &record) {
+    // Each directory below the root is reopened for its own seal, so its
+    // applied frame waits for the next intent's sync. The pass only reads
+    // besides, and the scope syncs what is left before a sidecar is touched.
+    let (seal_pass, settled) = wal.with_deferred_applied(|wal| {
+        directory_plan
+            .for_each_forward(|encoded| {
+                let record = decode_pre_seal_directory_plan_record(encoded)
+                    .map_err(StagingRenameError::ManifestCodec)?;
+                while !chain.is_empty() && !directory_plan_chain_holds_parent(&chain, &record) {
+                    seal_chain_top(
+                        &mut tree,
+                        wal,
+                        transaction,
+                        &source_root,
+                        &filesystem_id,
+                        &mut mutation_id,
+                        &mut chain,
+                    )?;
+                }
+                extend_directory_plan_chain(&mut chain, record)
+                    .map_err(StagingRenameError::HeldTree)?;
+                Ok(())
+            })
+            .map_err(|error| match error {
+                TreeSidecarFoldError::Sidecar(error) => StagingRenameError::Sidecar(error),
+                TreeSidecarFoldError::Fold(error) => error,
+            })?;
+        while !chain.is_empty() {
             seal_chain_top(
                 &mut tree,
                 wal,
@@ -816,29 +851,11 @@ pub(crate) fn execute_prepared_rename<'a>(
                 &mut chain,
             )?;
         }
-        extend_directory_plan_chain(&mut chain, record).map_err(StagingRenameError::HeldTree)?;
         Ok(())
     });
-    if let Err(error) = seal_pass {
+    if let Err(error) = seal_pass.and(settled.map_err(StagingRenameError::Wal)) {
         let _ = sidecars.cleanup_unpublished(wal);
-        return Err(match error {
-            TreeSidecarFoldError::Sidecar(error) => StagingRenameError::Sidecar(error),
-            TreeSidecarFoldError::Fold(error) => error,
-        });
-    }
-    while !chain.is_empty() {
-        if let Err(error) = seal_chain_top(
-            &mut tree,
-            wal,
-            transaction,
-            &source_root,
-            &filesystem_id,
-            &mut mutation_id,
-            &mut chain,
-        ) {
-            let _ = sidecars.cleanup_unpublished(wal);
-            return Err(error);
-        }
+        return Err(error);
     }
     if let Err(error) = directory_plan.finish() {
         let _ = sidecars.cleanup_unpublished(wal);

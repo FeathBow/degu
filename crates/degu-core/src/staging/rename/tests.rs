@@ -4825,6 +4825,182 @@ fn assessment_shape_matches() {
     );
 }
 
+/// A staging pays one WAL sync for each directory below the root, its
+/// intent's: the applied frame rides the next intent's sync. Twenty more
+/// directories are twenty more syncs.
+#[test]
+fn seals_sync_once() {
+    let syncs = |extra: usize| -> Option<u64> {
+        let fixture = Fixture::new()?;
+        for index in 0..extra {
+            let dir = fixture.source_root.join(format!("extra-{index:02}"));
+            std::fs::create_dir(&dir).unwrap();
+            set_mode(&dir, 0o770);
+        }
+        let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+        let before = crate::seal::wal::SESSION_SYNCS.with(std::cell::Cell::get);
+        engine
+            .stage_prepared_root(TransactionId([0x93; 16]), fixture.prepare())
+            .map(drop)
+            .unwrap();
+        Some(crate::seal::wal::SESSION_SYNCS.with(std::cell::Cell::get) - before)
+    };
+    let (Some(narrow), Some(wide)) = (syncs(4), syncs(24)) else {
+        return;
+    };
+    assert_eq!(wide - narrow, 20);
+}
+
+/// An undo and a rollback restore each directory with one WAL sync, its
+/// inverse intent's, as a staging seals it with one: twenty more directories
+/// are twenty more syncs.
+#[test]
+fn restores_sync_once() {
+    let fixture = |extra: usize| -> Option<Fixture> {
+        let fixture = Fixture::new()?;
+        for index in 0..extra {
+            let dir = fixture.source_root.join(format!("extra-{index:02}"));
+            std::fs::create_dir(&dir).unwrap();
+            set_mode(&dir, 0o770);
+        }
+        Some(fixture)
+    };
+    let syncs = || crate::seal::wal::SESSION_SYNCS.with(std::cell::Cell::get);
+    let undo = |extra| -> Option<u64> {
+        let fixture = fixture(extra)?;
+        let transaction = TransactionId([0x97; 16]);
+        let mut ready = stage_production(&fixture, transaction);
+        let token = ready
+            .verified_undo_token(transaction, "undo-group")
+            .unwrap();
+        let before = syncs();
+        ready
+            .undo_verified(token, verified_undo_request(&fixture))
+            .unwrap();
+        Some(syncs() - before)
+    };
+    let rollback = |extra| -> Option<u64> {
+        let fixture = fixture(extra)?;
+        let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+        AFTER_PRE_SEAL_DIRECTORY_SEALS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| panic!("simulated crash")));
+        });
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = engine.stage_prepared_root(TransactionId([0x98; 16]), fixture.prepare());
+        }));
+        assert!(crashed.is_err());
+        drop(engine);
+        let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+        let before = syncs();
+        engine
+            .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+            .unwrap();
+        Some(syncs() - before)
+    };
+    let (Some(narrow), Some(wide)) = (undo(4), undo(24)) else {
+        return;
+    };
+    assert_eq!(wide - narrow, 20, "undo");
+    let (Some(narrow), Some(wide)) = (rollback(4), rollback(24)) else {
+        return;
+    };
+    assert_eq!(wide - narrow, 20, "rollback");
+}
+
+/// A power loss can take back the applied frame of a directory sealed below
+/// the root, which waits for the next intent's sync. What the disk keeps is
+/// that directory's intent with its outcome unknown and its mode changed, and
+/// the next open settles it from the mode and rolls the whole tree back. The
+/// root, sealed last, is synced as before.
+///
+/// The root is 0o755, so it is what recovery can bind through while the seals
+/// below it are still being applied; a group-writable root it cannot, and that
+/// holds whether or not an applied frame was lost.
+#[test]
+fn lost_applied_frame() {
+    // The root, `child` and these four make six seals, the root's last.
+    for lost_after in [1_usize, 3, 6] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        set_mode(&fixture.source_root, 0o755);
+        for index in 0..4 {
+            let dir = fixture.source_root.join(format!("extra-{index}"));
+            std::fs::create_dir(&dir).unwrap();
+            set_mode(&dir, 0o770);
+        }
+        let transaction = TransactionId([0x94 + lost_after as u8; 16]);
+        let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+        let durable = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = durable.clone();
+        let mut seals = 0;
+        AFTER_TREE_SEAL.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |synced| {
+                seals += 1;
+                if seals == lost_after {
+                    seen.set(synced);
+                    panic!("simulated power loss");
+                }
+            }));
+        });
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = engine.stage_prepared_root(transaction, fixture.prepare());
+        }));
+        AFTER_TREE_SEAL.with(|hook| hook.borrow_mut().take());
+        assert!(crashed.is_err());
+        drop(engine);
+
+        // The disk keeps what the last sync carried and loses the rest.
+        let wal = fixture
+            .base
+            .join("wal-store")
+            .join(crate::seal::store::WAL_FILE_NAME);
+        let written = std::fs::read(&wal).unwrap();
+        let kept = usize::try_from(durable.get()).unwrap();
+        if lost_after == 6 {
+            assert_eq!(kept, written.len(), "the root's seal waited for a sync");
+        } else {
+            assert!(kept < written.len(), "nothing waited for a sync");
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_len(kept as u64)
+            .unwrap();
+        let mut lease = fixture.store.try_lease().unwrap();
+        lease.replay_and_repair().unwrap();
+        let replay = lease.take_replay().unwrap();
+        let last = replay
+            .permission_records(transaction, &written[..kept])
+            .unwrap()
+            .last()
+            .unwrap()
+            .application;
+        let expected = if lost_after == 6 {
+            crate::seal::wal::ApplicationStatus::Applied
+        } else {
+            crate::seal::wal::ApplicationStatus::IntentDurableApplicationUnknown
+        };
+        assert_eq!(last, expected);
+        drop(lease);
+
+        let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+        let (ready, summary) = engine
+            .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+            .unwrap();
+        assert_eq!(summary.recovered.len(), 1);
+        assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+        assert_eq!(mode(&fixture.source_parent), 0o770);
+        assert_eq!(mode(&fixture.source_root), 0o755);
+        for dir in ["child", "extra-0", "extra-1", "extra-2", "extra-3"] {
+            assert_eq!(mode(&fixture.source_root.join(dir)), 0o770, "{dir}");
+        }
+        assert!(fixture.source_root.join("child/data").is_file());
+        assert!(!fixture.destination_root.exists());
+    }
+}
+
 /// Recovery takes a tree above the 1,024 live seals it once refused. A process
 /// that dies with all 1,100 directories sealed is rolled back at the next open,
 /// and an undo that stops at its first inverse is finished there.

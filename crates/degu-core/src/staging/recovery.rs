@@ -18,7 +18,7 @@ use crate::backend::{
 };
 use crate::seal::executor::{
     LocalModeExecutionError, LocalModeMutationRequest, LocalModeMutationResult, LocalModeTransform,
-    RecoveryLocator, execute_staging_local_mode_mutation,
+    RecoveryLocator, execute_deferred_mutation,
 };
 use crate::seal::sidecar::{
     TreePurgePlan, TreeSidecarCommitment, TreeSidecarError, TreeSidecarStore,
@@ -835,43 +835,52 @@ impl RecoveryRestoreSession<'_> {
         // The exact source parent is forced after every descendant and sibling.
         sort_restore_plans(&mut self.restore.entries, &self.restore.source_parent_last);
 
-        for plan in self.restore.entries {
-            let original = plan.permission.clone();
-            let anchor = match plan.side {
-                RecoveryAnchorSide::Source => &self.restore.anchors.source,
-                RecoveryAnchorSide::Destination => &self.restore.anchors.destination,
-            };
-            let mut rebound = reopen_permission_plan(anchor, &plan, &self.restore.metadata)?;
-            rebound.verify_fresh_binding()?;
-            rebound
-                .held
-                .bind_recovered_seal_lineage(
-                    transaction,
-                    original.mutation_id,
-                    original.pre_mode,
-                    original.expected_mode,
-                    self.restore.metadata.backend(),
-                    original.evidence.device(),
-                    original.evidence.inode(),
-                )
-                .map_err(LocalModeExecutionError::Preparation)?;
-            let mutation_id = self.wal.next_recovery_mutation_id(transaction).ok_or(
-                AppendError::InvalidState("recovery mutation id space exhausted"),
-            )?;
-            execute_staging_local_mode_mutation(
-                self.wal,
-                &mut rebound.held,
-                LocalModeMutationRequest {
-                    transaction,
-                    mutation_id,
-                    locator: RecoveryLocator::durable_restore(
-                        rebound.relative_path,
-                        original.evidence.filesystem_id().map(str::to_owned),
-                    ),
-                    transform: LocalModeTransform::Restore { original },
-                },
-            )?;
-        }
+        // Each directory is reopened for its own restore, so its applied frame
+        // waits for the next intent's sync, and the scope syncs what is left.
+        let entries = self.restore.entries;
+        let (restored, settled) = self.wal.with_deferred_applied(|wal| {
+            for plan in entries {
+                let original = plan.permission.clone();
+                let anchor = match plan.side {
+                    RecoveryAnchorSide::Source => &self.restore.anchors.source,
+                    RecoveryAnchorSide::Destination => &self.restore.anchors.destination,
+                };
+                let mut rebound = reopen_permission_plan(anchor, &plan, &self.restore.metadata)?;
+                rebound.verify_fresh_binding()?;
+                rebound
+                    .held
+                    .bind_recovered_seal_lineage(
+                        transaction,
+                        original.mutation_id,
+                        original.pre_mode,
+                        original.expected_mode,
+                        self.restore.metadata.backend(),
+                        original.evidence.device(),
+                        original.evidence.inode(),
+                    )
+                    .map_err(LocalModeExecutionError::Preparation)?;
+                let mutation_id =
+                    wal.next_recovery_mutation_id(transaction)
+                        .ok_or(AppendError::InvalidState(
+                            "recovery mutation id space exhausted",
+                        ))?;
+                execute_deferred_mutation(
+                    wal,
+                    &mut rebound.held,
+                    LocalModeMutationRequest {
+                        transaction,
+                        mutation_id,
+                        locator: RecoveryLocator::durable_restore(
+                            rebound.relative_path,
+                            original.evidence.filesystem_id().map(str::to_owned),
+                        ),
+                        transform: LocalModeTransform::Restore { original },
+                    },
+                )?;
+            }
+            Ok::<_, RecoveryRebindError>(())
+        });
+        restored.and(settled.map_err(RecoveryRebindError::from))?;
         if self.wal.transaction_state(transaction) != Some(self.restore.completion) {
             if self.restore.completion == TransactionState::SourceParentRestored {
                 self.wal
@@ -1189,50 +1198,56 @@ impl VerifiedUndoRecoverySession<'_> {
                 })
                 .filter_map(|permission| permission.reverses_mutation_id)
                 .collect();
-            for plan in &self.undo.tree_seals {
-                let original = plan.permission.clone();
-                if restored.contains(&original.mutation_id) {
-                    continue;
+            // As in a rollback: each directory is reopened for its own
+            // restore, and the scope syncs the applied frame left last.
+            let (undone, settled) = self.wal.with_deferred_applied(|wal| {
+                for plan in &self.undo.tree_seals {
+                    let original = plan.permission.clone();
+                    if restored.contains(&original.mutation_id) {
+                        continue;
+                    }
+                    let mut rebound = reopen_permission_plan(
+                        &self.undo.anchors.destination,
+                        plan,
+                        &self.undo.metadata,
+                    )?;
+                    rebound.verify_fresh_sealed_directory(original.expected_mode)?;
+                    rebound
+                        .held
+                        .bind_recovered_seal_lineage(
+                            transaction,
+                            original.mutation_id,
+                            original.pre_mode,
+                            original.expected_mode,
+                            self.undo.metadata.backend(),
+                            original.evidence.device(),
+                            original.evidence.inode(),
+                        )
+                        .map_err(LocalModeExecutionError::Preparation)?;
+                    let mutation_id = wal.next_recovery_mutation_id(transaction).ok_or(
+                        AppendError::InvalidState("undo mutation id space exhausted"),
+                    )?;
+                    let reversed_mutation_id = original.mutation_id;
+                    let outcome = execute_deferred_mutation(
+                        wal,
+                        &mut rebound.held,
+                        LocalModeMutationRequest {
+                            transaction,
+                            mutation_id,
+                            locator: RecoveryLocator::durable_restore(
+                                rebound.relative_path.clone(),
+                                original.evidence.filesystem_id().map(str::to_owned),
+                            ),
+                            transform: LocalModeTransform::Restore { original },
+                        },
+                    )?;
+                    if matches!(outcome, LocalModeMutationResult::Applied { .. }) {
+                        restored.insert(reversed_mutation_id);
+                    }
                 }
-                let mut rebound = reopen_permission_plan(
-                    &self.undo.anchors.destination,
-                    plan,
-                    &self.undo.metadata,
-                )?;
-                rebound.verify_fresh_sealed_directory(original.expected_mode)?;
-                rebound
-                    .held
-                    .bind_recovered_seal_lineage(
-                        transaction,
-                        original.mutation_id,
-                        original.pre_mode,
-                        original.expected_mode,
-                        self.undo.metadata.backend(),
-                        original.evidence.device(),
-                        original.evidence.inode(),
-                    )
-                    .map_err(LocalModeExecutionError::Preparation)?;
-                let mutation_id = self.wal.next_recovery_mutation_id(transaction).ok_or(
-                    AppendError::InvalidState("undo mutation id space exhausted"),
-                )?;
-                let reversed_mutation_id = original.mutation_id;
-                let outcome = execute_staging_local_mode_mutation(
-                    self.wal,
-                    &mut rebound.held,
-                    LocalModeMutationRequest {
-                        transaction,
-                        mutation_id,
-                        locator: RecoveryLocator::durable_restore(
-                            rebound.relative_path.clone(),
-                            original.evidence.filesystem_id().map(str::to_owned),
-                        ),
-                        transform: LocalModeTransform::Restore { original },
-                    },
-                )?;
-                if matches!(outcome, LocalModeMutationResult::Applied { .. }) {
-                    restored.insert(reversed_mutation_id);
-                }
-            }
+                Ok::<_, RecoveryRebindError>(())
+            });
+            undone.and(settled.map_err(RecoveryRebindError::from))?;
             self.wal.record_undo_modes_restored(transaction)?;
             #[cfg(test)]
             AFTER_UNDO_MODES_RESTORED.with(|hook| {

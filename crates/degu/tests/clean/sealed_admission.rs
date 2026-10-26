@@ -898,6 +898,189 @@ fn explicit_path_batch_rejects_before_any_item_mutates() {
     assert!(external_peer.is_file());
 }
 
+/// A reservation names a trash entry by its sequence, at least four digits, a
+/// dash and the source's own name. A source the trash cannot hold under that
+/// name is blocked in the preview and refused before a clean prepares any
+/// trash, alone or in an explicit batch. One byte shorter, it is staged.
+#[test]
+fn trash_name_limit() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let trash = fixture.state.path().join("degu/trash");
+    for (length, fits) in [(251, false), (250, true)] {
+        let cache = fixture
+            .home
+            .path()
+            .join("relocated")
+            .join("p".repeat(length));
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(
+            cache.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        std::fs::write(cache.join("wheel.whl"), [0u8; 2048]).unwrap();
+        strip_extended_attributes(fixture.home.path()).unwrap();
+        crate::common::make_tree_non_shared_writable(fixture.home.path()).unwrap();
+        let run = |args: &[&str]| -> serde_json::Value {
+            let output = fixture
+                .command(args)
+                .env("PIP_CACHE_DIR", &cache)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.success(), fits || args.contains(&"-n"));
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+                panic!("{}", String::from_utf8_lossy(&output.stderr));
+            })
+        };
+
+        let preview = run(&["clean", "-n", "--json"]);
+        let preflight = &preview["staging_preflight"][0];
+        assert_eq!(
+            preview["planned"].as_array().unwrap().len(),
+            1,
+            "{preview:#}"
+        );
+        if fits {
+            assert_eq!(preflight["status"], "tree_policy_assessed", "{preview:#}");
+            let staged = run(&["clean", "--yes", "--json"]);
+            assert_eq!(staged["executed"][0]["state"], "staged", "{staged:#}");
+            assert!(trash.join(format!("0001-{}", "p".repeat(length))).is_dir());
+            assert!(!cache.exists());
+            continue;
+        }
+        assert_eq!(preflight["status"], "blocked", "{preview:#}");
+        assert_eq!(preflight["kind"], "trash_name_too_long", "{preview:#}");
+        assert_eq!(preflight["category"], "resource_limit", "{preview:#}");
+        for args in [
+            &["clean", "--yes", "--json"][..],
+            &[
+                "clean",
+                "--yes",
+                "--json",
+                "--path",
+                cache.to_str().unwrap(),
+            ],
+        ] {
+            let refused = run(args);
+            let item = &refused["executed"][0];
+            assert_eq!(item["state"], "stage_failed", "{refused:#}");
+            assert!(
+                item["outcome"]["failed"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("too long for the trash"),
+                "{refused:#}"
+            );
+            assert!(cache.join("wheel.whl").is_file());
+            assert!(!trash.exists(), "a refused name prepared the trash");
+        }
+    }
+}
+
+/// A batch reserves its items one after another, so each takes the trash's
+/// next sequence counted past the items ahead of it in the same trash. With
+/// the trash at 9998, a short name ahead of a 250-byte one takes 9999 and
+/// leaves the 250-byte one 10000, a name 256 bytes long. The batch is refused
+/// before either is staged. A clean of every finding stages the short name
+/// at 9999 and refuses the 250-byte one at its own preflight, before its
+/// reservation, for the sequence it would take.
+#[test]
+fn batch_sequence_limit() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    // A first staging makes the trash the way a clean makes it.
+    assert_output_success(&fixture.run(&["clean", "--yes", "--json"]));
+    let trash = fixture.state.path().join("degu/trash");
+    let filler = trash.join("9998-filler");
+    std::fs::create_dir(&filler).unwrap();
+    std::fs::set_permissions(&filler, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // A plan runs its largest item first, so the short name is the larger.
+    let short = fixture.home.path().join(".npm");
+    std::fs::create_dir_all(&short).unwrap();
+    std::fs::write(short.join("content"), [0_u8; 65_536]).unwrap();
+    let long = fixture.home.path().join("relocated").join("p".repeat(250));
+    std::fs::create_dir_all(&long).unwrap();
+    std::fs::write(
+        long.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+    std::fs::write(long.join("wheel.whl"), [0u8; 2048]).unwrap();
+    strip_extended_attributes(fixture.home.path()).unwrap();
+    crate::common::make_tree_non_shared_writable(fixture.home.path()).unwrap();
+
+    let output = fixture
+        .command(&[
+            "clean",
+            "--yes",
+            "--json",
+            "--path",
+            short.to_str().unwrap(),
+            "--path",
+            long.to_str().unwrap(),
+        ])
+        .env("PIP_CACHE_DIR", &long)
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!output.status.success(), "{report:#}");
+    let executed = report["executed"].as_array().unwrap();
+    let state = |path: &Path| {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        executed
+            .iter()
+            .find(|item| {
+                item["path"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&format!("/{name}"))
+            })
+            .unwrap_or_else(|| panic!("{report:#}"))
+            .clone()
+    };
+    assert_eq!(state(&short)["state"], "not_attempted", "{report:#}");
+    let refused = state(&long);
+    assert_eq!(refused["state"], "stage_failed", "{report:#}");
+    assert!(
+        refused["outcome"]["failed"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("too long for the trash"),
+        "{report:#}"
+    );
+    assert!(short.join("content").is_file());
+    assert!(long.join("wheel.whl").is_file());
+    let entries = std::fs::read_dir(&trash)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| !name.starts_with('.'))
+        .count();
+    assert_eq!(entries, 2, "a refused batch staged an item");
+
+    let output = fixture
+        .command(&["clean", "--yes", "--json"])
+        .env("PIP_CACHE_DIR", &long)
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!output.status.success(), "{report:#}");
+    assert!(trash.join("9999-.npm").is_dir(), "{report:#}");
+    let refused = &report["executed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["state"] == "stage_failed")
+        .unwrap_or_else(|| panic!("{report:#}"))["outcome"]["failed"]["reason"];
+    assert!(
+        refused.as_str().unwrap().contains("too long for the trash"),
+        "{report:#}"
+    );
+    assert!(long.join("wheel.whl").is_file());
+}
+
 fn assert_atomic_batch_rejected_without_source_mutation(
     output: &std::process::Output,
     eligible: &Path,
@@ -987,6 +1170,10 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> std::process::Output {
+        self.command(args).output().unwrap()
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(assert_cmd::cargo::cargo_bin("degu"));
         command
             .env_clear()
@@ -997,7 +1184,7 @@ impl Fixture {
             .env("DEGU_INTEGRATION_TEST_ANCHOR", &self.anchor)
             // Intentionally omit DEGU_INTEGRATION_TEST_LEGACY_CLEAN.
             .args(args);
-        command.output().unwrap()
+        command
     }
 
     fn assert_preview_assessed(&self) {

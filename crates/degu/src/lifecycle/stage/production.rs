@@ -1,4 +1,5 @@
-use std::ffi::OsString;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -63,11 +64,14 @@ pub(super) fn batch_preflight(
     ctx: &DetectCtx,
     plan: &CapturedCleanPlan,
 ) -> Option<Vec<CleanExecution>> {
+    // How many items before this one reserve in each trash root, so each is
+    // asked about the sequence it will take once they have.
+    let mut ahead = HashMap::new();
     let first_failure =
         plan.items_with_identities()
             .enumerate()
             .find_map(|(index, (finding, identity))| {
-                preflight_item(ctx, finding, identity)
+                preflight_item(ctx, finding, identity, &mut ahead)
                     .and_then(require_batch_assessment)
                     .err()
                     .map(|reason| (index, finding.path().to_path_buf(), reason))
@@ -118,16 +122,21 @@ fn preflight_item(
     ctx: &DetectCtx,
     finding: &Finding,
     identity: &EntryIdentity,
+    ahead: &mut HashMap<PathBuf, u64>,
 ) -> Result<HeldTreePolicyAssessmentOutcome, String> {
     // Match ordinary production's primary-failure order exactly. In particular,
     // a pathname policy failure must not be masked by a held-tree deferral or
     // assessment error that ordinary `execute` would never reach first.
     let policy = preflight_policy(ctx, finding, identity)?;
-    preflight_tree_policy(&policy.canonical_source)
+    let before = ahead.entry(policy.trash_root.clone()).or_insert(0);
+    let sequence = planned_sequence(&policy.trash_root, *before);
+    *before += 1;
+    preflight_tree_policy(&policy.canonical_source, sequence)
 }
 
 fn preflight_tree_policy(
     canonical_source: &Path,
+    sequence: u64,
 ) -> Result<HeldTreePolicyAssessmentOutcome, String> {
     let canonical_parent = canonical_source
         .parent()
@@ -135,14 +144,17 @@ fn preflight_tree_policy(
     let root_basename = canonical_source
         .file_name()
         .ok_or_else(|| "sealed staging source has no basename".to_string())?;
-    super::feasibility::probe(canonical_parent, root_basename).map_err(|failure| match failure {
-        ProbeFailure::ParentUnavailable(error) => {
-            format!("failed to hold sealed staging source parent: {error}")
+    super::feasibility::probe(canonical_parent, root_basename, sequence).map_err(|failure| {
+        match failure {
+            ProbeFailure::ParentUnavailable(error) => {
+                format!("failed to hold sealed staging source parent: {error}")
+            }
+            ProbeFailure::Certification(error) => {
+                format!("sealed staging source-parent certification failed: {error:?}")
+            }
+            ProbeFailure::NameTooLong => super::feasibility::NAME_TOO_LONG.to_owned(),
+            ProbeFailure::Assessment(error) => error.to_string(),
         }
-        ProbeFailure::Certification(error) => {
-            format!("sealed staging source-parent certification failed: {error:?}")
-        }
-        ProbeFailure::Assessment(error) => error.to_string(),
     })
 }
 
@@ -152,6 +164,20 @@ struct HeldReservation {
     claims: OwnedFd,
     claim_basename: OsString,
     claim_identity: ObjectIdentity,
+}
+
+/// The claim a reservation of `sequence` takes in `.claims`.
+pub(super) fn claim_name(sequence: u64) -> OsString {
+    OsString::from(format!("{sequence:0width$}", width = RESERVATION_WIDTH))
+}
+
+/// The name a reservation gives the source in the trash: its claim, a dash,
+/// and the source's own name.
+pub(super) fn destination_name(claim: &OsStr, source: &OsStr) -> OsString {
+    let mut name = claim.to_os_string();
+    name.push("-");
+    name.push(source);
+    name
 }
 
 impl HeldReservation {
@@ -168,11 +194,8 @@ impl HeldReservation {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source has no basename"))?;
         let mut sequence = next_sequence(&destination_parent)?;
         for _ in 0..RESERVATION_ATTEMPTS {
-            let claim_basename =
-                OsString::from(format!("{sequence:0width$}", width = RESERVATION_WIDTH));
-            let mut destination_basename = claim_basename.clone();
-            destination_basename.push("-");
-            destination_basename.push(source_name);
+            let claim_basename = claim_name(sequence);
+            let destination_basename = destination_name(&claim_basename, source_name);
             match rustix::fs::statat(
                 &destination_parent,
                 &destination_basename,
@@ -278,7 +301,8 @@ pub(super) fn execute(
         Ok(policy) => policy,
         Err(reason) => return failed(finding, reason, false),
     };
-    if let Err(reason) = preflight_tree_policy(&policy.canonical_source) {
+    let sequence = planned_sequence(&policy.trash_root, 0);
+    if let Err(reason) = preflight_tree_policy(&policy.canonical_source, sequence) {
         return failed(finding, reason, false);
     }
 
@@ -727,6 +751,54 @@ fn preflight_policy(
     policy::complete(source, lexical_trash)
 }
 
+/// The sequence a reservation in `trash_root` takes once `ahead` more have
+/// been made there: past every entry's sequence, then past each claim already
+/// taken, as [`HeldReservation::reserve`] counts. A trash not made yet starts
+/// at the first. It reads and changes nothing. A trash it cannot read is left
+/// to the preparation and the reservation that follow to refuse in their own
+/// words, and is answered with the first sequence, the shortest.
+fn planned_sequence(trash_root: &Path, ahead: u64) -> u64 {
+    let counted = || -> io::Result<u64> {
+        let (mut sequence, claims) = match open_directory(trash_root) {
+            Ok(parent) => {
+                let next = next_sequence(&parent)?;
+                match rustix::fs::openat(&parent, ".claims", OPEN_DIRECTORY, Mode::empty()) {
+                    Ok(claims) => (next, Some(claims)),
+                    Err(rustix::io::Errno::NOENT) => (next, None),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (1, None),
+            Err(error) => return Err(error),
+        };
+        let mut free = 0;
+        loop {
+            let taken = match &claims {
+                Some(claims) => match rustix::fs::statat(
+                    claims,
+                    claim_name(sequence),
+                    AtFlags::SYMLINK_NOFOLLOW,
+                ) {
+                    Ok(_) => true,
+                    Err(rustix::io::Errno::NOENT) => false,
+                    Err(error) => return Err(error.into()),
+                },
+                None => false,
+            };
+            if !taken {
+                if free == ahead {
+                    return Ok(sequence);
+                }
+                free += 1;
+            }
+            sequence = sequence.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "trash sequence overflow")
+            })?;
+        }
+    };
+    counted().unwrap_or(1)
+}
+
 fn next_sequence(destination_parent: &OwnedFd) -> io::Result<u64> {
     let duplicate = rustix::io::dup(destination_parent).map_err(io::Error::from)?;
     let mut maximum = 0_u64;
@@ -788,6 +860,26 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// A reservation's sequence passes every entry's, then each claim already
+    /// taken, and each reservation ahead of it in the same trash takes one
+    /// more. A trash not made yet starts at the first.
+    #[test]
+    fn planned_sequences() {
+        let temp = tempfile::tempdir().unwrap();
+        let trash = temp.path().join("trash");
+        assert_eq!(planned_sequence(&trash, 0), 1);
+        assert_eq!(planned_sequence(&trash, 2), 3);
+        std::fs::create_dir_all(trash.join(".claims")).unwrap();
+        std::fs::create_dir(trash.join("0005-a")).unwrap();
+        std::fs::create_dir(trash.join("9998-b")).unwrap();
+        assert_eq!(planned_sequence(&trash, 0), 9999);
+        assert_eq!(planned_sequence(&trash, 1), 10000);
+        std::fs::write(trash.join(".claims").join(claim_name(9999)), b"").unwrap();
+        std::fs::write(trash.join(".claims").join(claim_name(10001)), b"").unwrap();
+        assert_eq!(planned_sequence(&trash, 0), 10000);
+        assert_eq!(planned_sequence(&trash, 1), 10002);
+    }
+
     #[test]
     fn deferred_tree_assessment_is_always_rejected_by_atomic_preflight() {
         use degu_core::backend::{
@@ -848,7 +940,7 @@ mod tests {
         // produce a held-tree deferral when assessment is tried first. Atomic
         // production must nevertheless preserve ordinary pathname policy.
         let ordinary = preflight_policy(&ctx, &finding, &identity).unwrap_err();
-        let atomic = preflight_item(&ctx, &finding, &identity).unwrap_err();
+        let atomic = preflight_item(&ctx, &finding, &identity, &mut HashMap::new()).unwrap_err();
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         assert_eq!(atomic, ordinary);

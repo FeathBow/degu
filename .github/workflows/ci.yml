@@ -39,8 +39,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # Intra-doc links are invisible to clippy, and the `docs` job's link check
       # reads markdown only, so a link to a deleted or private item ships
-      # silently. This is the step that sees it.
-      - run: cargo doc --workspace --no-deps --locked
+      # silently. This is the step that sees it. Private items are documented too,
+      # or a broken link or stray HTML tag in their comments passes unread.
+      - run: cargo doc --workspace --no-deps --locked --document-private-items
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -236,11 +237,11 @@ jobs:
         run: |
           "${RUNNER_TEMP}/actionlint"
       - name: Audit workflows
-        uses: zizmorcore/zizmor-action@6599ee8b7a49aef6a770f63d261d214911a7ce02 # v0.6.0
+        uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e # v0.7.1
         with:
           advanced-security: false
           annotations: true
           min-confidence: high
           online-audits: true
           persona: regular
-          version: 1.27.0
+          version: 1.31.1

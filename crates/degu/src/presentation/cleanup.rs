@@ -75,7 +75,7 @@ pub(crate) struct Group<'a> {
     pub(crate) indent: u16,
 }
 
-/// Shared "<label> · <count> locations · <size>" header for the scan sections
+/// Shared `"<label> · <count> locations · <size>"` header for the scan sections
 /// and clean plan/exclusion summaries. Bytes are the decision datum: they keep
 /// the header tone while the count stays dimmed; layout follows [`Ui::headline`].
 pub(crate) fn group_header(ui: Ui, group: Group<'_>) -> String {

@@ -52,18 +52,22 @@ pub(crate) enum ProbeFailure {
 pub(crate) const NAME_TOO_LONG: &str =
     "the source's name is too long for the trash once a reservation's sequence is put before it";
 
-/// Look at one already-canonical parent and the basename beneath it.
+/// Look at one already-canonical parent and the basename beneath it, which a
+/// reservation of `sequence` would name in the trash.
 ///
 /// The caller canonicalizes: the preview resolves a path the reader typed, and
 /// production already holds a canonical source, so resolving again here would
 /// re-introduce a second answer to a question one of them has already settled.
+/// Production counts the sequence the reservation will take; the preview reads
+/// no trash and asks of the first, the shortest.
 pub(crate) fn probe(
     canonical_parent: &Path,
     basename: &OsStr,
+    sequence: u64,
 ) -> Result<HeldTreePolicyAssessmentOutcome, ProbeFailure> {
     let source_parent = rustix::fs::open(canonical_parent, OPEN_DIRECTORY, Mode::empty())
         .map_err(ProbeFailure::ParentUnavailable)?;
-    let name_fits = trash_holds(&source_parent, basename);
+    let name_fits = trash_holds(&source_parent, basename, sequence);
     let evidence = certify_held_fd(source_parent).map_err(ProbeFailure::Certification)?;
     if !name_fits {
         return Err(ProbeFailure::NameTooLong);
@@ -71,15 +75,16 @@ pub(crate) fn probe(
     assess_held_tree_policy_metadata(evidence, basename).map_err(ProbeFailure::Assessment)
 }
 
-/// Whether the trash can hold `basename` under the shortest name a reservation
-/// gives it, the first sequence's.
+/// Whether the trash can hold `basename` under the name a reservation of
+/// `sequence` gives it.
 ///
 /// The trash is on the source's mount, so the source parent can answer, and
 /// the reservation's own first step, a no-follow lookup of that name, is how.
 /// The filesystem refuses a name it could never hold by its own measure, which
 /// on APFS is not a byte count. Any other answer is left to the reservation.
-fn trash_holds(source_parent: &OwnedFd, basename: &OsStr) -> bool {
-    let name = super::production::destination_name(&super::production::claim_name(1), basename);
+fn trash_holds(source_parent: &OwnedFd, basename: &OsStr, sequence: u64) -> bool {
+    let name =
+        super::production::destination_name(&super::production::claim_name(sequence), basename);
     !matches!(
         rustix::fs::statat(source_parent, &name, AtFlags::SYMLINK_NOFOLLOW),
         Err(rustix::io::Errno::NAMETOOLONG)
@@ -175,7 +180,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).expect("a symlinked parent");
 
         // Through the link the open must refuse rather than land on `real`.
-        let refused = probe(&link, std::ffi::OsStr::new("cache"));
+        let refused = probe(&link, std::ffi::OsStr::new("cache"), 1);
         assert!(
             matches!(refused, Err(ProbeFailure::ParentUnavailable(_))),
             "a symlinked parent was followed"
@@ -183,7 +188,7 @@ mod tests {
 
         // The same directory reached directly gets past the open, so the refusal
         // above is the flag and not the fixture.
-        let direct = probe(&real, std::ffi::OsStr::new("cache"));
+        let direct = probe(&real, std::ffi::OsStr::new("cache"), 1);
         assert!(
             !matches!(direct, Err(ProbeFailure::ParentUnavailable(_))),
             "the real parent could not be held either"
@@ -202,7 +207,7 @@ mod tests {
             let name = "\u{4e2d}".repeat(count);
             std::fs::create_dir(parent.join(&name)).expect("a source APFS holds");
             let refused = matches!(
-                probe(&parent, OsStr::new(&name)),
+                probe(&parent, OsStr::new(&name), 1),
                 Err(ProbeFailure::NameTooLong)
             );
             assert_eq!(refused, !fits, "{count} characters");

@@ -418,7 +418,8 @@ fn assess_path(path: &Path) -> PreviewStagingStatus {
             );
         }
     };
-    match crate::lifecycle::feasibility::probe(&canonical_parent, basename) {
+    // The preview reads no trash, so it asks of the first sequence.
+    match crate::lifecycle::feasibility::probe(&canonical_parent, basename, 1) {
         Err(ProbeFailure::ParentUnavailable(error)) => unavailable(
             "source_parent_unavailable",
             "race_or_io",

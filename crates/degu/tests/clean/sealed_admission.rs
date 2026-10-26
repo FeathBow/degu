@@ -979,6 +979,108 @@ fn trash_name_limit() {
     }
 }
 
+/// A batch reserves its items one after another, so each takes the trash's
+/// next sequence counted past the items ahead of it in the same trash. With
+/// the trash at 9998, a short name ahead of a 250-byte one takes 9999 and
+/// leaves the 250-byte one 10000, a name 256 bytes long. The batch is refused
+/// before either is staged. A clean of every finding stages the short name
+/// at 9999 and refuses the 250-byte one at its own preflight, before its
+/// reservation, for the sequence it would take.
+#[test]
+fn batch_sequence_limit() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    // A first staging makes the trash the way a clean makes it.
+    assert_output_success(&fixture.run(&["clean", "--yes", "--json"]));
+    let trash = fixture.state.path().join("degu/trash");
+    let filler = trash.join("9998-filler");
+    std::fs::create_dir(&filler).unwrap();
+    std::fs::set_permissions(&filler, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // A plan runs its largest item first, so the short name is the larger.
+    let short = fixture.home.path().join(".npm");
+    std::fs::create_dir_all(&short).unwrap();
+    std::fs::write(short.join("content"), [0_u8; 65_536]).unwrap();
+    let long = fixture.home.path().join("relocated").join("p".repeat(250));
+    std::fs::create_dir_all(&long).unwrap();
+    std::fs::write(
+        long.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+    std::fs::write(long.join("wheel.whl"), [0u8; 2048]).unwrap();
+    strip_extended_attributes(fixture.home.path()).unwrap();
+    crate::common::make_tree_non_shared_writable(fixture.home.path()).unwrap();
+
+    let output = fixture
+        .command(&[
+            "clean",
+            "--yes",
+            "--json",
+            "--path",
+            short.to_str().unwrap(),
+            "--path",
+            long.to_str().unwrap(),
+        ])
+        .env("PIP_CACHE_DIR", &long)
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!output.status.success(), "{report:#}");
+    let executed = report["executed"].as_array().unwrap();
+    let state = |path: &Path| {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        executed
+            .iter()
+            .find(|item| {
+                item["path"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&format!("/{name}"))
+            })
+            .unwrap_or_else(|| panic!("{report:#}"))
+            .clone()
+    };
+    assert_eq!(state(&short)["state"], "not_attempted", "{report:#}");
+    let refused = state(&long);
+    assert_eq!(refused["state"], "stage_failed", "{report:#}");
+    assert!(
+        refused["outcome"]["failed"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("too long for the trash"),
+        "{report:#}"
+    );
+    assert!(short.join("content").is_file());
+    assert!(long.join("wheel.whl").is_file());
+    let entries = std::fs::read_dir(&trash)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| !name.starts_with('.'))
+        .count();
+    assert_eq!(entries, 2, "a refused batch staged an item");
+
+    let output = fixture
+        .command(&["clean", "--yes", "--json"])
+        .env("PIP_CACHE_DIR", &long)
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!output.status.success(), "{report:#}");
+    assert!(trash.join("9999-.npm").is_dir(), "{report:#}");
+    let refused = &report["executed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["state"] == "stage_failed")
+        .unwrap_or_else(|| panic!("{report:#}"))["outcome"]["failed"]["reason"];
+    assert!(
+        refused.as_str().unwrap().contains("too long for the trash"),
+        "{report:#}"
+    );
+    assert!(long.join("wheel.whl").is_file());
+}
+
 fn assert_atomic_batch_rejected_without_source_mutation(
     output: &std::process::Output,
     eligible: &Path,

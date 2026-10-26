@@ -140,6 +140,14 @@ pub(crate) enum RecoveryRebindError {
     Io(#[source] io::Error),
     #[error("recovery WAL transition failed: {0}")]
     Wal(#[from] AppendError),
+    /// A restore failed, and so did the sync its pass ends with, which leaves
+    /// the applied frame before it uncertain too.
+    #[error("{pass}; the WAL sync after it also failed: {sync}")]
+    Unsettled {
+        pass: Box<RecoveryRebindError>,
+        #[source]
+        sync: AppendError,
+    },
     #[error("durable permission record could not be read back: {0}")]
     PermissionRecord(#[from] crate::seal::wal::PermissionReadError),
     /// A retry of a refused inverse would leave the WAL without room for the
@@ -177,6 +185,22 @@ pub(crate) enum RecoveryRebindError {
 impl From<CertificationError> for RecoveryRebindError {
     fn from(error: CertificationError) -> Self {
         Self::Certification(error)
+    }
+}
+
+impl RecoveryRebindError {
+    /// A restore pass's result with that of the sync it ended with. A sync
+    /// that found the WAL poisoned was never tried, and what poisoned it
+    /// failed inside the pass, so the pass's error says it.
+    fn settled(pass: Result<(), Self>, sync: Result<(), AppendError>) -> Result<(), Self> {
+        match (pass, sync) {
+            (Ok(()), sync) => sync.map_err(Self::Wal),
+            (Err(error), Ok(()) | Err(AppendError::Poisoned)) => Err(error),
+            (Err(error), Err(sync)) => Err(Self::Unsettled {
+                pass: Box::new(error),
+                sync,
+            }),
+        }
     }
 }
 
@@ -880,7 +904,7 @@ impl RecoveryRestoreSession<'_> {
             }
             Ok::<_, RecoveryRebindError>(())
         });
-        restored.and(settled.map_err(RecoveryRebindError::from))?;
+        RecoveryRebindError::settled(restored, settled)?;
         if self.wal.transaction_state(transaction) != Some(self.restore.completion) {
             if self.restore.completion == TransactionState::SourceParentRestored {
                 self.wal
@@ -1247,7 +1271,7 @@ impl VerifiedUndoRecoverySession<'_> {
                 }
                 Ok::<_, RecoveryRebindError>(())
             });
-            undone.and(settled.map_err(RecoveryRebindError::from))?;
+            RecoveryRebindError::settled(undone, settled)?;
             self.wal.record_undo_modes_restored(transaction)?;
             #[cfg(test)]
             AFTER_UNDO_MODES_RESTORED.with(|hook| {

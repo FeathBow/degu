@@ -361,6 +361,14 @@ pub(crate) enum StagingRenameError {
     Binding(#[from] PreparedRootError),
     #[error("staging WAL operation failed before a confirmed rename: {0}")]
     Wal(#[from] AppendError),
+    /// A seal failed, and so did the sync the seal pass ends with, which
+    /// leaves the applied frame before it uncertain too.
+    #[error("{pass}; the WAL sync after it also failed: {sync}")]
+    Unsettled {
+        pass: Box<StagingRenameError>,
+        #[source]
+        sync: AppendError,
+    },
     #[error("durable permission record could not be read back: {0}")]
     PermissionRecord(#[from] crate::seal::wal::PermissionReadError),
     #[error("source-parent seal failed: {0}")]
@@ -399,6 +407,22 @@ pub(crate) enum StagingRenameError {
     WalFull { needed: u64, available: u64 },
     #[error("the room this staging needs could not be measured: {0}")]
     Allowance(#[from] crate::seal::wal::AllowanceError),
+}
+
+impl StagingRenameError {
+    /// The seal pass's result with that of the sync it ended with. A sync that
+    /// found the WAL poisoned was never tried, and what poisoned it failed
+    /// inside the pass, so the pass's error says it.
+    fn settled(pass: Result<(), Self>, sync: Result<(), AppendError>) -> Result<(), Self> {
+        match (pass, sync) {
+            (Ok(()), sync) => sync.map_err(Self::Wal),
+            (Err(error), Ok(()) | Err(AppendError::Poisoned)) => Err(error),
+            (Err(error), Err(sync)) => Err(Self::Unsettled {
+                pass: Box::new(error),
+                sync,
+            }),
+        }
+    }
 }
 
 /// Nonforgeable live result of the held-FD seal/rename sequence. It retains
@@ -853,7 +877,7 @@ pub(crate) fn execute_prepared_rename<'a>(
         }
         Ok(())
     });
-    if let Err(error) = seal_pass.and(settled.map_err(StagingRenameError::Wal)) {
+    if let Err(error) = StagingRenameError::settled(seal_pass, settled) {
         let _ = sidecars.cleanup_unpublished(wal);
         return Err(error);
     }

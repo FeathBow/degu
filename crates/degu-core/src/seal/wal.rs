@@ -53,8 +53,11 @@ thread_local! {
     pub(crate) static PERMISSION_RECORD_READS: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
     /// How many times a leased WAL has synced on this thread, for a frame or
-    /// for a replay.
+    /// for the lease.
     pub(crate) static SESSION_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The errno the next frame sync of a leased WAL on this thread fails with.
+    pub(crate) static FAIL_NEXT_SYNC: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// The append limit a resumed WAL is held to.
@@ -943,7 +946,8 @@ impl<W: DurableWrite> SealWal<W> {
     /// `body` but these mutations and the frames before them, and nothing
     /// changes outside it until the settle, so no other step can come to
     /// depend on an applied frame that a power loss took back. A process that
-    /// dies loses nothing, since the bytes are already in the file.
+    /// dies loses nothing, since the bytes are already in the file and the
+    /// next lease syncs them before its replay reads them.
     ///
     /// What is wider is the tail a power loss can tear. The applied frame and
     /// the next intent are written before one sync, so a filesystem that keeps
@@ -2716,9 +2720,9 @@ impl RecoverySession {
         self.lock.as_file()
     }
 
-    /// Reads committed frames, repairs only a physically partial final frame,
-    /// and syncs what it read. Fully present bad checksums, unknown versions,
-    /// and malformed interior records fail closed without truncation.
+    /// Reads committed frames and repairs only a physically partial final frame.
+    /// Fully present bad checksums, unknown versions, and malformed interior
+    /// records fail closed without truncation.
     pub fn replay_and_repair(&mut self) -> Result<&Replay, ReplayError> {
         let file = self.lock.as_file_mut();
         if file.metadata()?.len() > MAX_WAL_LEN {
@@ -2736,16 +2740,11 @@ impl RecoverySession {
         replay.frame_bytes = frame_bytes;
         if parsed.committed_len < bytes.len() {
             file.set_len(parsed.committed_len as u64)?;
+            file.sync_all()?;
             replay.tail_repair = Some(TailRepair {
                 truncated_bytes: (bytes.len() - parsed.committed_len) as u64,
             });
         }
-        // A process that died inside `SealWal::with_deferred_applied` left
-        // frames written but not synced, which this replay has read and its
-        // caller will act on, so they are made as durable as it takes them to be.
-        #[cfg(test)]
-        SESSION_SYNCS.with(|syncs| syncs.set(syncs.get() + 1));
-        file.sync_all()?;
         replay.committed_len = parsed.committed_len as u64;
         file.seek(SeekFrom::Start(parsed.committed_len as u64))?;
         self.replay = Some(replay);
@@ -2907,6 +2906,10 @@ impl DurableWrite for RecoverySession {
     fn sync_record(&mut self) -> io::Result<()> {
         #[cfg(test)]
         SESSION_SYNCS.with(|syncs| syncs.set(syncs.get() + 1));
+        #[cfg(test)]
+        if let Some(errno) = FAIL_NEXT_SYNC.with(std::cell::Cell::take) {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
         self.lock.as_file().sync_all()
     }
 

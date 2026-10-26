@@ -17,6 +17,17 @@ use crate::seal::wal::{
 use std::io;
 use std::path::PathBuf;
 
+#[cfg(test)]
+type DeferredTestHook = Box<dyn FnMut() -> Result<(), &'static str>>;
+
+#[cfg(test)]
+std::thread_local! {
+    /// Runs before each deferred mutation on this thread. An error refuses the
+    /// mutation before its intent is written.
+    pub(crate) static BEFORE_DEFERRED: std::cell::RefCell<Option<DeferredTestHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryLocator {
     relative_path: PathBuf,
@@ -142,6 +153,12 @@ pub(crate) fn execute_deferred_mutation<W: DurableWrite>(
     held: &mut HeldLocalBackendEvidence,
     request: LocalModeMutationRequest,
 ) -> Result<LocalModeMutationResult, LocalModeExecutionError> {
+    #[cfg(test)]
+    if let Some(Err(reason)) =
+        BEFORE_DEFERRED.with(|hook| hook.borrow_mut().as_mut().map(|hook| hook()))
+    {
+        return Err(LocalModeExecutionError::InvalidRequest(reason));
+    }
     execute_local_mode_mutation_inner(wal, held, request, true, true)
 }
 

@@ -880,16 +880,17 @@ fn a_broken_directory_lock_is_reported_and_a_busy_one_is_not() {
     ));
 }
 
-/// A replay syncs what it read, so frames a process wrote and died before
+/// Taking the lease syncs the WAL, so frames a process wrote and died before
 /// syncing, as it may inside a deferral scope, are durable before the next
-/// process acts on them. It does so with no tail to repair.
+/// process replays them. A replay with no tail to repair adds no sync.
 #[test]
-fn replay_syncs_once() {
+fn lease_syncs_once() {
     let temp = crate::secure_test_tempdir().unwrap();
     let store = store(&temp);
-    let mut lease = store.try_lease().unwrap();
     let syncs = || crate::seal::wal::SESSION_SYNCS.with(std::cell::Cell::get);
     let before = syncs();
+    let mut lease = store.try_lease().unwrap();
+    assert_eq!(syncs(), before + 1);
     let replay = lease.replay_and_repair().unwrap();
     assert!(replay.tail_repair.is_none());
     assert_eq!(syncs(), before + 1);

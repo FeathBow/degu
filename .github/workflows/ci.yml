@@ -75,10 +75,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
-    # ubuntu-latest now resolves to 26.04, whose /tmp is on a backend degu does not
-    # certify, and the tests that stage a tree need their temporary directory on one
-    # it does. The matrix keeps the name the required check is registered under.
-    runs-on: ${{ matrix.os == 'ubuntu-latest' && 'ubuntu-24.04' || matrix.os }}
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -93,9 +90,26 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y expect
+      # The tests that stage a tree need their temporary directory on a backend
+      # degu certifies, and on Linux they skip rather than fail when it is not.
+      # Ubuntu 26.04 may mount /tmp as tmpfs; /var/tmp stays on the runner's disk,
+      # root-owned and sticky as /tmp is on 24.04. The check fails the job where
+      # the tests would otherwise skip.
       - name: Test the workspace
         run: |
-          if [ "${RUNNER_OS}" = "Linux" ]; then umask 002; fi
+          if [ "${RUNNER_OS}" = "Linux" ]; then
+            umask 002
+            TMPDIR=$(mktemp -d /var/tmp/degu-test.XXXXXX)
+            export TMPDIR
+            fstype=$(findmnt -n -o FSTYPE -T "${TMPDIR}")
+            case "${fstype}" in
+              ext4 | xfs) ;;
+              *)
+                echo "::error::${TMPDIR} is on ${fstype}, which degu does not certify"
+                exit 1
+                ;;
+            esac
+          fi
           cargo test --workspace --locked
 
   quota-linux:

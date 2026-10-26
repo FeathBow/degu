@@ -60,7 +60,9 @@ jobs:
       actions: read
       attestations: read
       contents: read
-    uses: ./.github/workflows/ci.yml
+    # `$/` resolves to the same commit, but actionlint 1.7.12 rejects it as a
+    # reusable workflow reference, so this keeps `./` until actionlint parses it.
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository]
     with:
       toolchain: ${{ needs.metadata.outputs.toolchain }}
 

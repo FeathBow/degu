@@ -234,7 +234,7 @@ fn total_row(
 }
 
 /// The Total row carries no bar, but its percent must still land in the
-/// percent column: blank padding as wide as " <bar>" keeps it right-aligned
+/// percent column: blank padding as wide as `" <bar>"` keeps it right-aligned
 /// with the data rows' percents instead of the bar area.
 fn format_total_share(share: f64) -> String {
     format!(

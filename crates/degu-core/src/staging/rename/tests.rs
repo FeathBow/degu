@@ -2097,6 +2097,46 @@ fn drift_before_sidecars() {
 }
 
 #[test]
+fn drift_after_restore() {
+    // A directory whose mode changes once undo has restored it must not be
+    // renamed back, whether the tree is verified against a sidecar or not.
+    for before_sidecars in [false, true] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let label = if before_sidecars { "v11" } else { "v13" };
+        let transaction = TransactionId([0xde; 16]);
+        let mut ready = if before_sidecars {
+            stage_before_sidecars(&fixture, transaction)
+        } else {
+            stage_production(&fixture, transaction)
+        };
+        let child = fixture.destination_root.join("child");
+        crate::staging::recovery::AFTER_UNDO_MODES_RESTORED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert_eq!(mode(&child), 0o770, "undo restores the mode first");
+                set_mode(&child, 0o700);
+            }));
+        });
+
+        let token = ready
+            .verified_undo_token(transaction, "undo-group")
+            .unwrap();
+        ready
+            .undo_verified(token, verified_undo_request(&fixture))
+            .expect_err(label);
+
+        assert_eq!(
+            ready.state(transaction),
+            Some(TransactionState::UndoModesRestored),
+            "{label}"
+        );
+        assert!(!fixture.source_root.exists(), "{label}");
+        assert!(fixture.destination_root.is_dir(), "{label}");
+    }
+}
+
+#[test]
 fn purge_before_sidecars() {
     let Some(fixture) = Fixture::new() else {
         return;

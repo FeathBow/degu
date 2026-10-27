@@ -1478,7 +1478,7 @@ impl VerifiedUndoRecoverySession<'_> {
             .relative_path()
             .join(self.undo.metadata.source_basename());
         let mut expected_modes = BTreeMap::new();
-        let mut expected_identities = BTreeMap::new();
+        let mut expected_directories = BTreeMap::new();
         for plan in &self.undo.tree_seals {
             let permission = plan.permission();
             let suffix = permission
@@ -1488,7 +1488,15 @@ impl VerifiedUndoRecoverySession<'_> {
                 .map_err(|_| RecoveryRebindError::InvalidLocator)?
                 .to_path_buf();
             expected_modes.insert(suffix.clone(), permission.expected_mode);
-            expected_identities.insert(
+            // The mode each directory is in now is checked before the modes
+            // are normalized below, as the streamed v3 path checks it, so a
+            // mode changed after the restore is not hidden by the sealed one.
+            let current_mode = if modes_restored {
+                permission.pre_mode
+            } else {
+                permission.expected_mode
+            };
+            expected_directories.insert(
                 suffix,
                 (
                     permission.evidence.device(),
@@ -1497,19 +1505,25 @@ impl VerifiedUndoRecoverySession<'_> {
                         .evidence
                         .generation_or_btime()
                         .ok_or(RecoveryRebindError::StrongIdentityUnavailable)?,
+                    current_mode,
                 ),
             );
         }
-        let actual_identities = inventory
+        let actual_directories = inventory
             .directories_deepest_first()
             .map(|directory| {
                 (
                     directory.relative_path,
-                    (directory.device, directory.inode, directory.incarnation),
+                    (
+                        directory.device,
+                        directory.inode,
+                        directory.incarnation,
+                        directory.observed_mode,
+                    ),
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        if expected_identities != actual_identities {
+        if expected_directories != actual_directories {
             return Err(RecoveryRebindError::UndoManifestChanged);
         }
         inventory

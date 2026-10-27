@@ -650,7 +650,9 @@ impl<'a> CertifiedStagedRecovery<'a> {
         let expected = self
             .expected_manifest
             .ok_or(StagedVerificationFailure::MissingManifest)?;
-        let v3_commitment = if expected.schema_version == 3 {
+        // As in `streams_v3`: a v11 staging has no sidecar to stream against.
+        let streams_v3 = expected.schema_version == 3 && self.wal.binds_sidecar(self.transaction);
+        let v3_commitment = if streams_v3 {
             let Some(commitment) = self.sidecar_commitment else {
                 if let Err(error) = self.sidecars.cleanup_unpublished(self.wal) {
                     return Err(RecoveryRebindError::Sidecar(error).into());
@@ -1084,7 +1086,7 @@ impl VerifiedPurgeSession<'_> {
             undo: self.committed,
         };
         let manifest = verifier.undo.expected_manifest;
-        let tree = if manifest.schema_version == 3 {
+        let tree = if verifier.streams_v3() {
             let verified = verifier
                 .collect_exact_streamed_v3()
                 .and_then(|inventory| verifier.verify_purge_layout().map(|()| inventory));
@@ -1385,8 +1387,8 @@ impl VerifiedUndoRecoverySession<'_> {
         match self.verify_exact_tree() {
             Ok(()) => Ok(()),
             Err(error) => {
-                let missing_v3_sidecar = self.undo.expected_manifest.schema_version == 3
-                    && self.undo.sidecar_commitment.is_none();
+                let missing_v3_sidecar =
+                    self.streams_v3() && self.undo.sidecar_commitment.is_none();
                 // A missing or unauthentic published v3 baseline is not live-tree
                 // drift and cannot remain retryable at either proof boundary.
                 if missing_v3_sidecar
@@ -1405,10 +1407,17 @@ impl VerifiedUndoRecoverySession<'_> {
     }
 
     fn verify_exact_tree(&mut self) -> Result<(), RecoveryRebindError> {
-        if self.undo.expected_manifest.schema_version == 3 {
+        if self.streams_v3() {
             return self.collect_exact_streamed_v3().map(|_| ());
         }
         self.collect_exact_tree().map(|_| ())
+    }
+
+    /// Whether this tree is verified against its published sidecar. A v11
+    /// staging sealed its v3 manifest before sidecars existed, so it is
+    /// verified by the resident walk, as it was when it was sealed.
+    fn streams_v3(&self) -> bool {
+        self.undo.expected_manifest.schema_version == 3 && self.wal.binds_sidecar(self.transaction)
     }
 
     fn collect_exact_streamed_v3(&mut self) -> Result<StreamedV3Inventory, RecoveryRebindError> {
@@ -1469,7 +1478,7 @@ impl VerifiedUndoRecoverySession<'_> {
             .relative_path()
             .join(self.undo.metadata.source_basename());
         let mut expected_modes = BTreeMap::new();
-        let mut expected_identities = BTreeMap::new();
+        let mut expected_directories = BTreeMap::new();
         for plan in &self.undo.tree_seals {
             let permission = plan.permission();
             let suffix = permission
@@ -1479,7 +1488,15 @@ impl VerifiedUndoRecoverySession<'_> {
                 .map_err(|_| RecoveryRebindError::InvalidLocator)?
                 .to_path_buf();
             expected_modes.insert(suffix.clone(), permission.expected_mode);
-            expected_identities.insert(
+            // The mode each directory is in now is checked before the modes
+            // are normalized below, as the streamed v3 path checks it, so a
+            // mode changed after the restore is not hidden by the sealed one.
+            let current_mode = if modes_restored {
+                permission.pre_mode
+            } else {
+                permission.expected_mode
+            };
+            expected_directories.insert(
                 suffix,
                 (
                     permission.evidence.device(),
@@ -1488,19 +1505,25 @@ impl VerifiedUndoRecoverySession<'_> {
                         .evidence
                         .generation_or_btime()
                         .ok_or(RecoveryRebindError::StrongIdentityUnavailable)?,
+                    current_mode,
                 ),
             );
         }
-        let actual_identities = inventory
+        let actual_directories = inventory
             .directories_deepest_first()
             .map(|directory| {
                 (
                     directory.relative_path,
-                    (directory.device, directory.inode, directory.incarnation),
+                    (
+                        directory.device,
+                        directory.inode,
+                        directory.incarnation,
+                        directory.observed_mode,
+                    ),
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        if expected_identities != actual_identities {
+        if expected_directories != actual_directories {
             return Err(RecoveryRebindError::UndoManifestChanged);
         }
         inventory

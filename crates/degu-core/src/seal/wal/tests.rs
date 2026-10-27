@@ -470,6 +470,32 @@ fn v11_manifest_history_remains_replayable_but_cross_version_tags_fail_closed() 
 }
 
 #[test]
+fn sidecar_era_boundary() {
+    // v12 began publishing tree sidecars. main wrote v12 for weeks before any
+    // release did, so a v12 staging has one even though no release wrote it.
+    for (version, binds) in [(11, false), (12, true), (VERSION, true)] {
+        let transaction = tx(version as u8);
+        let bytes = legacy_frame(
+            version,
+            &SealRecord::StagingBegin {
+                transaction,
+                metadata: staging_metadata(),
+            },
+        );
+        let replay = replay_bytes(&bytes);
+        let wal = SealWal::resume(
+            FaultWriter {
+                bytes,
+                ..FaultWriter::default()
+            },
+            replay,
+        )
+        .unwrap();
+        assert_eq!(wal.binds_sidecar(transaction), binds, "v{version}");
+    }
+}
+
+#[test]
 fn wal_frame_versions_may_advance_but_never_regress() {
     let first = tx(0x16);
     let second = tx(0x17);

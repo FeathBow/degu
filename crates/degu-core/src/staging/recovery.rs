@@ -650,7 +650,9 @@ impl<'a> CertifiedStagedRecovery<'a> {
         let expected = self
             .expected_manifest
             .ok_or(StagedVerificationFailure::MissingManifest)?;
-        let v3_commitment = if expected.schema_version == 3 {
+        // As in `streams_v3`: a v11 staging has no sidecar to stream against.
+        let streams_v3 = expected.schema_version == 3 && self.wal.binds_sidecar(self.transaction);
+        let v3_commitment = if streams_v3 {
             let Some(commitment) = self.sidecar_commitment else {
                 if let Err(error) = self.sidecars.cleanup_unpublished(self.wal) {
                     return Err(RecoveryRebindError::Sidecar(error).into());
@@ -1084,7 +1086,7 @@ impl VerifiedPurgeSession<'_> {
             undo: self.committed,
         };
         let manifest = verifier.undo.expected_manifest;
-        let tree = if manifest.schema_version == 3 {
+        let tree = if verifier.streams_v3() {
             let verified = verifier
                 .collect_exact_streamed_v3()
                 .and_then(|inventory| verifier.verify_purge_layout().map(|()| inventory));
@@ -1385,8 +1387,8 @@ impl VerifiedUndoRecoverySession<'_> {
         match self.verify_exact_tree() {
             Ok(()) => Ok(()),
             Err(error) => {
-                let missing_v3_sidecar = self.undo.expected_manifest.schema_version == 3
-                    && self.undo.sidecar_commitment.is_none();
+                let missing_v3_sidecar =
+                    self.streams_v3() && self.undo.sidecar_commitment.is_none();
                 // A missing or unauthentic published v3 baseline is not live-tree
                 // drift and cannot remain retryable at either proof boundary.
                 if missing_v3_sidecar
@@ -1405,10 +1407,17 @@ impl VerifiedUndoRecoverySession<'_> {
     }
 
     fn verify_exact_tree(&mut self) -> Result<(), RecoveryRebindError> {
-        if self.undo.expected_manifest.schema_version == 3 {
+        if self.streams_v3() {
             return self.collect_exact_streamed_v3().map(|_| ());
         }
         self.collect_exact_tree().map(|_| ())
+    }
+
+    /// Whether this tree is verified against its published sidecar. A v11
+    /// staging sealed its v3 manifest before sidecars existed, so it is
+    /// verified by the resident walk, as it was when it was sealed.
+    fn streams_v3(&self) -> bool {
+        self.undo.expected_manifest.schema_version == 3 && self.wal.binds_sidecar(self.transaction)
     }
 
     fn collect_exact_streamed_v3(&mut self) -> Result<StreamedV3Inventory, RecoveryRebindError> {

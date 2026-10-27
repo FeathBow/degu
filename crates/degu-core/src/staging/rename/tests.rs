@@ -1993,6 +1993,161 @@ fn verified_undo_content_drift_fails_before_durable_undo_intent() {
     assert!(fixture.destination_root.is_dir());
 }
 
+/// Rewrites the store as v0.1.7 would have left it: a v3 manifest in a v11
+/// WAL, from before sidecars, so no sidecar was ever published for it.
+#[allow(clippy::disallowed_methods)] // removes the sidecar a v11 writer never published
+fn strip_sidecar_era(fixture: &Fixture, transaction: TransactionId) {
+    let store = fixture.base.join("wal-store");
+    let wal = store.join(crate::seal::store::WAL_FILE_NAME);
+    let written = std::fs::read(&wal).unwrap();
+    std::fs::write(&wal, crate::seal::wal::frames_as_v11(&written)).unwrap();
+    for entry in std::fs::read_dir(&store).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension() == Some(OsStr::new("sidecar")) {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    let mut lease = fixture.store.try_lease().unwrap();
+    lease.replay_and_repair().unwrap();
+    let replay = lease.take_replay().unwrap();
+    let replayed = &replay.transactions[&transaction];
+    assert_eq!(replayed.staging_schema_version, Some(11));
+    assert_eq!(replayed.tree_sidecar, None);
+    assert_eq!(
+        replayed
+            .tree_manifest
+            .map(|manifest| manifest.schema_version),
+        Some(3)
+    );
+}
+
+fn stage_before_sidecars(
+    fixture: &Fixture,
+    transaction: TransactionId,
+) -> crate::staging::ReadyStagingEngine {
+    drop(stage_production(fixture, transaction));
+    strip_sidecar_era(fixture, transaction);
+    let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let (ready, _) = engine
+        .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+        .unwrap();
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    ready
+}
+
+#[test]
+fn undo_before_sidecars() {
+    // Its manifest is checked by the resident walk it was sealed against.
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xd9; 16]);
+    let mut ready = stage_before_sidecars(&fixture, transaction);
+
+    let token = ready
+        .verified_undo_token(transaction, "undo-group")
+        .unwrap();
+    ready
+        .undo_verified(token, verified_undo_request(&fixture))
+        .unwrap();
+
+    assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+    assert!(!fixture.destination_root.exists());
+    assert_eq!(mode(&fixture.source_root), 0o770);
+    assert_eq!(mode(&fixture.source_root.join("child")), 0o770);
+    assert_eq!(
+        std::fs::read(fixture.source_root.join("child/data")).unwrap(),
+        b"sealed staging"
+    );
+}
+
+#[test]
+fn drift_before_sidecars() {
+    // A changed tree is refused as it is for a staging with a sidecar, and
+    // stays undoable: the sidecar it lacks is not a lost baseline.
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xdb; 16]);
+    let mut ready = stage_before_sidecars(&fixture, transaction);
+    std::fs::write(
+        fixture.destination_root.join("child/data"),
+        b"evil!! staging",
+    )
+    .unwrap();
+
+    let token = ready
+        .verified_undo_token(transaction, "undo-group")
+        .unwrap();
+    let error = ready
+        .undo_verified(token, verified_undo_request(&fixture))
+        .unwrap_err();
+    assert_eq!(
+        error.disposition(),
+        VerifiedUndoFailureDisposition::NotStarted
+    );
+    assert_eq!(
+        ready.state(transaction),
+        Some(TransactionState::VerifiedCommitted)
+    );
+    assert!(fixture.destination_root.is_dir());
+}
+
+#[test]
+fn purge_before_sidecars() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xe3; 16]);
+    let mut ready = stage_before_sidecars(&fixture, transaction);
+
+    let authority = ready
+        .request_verified_purge(verified_purge_request(&fixture, transaction, "undo-group"))
+        .unwrap();
+    ready.execute_verified_purge(authority).unwrap();
+
+    assert_eq!(ready.state(transaction), Some(TransactionState::Purged));
+    assert!(!fixture.destination_root.exists());
+}
+
+#[test]
+fn verify_before_sidecars() {
+    // v0.1.7 stopped after the rename and before verifying it.
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let transaction = TransactionId([0xdd; 16]);
+    let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let staged = engine
+        .stage_prepared_root(transaction, fixture.prepare())
+        .unwrap();
+    assert_eq!(staged.wal_state(), Some(TransactionState::StagedUnverified));
+    drop(staged);
+    drop(engine);
+    strip_sidecar_era(&fixture, transaction);
+
+    let (mut recovered, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+    let candidate = report
+        .into_candidates()
+        .into_iter()
+        .find(|candidate| candidate.transaction() == transaction)
+        .unwrap();
+    let capability = recovered
+        .prepare_startup_recovery(candidate, fixture.anchors())
+        .unwrap();
+    let StartupRecoveryCapability::PendingVerification(pending) = capability else {
+        panic!("a staging from before sidecars did not resume verification")
+    };
+    let StagedVerificationOutcome::StagedSealed(verified) = pending.verify_or_quarantine().unwrap()
+    else {
+        panic!("a staging from before sidecars did not verify after restart")
+    };
+    assert_eq!(verified.wal_state(), Some(TransactionState::StagedSealed));
+}
+
 #[test]
 fn verified_undo_mode_drift_fails_before_durable_undo_intent() {
     let Some(fixture) = Fixture::new() else {

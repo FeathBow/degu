@@ -1095,6 +1095,15 @@ impl<W: DurableWrite> SealWal<W> {
         self.sidecars.get(&transaction).copied()
     }
 
+    /// Whether this transaction was staged by a writer that publishes a tree
+    /// sidecar, which v12 began. A v11 staging carries its v3 manifest alone,
+    /// so a sidecar it lacks was never written rather than lost.
+    pub(crate) fn binds_sidecar(&self, transaction: TransactionId) -> bool {
+        self.staging_schema_versions
+            .get(&transaction)
+            .is_some_and(|version| *version >= 12)
+    }
+
     /// Exact in-memory projection of the transaction held by this leased WAL.
     /// Recovery must derive work from this snapshot rather than caller-provided
     /// permission subsets or durable-path guesses.
@@ -4392,6 +4401,39 @@ fn encode_frame(record: &SealRecord) -> Result<Vec<u8>, FrameError> {
     frame.extend_from_slice(&crc32(&payload).to_le_bytes());
     frame.extend_from_slice(&payload);
     Ok(frame)
+}
+
+/// The WAL a v11 writer would have left for the same history: every frame at
+/// version 11, each tree manifest without the sidecar commitment v12 added.
+/// v0.1.7 wrote these, so tests stand its stagings up from one made now.
+#[cfg(test)]
+pub(crate) fn frames_as_v11(bytes: &[u8]) -> Vec<u8> {
+    let parsed = parse_frames(bytes).expect("a WAL this process wrote parses");
+    let mut rewritten = Vec::with_capacity(bytes.len());
+    for versioned in parsed.records {
+        let record = match versioned.record {
+            SealRecord::TreeManifestSidecarComplete {
+                transaction,
+                manifest,
+                ..
+            } => SealRecord::TreeManifestComplete {
+                transaction,
+                manifest,
+            },
+            record => record,
+        };
+        let payload = encode_record(&record).expect("a replayed record encodes");
+        let start = rewritten.len();
+        rewritten.extend_from_slice(MAGIC);
+        rewritten.extend_from_slice(&11_u16.to_le_bytes());
+        rewritten.extend_from_slice(&0_u16.to_le_bytes());
+        rewritten.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        let header_checksum = crc32(&rewritten[start + 4..start + 12]);
+        rewritten.extend_from_slice(&header_checksum.to_le_bytes());
+        rewritten.extend_from_slice(&crc32(&payload).to_le_bytes());
+        rewritten.extend_from_slice(&payload);
+    }
+    rewritten
 }
 
 fn encode_record(record: &SealRecord) -> Result<Vec<u8>, FrameError> {

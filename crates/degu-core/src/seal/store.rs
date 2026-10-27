@@ -413,8 +413,12 @@ impl SealWalStore {
         // The exact WAL lease is already held. A second protocol participant
         // cannot append before both the inode and its directory entry are
         // durable. Sync existing entries too: this safely completes a previous
-        // creator whose file or directory fsync returned an error. Any failure
-        // drops the lease on return.
+        // creator whose file or directory fsync returned an error, and makes
+        // durable the frames a process that died inside
+        // `SealWal::with_deferred_applied` wrote and never synced, before replay
+        // reads them. Any failure drops the lease on return.
+        #[cfg(test)]
+        crate::seal::wal::SESSION_SYNCS.with(|syncs| syncs.set(syncs.get() + 1));
         lease
             .as_file()
             .sync_all()

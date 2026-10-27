@@ -17,7 +17,7 @@ use crate::backend::{
 };
 use crate::seal::executor::{
     LocalModeExecutionError, LocalModeMutationRequest, LocalModeMutationResult, LocalModeTransform,
-    RecoveryLocator, execute_staging_local_mode_mutation,
+    RecoveryLocator, execute_deferred_mutation, execute_staging_local_mode_mutation,
 };
 use crate::seal::sidecar::AuthenticatedTreeManifest;
 use crate::seal::wal::{
@@ -3093,7 +3093,10 @@ impl PreSealV3Inventory {
                     });
                 }
             };
-            let result = execute_staging_local_mode_mutation(
+            // Reopened for this one seal and dropped after it, so nothing holds
+            // the mode it reports past the next sync. The root, held for the
+            // rest of the staging, is synced as before.
+            let result = execute_deferred_mutation(
                 wal,
                 held,
                 LocalModeMutationRequest {

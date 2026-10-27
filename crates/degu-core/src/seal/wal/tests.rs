@@ -4284,3 +4284,103 @@ fn compaction_keeps_a_terminal_transaction_whose_group_is_unfinished() {
 
 mod frame_index;
 mod permission_ledger;
+
+/// Inside the deferral scope a mutation's applied frame is written but left
+/// for the next sync: the next intent's carries it, and the scope syncs the
+/// last one before it returns. A power loss inside it leaves the WAL at the
+/// last intent with that mutation's outcome unknown, the state a crash
+/// between the mode change and the applied frame's own sync leaves. Outside
+/// the scope the same call syncs both frames.
+#[test]
+fn deferred_applied_syncs() {
+    let transaction = tx(0x6d);
+    let mut wal = SealWal::new(FaultWriter::default()).unwrap();
+    wal.begin_staging(transaction, staging_metadata()).unwrap();
+    advance_to_tree_intent(&mut wal, transaction);
+    let intent = |mutation_id: u64, path| PermissionIntent {
+        transaction,
+        mutation_id,
+        evidence: staging_tree_evidence(path, 20 + mutation_id),
+        pre_mode: 0o770,
+        expected_mode: 0o500,
+        reverses_mutation_id: None,
+    };
+    let start = wal.writer.sync_count;
+
+    let (inside, settled) = wal.with_deferred_applied(|wal| {
+        [(1, "tree/a"), (2, "tree/b")].map(|(mutation_id, path)| {
+            wal.apply_deferred_mutation(intent(mutation_id, path), || Ok(()))
+                .unwrap();
+            (wal.writer.sync_count, wal.synced_len(), wal.committed_len)
+        })
+    });
+    settled.unwrap();
+    let [
+        (first_syncs, _, first_end),
+        (second_syncs, second_synced, second_end),
+    ] = inside;
+    assert_eq!((first_syncs, second_syncs), (start + 1, start + 2));
+    assert!(first_end <= second_synced && second_synced < second_end);
+    assert_eq!(wal.writer.sync_count, start + 3);
+    assert_eq!(wal.synced_len(), wal.committed_len);
+
+    let lost = &wal.writer.bytes[..usize::try_from(second_synced).unwrap()];
+    let parsed = parse_frames(lost).unwrap();
+    let replay = replay_records(parsed.records, lost).unwrap();
+    let outcomes = replay
+        .permission_records(transaction, lost)
+        .unwrap()
+        .iter()
+        .map(|record| (record.mutation_id, record.application))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes,
+        [
+            (1, ApplicationStatus::Applied),
+            (2, ApplicationStatus::IntentDurableApplicationUnknown),
+        ]
+    );
+
+    let before = wal.writer.sync_count;
+    wal.apply_deferred_mutation(intent(3, "tree/c"), || Ok(()))
+        .unwrap();
+    assert_eq!(wal.writer.sync_count, before + 2);
+    let (_, settled) = wal.with_deferred_applied(|_| ());
+    settled.unwrap();
+    assert_eq!(wal.writer.sync_count, before + 2);
+}
+
+/// The sync a deferral scope ends with is the applied frame's own, so its
+/// failure poisons the WAL as that frame's failure did.
+#[test]
+fn settle_failure_poisons() {
+    let transaction = tx(0x6e);
+    // Begin, three transitions and the intent are syncs 0 to 4; the scope's
+    // settle is the sixth.
+    let mut wal = SealWal::new(FaultWriter {
+        fail_sync_at: Some((5, 5)),
+        ..FaultWriter::default()
+    })
+    .unwrap();
+    wal.begin_staging(transaction, staging_metadata()).unwrap();
+    advance_to_tree_intent(&mut wal, transaction);
+    let (applied, settled) = wal.with_deferred_applied(|wal| {
+        wal.apply_deferred_mutation(
+            PermissionIntent {
+                transaction,
+                mutation_id: 1,
+                evidence: staging_tree_evidence("tree/a", 21),
+                pre_mode: 0o770,
+                expected_mode: 0o500,
+                reverses_mutation_id: None,
+            },
+            || Ok(()),
+        )
+    });
+    applied.unwrap();
+    assert!(matches!(settled, Err(AppendError::Io(ref error)) if error.raw_os_error() == Some(5)));
+    assert!(matches!(
+        wal.append_synced(&state(tx(0x6f), TransactionState::Prepared)),
+        Err(AppendError::Poisoned)
+    ));
+}

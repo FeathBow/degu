@@ -4825,6 +4825,341 @@ fn assessment_shape_matches() {
     );
 }
 
+/// A staging pays one WAL sync for each directory below the root, its
+/// intent's: the applied frame rides the next intent's sync. Twenty more
+/// directories are twenty more syncs.
+#[test]
+fn seals_sync_once() {
+    let syncs = |extra: usize| -> Option<u64> {
+        let fixture = Fixture::new()?;
+        for index in 0..extra {
+            let dir = fixture.source_root.join(format!("extra-{index:02}"));
+            std::fs::create_dir(&dir).unwrap();
+            set_mode(&dir, 0o770);
+        }
+        let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+        let before = crate::seal::wal::SESSION_SYNCS.with(std::cell::Cell::get);
+        engine
+            .stage_prepared_root(TransactionId([0x93; 16]), fixture.prepare())
+            .map(drop)
+            .unwrap();
+        Some(crate::seal::wal::SESSION_SYNCS.with(std::cell::Cell::get) - before)
+    };
+    let (Some(narrow), Some(wide)) = (syncs(4), syncs(24)) else {
+        return;
+    };
+    assert_eq!(wide - narrow, 20);
+}
+
+/// An undo and a rollback restore each directory with one WAL sync, its
+/// inverse intent's, as a staging seals it with one: twenty more directories
+/// are twenty more syncs.
+#[test]
+fn restores_sync_once() {
+    let fixture = |extra: usize| -> Option<Fixture> {
+        let fixture = Fixture::new()?;
+        for index in 0..extra {
+            let dir = fixture.source_root.join(format!("extra-{index:02}"));
+            std::fs::create_dir(&dir).unwrap();
+            set_mode(&dir, 0o770);
+        }
+        Some(fixture)
+    };
+    let syncs = || crate::seal::wal::SESSION_SYNCS.with(std::cell::Cell::get);
+    let undo = |extra| -> Option<u64> {
+        let fixture = fixture(extra)?;
+        let transaction = TransactionId([0x97; 16]);
+        let mut ready = stage_production(&fixture, transaction);
+        let token = ready
+            .verified_undo_token(transaction, "undo-group")
+            .unwrap();
+        let before = syncs();
+        ready
+            .undo_verified(token, verified_undo_request(&fixture))
+            .unwrap();
+        Some(syncs() - before)
+    };
+    let rollback = |extra| -> Option<u64> {
+        let fixture = fixture(extra)?;
+        let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+        AFTER_PRE_SEAL_DIRECTORY_SEALS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| panic!("simulated crash")));
+        });
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = engine.stage_prepared_root(TransactionId([0x98; 16]), fixture.prepare());
+        }));
+        assert!(crashed.is_err());
+        drop(engine);
+        let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+        let before = syncs();
+        engine
+            .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+            .unwrap();
+        Some(syncs() - before)
+    };
+    let (Some(narrow), Some(wide)) = (undo(4), undo(24)) else {
+        return;
+    };
+    assert_eq!(wide - narrow, 20, "undo");
+    let (Some(narrow), Some(wide)) = (rollback(4), rollback(24)) else {
+        return;
+    };
+    assert_eq!(wide - narrow, 20, "rollback");
+}
+
+/// A power loss can take back the applied frame of a directory sealed below
+/// the root, which waits for the next intent's sync. What the disk keeps is
+/// that directory's intent with its outcome unknown and its mode changed, and
+/// the next open settles it from the mode and rolls the whole tree back. The
+/// root, sealed last, is synced as before.
+///
+/// The root is 0o755, so it is what recovery can bind through while the seals
+/// below it are still being applied; a group-writable root it cannot, and that
+/// holds whether or not an applied frame was lost.
+#[test]
+fn lost_applied_frame() {
+    // The root, `child` and these four make six seals, the root's last.
+    for lost_after in [1_usize, 3, 6] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        set_mode(&fixture.source_root, 0o755);
+        for index in 0..4 {
+            let dir = fixture.source_root.join(format!("extra-{index}"));
+            std::fs::create_dir(&dir).unwrap();
+            set_mode(&dir, 0o770);
+        }
+        let transaction = TransactionId([0x94 + lost_after as u8; 16]);
+        let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+        let durable = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = durable.clone();
+        let mut seals = 0;
+        AFTER_TREE_SEAL.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |synced| {
+                seals += 1;
+                if seals == lost_after {
+                    seen.set(synced);
+                    panic!("simulated power loss");
+                }
+            }));
+        });
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = engine.stage_prepared_root(transaction, fixture.prepare());
+        }));
+        AFTER_TREE_SEAL.with(|hook| hook.borrow_mut().take());
+        assert!(crashed.is_err());
+        drop(engine);
+
+        // The disk keeps what the last sync carried and loses the rest.
+        let wal = fixture
+            .base
+            .join("wal-store")
+            .join(crate::seal::store::WAL_FILE_NAME);
+        let written = std::fs::read(&wal).unwrap();
+        let kept = usize::try_from(durable.get()).unwrap();
+        if lost_after == 6 {
+            assert_eq!(kept, written.len(), "the root's seal waited for a sync");
+        } else {
+            assert!(kept < written.len(), "nothing waited for a sync");
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_len(kept as u64)
+            .unwrap();
+        let mut lease = fixture.store.try_lease().unwrap();
+        lease.replay_and_repair().unwrap();
+        let replay = lease.take_replay().unwrap();
+        let last = replay
+            .permission_records(transaction, &written[..kept])
+            .unwrap()
+            .last()
+            .unwrap()
+            .application;
+        let expected = if lost_after == 6 {
+            crate::seal::wal::ApplicationStatus::Applied
+        } else {
+            crate::seal::wal::ApplicationStatus::IntentDurableApplicationUnknown
+        };
+        assert_eq!(last, expected);
+        drop(lease);
+
+        let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+        let (ready, summary) = engine
+            .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+            .unwrap();
+        assert_eq!(summary.recovered.len(), 1);
+        assert_eq!(ready.state(transaction), Some(TransactionState::Restored));
+        assert_eq!(mode(&fixture.source_parent), 0o770);
+        assert_eq!(mode(&fixture.source_root), 0o755);
+        for dir in ["child", "extra-0", "extra-1", "extra-2", "extra-3"] {
+            assert_eq!(mode(&fixture.source_root.join(dir)), 0o770, "{dir}");
+        }
+        assert!(fixture.source_root.join("child/data").is_file());
+        assert!(!fixture.destination_root.exists());
+    }
+}
+
+/// Arms an EIO for the next WAL sync when the second deferred mutation on
+/// this thread is reached. With `refuse`, that mutation is refused before its
+/// intent, so the sync that fails is the one its pass ends with; without it,
+/// the sync that fails is its intent's.
+fn fail_second_deferred(refuse: bool) {
+    let mut calls = 0;
+    crate::seal::executor::BEFORE_DEFERRED.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            calls += 1;
+            if calls != 2 {
+                return Ok(());
+            }
+            crate::seal::wal::FAIL_NEXT_SYNC.with(|errno| errno.set(Some(libc::EIO)));
+            if refuse {
+                Err("refused by the test")
+            } else {
+                Ok(())
+            }
+        }));
+    });
+}
+
+fn clear_deferred_faults() {
+    crate::seal::executor::BEFORE_DEFERRED.with(|hook| hook.borrow_mut().take());
+    crate::seal::wal::FAIL_NEXT_SYNC.with(std::cell::Cell::take);
+}
+
+fn is_eio(error: &AppendError) -> bool {
+    matches!(error, AppendError::Io(error) if error.raw_os_error() == Some(libc::EIO))
+}
+
+/// A seal refused after the applied frame before it was written, with the
+/// sync the seal pass ends with failing too, reports both failures, since
+/// that frame is now uncertain as well. When the failure is the intent's own
+/// sync, the WAL is poisoned and the pass ends with no sync to try, so the
+/// intent's failure is the one reported.
+#[test]
+fn seal_failures_reported() {
+    for refuse in [true, false] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        for index in 0..2 {
+            let dir = fixture.source_root.join(format!("extra-{index}"));
+            std::fs::create_dir(&dir).unwrap();
+            set_mode(&dir, 0o770);
+        }
+        let (mut engine, _) = SealedStagingEngine::open(&fixture.store).unwrap();
+        fail_second_deferred(refuse);
+        let staged = engine
+            .stage_prepared_root(TransactionId([0x9a; 16]), fixture.prepare())
+            .map(drop);
+        clear_deferred_faults();
+        match staged {
+            Err(StagingRenameError::Unsettled { pass, sync }) if refuse => {
+                assert!(
+                    matches!(
+                        *pass,
+                        StagingRenameError::TreeSeal(HeldTreeSealError::Mutation {
+                            source: LocalModeExecutionError::InvalidRequest(_),
+                            ..
+                        })
+                    ),
+                    "{pass:?}"
+                );
+                assert!(is_eio(&sync), "{sync:?}");
+            }
+            Err(StagingRenameError::TreeSeal(HeldTreeSealError::Mutation {
+                source: LocalModeExecutionError::IntentNotDurable(sync),
+                ..
+            })) if !refuse => assert!(is_eio(&sync), "{sync:?}"),
+            other => panic!("refuse = {refuse}: {other:?}"),
+        }
+    }
+}
+
+/// A rollback's and an undo's restore pass report a refused restore together
+/// with the failed sync the pass ends with, as a staging's seal pass does,
+/// and only the intent's failure when it was the intent's own sync.
+#[test]
+fn restore_failures_reported() {
+    let unsettled = |error: &(dyn std::error::Error + 'static)| {
+        std::iter::successors(Some(error), |error| error.source()).any(|error| {
+            matches!(
+                error.downcast_ref::<RecoveryRebindError>(),
+                Some(RecoveryRebindError::Unsettled { pass, sync })
+                    if is_eio(sync)
+                        && matches!(
+                            **pass,
+                            RecoveryRebindError::Execution(LocalModeExecutionError::InvalidRequest(_))
+                        )
+            )
+        })
+    };
+    let fixture = || -> Option<Fixture> {
+        let fixture = Fixture::new()?;
+        for index in 0..2 {
+            let dir = fixture.source_root.join(format!("extra-{index}"));
+            std::fs::create_dir(&dir).unwrap();
+            set_mode(&dir, 0o770);
+        }
+        Some(fixture)
+    };
+
+    let Some(rolled_back) = fixture() else {
+        return;
+    };
+    let (mut engine, _) = SealedStagingEngine::open(&rolled_back.store).unwrap();
+    AFTER_PRE_SEAL_DIRECTORY_SEALS.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|| panic!("simulated crash")));
+    });
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = engine.stage_prepared_root(TransactionId([0x9b; 16]), rolled_back.prepare());
+    }));
+    assert!(crashed.is_err());
+    drop(engine);
+    let (engine, report) = SealedStagingEngine::open(&rolled_back.store).unwrap();
+    fail_second_deferred(true);
+    let error = engine
+        .recover_startup(report, |_, _| Ok(rolled_back.raw_anchors()))
+        .map(drop)
+        .unwrap_err();
+    clear_deferred_faults();
+    assert!(unsettled(&error), "rollback: {error:?}");
+
+    // An intent whose own sync fails leaves the pass no sync to try, and the
+    // intent's failure is the one reported.
+    let intent_failed = |error: &(dyn std::error::Error + 'static)| {
+        std::iter::successors(Some(error), |error| error.source()).any(|error| {
+            matches!(
+                error.downcast_ref::<RecoveryRebindError>(),
+                Some(RecoveryRebindError::Execution(LocalModeExecutionError::IntentNotDurable(sync)))
+                    if is_eio(sync)
+            )
+        })
+    };
+    for (refuse, byte) in [(true, 0x9c), (false, 0x9d)] {
+        let Some(undone) = fixture() else {
+            return;
+        };
+        let transaction = TransactionId([byte; 16]);
+        let mut ready = stage_production(&undone, transaction);
+        let token = ready
+            .verified_undo_token(transaction, "undo-group")
+            .unwrap();
+        fail_second_deferred(refuse);
+        let error = ready
+            .undo_verified(token, verified_undo_request(&undone))
+            .map(drop)
+            .unwrap_err();
+        clear_deferred_faults();
+        if refuse {
+            assert!(unsettled(&error), "undo: {error:?}");
+        } else {
+            assert!(intent_failed(&error), "undo: {error:?}");
+        }
+    }
+}
+
 /// Recovery takes a tree above the 1,024 live seals it once refused. A process
 /// that dies with all 1,100 directories sealed is rolled back at the next open,
 /// and an undo that stops at its first inverse is finished there.

@@ -183,7 +183,7 @@ impl Ui {
     /// Lays out a suggested command under its heading. On a terminal the
     /// command always occupies a full line of its own, indented two spaces,
     /// and is never wrapped even when it exceeds the width; piped output
-    /// keeps the single-line "<heading> <command>" form.
+    /// keeps the single-line `"<heading> <command>"` form.
     pub(crate) fn command_block(self, heading: &str, command: &str) -> String {
         if self.stdout_is_terminal {
             format!("{heading}\n  {command}")

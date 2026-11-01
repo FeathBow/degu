@@ -39,6 +39,8 @@ const MAGIC: &[u8; 4] = b"DSWL";
 const VERSION: u16 = 13;
 const LEGACY_CONTENT_PROOF_MANIFEST_VERSION: u16 = 2;
 const CONTENT_PROOF_MANIFEST_VERSION: u16 = 3;
+/// The first version whose stagings publish a held-tree sidecar.
+const SIDECAR_VERSION: u16 = 12;
 const HEADER_LEN: usize = 20;
 const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 pub(crate) const MAX_WAL_LEN: u64 = 64 * 1024 * 1024;
@@ -1098,10 +1100,18 @@ impl<W: DurableWrite> SealWal<W> {
     /// Whether this transaction was staged by a writer that publishes a tree
     /// sidecar, which v12 began. A v11 staging carries its v3 manifest alone,
     /// so a sidecar it lacks was never written rather than lost.
-    pub(crate) fn binds_sidecar(&self, transaction: TransactionId) -> bool {
+    fn binds_sidecar(&self, transaction: TransactionId) -> bool {
         self.staging_schema_versions
             .get(&transaction)
-            .is_some_and(|version| *version >= 12)
+            .is_some_and(|version| *version >= SIDECAR_VERSION)
+    }
+
+    /// Whether recovery verifies this transaction's tree against its
+    /// published sidecar. A v11 staging sealed its v3 manifest before sidecars
+    /// existed, so it is verified by the resident walk, as it was when it was
+    /// sealed.
+    pub(crate) fn streams_v3(&self, transaction: TransactionId, schema_version: u16) -> bool {
+        schema_version == CONTENT_PROOF_MANIFEST_VERSION && self.binds_sidecar(transaction)
     }
 
     /// Exact in-memory projection of the transaction held by this leased WAL.
@@ -1647,11 +1657,7 @@ impl<W: DurableWrite> SealWal<W> {
         if current == TransactionState::TreeSealIntent
             && next == TransactionState::TreeSealed
             && (!self.manifests.contains_key(&transaction)
-                || (self
-                    .staging_schema_versions
-                    .get(&transaction)
-                    .is_some_and(|version| *version >= 12)
-                    && !self.sidecars.contains_key(&transaction)))
+                || (self.binds_sidecar(transaction) && !self.sidecars.contains_key(&transaction)))
         {
             return Err(AppendError::InvalidState(
                 "tree seal completion requires a durable manifest and v12 sidecar binding",
@@ -1723,12 +1729,7 @@ impl<W: DurableWrite> SealWal<W> {
                 "tree manifest is outside tree seal intent",
             ));
         }
-        if self
-            .staging_schema_versions
-            .get(&transaction)
-            .is_none_or(|version| *version < 12)
-            || !self.staging.contains_key(&transaction)
-        {
+        if !self.binds_sidecar(transaction) || !self.staging.contains_key(&transaction) {
             return Err(AppendError::InvalidState(
                 "v12 sidecar completion requires v12 staging metadata",
             ));
@@ -1780,11 +1781,7 @@ impl<W: DurableWrite> SealWal<W> {
         if self.states.get(&transaction).copied() != Some(TransactionState::TreeSealed)
             || !self.staging.contains_key(&transaction)
             || !self.manifests.contains_key(&transaction)
-            || (self
-                .staging_schema_versions
-                .get(&transaction)
-                .is_some_and(|version| *version >= 12)
-                && !self.sidecars.contains_key(&transaction))
+            || (self.binds_sidecar(transaction) && !self.sidecars.contains_key(&transaction))
         {
             return Err(AppendError::InvalidState(
                 "rename intent requires staging metadata and a complete v12 sidecar-bound tree",
@@ -3504,10 +3501,10 @@ fn replay_records<R: IntoVersionedRecord>(
                 tx.staging = Some(metadata);
             }
             SealRecord::TreeManifestComplete { manifest, .. } => {
-                if versioned.version > 11
+                if versioned.version >= SIDECAR_VERSION
                     || tx
                         .staging_schema_version
-                        .is_some_and(|version| version >= 12)
+                        .is_some_and(|version| version >= SIDECAR_VERSION)
                 {
                     return Err(ReplayError::InvalidHistory(
                         "legacy tree manifest completion cannot complete a v12 transaction",
@@ -3541,8 +3538,10 @@ fn replay_records<R: IntoVersionedRecord>(
                 commitment,
                 ..
             } => {
-                if versioned.version < 12
-                    || tx.staging_schema_version.is_none_or(|version| version < 12)
+                if versioned.version < SIDECAR_VERSION
+                    || tx
+                        .staging_schema_version
+                        .is_none_or(|version| version < SIDECAR_VERSION)
                     || tx.staging.is_none()
                     || manifest.schema_version != CONTENT_PROOF_MANIFEST_VERSION
                     || commitment.transaction != id
@@ -3575,7 +3574,7 @@ fn replay_records<R: IntoVersionedRecord>(
                     || tx.tree_manifest.is_none()
                     || (tx
                         .staging_schema_version
-                        .is_some_and(|version| version >= 12)
+                        .is_some_and(|version| version >= SIDECAR_VERSION)
                         && tx.tree_sidecar.is_none())
                 {
                     return Err(ReplayError::InvalidHistory(
@@ -3746,7 +3745,7 @@ fn replay_records<R: IntoVersionedRecord>(
                         && (tx.tree_manifest.is_none()
                             || (tx
                                 .staging_schema_version
-                                .is_some_and(|version| version >= 12)
+                                .is_some_and(|version| version >= SIDECAR_VERSION)
                                 && tx.tree_sidecar.is_none()))
                     {
                         return Err(ReplayError::InvalidHistory(
@@ -4387,19 +4386,23 @@ fn encode_frame(record: &SealRecord) -> Result<Vec<u8>, FrameError> {
     if matches!(record, SealRecord::TreeManifestComplete { .. }) {
         return Err(FrameError::LegacyTreeManifest);
     }
-    let payload = encode_record(record)?;
+    frame_payload(VERSION, &encode_record(record)?)
+}
+
+/// Frames an encoded record at `version`. Only tests frame below `VERSION`.
+fn frame_payload(version: u16, payload: &[u8]) -> Result<Vec<u8>, FrameError> {
     let payload_len = u32::try_from(payload.len()).map_err(|_| FrameError::PayloadTooLarge {
         limit: MAX_PAYLOAD_LEN,
     })?;
     let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
     frame.extend_from_slice(MAGIC);
-    frame.extend_from_slice(&VERSION.to_le_bytes());
+    frame.extend_from_slice(&version.to_le_bytes());
     frame.extend_from_slice(&0_u16.to_le_bytes());
     frame.extend_from_slice(&payload_len.to_le_bytes());
     let header_checksum = crc32(&frame[4..12]);
     frame.extend_from_slice(&header_checksum.to_le_bytes());
-    frame.extend_from_slice(&crc32(&payload).to_le_bytes());
-    frame.extend_from_slice(&payload);
+    frame.extend_from_slice(&crc32(payload).to_le_bytes());
+    frame.extend_from_slice(payload);
     Ok(frame)
 }
 
@@ -4423,15 +4426,8 @@ pub(crate) fn frames_as_v11(bytes: &[u8]) -> Vec<u8> {
             record => record,
         };
         let payload = encode_record(&record).expect("a replayed record encodes");
-        let start = rewritten.len();
-        rewritten.extend_from_slice(MAGIC);
-        rewritten.extend_from_slice(&11_u16.to_le_bytes());
-        rewritten.extend_from_slice(&0_u16.to_le_bytes());
-        rewritten.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        let header_checksum = crc32(&rewritten[start + 4..start + 12]);
-        rewritten.extend_from_slice(&header_checksum.to_le_bytes());
-        rewritten.extend_from_slice(&crc32(&payload).to_le_bytes());
-        rewritten.extend_from_slice(&payload);
+        rewritten
+            .extend_from_slice(&frame_payload(11, &payload).expect("a replayed record frames"));
     }
     rewritten
 }
@@ -4686,7 +4682,7 @@ fn decode_record(payload: &[u8], offset: u64, version: u16) -> Result<SealRecord
             transaction,
             metadata: decode_staging_metadata(&mut cursor, offset, version)?,
         },
-        6 if (3..=11).contains(&version) => SealRecord::TreeManifestComplete {
+        6 if (3..SIDECAR_VERSION).contains(&version) => SealRecord::TreeManifestComplete {
             transaction,
             manifest: DurableTreeManifest {
                 schema_version: if version >= 7 { cursor.u16()? } else { 1 },
@@ -4764,7 +4760,7 @@ fn decode_record(payload: &[u8], offset: u64, version: u16) -> Result<SealRecord
             removed_entries: cursor.u64()?,
             last_path: PathBuf::from(std::ffi::OsString::from_vec(cursor.bytes()?)),
         },
-        13 if version >= 12 => SealRecord::TreeManifestSidecarComplete {
+        13 if version >= SIDECAR_VERSION => SealRecord::TreeManifestSidecarComplete {
             transaction,
             manifest: DurableTreeManifest {
                 schema_version: cursor.u16()?,

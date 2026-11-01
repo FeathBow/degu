@@ -492,6 +492,12 @@ fn sidecar_era_boundary() {
         )
         .unwrap();
         assert_eq!(wal.binds_sidecar(transaction), binds, "v{version}");
+        assert_eq!(
+            wal.streams_v3(transaction, CONTENT_PROOF_MANIFEST_VERSION),
+            binds,
+            "v{version}"
+        );
+        assert!(!wal.streams_v3(transaction, LEGACY_CONTENT_PROOF_MANIFEST_VERSION));
     }
 }
 

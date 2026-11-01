@@ -650,9 +650,10 @@ impl<'a> CertifiedStagedRecovery<'a> {
         let expected = self
             .expected_manifest
             .ok_or(StagedVerificationFailure::MissingManifest)?;
-        // As in `streams_v3`: a v11 staging has no sidecar to stream against.
-        let streams_v3 = expected.schema_version == 3 && self.wal.binds_sidecar(self.transaction);
-        let v3_commitment = if streams_v3 {
+        let v3_commitment = if self
+            .wal
+            .streams_v3(self.transaction, expected.schema_version)
+        {
             let Some(commitment) = self.sidecar_commitment else {
                 if let Err(error) = self.sidecars.cleanup_unpublished(self.wal) {
                     return Err(RecoveryRebindError::Sidecar(error).into());
@@ -1413,11 +1414,9 @@ impl VerifiedUndoRecoverySession<'_> {
         self.collect_exact_tree().map(|_| ())
     }
 
-    /// Whether this tree is verified against its published sidecar. A v11
-    /// staging sealed its v3 manifest before sidecars existed, so it is
-    /// verified by the resident walk, as it was when it was sealed.
     fn streams_v3(&self) -> bool {
-        self.undo.expected_manifest.schema_version == 3 && self.wal.binds_sidecar(self.transaction)
+        self.wal
+            .streams_v3(self.transaction, self.undo.expected_manifest.schema_version)
     }
 
     fn collect_exact_streamed_v3(&mut self) -> Result<StreamedV3Inventory, RecoveryRebindError> {

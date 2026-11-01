@@ -8,7 +8,7 @@
 
 <p align="center"><a href="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/demo-light.svg"><picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/demo-dark.svg">
-  <img src="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/demo-light.svg" alt="degu scan of a synthetic fixture at ML-node scale: 13.6 GiB across five caches, split into Ready to clean, Needs review with its reason per location, and Not managed, followed by a copyable preview command" width="92%">
+  <img src="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/demo-light.svg" alt="degu scan of a synthetic fixture at ML-node scale: 13.6 GiB across five caches, split into Eligible to clean, Needs review with its reason per location, and Not managed, followed by a copyable preview command" width="92%">
 </picture></a></p>
 <p align="center"><sub>Real output, from a synthetic fixture whose allocated bytes match a working ML node. Not a benchmark: five large files are not a real cache's directory and inode load. Tap for a readable copy.</sub></p>
 
@@ -55,7 +55,7 @@ Deleting the wrong files is the core risk, so degu earns every deletion:
 - **Corroboration, not names.** A directory becomes eligible only on structural evidence that it is regenerable — a tool's own cache marker, a build manifest — never because it is *named* `cache`, `target`, or `__pycache__`. Among locations degu discovers, anything it cannot corroborate is reported, never cleaned; degu is not a whole-disk file finder.
 - **Three tiers, conservative by default.** *Eligible to clean* is cheap-to-regenerate cache. *Needs review* is regenerable but costly (model downloads, compile caches) and stays excluded until you preview an exact path. *Not managed* — your data, tool-coordinated caches, checkpoints — can never enter a plan.
 - **Fail closed.** If any selected location cannot be fully measured or classified, degu refuses the whole plan instead of guessing. Default cleanup is staged for undo; permanent purge is separately disclosed and confirmed.
-- **Preview matches execution.** `degu clean -n` runs the same sealed-staging admission checks that execution re-verifies: a location the preview still lists as *Eligible to clean* has already passed them, and anything that sealed staging cannot execute — external hard links, unsupported metadata, inventory ceilings — is disclosed with its reason up front instead of failing later.
+- **Preview matches execution.** `degu clean -n` runs the same sealed-staging admission checks that execution re-verifies: a location the preview still lists as *Eligible to clean* has already passed them, and anything that sealed staging cannot execute — external hard links, unsupported metadata, inventory bounds — is disclosed with its reason up front instead of failing later. The preview also blocks a name too long for the trash and an item the seal WAL has no room for, but staging measures both again against what the trash holds then, so it can still refuse an item the preview admitted.
 
 ## How degu compares
 
@@ -122,7 +122,7 @@ When the decision is about one location rather than a rule, `degu tui` brings th
 degu tui
 ```
 
-<p align="center"><a href="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/review.svg"><img src="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/review.svg" alt="degu tui mid-decision: a 7.23 GiB Needs review model checked into the plan alongside the Ready to clean pip cache, two review locations left unchecked, the Not managed cache unselectable, and the header totalling what a clean would move" width="92%"></a></p>
+<p align="center"><a href="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/review.svg"><img src="https://raw.githubusercontent.com/FeathBow/degu/main/docs/assets/review.svg" alt="degu tui mid-decision: a 7.23 GiB Needs review model checked into the plan alongside the Eligible to clean pip cache, two review locations left unchecked, the Not managed cache unselectable, and the header totalling what a clean would move" width="92%"></a></p>
 <p align="center"><sub>One Needs review location chosen; the header totals what a clean would move. Tap the image for a readable copy.</sub></p>
 
 Four keys carry the whole decision, and `?` opens a scrollable field guide to the rest:
@@ -158,7 +158,7 @@ After that the lifecycle is four short commands:
 
 ```sh
 degu clean -n        # preview the exact plan; changes nothing
-degu clean           # stage Ready-to-clean findings into undoable trash
+degu clean           # stage Eligible-to-clean findings into undoable trash
 degu undo            # restore the latest clean operation
 degu trash purge     # or permanently delete what you reviewed
 ```

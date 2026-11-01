@@ -8,15 +8,15 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FeathBow/degu"
 
 [workspace.dependencies]
-degu-core = { path = "crates/degu-core", version = "0.1.7" }
-degu-walk = { path = "crates/degu-walk", version = "0.1.7" }
-degu-adapters = { path = "crates/degu-adapters", version = "0.1.7" }
+degu-core = { path = "crates/degu-core", version = "0.1.8" }
+degu-walk = { path = "crates/degu-walk", version = "0.1.8" }
+degu-adapters = { path = "crates/degu-adapters", version = "0.1.8" }
 clap = { version = "4.6", features = ["derive", "wrap_help"] }
 clap_complete = "4.6"
 clap_mangen = "0.2"

@@ -16,6 +16,10 @@ pub(crate) enum CleanExecutionFailure<'a> {
         entry: Option<&'a Path>,
         reason: &'a str,
     },
+    AwaitingRoom {
+        entry: Option<&'a Path>,
+        reason: &'a str,
+    },
     UnverifiedDestination {
         entry: &'a Path,
         reason: &'a str,
@@ -43,6 +47,7 @@ impl<'a> CleanExecutionFailure<'a> {
             | Self::StageFailed { reason }
             | Self::Quarantined { reason, .. }
             | Self::RecoveryBlocked { reason, .. }
+            | Self::AwaitingRoom { reason, .. }
             | Self::UnverifiedDestination { reason, .. }
             | Self::Staged { reason, .. }
             | Self::PurgeFailed { reason }

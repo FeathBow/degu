@@ -82,6 +82,12 @@ Sealed staging admits one finding at a time within fixed inventory bounds: 100,0
 
 `degu undo` restores the latest staged clean operation to its original paths. Restoring data does not release quota.
 
+### When the disk or quota is full
+
+Checking a staged tree writes private sort files into the store directory, so it needs room on the store's filesystem, and how much grows with the tree. When one of those writes fails because the disk or the quota is full, degu records nothing against the tree. `degu undo` and `degu trash purge` refuse and leave the entry staged. A `degu clean` whose rename has already happened reports `awaiting_room`: the entry is in the trash, quota is unchanged, and its check is still to run. The next mutating command with room repeats the whole check first, and a tree that changed in the meantime is treated as it would be at any other check. Until then no new staging starts, and the source parent keeps the seal staging gave it, which leaves its owner able to write there.
+
+This covers those sort files only. A failed write to the seal WAL can still leave a transaction that needs recovery, and so can any failure once a purge has recorded its claim, because at those points degu cannot tell from the record what happened.
+
 ### When the recorded store is gone
 
 An account can end up with an anchor holding activation records that name a store which is no longer there — a moved state directory, a reimaged node, or a swept scratch filesystem is enough. `degu doctor` then reports `recovery_required` with `Activation lost`, and every mutation, including `degu undo`, refuses with `activation is not in a resumable never/preparing state`. degu clears none of this on its own, because a store it cannot authenticate is not something it may decide about.

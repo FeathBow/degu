@@ -65,3 +65,49 @@ fn modes_by_path() {
         Err(RecoveryRebindError::InvalidLocator)
     ));
 }
+
+fn io_failure(code: i32) -> TreeSidecarError {
+    TreeSidecarError::Io {
+        path: PathBuf::from("/store/run"),
+        source: io::Error::from_raw_os_error(code),
+    }
+}
+
+/// What the hardlink records showed decides when only a full disk stopped the
+/// fold tidying up. Any other failure keeps its place ahead of them.
+#[test]
+fn hardlinks_outrank_removal() {
+    for code in [libc::ENOSPC, libc::EDQUOT] {
+        assert!(matches!(
+            hardlink_fold_failure(io_failure(code), HardlinkTopologyFold::miscounted()),
+            RecoveryRebindError::UndoManifestChanged
+        ));
+        assert!(
+            hardlink_fold_failure(io_failure(code), HardlinkTopologyFold::new()).is_disk_full()
+        );
+    }
+    assert!(matches!(
+        hardlink_fold_failure(io_failure(libc::EIO), HardlinkTopologyFold::miscounted()),
+        RecoveryRebindError::Sidecar(_)
+    ));
+}
+
+/// A full disk never replaces what a check found, and anything else still does.
+#[test]
+fn outrank_keeps_findings() {
+    let disk = || sidecar_error(io_failure(libc::EDQUOT));
+    let damage = || sidecar_error(TreeSidecarError::InvalidScratch("damaged"));
+    assert!(matches!(
+        outrank_primary(Err(disk()), Err(disk()), manifest_changed()),
+        RecoveryRebindError::UndoManifestChanged
+    ));
+    assert!(matches!(
+        outrank_primary(Ok(()), Err(damage()), manifest_changed()),
+        RecoveryRebindError::Sidecar(TreeSidecarError::InvalidScratch(_))
+    ));
+    assert!(matches!(
+        outrank_primary(Err(disk()), Err(damage()), manifest_changed()),
+        RecoveryRebindError::Sidecar(TreeSidecarError::InvalidScratch(_))
+    ));
+    assert!(outrank_primary(Ok(()), Ok(()), disk()).is_disk_full());
+}

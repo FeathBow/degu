@@ -40,6 +40,22 @@ fn fire_after_manifest_scratch_build_test_hook() {
 #[cfg(not(test))]
 fn fire_after_manifest_scratch_build_test_hook() {}
 
+#[cfg(test)]
+std::thread_local! {
+    static BEFORE_REWALK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn set_before_rewalk(callback: impl FnOnce() + 'static) {
+    BEFORE_REWALK.with(|slot| {
+        assert!(
+            slot.borrow_mut().replace(Box::new(callback)).is_none(),
+            "recovery v3 rewalk hook already installed"
+        );
+    });
+}
+
 #[derive(Debug)]
 enum RecoveryV3EmitError {
     Sidecar(TreeSidecarError),
@@ -195,10 +211,24 @@ fn authenticate_then_cleanup(
     primary: RecoveryRebindError,
 ) -> RecoveryRebindError {
     let authenticated = authenticate_manifest(sidecars, commitment, manifest);
-    let cleanup = sidecars.cleanup_unpublished(wal).map_err(sidecar_error);
-    authenticated
-        .err()
-        .or_else(|| cleanup.err())
+    let cleanup = sidecars
+        .cleanup_unpublished(wal)
+        .map(|_| ())
+        .map_err(sidecar_error);
+    outrank_primary(authenticated, cleanup, primary)
+}
+
+/// A later failure replaces what a check already found, except that a full disk
+/// says nothing about the tree or the baseline and so replaces nothing.
+fn outrank_primary(
+    authenticated: Result<(), RecoveryRebindError>,
+    cleanup: Result<(), RecoveryRebindError>,
+    primary: RecoveryRebindError,
+) -> RecoveryRebindError {
+    [authenticated.err(), cleanup.err()]
+        .into_iter()
+        .flatten()
+        .find(|later| !later.is_disk_full())
         .unwrap_or(primary)
 }
 
@@ -455,32 +485,37 @@ pub(super) fn verify_rebound_v3(
             ));
         }
     };
+    // Held out here because the fold may fail to tidy up after reading every
+    // record, and what the records showed still has to be asked.
+    let mut hardlink_groups = HardlinkTopologyFold::new();
     let hardlink_fold = sidecars.fold_sorted_hardlink_scratch(
         wal,
         transaction,
         hardlink_scratch,
-        HardlinkTopologyFold::new(),
-        |groups, record| {
+        (),
+        |(), record| {
             let record = decode_hardlink_scratch_record(record)
                 .map_err(HeldTreeV3CollectError::<Infallible>::Codec)?
                 .ok_or(HeldTreeV3CollectError::Codec(
                     ManifestV3CodecError::InvalidTag,
                 ))?;
-            groups.observe(record).map_err(HeldTreeV3CollectError::Tree)
+            hardlink_groups
+                .observe(record)
+                .map_err(HeldTreeV3CollectError::Tree)
         },
     );
-    let hardlink_fold = match hardlink_fold {
-        Ok(fold) => fold,
+    match hardlink_fold {
+        Ok(()) => {}
         Err(TreeSidecarFoldError::Sidecar(error)) => {
             authenticate_manifest(sidecars, commitment, expected_manifest)?;
-            return Err(sidecar_error(error));
+            return Err(hardlink_fold_failure(error, hardlink_groups));
         }
         Err(TreeSidecarFoldError::Fold(_)) => {
             authenticate_manifest(sidecars, commitment, expected_manifest)?;
             return Err(manifest_changed());
         }
-    };
-    let hardlinks = match hardlink_fold.finish() {
+    }
+    let hardlinks = match hardlink_groups.finish() {
         Ok(hardlinks) => hardlinks,
         Err(_) => {
             authenticate_manifest(sidecars, commitment, expected_manifest)?;
@@ -494,6 +529,12 @@ pub(super) fn verify_rebound_v3(
             return Err(manifest_changed());
         }
     };
+    #[cfg(test)]
+    BEFORE_REWALK.with(|slot| {
+        if let Some(callback) = slot.borrow_mut().take() {
+            callback();
+        }
+    });
     if let Err(error) = rewalk_structure(
         wal,
         sidecars,
@@ -522,6 +563,19 @@ pub(super) fn verify_rebound_v3(
     }
     authenticate_manifest(sidecars, commitment, expected_manifest)?;
     Ok(tree)
+}
+
+/// The fold read every record and then could not tidy up. A full disk says nothing
+/// about what those records showed, so what they showed still decides.
+fn hardlink_fold_failure(
+    error: TreeSidecarError,
+    groups: HardlinkTopologyFold,
+) -> RecoveryRebindError {
+    if error.is_disk_full() && groups.finish().is_err() {
+        manifest_changed()
+    } else {
+        sidecar_error(error)
+    }
 }
 
 pub(super) fn build_purge_plan(
@@ -696,6 +750,14 @@ fn rewalk_structure(
         Err(error) => {
             let primary = match error {
                 TreeManifestScratchBuildError::Sidecar(error) => sidecar_error(error),
+                // A spill while the walk runs reaches here as the producer's
+                // error. Only a full disk keeps its own name: every other one
+                // has always read as the tree having changed.
+                TreeManifestScratchBuildError::Produce(HeldTreeV3CollectError::Emit(error))
+                    if error.is_disk_full() =>
+                {
+                    sidecar_error(error)
+                }
                 TreeManifestScratchBuildError::Produce(_) => manifest_changed(),
             };
             return Err(authenticate_then_cleanup(
@@ -738,10 +800,7 @@ fn rewalk_structure(
             .finish_sorted_structure_scratch_cursor(wal, cursor)
             .map_err(sidecar_error);
         let authenticated = authenticate_manifest(sidecars, commitment, manifest);
-        return Err(authenticated
-            .err()
-            .or_else(|| cleanup.err())
-            .unwrap_or(primary));
+        return Err(outrank_primary(authenticated, cleanup, primary));
     }
     while comparison.actual.is_some()
         || (comparison.scratch_error.is_none()
@@ -760,15 +819,21 @@ fn rewalk_structure(
             comparison.record_tree_error(HeldTreeError::PostAdded(actual.path().to_path_buf()));
         }
     }
+    // Scratch integrity outranks a tree difference, because a corrupt scratch
+    // proves nothing about the tree. A full disk does not, because the records
+    // that showed the difference had already been read back and authenticated.
+    let tree_differs = comparison.first_tree_error.is_some();
     if let Err(error) = sidecars.finish_sorted_structure_scratch_cursor(wal, cursor) {
         authenticate_manifest(sidecars, commitment, manifest)?;
-        return Err(sidecar_error(error));
+        if !(tree_differs && error.is_disk_full()) {
+            return Err(sidecar_error(error));
+        }
     }
     if let Some(error) = comparison.scratch_error {
         authenticate_manifest(sidecars, commitment, manifest)?;
         return Err(sidecar_error(error));
     }
-    if comparison.first_tree_error.is_some() {
+    if tree_differs {
         authenticate_manifest(sidecars, commitment, manifest)?;
         return Err(manifest_changed());
     }

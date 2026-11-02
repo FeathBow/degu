@@ -160,7 +160,7 @@ pub(crate) enum RecoveryRebindError {
     Resolution(#[from] ResolveError),
     #[error("held recovery mutation failed: {0}")]
     Execution(#[from] LocalModeExecutionError),
-    #[error("recovery tree sidecar failed authentication: {0}")]
+    #[error("recovery tree sidecar check failed: {0}")]
     Sidecar(#[source] TreeSidecarError),
     #[error("published recovery tree sidecar does not match its durable manifest")]
     SidecarManifestChanged,
@@ -430,10 +430,34 @@ struct ReboundRestore {
     completion: TransactionState,
 }
 
+/// Runs just before a v3 check walks the structure, after everything else it
+/// checks has passed.
+#[cfg(test)]
+pub(crate) fn before_structure_walk(callback: impl FnOnce() + 'static) {
+    stream_v3::set_before_rewalk(callback);
+}
+
+impl RecoveryRebindError {
+    /// Whether a check stopped for lack of room to write its private scratch,
+    /// before it could say anything about the tree or its baseline.
+    pub(crate) fn is_disk_full(&self) -> bool {
+        matches!(
+            self,
+            Self::Sidecar(error) | Self::PurgePlan(error) if error.is_disk_full()
+        )
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StagedVerificationError {
     #[error("staged verification capability is not at StagedUnverified")]
     InvalidState,
+    /// Nothing was recorded, so the transaction stays `StagedUnverified` and the
+    /// next open verifies it again from the start.
+    #[error(
+        "no room to finish verifying the staged tree; it stays staged and the next run with room finishes it"
+    )]
+    DiskFull(#[source] StagedVerificationFailure),
     #[error("verified staged state was not durable: {0}")]
     StagedSealedNotDurable(#[source] AppendError),
     #[error("staged verification failed ({failure}) and quarantine was not durable: {source}")]
@@ -442,6 +466,12 @@ pub(crate) enum StagedVerificationError {
         #[source]
         source: AppendError,
     },
+}
+
+impl StagedVerificationFailure {
+    fn is_disk_full(&self) -> bool {
+        matches!(self, Self::Rebind(error) if error.is_disk_full())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -619,6 +649,9 @@ impl<'a> CertifiedStagedRecovery<'a> {
         }
         let verification = self.verify_staged_tree(limits);
         if let Err(failure) = verification {
+            if failure.is_disk_full() {
+                return Err(StagedVerificationError::DiskFull(failure));
+            }
             return match self
                 .wal
                 .transition_staging_foundation(self.transaction, TransactionState::Quarantined)
@@ -1093,6 +1126,12 @@ impl VerifiedPurgeSession<'_> {
                 .and_then(|inventory| verifier.verify_purge_layout().map(|()| inventory));
             let inventory = match verified {
                 Ok(inventory) => inventory,
+                Err(error) if error.is_disk_full() => {
+                    // Nothing about the tree is known yet, and nothing has been
+                    // claimed: the entry stays committed and can be asked again.
+                    *verifier.startup_blocked = !verifier.wal.can_begin_staging_transaction();
+                    return Err(error);
+                }
                 Err(error) => {
                     verifier.wal.transition_recovery_required(transaction)?;
                     *verifier.startup_blocked = true;
@@ -1391,13 +1430,16 @@ impl VerifiedUndoRecoverySession<'_> {
                 let missing_v3_sidecar =
                     self.streams_v3() && self.undo.sidecar_commitment.is_none();
                 // A missing or unauthentic published v3 baseline is not live-tree
-                // drift and cannot remain retryable at either proof boundary.
+                // drift and cannot remain retryable at either proof boundary. No
+                // room to write the check's scratch is neither: the check never
+                // reached a conclusion about the baseline.
                 if missing_v3_sidecar
-                    || matches!(
-                        error,
-                        RecoveryRebindError::Sidecar(_)
-                            | RecoveryRebindError::SidecarManifestChanged
-                    )
+                    || (!error.is_disk_full()
+                        && matches!(
+                            error,
+                            RecoveryRebindError::Sidecar(_)
+                                | RecoveryRebindError::SidecarManifestChanged
+                        ))
                 {
                     self.wal.transition_recovery_required(self.transaction)?;
                     *self.startup_blocked = true;

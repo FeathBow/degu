@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 mod scratch;
 #[cfg(test)]
 pub(crate) use scratch::TreeDirectoryPlan;
+#[cfg(test)]
+pub(crate) use scratch::{SCRATCH_MEMORY, ScratchFault, ScratchStep, arm_fault, disarm_fault};
 pub(crate) use scratch::{
     TreeManifestScratchBuildError, TreePurgePlan, TreeStructureScratchCursor,
 };
@@ -103,6 +105,20 @@ pub(crate) enum TreeSidecarError {
         #[source]
         source: io::Error,
     },
+}
+
+impl TreeSidecarError {
+    /// Whether the filesystem or the account's quota refused a write. It says
+    /// nothing about the sidecar, the scratch or the tree, so it must never be
+    /// recorded as though it did: the same check can pass once there is room.
+    pub(crate) fn is_disk_full(&self) -> bool {
+        let Self::Io { source, .. } = self else {
+            return false;
+        };
+        source
+            .raw_os_error()
+            .is_some_and(|code| code == libc::ENOSPC || code == libc::EDQUOT)
+    }
 }
 
 #[derive(Debug)]
@@ -857,6 +873,10 @@ fn remove_validated_private_file<Fd: AsFd>(
     // directory scan observation. The unique mutable WAL writer excludes every
     // cooperative publisher while this exact name is removed.
     validate_file(directory, name, fd, backend, device, path)?;
+    #[cfg(test)]
+    if let Some(error) = scratch::injected_fault(scratch::ScratchStep::Remove) {
+        return Err(io_error(path, error));
+    }
     rustix::fs::unlinkat(directory, name, AtFlags::empty())
         .map_err(|error| io_error(path, error.into()))
 }
@@ -2091,6 +2111,104 @@ mod tests {
         );
         assert!(run_names.iter().all(|name| !root.join(name).exists()));
         assert_eq!(store.cleanup_unpublished(&mut wal).unwrap(), 0);
+    }
+
+    #[test]
+    fn disk_full_names() {
+        // Only the two errnos a full disk or quota writes, and only as an I/O
+        // failure: a missing or damaged baseline must never read as one.
+        let io = |code| TreeSidecarError::Io {
+            path: PathBuf::from("/store/run"),
+            source: io::Error::from_raw_os_error(code),
+        };
+        assert!(io(libc::ENOSPC).is_disk_full());
+        assert!(io(libc::EDQUOT).is_disk_full());
+        assert!(!io(libc::EIO).is_disk_full());
+        assert!(!io(libc::ENOENT).is_disk_full());
+        assert!(!io(libc::EMFILE).is_disk_full());
+        assert!(!TreeSidecarError::InvalidScratch("damaged").is_disk_full());
+        assert!(!TreeSidecarError::Integrity(PathBuf::from("/store/run")).is_disk_full());
+    }
+
+    #[test]
+    fn fold_outranks_removal() {
+        // A full disk while tidying up must not replace what the records showed,
+        // while any other removal failure still does.
+        for (errno, kept) in [
+            (libc::EDQUOT, true),
+            (libc::ENOSPC, true),
+            (libc::EIO, false),
+        ] {
+            let (_temp, _root, store, mut wal) = fixture();
+            let transaction = tx(41);
+            let (hardlinks, ()) = store
+                .build_sorted_hardlink_scratch_with_output(&mut wal, transaction, |emit| {
+                    emit(crate::backend::held::hardlink_scratch_sentinel_record())?;
+                    let mut identity = [0_u8; 24];
+                    identity[23] = 1;
+                    emit(&private_hardlink_record(identity, b"file", 1))?;
+                    Ok::<_, TreeSidecarError>(())
+                })
+                .unwrap();
+            scratch::arm_fault(scratch::ScratchFault {
+                step: scratch::ScratchStep::Remove,
+                run: 0,
+                errno,
+            });
+            let failed =
+                store.fold_sorted_hardlink_scratch(&mut wal, transaction, hardlinks, (), |_, _| {
+                    Err::<(), &str>("the records disagree")
+                });
+            assert!(!scratch::disarm_fault(), "the removal must have failed");
+            match failed {
+                Err(TreeSidecarFoldError::Fold(reason)) => assert!(kept, "{reason}"),
+                Err(TreeSidecarFoldError::Sidecar(_)) => assert!(!kept, "{errno}"),
+                Ok(()) => panic!("the fold failed"),
+            }
+        }
+    }
+
+    #[test]
+    fn fold_outranks_cleanup() {
+        // The same when the runs came off and only the sweep for leftovers failed.
+        for (errno, kept) in [
+            (libc::EDQUOT, true),
+            (libc::ENOSPC, true),
+            (libc::EIO, false),
+        ] {
+            let (_temp, _root, store, mut wal) = fixture();
+            let transaction = tx(42);
+            let build = |wal: &mut SealWal<RecoverySession>| {
+                store
+                    .build_sorted_hardlink_scratch_with_output(wal, transaction, |emit| {
+                        emit(crate::backend::held::hardlink_scratch_sentinel_record())?;
+                        let mut identity = [0_u8; 24];
+                        identity[23] = 1;
+                        emit(&private_hardlink_record(identity, b"file", 1))?;
+                        Ok::<_, TreeSidecarError>(())
+                    })
+                    .unwrap()
+                    .0
+            };
+            let hardlinks = build(&mut wal);
+            // Never consumed, so its run is left for the sweep to remove.
+            let _leftover = build(&mut wal);
+            scratch::arm_fault(scratch::ScratchFault {
+                step: scratch::ScratchStep::Remove,
+                run: 1,
+                errno,
+            });
+            let failed =
+                store.fold_sorted_hardlink_scratch(&mut wal, transaction, hardlinks, (), |_, _| {
+                    Err::<(), &str>("the records disagree")
+                });
+            assert!(!scratch::disarm_fault(), "the sweep must have failed");
+            match failed {
+                Err(TreeSidecarFoldError::Fold(reason)) => assert!(kept, "{reason}"),
+                Err(TreeSidecarFoldError::Sidecar(_)) => assert!(!kept, "{errno}"),
+                Ok(()) => panic!("the fold failed"),
+            }
+        }
     }
 
     #[test]

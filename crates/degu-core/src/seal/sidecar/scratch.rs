@@ -240,6 +240,74 @@ struct RecordIndex {
     length: usize,
 }
 
+/// Where a test makes one scratch run fail, as a full disk or quota would.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScratchStep {
+    Create,
+    Write,
+    Finish,
+    /// Damages the run's last byte instead of failing, so its digest cannot match.
+    Corrupt,
+    Remove,
+}
+
+/// The one failure a test has armed. `run` counts the scratch runs started since
+/// it was armed, so a test can walk every run of a verification; `Remove` counts
+/// removals instead.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScratchFault {
+    pub(crate) step: ScratchStep,
+    pub(crate) run: u32,
+    pub(crate) errno: i32,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SCRATCH_FAULT: std::cell::Cell<Option<ScratchFault>> =
+        const { std::cell::Cell::new(None) };
+    static SCRATCH_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static SCRATCH_REMOVALS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// A smaller sort budget, so that a producer spills while it is still running.
+    pub(crate) static SCRATCH_MEMORY: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn arm_fault(fault: ScratchFault) {
+    SCRATCH_RUNS.with(|runs| runs.set(0));
+    SCRATCH_REMOVALS.with(|removals| removals.set(0));
+    SCRATCH_FAULT.with(|slot| slot.set(Some(fault)));
+}
+
+/// Takes back an armed failure, and says whether it was still waiting to fire.
+#[cfg(test)]
+pub(crate) fn disarm_fault() -> bool {
+    SCRATCH_FAULT.with(std::cell::Cell::take).is_some()
+}
+
+#[cfg(test)]
+pub(super) fn injected_fault(step: ScratchStep) -> Option<io::Error> {
+    if step == ScratchStep::Create {
+        SCRATCH_RUNS.with(|runs| runs.set(runs.get() + 1));
+    }
+    if step == ScratchStep::Remove {
+        SCRATCH_REMOVALS.with(|removals| removals.set(removals.get() + 1));
+    }
+    let seen = if step == ScratchStep::Remove {
+        SCRATCH_REMOVALS.with(std::cell::Cell::get)
+    } else {
+        SCRATCH_RUNS.with(std::cell::Cell::get)
+    };
+    let fault = SCRATCH_FAULT.with(std::cell::Cell::get)?;
+    if fault.step != step || seen != fault.run + 1 {
+        return None;
+    }
+    SCRATCH_FAULT.with(std::cell::Cell::take);
+    Some(io::Error::from_raw_os_error(fault.errno))
+}
+
 struct RunBuilder<'a> {
     store: &'a TreeSidecarStore,
     transaction: TransactionId,
@@ -525,6 +593,10 @@ impl TreeSidecarStore {
                 TreeSidecarError::InvalidScratch("invalid scratch sort memory budget").into(),
             );
         }
+        #[cfg(test)]
+        let memory_bytes = SCRATCH_MEMORY
+            .with(std::cell::Cell::get)
+            .unwrap_or(memory_bytes);
         self.require_matching_wal(wal)?;
         self.revalidate_store_binding()?;
         let mut builder = RunBuilder {
@@ -742,9 +814,17 @@ impl TreeSidecarStore {
             }
             self.require_matching_wal(wal)?;
             self.revalidate_store_binding()?;
-            self.remove_runs(&scratch.runs)?;
-            rustix::fs::fsync(&self.directory)
-                .map_err(|error| io_error(&self.path, error.into()))?;
+            let removed = self.remove_runs(&scratch.runs).and_then(|()| {
+                rustix::fs::fsync(&self.directory)
+                    .map_err(|error| io_error(&self.path, error.into()))
+            });
+            if let Err(error) = removed {
+                // A full disk while tidying up says nothing about what the
+                // records showed, so it must not replace what they showed.
+                if !(error.is_disk_full() && fold_error.is_some()) {
+                    return Err(error.into());
+                }
+            }
             self.require_matching_wal(wal)?;
             self.revalidate_store_binding()?;
             if let Some(error) = fold_error {
@@ -760,6 +840,9 @@ impl TreeSidecarStore {
         match (validation, cleanup) {
             (Err(TreeSidecarFoldError::Sidecar(primary)), _) => {
                 Err(TreeSidecarFoldError::Sidecar(primary))
+            }
+            (Err(TreeSidecarFoldError::Fold(error)), Err(cleanup)) if cleanup.is_disk_full() => {
+                Err(TreeSidecarFoldError::Fold(error))
             }
             (Err(TreeSidecarFoldError::Fold(_)), Err(cleanup)) | (Ok(_), Err(cleanup)) => {
                 Err(TreeSidecarFoldError::Sidecar(cleanup))
@@ -1358,6 +1441,10 @@ impl<'a> ScratchRunWriter<'a> {
     ) -> Result<Self, TreeSidecarError> {
         let name = scratch_name(transaction);
         let path = store.path.join(&name);
+        #[cfg(test)]
+        if let Some(error) = injected_fault(ScratchStep::Create) {
+            return Err(io_error(&path, error));
+        }
         let fd = match rustix::fs::openat(&store.directory, &name, OPEN_NEW, FILE_MODE) {
             Ok(fd) => fd,
             Err(rustix::io::Errno::EXIST) => return Err(TreeSidecarError::AlreadyExists(path)),
@@ -1409,6 +1496,10 @@ impl<'a> ScratchRunWriter<'a> {
                     "scratch payload length overflow",
                 ))?;
         let length_bytes = length.to_be_bytes();
+        #[cfg(test)]
+        if let Some(error) = injected_fault(ScratchStep::Write) {
+            return Err(io_error(&self.path, error));
+        }
         self.file
             .write_all(&length_bytes)
             .and_then(|()| self.file.write_all(record))
@@ -1435,11 +1526,23 @@ impl<'a> ScratchRunWriter<'a> {
         let digest = self.digest.finalize().into();
         let header =
             encode_scratch_header(self.transaction, self.records, self.payload_bytes, digest);
+        #[cfg(test)]
+        if let Some(error) = injected_fault(ScratchStep::Finish) {
+            return Err(io_error(&self.path, error));
+        }
         self.file
             .seek(SeekFrom::Start(0))
             .and_then(|_| self.file.write_all(&header))
             .and_then(|_| self.file.flush())
             .map_err(|error| io_error(&self.path, error))?;
+        #[cfg(test)]
+        if injected_fault(ScratchStep::Corrupt).is_some() {
+            let mut last = [0_u8];
+            self.file.seek(SeekFrom::End(-1)).unwrap();
+            self.file.read_exact(&mut last).unwrap();
+            self.file.seek(SeekFrom::End(-1)).unwrap();
+            self.file.write_all(&[last[0] ^ 0xff]).unwrap();
+        }
         validate_file(
             &self.store.directory,
             &self.name,

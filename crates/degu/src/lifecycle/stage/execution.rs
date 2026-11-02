@@ -40,6 +40,10 @@ enum CleanState {
         entry: Option<PathBuf>,
         reason: String,
     },
+    AwaitingRoom {
+        entry: Option<PathBuf>,
+        reason: String,
+    },
     UnverifiedDestination {
         entry: PathBuf,
         reason: String,
@@ -183,6 +187,10 @@ impl CleanExecution {
         Self::with_state(finding, CleanState::RecoveryBlocked { entry, reason })
     }
 
+    pub(super) fn awaiting_room(finding: &Finding, entry: Option<PathBuf>, reason: String) -> Self {
+        Self::with_state(finding, CleanState::AwaitingRoom { entry, reason })
+    }
+
     pub(super) fn plain_stage_failed(finding: &Finding, reason: String) -> Self {
         Self::stage_failed(finding, reason)
     }
@@ -235,9 +243,9 @@ impl CleanExecution {
     pub(crate) fn trash_entry(&self) -> Option<&Path> {
         match &self.state {
             CleanState::NotAttempted { .. } | CleanState::StageFailed { .. } => None,
-            CleanState::Quarantined { entry, .. } | CleanState::RecoveryBlocked { entry, .. } => {
-                entry.as_deref()
-            }
+            CleanState::Quarantined { entry, .. }
+            | CleanState::RecoveryBlocked { entry, .. }
+            | CleanState::AwaitingRoom { entry, .. } => entry.as_deref(),
             CleanState::UnverifiedDestination { entry, .. }
             | CleanState::Staged { entry, .. }
             | CleanState::ProductionStaged { entry, .. }
@@ -267,6 +275,12 @@ impl CleanExecution {
             }),
             CleanState::RecoveryBlocked { entry, reason } => {
                 Some(CleanExecutionFailure::RecoveryBlocked {
+                    entry: entry.as_deref(),
+                    reason,
+                })
+            }
+            CleanState::AwaitingRoom { entry, reason } => {
+                Some(CleanExecutionFailure::AwaitingRoom {
                     entry: entry.as_deref(),
                     reason,
                 })
@@ -317,6 +331,7 @@ impl CleanExecution {
             CleanState::StageFailed { .. } => "stage_failed",
             CleanState::Quarantined { .. } => "quarantined",
             CleanState::RecoveryBlocked { .. } => "recovery_blocked",
+            CleanState::AwaitingRoom { .. } => "awaiting_room",
             CleanState::UnverifiedDestination { .. } => "unverified_destination",
             CleanState::Staged { .. }
             | CleanState::ProductionStaged { .. }
@@ -333,6 +348,7 @@ impl CleanExecution {
             self.state,
             CleanState::Quarantined { entry: Some(_), .. }
                 | CleanState::RecoveryBlocked { entry: Some(_), .. }
+                | CleanState::AwaitingRoom { entry: Some(_), .. }
                 | CleanState::UnverifiedDestination { .. }
                 | CleanState::Staged { .. }
                 | CleanState::ProductionStaged { .. }
@@ -392,6 +408,7 @@ impl CleanExecution {
                 | CleanState::PurgeUnsupported { .. }
                 | CleanState::Quarantined { .. }
                 | CleanState::RecoveryBlocked { .. }
+                | CleanState::AwaitingRoom { .. }
         )
     }
 
@@ -409,9 +426,12 @@ impl CleanExecution {
             CleanState::Staged { .. } | CleanState::StagedWithFailure { .. } => {
                 RestoreAuthority::OperationLog
             }
+            // The WAL still governs it, and the next run with room finishes the
+            // check that lets undo restore it.
             CleanState::ProductionStaged { .. }
             | CleanState::ProductionCommittedWithFailure { .. }
-            | CleanState::PurgeUnsupported { .. } => RestoreAuthority::SealWal,
+            | CleanState::PurgeUnsupported { .. }
+            | CleanState::AwaitingRoom { .. } => RestoreAuthority::SealWal,
             CleanState::PurgeFailed {
                 restore_authority, ..
             } => *restore_authority,

@@ -1,4 +1,6 @@
 mod lustre;
+mod nfs;
+mod tool;
 
 use super::{MountInfo, ProbeError};
 use crate::quota::model::{ActiveQuota, QuotaDimension, QuotaGrace, QuotaLimits, QuotaSnapshot};
@@ -11,6 +13,7 @@ const PROVIDER: &str = "linux_vfs";
 const DATA_SOURCE: &str = "linux_quotactl";
 const QUOTA_BLOCK_BYTES: u64 = 1024;
 const SUPPORTED_FILESYSTEM: &str = "ext4";
+const SETGID_BIT: u32 = 0o2000;
 const SUBCOMMAND_SHIFT: u32 = 8;
 const OCTAL_DIGIT_COUNT: usize = 3;
 const OCTAL_RADIX: u32 = 8;
@@ -23,11 +26,34 @@ struct QueryResult {
 }
 
 pub(super) fn probe(path: &Path) -> Result<QuotaSnapshot, ProbeError> {
+    read_quota(path, Reach::UserOnly)
+}
+
+pub(super) fn survey(path: &Path) -> Result<QuotaSnapshot, ProbeError> {
+    read_quota(path, Reach::EverySubject)
+}
+
+#[derive(Clone, Copy)]
+enum Reach {
+    UserOnly,
+    EverySubject,
+}
+
+fn read_quota(path: &Path, reach: Reach) -> Result<QuotaSnapshot, ProbeError> {
     let mount = inspect_mount(path)?;
     let subject_id = rustix::process::geteuid().as_raw();
-    let snapshot = match mount.filesystem.as_str() {
-        SUPPORTED_FILESYSTEM => probe_vfs(mount.clone(), path, subject_id),
-        lustre::FILESYSTEM => lustre::probe(mount.clone(), path, subject_id),
+    let snapshot = match (mount.filesystem.as_str(), reach) {
+        (SUPPORTED_FILESYSTEM, _) => probe_vfs(mount.clone(), path, subject_id),
+        (lustre::FILESYSTEM, Reach::UserOnly) => lustre::probe(mount.clone(), path, subject_id),
+        (lustre::FILESYSTEM, Reach::EverySubject) => {
+            lustre::survey(mount.clone(), path, subject_id, group_for_files(path))
+        }
+        (filesystem, Reach::UserOnly) if nfs::FILESYSTEMS.contains(&filesystem) => {
+            nfs::probe(mount.clone(), path, subject_id)
+        }
+        (filesystem, Reach::EverySubject) if nfs::FILESYSTEMS.contains(&filesystem) => {
+            nfs::survey(mount.clone(), path, subject_id, group_for_files(path))
+        }
         _ => Err(unsupported(&mount)),
     }?;
     // Detect ordinary concurrent replacement. A privileged mount controller can
@@ -41,6 +67,33 @@ pub(super) fn probe(path: &Path) -> Result<QuotaSnapshot, ProbeError> {
         ));
     }
     Ok(snapshot)
+}
+
+/// The group a file created here is charged to. Shared project directories on a
+/// cluster are setgid, and that group is the one whose limit a write there runs
+/// into. A directory that cannot be read leaves the process's own group.
+fn group_for_files(path: &Path) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    let egid = rustix::process::getegid().as_raw();
+    std::fs::metadata(directory_holding(path))
+        .map(|directory| charged_group(directory.mode(), directory.gid(), egid))
+        .unwrap_or(egid)
+}
+
+fn directory_holding(path: &Path) -> &Path {
+    if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    }
+}
+
+fn charged_group(directory_mode: u32, directory_gid: u32, egid: u32) -> u32 {
+    if directory_mode & SETGID_BIT != 0 {
+        directory_gid
+    } else {
+        egid
+    }
 }
 
 fn probe_vfs(mount: MountInfo, path: &Path, subject_id: u32) -> Result<QuotaSnapshot, ProbeError> {
@@ -226,7 +279,7 @@ fn unsupported(mount: &MountInfo) -> ProbeError {
     ProbeError::Unsupported {
         filesystem: mount.filesystem.clone(),
         mount_point: mount.mount_point.display().to_string(),
-        reason: "only positively validated ext4 and lustre user quotas are supported",
+        reason: "only positively validated ext4, lustre and nfs quotas are supported",
     }
 }
 
@@ -310,6 +363,22 @@ mod tests {
         assert_eq!(inodes.headroom_to_hard_limit, Some(2));
         assert_eq!(space.grace.unwrap().state, QuotaGraceState::Active);
         assert_eq!(inodes.grace.unwrap().state, QuotaGraceState::Expired);
+    }
+
+    #[test]
+    fn setgid_directory_names_the_group() {
+        assert_eq!(super::charged_group(0o2770, 2000, 1000), 2000);
+        assert_eq!(super::charged_group(0o0770, 2000, 1000), 1000);
+    }
+
+    // A file answers for the directory it sits in.
+    #[test]
+    fn file_answers_for_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(super::directory_holding(dir.path()), dir.path());
+        assert_eq!(super::directory_holding(&file), dir.path());
     }
 
     #[test]

@@ -90,6 +90,11 @@ fn quota_linux_returns_authoritative_state_or_explicit_error() {
                 assert_eq!(json["data_source"], "lfs_quota");
                 assert_eq!(json["scope"]["filesystem"], "lustre");
             }
+            "nfs_rquota" => {
+                assert_eq!(json["data_source"], "quota_tool");
+                let filesystem = json["scope"]["filesystem"].as_str().unwrap();
+                assert!(filesystem.starts_with("nfs"), "{filesystem}");
+            }
             other => panic!("unexpected quota provider {other}"),
         }
         return;
@@ -177,4 +182,6 @@ fn quota_linux_lustre_fixture_reports_the_lfs_provider() {
     for dimension in ["space", "inodes"] {
         assert!(json[dimension]["used"].is_number());
     }
+    assert!(json["other_subjects"].is_array());
+    assert!(json["limits_complete"].is_boolean());
 }

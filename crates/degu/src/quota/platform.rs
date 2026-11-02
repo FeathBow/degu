@@ -140,6 +140,18 @@ impl ProbeError {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl ProbeError {
+    /// Why, without the filesystem and mount a report states once already.
+    pub(super) fn reason_text(&self) -> String {
+        match self {
+            Self::NotConfigured { .. } => "quota is not configured".to_owned(),
+            Self::Io { source, .. } => source.to_string(),
+            _ => failure_fields(self).3.to_owned(),
+        }
+    }
+}
+
 impl std::error::Error for ProbeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -215,9 +227,19 @@ pub(super) fn probe(path: &Path) -> Result<QuotaSnapshot, ProbeError> {
     linux::probe(path)
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn survey(path: &Path) -> Result<QuotaSnapshot, ProbeError> {
+    linux::survey(path)
+}
+
 #[cfg(target_os = "macos")]
 pub(super) fn probe(path: &Path) -> Result<QuotaSnapshot, ProbeError> {
     macos::probe(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn survey(path: &Path) -> Result<QuotaSnapshot, ProbeError> {
+    probe(path)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

@@ -13,7 +13,7 @@ pub(crate) fn run(args: QuotaArgs, ui: Ui) -> Result<()> {
     let target_text = escape_terminal_text(&target.display().to_string());
     let canonical = std::fs::canonicalize(&target)
         .with_context(|| format!("quota target is unavailable: {target_text}"))?;
-    let report = crate::quota::probe(&canonical)?;
+    let report = crate::quota::survey(&canonical)?;
     output::print(&report, json, ui)?;
     guidance::print(Request {
         output: output_mode(json, ui),

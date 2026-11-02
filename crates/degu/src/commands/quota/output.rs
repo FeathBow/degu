@@ -1,6 +1,8 @@
 use crate::output::stdoutln;
 use crate::presentation::{escape_terminal_text, human_bytes, ratio_bar};
-use crate::quota::model::{QuotaDimension, QuotaGrace, QuotaGraceState, QuotaSnapshot};
+use crate::quota::model::{
+    ClosestLimit, QuotaDimension, QuotaGrace, QuotaGraceState, QuotaSnapshot, SubjectQuota,
+};
 use crate::runtime::{Glyphs, Ui};
 use anyhow::Result;
 use std::cmp::Ordering;
@@ -32,14 +34,113 @@ fn render_human(report: &QuotaSnapshot, ui: Ui) -> String {
         "Quota {separator} {target}\n\nFilesystem  {filesystem} {separator} {mount}\nSubject     {subject} {}\nProvider    {provider}\nData source {data_source}",
         report.subject.id
     );
+    write!(output, "\n\n{}", closest_line(report, glyphs))
+        .expect("writing to a String cannot fail");
+    if !report.other_subjects.is_empty() {
+        write!(output, "\n\nUser {}", report.subject.id).expect("writing to a String cannot fail");
+    } else {
+        output.push('\n');
+    }
     write!(
         output,
-        "\n\n{}\n{}",
+        "\n{}\n{}",
         render_dimension("Space", &report.space, human_bytes, glyphs),
         render_dimension("Inodes", &report.inodes, format_count, glyphs)
     )
     .expect("writing to a String cannot fail");
+    for other in &report.other_subjects {
+        write!(output, "\n\n{}", render_subject(other, glyphs))
+            .expect("writing to a String cannot fail");
+    }
     reflow_human(&output, ui.width)
+}
+
+/// The answer to "what do I hit first?". Every limit below is stated too, but a
+/// reader should not have to compare percentages across subjects to find it.
+fn closest_line(report: &QuotaSnapshot, glyphs: Glyphs) -> String {
+    const LABEL: &str = "Closest";
+    let Some(closest) = &report.closest_limit else {
+        return if report.limits_complete {
+            format!("{LABEL:<DETAIL_INDENT$}no limit configured on any subject read")
+        } else {
+            format!(
+                "{LABEL:<DETAIL_INDENT$}unknown: no limit found, but not every subject could be read"
+            )
+        };
+    };
+    let line = format!(
+        "{LABEL:<DETAIL_INDENT$}{}",
+        describe_closest(closest, glyphs)
+    );
+    if report.limits_complete {
+        line
+    } else {
+        format!(
+            "{line}\n{}",
+            detail_line("may not be the real one: not every subject could be read".to_owned())
+        )
+    }
+}
+
+fn describe_closest(closest: &ClosestLimit, glyphs: Glyphs) -> String {
+    let separator = glyphs.separator;
+    let format_value: fn(u64) -> String = if closest.dimension == "space" {
+        human_bytes
+    } else {
+        format_count
+    };
+    let kind = if closest.limit_kind == "soft" {
+        "soft limit"
+    } else {
+        "hard limit"
+    };
+    let subject = match closest.subject_id {
+        Some(id) => format!("{} {id}", closest.subject_kind),
+        None => closest.subject_kind.to_owned(),
+    };
+    let ratio = closest.used as f64 / closest.limit as f64;
+    format!(
+        "{subject} {} {:.1}% of {kind} {separator} {}",
+        closest.dimension,
+        ratio * PERCENT_SCALE,
+        boundary_status(
+            Boundary {
+                kind,
+                limit: closest.limit,
+            },
+            closest.used,
+            format_value,
+        )
+    )
+}
+
+fn render_subject(subject: &SubjectQuota, glyphs: Glyphs) -> String {
+    let title = match subject.id {
+        Some(id) => format!("{} {id}", capitalized(subject.kind)),
+        None => capitalized(subject.kind),
+    };
+    match (&subject.space, &subject.inodes) {
+        (Some(space), Some(inodes)) => format!(
+            "{title}\n{}\n{}",
+            render_dimension("Space", space, human_bytes, glyphs),
+            render_dimension("Inodes", inodes, format_count, glyphs)
+        ),
+        _ => format!(
+            "{title}\n{}",
+            detail_line(format!(
+                "could not be read: {}",
+                escape_terminal_text(subject.reason.as_deref().unwrap_or("no reason given"))
+            ))
+        ),
+    }
+}
+
+fn capitalized(word: &str) -> String {
+    let mut characters = word.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
+    }
 }
 
 fn reflow_human(output: &str, width: u16) -> String {

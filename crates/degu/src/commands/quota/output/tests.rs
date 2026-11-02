@@ -1,7 +1,7 @@
 use super::{format_count, render_dimension, render_human};
 use crate::quota::model::{
     ActiveQuota, QuotaDimension, QuotaGrace, QuotaGraceState, QuotaLimits, QuotaScope,
-    QuotaScopeIdentity, QuotaSnapshot,
+    QuotaScopeIdentity, QuotaSnapshot, SubjectQuota,
 };
 use crate::runtime::{Glyphs, Ui};
 use std::path::PathBuf;
@@ -199,4 +199,120 @@ fn quota_human_expired_grace_without_deadline_never_invents_a_timestamp() {
         "{rendered}"
     );
     assert!(!rendered.contains("Unix"), "{rendered}");
+}
+
+fn lustre_user() -> QuotaSnapshot {
+    QuotaSnapshot::active(
+        QuotaScope::new(
+            PathBuf::from("/scratch/me"),
+            PathBuf::from("/scratch"),
+            "lustre".to_owned(),
+            QuotaScopeIdentity::new(36, 0, 1, PathBuf::from("server:/scratch")),
+        ),
+        1000,
+        ActiveQuota {
+            provider: "lustre_lfs",
+            data_source: "lfs_quota",
+            space: QuotaDimension::new(8, QuotaLimits::new(0, 0), None),
+            inodes: QuotaDimension::new(8, QuotaLimits::new(0, 0), None),
+        },
+    )
+}
+
+// The whole point: a user with no limit of their own must not read as unlimited
+// when the project they write into is nearly out of inodes.
+#[test]
+fn quota_human_leads_with_the_closest_limit() {
+    let report = lustre_user().with_subjects(vec![
+        SubjectQuota::active(
+            "project",
+            654_321,
+            QuotaDimension::new(2_307_527_940, QuotaLimits::new(0, 5_368_709_120), None),
+            QuotaDimension::new(828_409, QuotaLimits::new(0, 1_024_000), None),
+        ),
+        SubjectQuota::active(
+            "group",
+            2000,
+            QuotaDimension::new(9, QuotaLimits::new(0, 0), None),
+            QuotaDimension::new(9, QuotaLimits::new(0, 0), None),
+        ),
+    ]);
+
+    let rendered = render_human(&report, Ui::test_terminal(120));
+
+    let closest = rendered.find("Closest").unwrap();
+    let first_section = rendered.find("User 1000").unwrap();
+    assert!(closest < first_section, "{rendered}");
+    let line = rendered
+        .lines()
+        .find(|line| line.starts_with("Closest"))
+        .unwrap();
+    assert!(
+        line.contains("project 654321 inodes 80.9% of hard limit"),
+        "{line}"
+    );
+    assert!(line.contains("195591 remaining to hard limit"), "{line}");
+    assert!(rendered.contains("Project 654321"), "{rendered}");
+    assert!(rendered.contains("Group 2000"), "{rendered}");
+}
+
+#[test]
+fn quota_human_says_nothing_is_configured() {
+    let rendered = render_human(&lustre_user(), Ui::test_terminal(120));
+    assert!(rendered.contains("no limit configured"), "{rendered}");
+    // A single subject needs no section title.
+    assert!(!rendered.contains("User 1000"), "{rendered}");
+}
+
+// With a subject unread, "no limit found" must not read as "no limit".
+#[test]
+fn quota_human_refuses_to_claim_unlimited() {
+    let report = lustre_user().with_subjects(vec![SubjectQuota::unavailable(
+        "group",
+        Some(2000),
+        "Connection refused\x1b[2J".to_owned(),
+    )]);
+
+    let rendered = render_human(&report, Ui::test_terminal(120));
+
+    assert!(!rendered.contains("no limit configured"), "{rendered}");
+    assert!(rendered.contains("unknown: no limit found"), "{rendered}");
+    assert!(rendered.contains("Group 2000"), "{rendered}");
+    assert!(
+        rendered.contains("could not be read: Connection refused"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains('\x1b'), "{rendered:?}");
+}
+
+#[test]
+fn quota_human_doubts_a_partial_answer() {
+    let report = QuotaSnapshot::active(
+        QuotaScope::new(
+            PathBuf::from("/home/me"),
+            PathBuf::from("/home"),
+            "nfs4".to_owned(),
+            QuotaScopeIdentity::new(36, 0, 1, PathBuf::from("server:/home")),
+        ),
+        1000,
+        ActiveQuota {
+            provider: "nfs_rquota",
+            data_source: "quota_tool",
+            space: QuotaDimension::new(10, QuotaLimits::new(0, 100), None),
+            inodes: QuotaDimension::new(1, QuotaLimits::new(0, 100), None),
+        },
+    )
+    .with_subjects(vec![SubjectQuota::unavailable(
+        "group",
+        Some(2000),
+        "Connection refused".to_owned(),
+    )]);
+
+    let rendered = render_human(&report, Ui::test_terminal(120));
+
+    assert!(
+        rendered.contains("user 1000 space 10.0% of hard limit"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("may not be the real one"), "{rendered}");
 }

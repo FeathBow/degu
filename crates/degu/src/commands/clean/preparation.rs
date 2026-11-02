@@ -51,6 +51,10 @@ pub(super) struct PreparedClean {
     /// by the incompleteness wording, which otherwise reports only that the
     /// totals it did render are lower bounds.
     pub(super) unmeasured_locations: bool,
+    /// The measurement regions this scan recorded, listed for the reader. A clean
+    /// proceeds beside them only once they are proven clear of the plan, and what it
+    /// leaves out has to be named: the totals alone would read as everything.
+    pub(super) not_inspected: Option<String>,
     /// Count of planned findings dropped for a non-UTF-8 path, reported as omitted.
     pub(super) unrepresentable: usize,
     pub(super) settings: CleanSettings,
@@ -246,6 +250,7 @@ pub(super) fn prepare(args: CleanArgs, ui: Ui) -> Result<PreparedClean> {
         0
     };
     let unmeasured_locations = incomplete_regions.has_measurement_events();
+    let not_inspected = recorded_regions_text(&incomplete_regions);
     // Guard identity is independent of sealed-staging availability. Preview
     // must check the complete plan just like execution, including blocked,
     // deferred, and unavailable items.
@@ -261,6 +266,7 @@ pub(super) fn prepare(args: CleanArgs, ui: Ui) -> Result<PreparedClean> {
         scan_status,
         protected_regions_excluded,
         unmeasured_locations,
+        not_inspected,
         unrepresentable,
         settings: request.settings,
         scope: request.scope,
@@ -432,7 +438,13 @@ fn capture_clean_plan(
             refuse_incompleteness_overlapping_selection(&selected, incomplete_regions)?;
             note_protected_regions_skipped(incomplete_regions);
         } else {
-            return Err(refuse_incomplete_scope(incomplete_regions));
+            // The plan is the selection here. A region proven clear of every planned
+            // location cannot veto one, and a location it hides simply stays out of
+            // this plan, which the output says. The same proof, and for the same
+            // reason, as --path: only the selection differs.
+            let selected = planned.iter().map(Finding::path).collect::<Vec<_>>();
+            refuse_incompleteness_overlapping_plan(&selected, incomplete_regions)?;
+            note_protected_regions_skipped(incomplete_regions);
         }
     }
     let plan = Plan::new(planned, scope.include_review())?;
@@ -474,7 +486,34 @@ fn note_protected_regions_skipped(regions: &IncompleteRegions) {
 /// the first few and discloses the rest as a count.
 const PRINTED_REGION_CAP: usize = 10;
 
-/// Whole-scope incompleteness refusal (no `--path`). Lists the recorded
+/// Whole-scope refusal when no proof clears the plan of the incomplete regions.
+/// A proof that names the pair at fault says so; one that could not account for
+/// every region lists what it recorded.
+fn refuse_incompleteness_overlapping_plan(
+    selected: &[&Path],
+    regions: &IncompleteRegions,
+) -> Result<()> {
+    match regions::prove_disjoint(selected, regions) {
+        Ok(()) => {
+            tracing::info!(
+                target: "degu",
+                regions = regions.sample().len(),
+                "scan incomplete only in regions verified disjoint from every planned location; proceeding"
+            );
+            Ok(())
+        }
+        Err(
+            failure @ (DisjointnessFailure::Overlap { .. }
+            | DisjointnessFailure::UnresolvableRegion { .. }
+            | DisjointnessFailure::UnresolvableSelection { .. }),
+        ) => Err(disjointness_refusal(failure, regions)),
+        Err(DisjointnessFailure::Unsampled { .. } | DisjointnessFailure::NoRecordedRegion) => {
+            Err(refuse_incomplete_scope(regions))
+        }
+    }
+}
+
+/// Whole-scope refusal for regions no proof could account for. Lists the recorded
 /// measurement-cause regions so the remedy names real locations instead of
 /// pointing at scan warnings the clean never prints; deliberately protected
 /// regions never block the plan, so naming them here would misdirect the
@@ -482,13 +521,7 @@ const PRINTED_REGION_CAP: usize = 10;
 /// relaxation consumes, so the message can only ever name locations the
 /// scan actually flagged.
 fn refuse_incomplete_scope(regions: &IncompleteRegions) -> anyhow::Error {
-    let sample = regions
-        .sample()
-        .iter()
-        .filter(|region| region.cause() == RegionCause::Measurement)
-        .map(IncompleteRegion::path)
-        .collect::<Vec<_>>();
-    if sample.is_empty() {
+    let Some(listed) = recorded_regions_text(regions) else {
         // Only unlocated or overflow events: nothing to name, so mirror the
         // honesty of the `NoRecordedRegion`/`Unsampled` arms rather than print
         // an empty list or promise `-vv` output that does not exist for these
@@ -496,6 +529,24 @@ fn refuse_incomplete_scope(regions: &IncompleteRegions) -> anyhow::Error {
         return anyhow::anyhow!(
             "scan could not fully inspect or classify every location in this scope, but recorded no specific location; refusing to clean on incomplete results (narrow the clean with --path to fully measured locations)"
         );
+    };
+    anyhow::anyhow!(
+        "scan could not fully inspect or classify every location in this scope; refusing to clean on incomplete results (incomplete: {listed}; narrow the clean with --path to fully measured locations)"
+    )
+}
+
+/// The recorded measurement regions as one line, or `None` when there are none to
+/// name. Past the print cap, and for events that lost their path, it says how many
+/// more there are, so the list never reads as complete when it is not.
+fn recorded_regions_text(regions: &IncompleteRegions) -> Option<String> {
+    let sample = regions
+        .sample()
+        .iter()
+        .filter(|region| region.cause() == RegionCause::Measurement)
+        .map(IncompleteRegion::path)
+        .collect::<Vec<_>>();
+    if sample.is_empty() {
+        return None;
     }
     let mut listed = sample
         .iter()
@@ -517,9 +568,7 @@ fn refuse_incomplete_scope(regions: &IncompleteRegions) -> anyhow::Error {
             " (and {unlocated} location(s) with no recorded path)"
         ));
     }
-    anyhow::anyhow!(
-        "scan could not fully inspect or classify every location in this scope; refusing to clean on incomplete results (incomplete: {listed}; narrow the clean with --path to fully measured locations)"
-    )
+    Some(listed)
 }
 
 /// Per-item completeness gate at the mutation boundary: a location may only
@@ -631,7 +680,7 @@ fn disjointness_refusal(
                 region = %region.display(),
                 selected = %selected.display(),
                 relation,
-                "incompletely scanned region overlaps the --path selection"
+                "incompletely scanned region overlaps the selection"
             );
             anyhow::anyhow!(
                 "scan could not fully inspect or classify {}, which {} {}; refusing to clean on incomplete results (its complete-world classification could change what this selection matches; make that region fully readable or narrow the clean away from it, then rerun the clean)",
@@ -673,7 +722,10 @@ fn validate_invocation(settings: CleanSettings) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{refuse_incomplete_scope, refuse_incompleteness_overlapping_selection};
+    use super::{
+        refuse_incomplete_scope, refuse_incompleteness_overlapping_plan,
+        refuse_incompleteness_overlapping_selection,
+    };
     use degu_core::ecosystem::{IncompleteRegions, RegionCause};
     use std::path::{Path, PathBuf};
 
@@ -720,6 +772,139 @@ mod tests {
         let regions = IncompleteRegions::default();
 
         let message = refusal(&[Path::new("/degu-test-selected")], &regions);
+
+        assert!(message.contains(REFUSAL_TOKEN), "message: {message}");
+    }
+
+    fn plan_refusal(selected: &[&Path], regions: &IncompleteRegions) -> String {
+        refuse_incompleteness_overlapping_plan(selected, regions)
+            .unwrap_err()
+            .to_string()
+    }
+
+    /// The whole-scope relaxation itself: a region beside the plan does not stop it.
+    #[test]
+    fn plan_passes_beside_region() {
+        let root = tempfile::tempdir().unwrap();
+        let (item, region) = (root.path().join("item"), root.path().join("region"));
+        std::fs::create_dir_all(&item).unwrap();
+        std::fs::create_dir_all(&region).unwrap();
+        let mut regions = IncompleteRegions::default();
+        regions.record(&region, RegionCause::Measurement);
+
+        refuse_incompleteness_overlapping_plan(&[item.as_path()], &regions).unwrap();
+    }
+
+    // Each failure the --path proof has, reached from a whole-scope plan.
+    #[test]
+    fn plan_refuses_inside_region() {
+        let root = tempfile::tempdir().unwrap();
+        let item = root.path().join("item");
+        let region = item.join("unreadable");
+        std::fs::create_dir_all(&region).unwrap();
+        let mut regions = IncompleteRegions::default();
+        regions.record(&region, RegionCause::Measurement);
+
+        let message = plan_refusal(&[item.as_path()], &regions);
+
+        assert!(message.contains(REFUSAL_TOKEN), "message: {message}");
+        assert!(message.contains("lies inside"), "message: {message}");
+    }
+
+    // An unclassified ancestor could have claimed the whole subtree.
+    #[test]
+    fn plan_refuses_ancestor_region() {
+        let root = tempfile::tempdir().unwrap();
+        let region = root.path().join("region");
+        let item = region.join("item");
+        std::fs::create_dir_all(&item).unwrap();
+        let mut regions = IncompleteRegions::default();
+        regions.record(&region, RegionCause::Measurement);
+
+        let message = plan_refusal(&[item.as_path()], &regions);
+
+        assert!(message.contains(REFUSAL_TOKEN), "message: {message}");
+        assert!(
+            message.contains("contains the selected"),
+            "message: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_refuses_symlinked_region() {
+        let root = tempfile::tempdir().unwrap();
+        let item = root.path().join("item");
+        std::fs::create_dir_all(item.join("inner")).unwrap();
+        let link = root.path().join("looks-disjoint");
+        std::os::unix::fs::symlink(item.join("inner"), &link).unwrap();
+        let mut regions = IncompleteRegions::default();
+        regions.record(&link, RegionCause::Measurement);
+
+        let message = plan_refusal(&[item.as_path()], &regions);
+
+        assert!(message.contains("lies inside"), "message: {message}");
+    }
+
+    #[test]
+    fn plan_refuses_unresolvable_region() {
+        let root = tempfile::tempdir().unwrap();
+        let item = root.path().join("item");
+        std::fs::create_dir_all(&item).unwrap();
+        let mut regions = IncompleteRegions::default();
+        regions.record(&root.path().join("gone"), RegionCause::Measurement);
+
+        let message = plan_refusal(&[item.as_path()], &regions);
+
+        assert!(message.contains(REFUSAL_TOKEN), "message: {message}");
+    }
+
+    #[test]
+    fn plan_refuses_unresolvable_item() {
+        let root = tempfile::tempdir().unwrap();
+        let region = root.path().join("region");
+        std::fs::create_dir_all(&region).unwrap();
+        let gone = root.path().join("gone");
+        let mut regions = IncompleteRegions::default();
+        regions.record(&region, RegionCause::Measurement);
+
+        let message = plan_refusal(&[gone.as_path()], &regions);
+
+        assert!(message.contains(REFUSAL_TOKEN), "message: {message}");
+    }
+
+    // Past the sample bound nothing proves the unnamed regions clear of the plan.
+    #[test]
+    fn plan_refuses_unsampled_regions() {
+        let root = tempfile::tempdir().unwrap();
+        let item = root.path().join("item");
+        std::fs::create_dir_all(&item).unwrap();
+        let mut regions = IncompleteRegions::default();
+        for index in 0..=IncompleteRegions::SAMPLE_CAP {
+            regions.record(
+                &root.path().join(format!("region-{index}")),
+                RegionCause::Measurement,
+            );
+        }
+        assert!(regions.unsampled() > 0);
+
+        let message = plan_refusal(&[item.as_path()], &regions);
+
+        assert!(message.contains(REFUSAL_TOKEN), "message: {message}");
+        assert!(message.contains("region-0"), "message: {message}");
+
+        let mut unlocated = IncompleteRegions::default();
+        unlocated.record_unlocated();
+        let message = plan_refusal(&[item.as_path()], &unlocated);
+        assert!(message.contains(REFUSAL_TOKEN), "message: {message}");
+    }
+
+    #[test]
+    fn plan_refuses_empty_ledger() {
+        let message = plan_refusal(
+            &[Path::new("/degu-test-selected")],
+            &IncompleteRegions::default(),
+        );
 
         assert!(message.contains(REFUSAL_TOKEN), "message: {message}");
     }

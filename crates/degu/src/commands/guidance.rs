@@ -43,6 +43,9 @@ pub(crate) struct ScanState<'a> {
     /// The findings incompleteness ledger holds only deliberate protected
     /// prunes -- the same classification that leaves a clean plan unaffected.
     pub(crate) protected_prunes_only: bool,
+    /// Every region the scan could not measure is proven clear of every eligible
+    /// location, which is what the clean gate asks of its plan.
+    pub(crate) gaps_clear_of_cleanable: bool,
     pub(crate) cleanable: bool,
     pub(crate) needs_review: bool,
     pub(crate) has_effective_project_roots: bool,
@@ -214,11 +217,12 @@ fn scan_action(state: ScanState<'_>) -> Option<Action> {
     if state.trash_entries > 0 {
         return Some(Action::TrashList);
     }
-    if state.completeness.findings.is_incomplete() && !state.protected_prunes_only {
-        return None;
-    }
-    if state.cleanable {
+    let unmeasured = state.completeness.findings.is_incomplete() && !state.protected_prunes_only;
+    if state.cleanable && (!unmeasured || state.gaps_clear_of_cleanable) {
         return Some(Action::CleanPreview(state.scope.clean_scope()));
+    }
+    if unmeasured {
+        return None;
     }
     if state.needs_review || state.has_effective_project_roots {
         return None;

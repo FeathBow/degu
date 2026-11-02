@@ -149,6 +149,64 @@ spawn -noecho $env(DEGU_BIN) --color never scan
     );
 }
 
+/// The scan offers the preview exactly when the clean gate would take it: an
+/// unreadable source beside the eligible caches keeps the hint, and one resolving
+/// to an eligible cache withholds it.
+#[cfg(unix)]
+#[test]
+fn disjoint_gap_keeps_hint() {
+    let stdout = scan_with_uv_alias(false);
+    assert!(stdout.contains("Scan incomplete"), "stdout: {stdout}");
+    assert_next_command(&stdout, "Next:", "degu clean -n");
+}
+
+#[cfg(unix)]
+#[test]
+fn overlapping_gap_withholds_hint() {
+    let stdout = scan_with_uv_alias(true);
+    assert!(stdout.contains("Scan incomplete"), "stdout: {stdout}");
+    assert!(
+        !stdout.lines().any(|line| line.trim_end() == "Next:"),
+        "stdout: {stdout}"
+    );
+    assert!(!stdout.contains("degu clean -n"), "stdout: {stdout}");
+}
+
+#[cfg(unix)]
+fn scan_with_uv_alias(onto_eligible: bool) -> String {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let unrelated = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(config.path().join("degu")).unwrap();
+    std::fs::write(config.path().join("degu/config.toml"), "").unwrap();
+    let pip = crate::common::platform_cache_dir(home.path(), "pip");
+    std::fs::create_dir_all(&pip).unwrap();
+    std::fs::write(pip.join("wheel.whl"), [0_u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+    let alias = home.path().join("uv-cache-link");
+    let target = if onto_eligible {
+        pip.as_path()
+    } else {
+        unrelated.path()
+    };
+    std::os::unix::fs::symlink(target, &alias).unwrap();
+    let extra_env = [("UV_CACHE_DIR", alias.as_os_str())];
+
+    let out = run_pty(PtyRun {
+        body: r#"
+spawn -noecho $env(DEGU_BIN) --color never scan
+"#,
+        home: home.path(),
+        config_home: config.path(),
+        state_home: state.path(),
+        extra_env: &extra_env,
+    });
+
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap()
+}
+
 #[test]
 fn protected_only_incompleteness_keeps_the_clean_hint() {
     let home = tempfile::tempdir().unwrap();

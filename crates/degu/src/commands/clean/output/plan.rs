@@ -22,6 +22,7 @@ pub(in crate::commands::clean) fn print(prepared: &PreparedClean) -> Result<()> 
         prepared.unmeasured_locations,
         prepared.settings.ui,
     )?;
+    print_not_inspected(prepared)?;
     print_protected_gate_note(prepared)?;
     print_omitted_note(prepared)?;
     if prepared.plan.items().is_empty() {
@@ -81,6 +82,22 @@ fn print_dry_run_header(prepared: &PreparedClean) -> Result<()> {
                 .label_tone(Tone::AccentHeading)
                 .stat("no changes will be made.")
         )
+    )
+}
+
+/// Names what the scan could not inspect, and so what this plan leaves out. Every
+/// recorded region is proven clear of the plan by the time a plan gets here.
+fn print_not_inspected(prepared: &PreparedClean) -> Result<()> {
+    let Some(listed) = &prepared.not_inspected else {
+        return Ok(());
+    };
+    let note = format!(
+        "Could not be inspected, so left out of this plan: {}",
+        crate::presentation::escape_terminal_text(listed)
+    );
+    stdoutln!(
+        "{}",
+        prepared.settings.ui.toned_prose(0, &note, Tone::Secondary)
     )
 }
 

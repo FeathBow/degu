@@ -68,10 +68,11 @@ fn path_clean_of_a_fully_measured_root_survives_an_incomplete_sibling_root() {
         !would_move.contains(">="),
         "fully measured selection must not display a lower bound: {would_move}"
     );
-    assert!(!whole_plan.status.success());
+    // The whole plan reaches the same answer: the sibling is proven clear of it.
     assert!(
+        whole_plan.status.success(),
+        "stderr: {}",
         String::from_utf8_lossy(&whole_plan.stderr)
-            .contains("refusing to clean on incomplete results")
     );
     assert!(registry.join("cache/crate.crate").exists());
     assert!(!state.path().join("degu/trash").exists());
@@ -165,6 +166,56 @@ fn clean_json_omits_a_native_path_and_keeps_representable_findings() {
 #[cfg(unix)]
 #[test]
 fn whole_scope_refusal_names_the_incomplete_region() {
+    let home = tempfile::tempdir().unwrap();
+    let (cache, state) = fake_pip_cache(&home, ".cache/pip");
+    // Spelled apart from the plan, but it resolves to a planned location, so nothing
+    // proves the plan clear of what the scan could not inspect.
+    let alias = home.path().join("uv-cache-link");
+    std::os::unix::fs::symlink(&cache, &alias).unwrap();
+
+    let out = run_gap_clean(&home, &state, &alias, &["clean", "--dry-run"]);
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to clean on incomplete results"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("uv-cache-link"),
+        "refusal does not name the incomplete region; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("resolve the reported scan warnings"),
+        "refusal still points at scan warnings the clean never prints; stderr: {stderr}"
+    );
+    assert!(cache.join("wheel.whl").exists());
+    assert!(!state.path().join("degu/trash").exists());
+    assert!(!state.path().join("degu/ops.jsonl").exists());
+}
+
+fn run_gap_clean(
+    home: &tempfile::TempDir,
+    state: &tempfile::TempDir,
+    uv_cache: &std::path::Path,
+    args: &[&str],
+) -> std::process::Output {
+    let mut command = degu();
+    crate::common::with_mutation_anchor(&mut command, state.path());
+    command
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .env("UV_CACHE_DIR", uv_cache)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// The positive half: a region beside the plan leaves the plan alone, and the
+/// output names what stayed out of it.
+#[cfg(unix)]
+#[test]
+fn whole_scope_names_left_out() {
     if root_ignores_dir_modes() {
         return;
     }
@@ -175,23 +226,55 @@ fn whole_scope_refusal_names_the_incomplete_region() {
     let out = run_clean(&home, &state, &["clean", "--dry-run"]);
     set_mode(&git_db, 0o755);
 
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("refusing to clean on incomplete results"),
-        "stderr: {stderr}"
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let unwrapped: String = stdout.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        stderr.contains(".cargo/git"),
-        "refusal does not name the incomplete region; stderr: {stderr}"
+        unwrapped.contains("Couldnotbeinspected,soleftoutofthisplan:"),
+        "stdout: {stdout}"
     );
-    assert!(
-        !stderr.contains("resolve the reported scan warnings"),
-        "refusal still points at scan warnings the clean never prints; stderr: {stderr}"
-    );
+    assert!(unwrapped.contains(".cargo/git"), "stdout: {stdout}");
+    assert!(stdout.contains("Would move "), "stdout: {stdout}");
+    assert!(stdout.contains(".cargo/registry"), "stdout: {stdout}");
     assert!(registry.join("cache/crate.crate").exists());
     assert!(!state.path().join("degu/trash").exists());
-    assert!(!state.path().join("degu/ops.jsonl").exists());
+}
+
+/// All the way through: the plan moves, the unreadable sibling stays where it is,
+/// and undo brings the plan back.
+#[cfg(unix)]
+#[test]
+fn whole_clean_stages_beside_gap() {
+    if root_ignores_dir_modes() {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let (registry, git_db) = fake_cargo_home_with_unreadable_git(&home);
+
+    let cleaned = run_clean(&home, &state, &["clean", "--yes"]);
+    let moved = !registry.exists();
+    set_mode(&git_db, 0o755);
+
+    assert!(
+        cleaned.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&cleaned.stderr)
+    );
+    assert!(moved, "the planned location must have moved");
+    assert!(git_db.exists(), "the unmeasured region must stay in place");
+
+    let undone = run_clean(&home, &state, &["undo"]);
+    assert!(
+        undone.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&undone.stderr)
+    );
+    assert!(registry.join("cache/crate.crate").exists());
 }
 
 /// Selecting the incompletely measured root itself must keep failing closed,
@@ -367,10 +450,9 @@ fn interactive_clean_rejects_an_incomplete_nonempty_plan_before_confirmation() {
     use crate::pty::{PtyRun, run as run_pty};
 
     let home = tempfile::tempdir().unwrap();
-    let unresolved = tempfile::tempdir().unwrap();
     let (cache, state) = fake_pip_cache(&home, ".cache/pip");
     let alias = home.path().join("uv-cache-link");
-    std::os::unix::fs::symlink(unresolved.path(), &alias).unwrap();
+    std::os::unix::fs::symlink(&cache, &alias).unwrap();
     let body = r#"
 spawn -noecho $env(DEGU_BIN) clean
 expect {
@@ -404,4 +486,46 @@ expect {
     assert!(cache.join("wheel.whl").exists());
     assert!(!state.path().join("degu/trash").exists());
     assert!(!state.path().join("degu/ops.jsonl").exists());
+}
+
+/// A plan clear of the gaps still reaches the prompt, and the reader sees what it
+/// leaves out before answering.
+#[cfg(unix)]
+#[test]
+fn interactive_clean_discloses_gap() {
+    use crate::pty::{PtyRun, run as run_pty};
+
+    let home = tempfile::tempdir().unwrap();
+    let unresolved = tempfile::tempdir().unwrap();
+    let (cache, state) = fake_pip_cache(&home, ".cache/pip");
+    let alias = home.path().join("uv-cache-link");
+    std::os::unix::fs::symlink(unresolved.path(), &alias).unwrap();
+    let body = r#"
+spawn -noecho $env(DEGU_BIN) --color never clean
+expect -exact {Proceed? [y/N] }
+send "n\r"
+expect eof
+"#;
+    let extra_env = [("UV_CACHE_DIR", alias.as_os_str())];
+    let out = run_pty(PtyRun {
+        body,
+        home: home.path(),
+        config_home: test_config_home(),
+        state_home: state.path(),
+        extra_env: &extra_env,
+    });
+
+    let transcript = String::from_utf8_lossy(&out.stdout);
+    let unwrapped: String = transcript.chars().filter(|c| !c.is_whitespace()).collect();
+    let disclosed = unwrapped
+        .find("Couldnotbeinspected,soleftoutofthisplan:")
+        .unwrap_or_else(|| panic!("transcript: {transcript}"));
+    let prompt = unwrapped.find("Proceed?[y/N]").unwrap();
+    assert!(disclosed < prompt, "transcript: {transcript}");
+    assert!(
+        unwrapped.contains("uv-cache-link"),
+        "transcript: {transcript}"
+    );
+    assert!(cache.join("wheel.whl").exists());
+    assert!(!state.path().join("degu/trash").exists());
 }

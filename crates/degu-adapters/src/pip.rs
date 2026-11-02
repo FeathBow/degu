@@ -27,8 +27,8 @@ impl Ecosystem for Pip {
 
     /// `PIP_CACHE_DIR` on scratch is how clusters keep pip out of a small home, and
     /// pip writes no `CACHEDIR.TAG` of its own.
-    fn corroborates_redirect(&self, root: &Root) -> bool {
-        has_pip_layout(&root.path)
+    fn matches_redirect_layout(&self, path: &Path) -> bool {
+        has_pip_layout(path)
     }
 
     fn relocations(&self) -> Vec<Relocation> {
@@ -63,10 +63,12 @@ impl Ecosystem for Pip {
     }
 }
 
-/// Whether `root` holds what pip's own cache holds and nothing else: every entry is
-/// one pip writes, with the right type and hash-shaped names, and at least one is a
-/// cache directory. A single other file refuses, so a redirect aimed at a home, a
-/// project, or a directory pip merely shares never passes. Any I/O error refuses too.
+/// Whether `root` looks like pip's cache from its top two levels: every entry is a
+/// name pip writes, with the right type, fan-out directories hold hash-shaped names,
+/// and at least one cache directory is there. A stray top-level file refuses, so a
+/// redirect aimed at most homes and projects stays out. This reads no contents and
+/// looks no deeper, so `wheels/ab/results.csv` passes: a match is a reason to ask,
+/// never a proof the data can be rebuilt. Any I/O error refuses.
 fn has_pip_layout(root: &Path) -> bool {
     if !std::fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_dir()) {
         return false;
@@ -168,6 +170,22 @@ mod tests {
     #[test]
     fn real_layout_passes() {
         assert!(has_pip_layout(real_cache().path()));
+    }
+
+    // The limit of the check, pinned so nothing leans on it for more: data below the
+    // levels it looks at passes, which is why a match only ever earns a review.
+    #[test]
+    fn deep_user_data_passes() {
+        let nested = tempfile::tempdir().unwrap();
+        dir(nested.path(), "wheels/ab");
+        file(nested.path(), "wheels/ab/results.csv");
+        assert!(has_pip_layout(nested.path()));
+
+        let notes = tempfile::tempdir().unwrap();
+        dir(notes.path(), "http");
+        dir(notes.path(), "selfcheck");
+        file(notes.path(), "selfcheck/notes.txt");
+        assert!(has_pip_layout(notes.path()));
     }
 
     #[test]

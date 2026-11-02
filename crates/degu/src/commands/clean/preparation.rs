@@ -15,7 +15,7 @@ use crate::selection::SourceSelection;
 use anyhow::Result;
 use degu_core::config::Config;
 use degu_core::ecosystem::{DetectCtx, IncompleteRegion, IncompleteRegions, RegionCause};
-use degu_core::finding::{DispositionMode, Finding};
+use degu_core::finding::{Confidence, DispositionMode, Finding};
 use degu_core::plan::Plan;
 use degu_core::safety::Guard;
 use std::path::{Path, PathBuf};
@@ -140,8 +140,30 @@ impl PreparedClean {
         let mut guard = build_guard(&self.ctx, &self.config)?;
         Lifecycle::new(&self.ctx).add_trash_roots_to_guard(single, &mut guard)?;
         guard.check(finding.path())?;
+        require_layout_still_matches(finding)?;
         Ok(())
     }
+}
+
+/// A layout is evidence about a moment, and it was read at the scan. Anything can have
+/// landed in the directory while the plan waited for its answer, and nothing else here
+/// would notice: the identity a plan holds is the root's, which a write further down
+/// leaves as it was. So what the layout earned is asked for again at the boundary.
+fn require_layout_still_matches(finding: &Finding) -> Result<()> {
+    if finding.confidence() != Confidence::LayoutMatched {
+        return Ok(());
+    }
+    let adapters = degu_adapters::all();
+    let still_matches = adapters
+        .iter()
+        .find(|adapter| adapter.id() == finding.ecosystem())
+        .is_some_and(|adapter| adapter.ecosystem().matches_redirect_layout(finding.path()));
+    anyhow::ensure!(
+        still_matches,
+        "{} no longer has the layout it was offered for review on; refusing to move it",
+        finding.path().display()
+    );
+    Ok(())
 }
 
 struct CleanRequest {
@@ -856,7 +878,10 @@ mod tests {
 
         let message = plan_refusal(&[item.as_path()], &regions);
 
-        assert!(message.contains(REFUSAL_TOKEN), "message: {message}");
+        assert!(
+            message.contains("failed to canonicalize incompletely scanned region"),
+            "message: {message}"
+        );
     }
 
     #[test]
@@ -870,7 +895,10 @@ mod tests {
 
         let message = plan_refusal(&[gone.as_path()], &regions);
 
-        assert!(message.contains(REFUSAL_TOKEN), "message: {message}");
+        assert!(
+            message.contains("failed to canonicalize selected clean location"),
+            "message: {message}"
+        );
     }
 
     // Past the sample bound nothing proves the unnamed regions clear of the plan.
@@ -880,23 +908,45 @@ mod tests {
         let item = root.path().join("item");
         std::fs::create_dir_all(&item).unwrap();
         let mut regions = IncompleteRegions::default();
-        for index in 0..=IncompleteRegions::SAMPLE_CAP {
-            regions.record(
-                &root.path().join(format!("region-{index}")),
-                RegionCause::Measurement,
-            );
+        for index in 0..IncompleteRegions::SAMPLE_CAP {
+            let region = root.path().join(format!("region-{index}"));
+            std::fs::create_dir_all(&region).unwrap();
+            regions.record(&region, RegionCause::Measurement);
         }
-        assert!(regions.unsampled() > 0);
+        // A full sample of real regions, all clear of the plan: nothing else is wrong.
+        refuse_incompleteness_overlapping_plan(&[item.as_path()], &regions).unwrap();
+
+        let one_more = root.path().join("region-past-the-sample");
+        std::fs::create_dir_all(&one_more).unwrap();
+        regions.record(&one_more, RegionCause::Measurement);
+        assert_eq!(regions.unsampled(), 1);
 
         let message = plan_refusal(&[item.as_path()], &regions);
 
         assert!(message.contains(REFUSAL_TOKEN), "message: {message}");
-        assert!(message.contains("region-0"), "message: {message}");
+        assert!(
+            message.contains(&format!(
+                "(and {} more recorded location(s))",
+                IncompleteRegions::SAMPLE_CAP - 10 + 1
+            )),
+            "message: {message}"
+        );
+    }
 
-        let mut unlocated = IncompleteRegions::default();
-        unlocated.record_unlocated();
-        let message = plan_refusal(&[item.as_path()], &unlocated);
-        assert!(message.contains(REFUSAL_TOKEN), "message: {message}");
+    #[test]
+    fn plan_refuses_unlocated_event() {
+        let root = tempfile::tempdir().unwrap();
+        let item = root.path().join("item");
+        std::fs::create_dir_all(&item).unwrap();
+        let mut regions = IncompleteRegions::default();
+        regions.record_unlocated();
+
+        let message = plan_refusal(&[item.as_path()], &regions);
+
+        assert!(
+            message.contains("recorded no specific location"),
+            "message: {message}"
+        );
     }
 
     #[test]
@@ -906,7 +956,10 @@ mod tests {
             &IncompleteRegions::default(),
         );
 
-        assert!(message.contains(REFUSAL_TOKEN), "message: {message}");
+        assert!(
+            message.contains("recorded no specific location"),
+            "message: {message}"
+        );
     }
 
     #[test]

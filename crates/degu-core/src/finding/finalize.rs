@@ -16,10 +16,11 @@ impl FindingSource {
     fn confidence(self) -> Confidence {
         match self {
             Self::WellKnownRoot | Self::ProjectRoot => Confidence::Verified,
-            Self::RedirectRoot { corroborated: true } => Confidence::Verified,
-            Self::RedirectRoot {
-                corroborated: false,
-            } => Confidence::Unverified,
+            Self::RedirectRoot { evidence } => match evidence {
+                RedirectEvidence::CachedirTag => Confidence::Verified,
+                RedirectEvidence::ToolLayout => Confidence::LayoutMatched,
+                RedirectEvidence::None => Confidence::Unverified,
+            },
         }
     }
 }

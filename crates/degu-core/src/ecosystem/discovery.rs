@@ -42,11 +42,11 @@ pub trait Ecosystem: Send + Sync {
         None
     }
 
-    /// Whether a redirected `root` carries this tool's own layout, which speaks for
-    /// the location the way a valid `CACHEDIR.TAG` does. An environment variable can
-    /// name any directory, so an override has to be specific enough that a directory
-    /// the tool never wrote cannot pass, and any doubt answers `false`.
-    fn corroborates_redirect(&self, _root: &Root) -> bool {
+    /// Whether a redirected directory looks like this tool's cache, as far as a
+    /// shallow look at its layout can tell. Weaker than a `CACHEDIR.TAG`: a directory
+    /// the tool never wrote can pass, so a match offers the location for review and
+    /// never plans it by default. Any doubt answers `false`.
+    fn matches_redirect_layout(&self, _path: &Path) -> bool {
         false
     }
 

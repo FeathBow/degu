@@ -1,8 +1,8 @@
 use super::lower_bound_bytes;
 use crate::runtime::{Glyphs, Headline, HeadlineLead, Ui};
 use degu_core::disposition::{
-    ACTIVE_USE, BREAKS_CONSUMERS, COSTLY_REGEN, INCOMPLETE_MEASUREMENT, TOOL_MANAGED,
-    UNKNOWN_OWNERSHIP, UNKNOWN_RECOVERY, UNVERIFIED_REDIRECT, USER_ASSET,
+    ACTIVE_USE, BREAKS_CONSUMERS, COSTLY_REGEN, INCOMPLETE_MEASUREMENT, LAYOUT_ONLY_REDIRECT,
+    TOOL_MANAGED, UNKNOWN_OWNERSHIP, UNKNOWN_RECOVERY, UNVERIFIED_REDIRECT, USER_ASSET,
 };
 use degu_core::finding::{DispositionMode, Finding};
 use degu_core::safety::{
@@ -49,6 +49,9 @@ pub(crate) fn short_reason(reason: &str, ecosystem: &str) -> Option<String> {
         USER_ASSET => "user asset",
         TOOL_MANAGED => return Some(format!("managed by {ecosystem}")),
         UNVERIFIED_REDIRECT => "unverified redirect",
+        LAYOUT_ONLY_REDIRECT => {
+            return Some(format!("redirected cache; confirm it is {ecosystem}'s"));
+        }
         UNKNOWN_RECOVERY => "no verified recovery",
         UNKNOWN_OWNERSHIP => "unknown ownership",
         INCOMPLETE_MEASUREMENT => "incomplete measurement",

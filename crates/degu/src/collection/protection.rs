@@ -3,8 +3,8 @@ use degu_core::ecosystem::{
     DetectCtx, Ecosystem, IncompleteRegions, RegionCause, Root, RootProvenance,
 };
 use degu_core::finding::{
-    AuthorityConstraint, Finding, FindingCandidate, FindingSource, finalize_findings,
-    finalize_findings_with_constraint,
+    AuthorityConstraint, Finding, FindingCandidate, FindingSource, RedirectEvidence,
+    finalize_findings, finalize_findings_with_constraint,
 };
 use degu_core::safety::ProtectionPolicy;
 
@@ -16,19 +16,24 @@ pub(super) fn finding_source(
     let ecosystem = adapter.id();
     match root.provenance {
         RootProvenance::WellKnown => FindingSource::WellKnownRoot,
-        RootProvenance::Redirect
-            if degu_adapters::has_valid_cachedir_tag(&root.path)
-                || adapter.corroborates_redirect(root) =>
-        {
+        RootProvenance::Redirect if degu_adapters::has_valid_cachedir_tag(&root.path) => {
             tracing::debug!(target: "degu", ecosystem, root = %root.path.display(), "redirect root corroborated by CACHEDIR.TAG");
-            FindingSource::RedirectRoot { corroborated: true }
+            FindingSource::RedirectRoot {
+                evidence: RedirectEvidence::CachedirTag,
+            }
+        }
+        RootProvenance::Redirect if adapter.matches_redirect_layout(&root.path) => {
+            tracing::debug!(target: "degu", ecosystem, root = %root.path.display(), "redirect root layout matches its tool; offered for review");
+            FindingSource::RedirectRoot {
+                evidence: RedirectEvidence::ToolLayout,
+            }
         }
         RootProvenance::Redirect => {
             if finding_count > 0 {
                 tracing::debug!(target: "degu", ecosystem, root = %root.path.display(), findings = finding_count, "redirect root is not corroborated as a cache");
             }
             FindingSource::RedirectRoot {
-                corroborated: false,
+                evidence: RedirectEvidence::None,
             }
         }
     }

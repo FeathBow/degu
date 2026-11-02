@@ -529,3 +529,145 @@ expect eof
     assert!(cache.join("wheel.whl").exists());
     assert!(!state.path().join("degu/trash").exists());
 }
+
+/// Lays out a directory `PIP_CACHE_DIR` will name: pip's shape, no tag.
+fn redirected_pip_layout(home: &tempfile::TempDir) -> std::path::PathBuf {
+    let cache = home.path().join("scratch/cache/pip");
+    std::fs::create_dir_all(cache.join("wheels/ab")).unwrap();
+    std::fs::write(cache.join("wheels/ab/results.csv"), [0_u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+    cache
+}
+
+fn run_with_pip_dir(
+    home: &tempfile::TempDir,
+    state: &tempfile::TempDir,
+    cache: &std::path::Path,
+    args: &[&str],
+) -> std::process::Output {
+    let mut command = degu();
+    crate::common::with_mutation_anchor(&mut command, state.path());
+    command
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .env("PIP_CACHE_DIR", cache)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// Data a shallow layout check cannot see stays where it is unless someone asks for
+/// that exact location: a default clean never takes it.
+#[test]
+fn default_clean_spares_layout_match() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+
+    let out = run_with_pip_dir(&home, &state, &cache, &["clean", "--yes"]);
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(cache.join("wheels/ab/results.csv").exists());
+    assert!(!state.path().join("degu/ops.jsonl").exists());
+}
+
+/// The other half: a location offered for review moves when asked for, and comes back.
+#[test]
+fn review_moves_layout_match() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+    let path = cache.to_str().unwrap();
+
+    let moved = run_with_pip_dir(&home, &state, &cache, &["clean", "--yes", "--review", path]);
+
+    assert!(
+        moved.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    assert!(!cache.exists(), "the reviewed location must have moved");
+
+    let undone = run_with_pip_dir(&home, &state, &cache, &["undo"]);
+    assert!(
+        undone.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&undone.stderr)
+    );
+    assert!(cache.join("wheels/ab/results.csv").exists());
+}
+
+fn confirm_after_change(
+    home: &tempfile::TempDir,
+    state: &tempfile::TempDir,
+    cache: &std::path::Path,
+    late_dir: &std::path::Path,
+) -> std::process::Output {
+    use crate::pty::{PtyRun, run as run_pty};
+
+    let body = r#"
+spawn -noecho $env(DEGU_BIN) --color never clean --review $env(PIP_CACHE_DIR)
+expect -exact {Proceed? [y/N] }
+file mkdir $env(LATE_DIR)
+send "y\r"
+expect eof
+"#;
+    let extra_env = [
+        ("PIP_CACHE_DIR", cache.as_os_str()),
+        ("LATE_DIR", late_dir.as_os_str()),
+    ];
+    run_pty(PtyRun {
+        body,
+        home: home.path(),
+        config_home: test_config_home(),
+        state_home: state.path(),
+        extra_env: &extra_env,
+    })
+}
+
+/// A write below the root leaves the root's identity alone, so only asking the layout
+/// again can notice it. Here a build drops a release directory into `wheels` while the
+/// plan waits for its answer.
+#[cfg(unix)]
+#[test]
+fn layout_change_during_prompt_refuses() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+    let late = cache.join("wheels/release");
+
+    let out = confirm_after_change(&home, &state, &cache, &late);
+
+    let transcript: String = String::from_utf8_lossy(&out.stdout)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        transcript.contains("nolongerhasthelayout"),
+        "transcript: {transcript}"
+    );
+    assert!(cache.join("wheels/ab/results.csv").exists());
+    assert!(late.exists());
+}
+
+/// The positive half: the same prompt with a change the layout allows goes through.
+#[cfg(unix)]
+#[test]
+fn layout_kept_during_prompt_moves() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+
+    let out = confirm_after_change(&home, &state, &cache, &cache.join("wheels/cd"));
+
+    assert!(
+        out.status.success(),
+        "transcript: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(!cache.exists(), "the reviewed location must have moved");
+}

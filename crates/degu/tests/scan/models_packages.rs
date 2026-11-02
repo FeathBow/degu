@@ -156,17 +156,63 @@ fn pip_redirect_finding(home: &std::path::Path, cache: &std::path::Path) -> serd
     arr[0].clone()
 }
 
-/// pip writes no `CACHEDIR.TAG`, so its own layout has to speak for a redirect.
+/// pip writes no `CACHEDIR.TAG`, so its layout is all a redirect has to go on. That
+/// earns a review and nothing more.
 #[test]
-fn pip_layout_verifies_redirect() {
+fn pip_layout_earns_review() {
     let home = tempfile::tempdir().unwrap();
     let cache = home.path().join("scratch/cache/pip");
     pip_cache_at(&cache);
 
     let finding = pip_redirect_finding(home.path(), &cache);
 
+    assert_eq!(finding["confidence"], "unverified");
+    assert_eq!(finding["disposition"]["mode"], "opt_in");
+    assert_eq!(
+        finding["disposition"]["reason"],
+        degu_core::disposition::LAYOUT_ONLY_REDIRECT
+    );
+}
+
+/// A `CACHEDIR.TAG` still does what it did: the same layout with a tag is eligible.
+#[test]
+fn tagged_layout_stays_eligible() {
+    let home = tempfile::tempdir().unwrap();
+    let cache = home.path().join("scratch/cache/pip");
+    pip_cache_at(&cache);
+    std::fs::write(
+        cache.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+
+    let finding = pip_redirect_finding(home.path(), &cache);
+
     assert_eq!(finding["confidence"], "verified");
     assert_eq!(finding["disposition"]["mode"], "eligible");
+}
+
+/// What the layout cannot see: user data below the levels it looks at, or a stray
+/// file in `selfcheck`. These match, which is why a match is only ever a question.
+#[test]
+fn deep_user_data_earns_review() {
+    let cases: [(&str, &[&str], &str); 2] = [
+        ("wheels/ab", &[], "wheels/ab/results.csv"),
+        ("selfcheck", &["http"], "selfcheck/notes.txt"),
+    ];
+    for (holder, others, file) in cases {
+        let home = tempfile::tempdir().unwrap();
+        let cache = home.path().join("scratch/somewhere");
+        std::fs::create_dir_all(cache.join(holder)).unwrap();
+        for other in others {
+            std::fs::create_dir_all(cache.join(other)).unwrap();
+        }
+        std::fs::write(cache.join(file), [0_u8; 2048]).unwrap();
+
+        let finding = pip_redirect_finding(home.path(), &cache);
+
+        assert_eq!(finding["disposition"]["mode"], "opt_in", "{file}");
+    }
 }
 
 /// The other half: the variable can name anything, and only pip's own layout passes.

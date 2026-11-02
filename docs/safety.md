@@ -14,13 +14,14 @@ Every finding also carries independent machine facts: recovery and ownership may
 
 A regenerable cache relocated with a tool's own environment variable, such as `PIP_CACHE_DIR` or `HF_HUB_CACHE`, appears as **Not managed** (`report_only` in JSON) unless evidence at the location corroborates it. Without that evidence, degu uses the redirected path verbatim and marks its location unverified.
 
-Three related location forms remain verified:
+Two related location forms remain verified:
 
 - Standard user bases where degu computes a fixed ecosystem cache subdirectory, including `XDG_CACHE_HOME` and the first usable Python temporary-directory candidate used by PyTorch Inductor.
 - A relocated cache carrying a valid `CACHEDIR.TAG` at its top level.
-- A `PIP_CACHE_DIR` holding pip's own layout and nothing else. pip writes no `CACHEDIR.TAG`, and relocating it to scratch is common practice, so its layout stands in: every top-level entry must be one pip writes (`http`, `http-v2`, `wheels`, `selfcheck`, `selfcheck.json`), real directories with hash-shaped names beneath the fan-outs, and at least one of the three cache directories must be there. One other file, a symlink, or a hand-kept wheelhouse leaves the location unverified.
 
 `XDG_CACHE_HOME` is a cache base by specification, so a fixed ecosystem subdirectory beneath it is trusted structurally and stays verified without a `CACHEDIR.TAG`; this keeps the sanctioned `XDG_CACHE_HOME=/scratch/$USER/cache` relocation cleanable. `XDG_DATA_HOME` holds user data rather than cache, so degu derives no eligible finding from it: its only `XDG_DATA_HOME` consumers, the podman and rootless docker container stores, are always **Not managed**.
+
+pip writes no `CACHEDIR.TAG`, and relocating it to scratch is common practice, so a `PIP_CACHE_DIR` whose top two levels look like pip's cache appears as **Needs review** rather than **Not managed** (`opt_in` in JSON, with `confidence` still `unverified`). Every top-level entry must be a name pip writes (`http`, `http-v2`, `wheels`, `selfcheck`, `selfcheck.json`) with the right type, the directories directly under the fan-outs must have hash-shaped names, at least one of the three cache directories must be there, and a symlink at any of these levels refuses. This is weak evidence: degu reads no contents and looks no deeper, so a directory the tool never wrote can match, such as one holding `wheels/ab/results.csv`. It therefore never enters a default plan, moves only when that exact path is passed to `--review`, and the layout is checked again immediately before the move, which refuses if it no longer matches. A valid `CACHEDIR.TAG` makes the same location **Eligible to clean**.
 
 Cache subdirectories derived from `HF_HOME` and `CARGO_HOME` remain unverified unless their exact roots carry valid `CACHEDIR.TAG` files. The variables still select mixed-state tool homes that can also hold tokens or installed binaries, so `degu relocate` points cache-only variables such as `HF_HUB_CACHE` at scratch and never proposes moving either mixed-state home.
 

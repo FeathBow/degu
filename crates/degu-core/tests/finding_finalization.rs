@@ -49,15 +49,13 @@ fn source_evidence_derives_confidence_and_disposition() {
             DispositionMode::OptIn,
         ),
         (
-            FindingSource::RedirectRoot {
-                has_valid_cachedir_tag: true,
-            },
+            FindingSource::RedirectRoot { corroborated: true },
             Confidence::Verified,
             DispositionMode::OptIn,
         ),
         (
             FindingSource::RedirectRoot {
-                has_valid_cachedir_tag: false,
+                corroborated: false,
             },
             Confidence::Unverified,
             DispositionMode::ReportOnly,

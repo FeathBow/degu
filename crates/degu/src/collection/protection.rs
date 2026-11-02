@@ -1,26 +1,34 @@
 use anyhow::{Context, Result};
-use degu_core::ecosystem::{DetectCtx, IncompleteRegions, RegionCause, Root, RootProvenance};
+use degu_core::ecosystem::{
+    DetectCtx, Ecosystem, IncompleteRegions, RegionCause, Root, RootProvenance,
+};
 use degu_core::finding::{
     AuthorityConstraint, Finding, FindingCandidate, FindingSource, finalize_findings,
     finalize_findings_with_constraint,
 };
 use degu_core::safety::ProtectionPolicy;
 
-pub(super) fn finding_source(ecosystem: &str, root: &Root, finding_count: usize) -> FindingSource {
+pub(super) fn finding_source(
+    adapter: &dyn Ecosystem,
+    root: &Root,
+    finding_count: usize,
+) -> FindingSource {
+    let ecosystem = adapter.id();
     match root.provenance {
         RootProvenance::WellKnown => FindingSource::WellKnownRoot,
-        RootProvenance::Redirect if degu_adapters::has_valid_cachedir_tag(&root.path) => {
+        RootProvenance::Redirect
+            if degu_adapters::has_valid_cachedir_tag(&root.path)
+                || adapter.corroborates_redirect(root) =>
+        {
             tracing::debug!(target: "degu", ecosystem, root = %root.path.display(), "redirect root corroborated by CACHEDIR.TAG");
-            FindingSource::RedirectRoot {
-                has_valid_cachedir_tag: true,
-            }
+            FindingSource::RedirectRoot { corroborated: true }
         }
         RootProvenance::Redirect => {
             if finding_count > 0 {
                 tracing::debug!(target: "degu", ecosystem, root = %root.path.display(), findings = finding_count, "redirect root is not corroborated as a cache");
             }
             FindingSource::RedirectRoot {
-                has_valid_cachedir_tag: false,
+                corroborated: false,
             }
         }
     }

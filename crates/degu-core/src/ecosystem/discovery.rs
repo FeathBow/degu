@@ -42,6 +42,14 @@ pub trait Ecosystem: Send + Sync {
         None
     }
 
+    /// Whether a redirected `root` carries this tool's own layout, which speaks for
+    /// the location the way a valid `CACHEDIR.TAG` does. An environment variable can
+    /// name any directory, so an override has to be specific enough that a directory
+    /// the tool never wrote cannot pass, and any doubt answers `false`.
+    fn corroborates_redirect(&self, _root: &Root) -> bool {
+        false
+    }
+
     fn relocations(&self) -> Vec<Relocation> {
         Vec::new()
     }

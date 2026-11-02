@@ -16,11 +16,9 @@ impl FindingSource {
     fn confidence(self) -> Confidence {
         match self {
             Self::WellKnownRoot | Self::ProjectRoot => Confidence::Verified,
+            Self::RedirectRoot { corroborated: true } => Confidence::Verified,
             Self::RedirectRoot {
-                has_valid_cachedir_tag: true,
-            } => Confidence::Verified,
-            Self::RedirectRoot {
-                has_valid_cachedir_tag: false,
+                corroborated: false,
             } => Confidence::Unverified,
         }
     }

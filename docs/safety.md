@@ -12,12 +12,13 @@ degu never deletes a finding in place. Human output starts with the action avail
 
 Every finding also carries independent machine facts: recovery and ownership may be known or unknown, regeneration may be cheap or costly, locations may be verified or unverified, and deletion may carry hazards. JSON derives the stable `eligible`, `opt_in`, or `report_only` disposition from those facts while human output uses the action-oriented names above.
 
-A regenerable cache relocated with a tool's own environment variable, such as `PIP_CACHE_DIR` or `HF_HUB_CACHE`, appears as **Not managed** (`report_only` in JSON) unless a valid `CACHEDIR.TAG` corroborates the location. Without that evidence, degu uses the redirected path verbatim and marks its location unverified.
+A regenerable cache relocated with a tool's own environment variable, such as `PIP_CACHE_DIR` or `HF_HUB_CACHE`, appears as **Not managed** (`report_only` in JSON) unless evidence at the location corroborates it. Without that evidence, degu uses the redirected path verbatim and marks its location unverified.
 
-Two related location forms remain verified:
+Three related location forms remain verified:
 
 - Standard user bases where degu computes a fixed ecosystem cache subdirectory, including `XDG_CACHE_HOME` and the first usable Python temporary-directory candidate used by PyTorch Inductor.
 - A relocated cache carrying a valid `CACHEDIR.TAG` at its top level.
+- A `PIP_CACHE_DIR` holding pip's own layout and nothing else. pip writes no `CACHEDIR.TAG`, and relocating it to scratch is common practice, so its layout stands in: every top-level entry must be one pip writes (`http`, `http-v2`, `wheels`, `selfcheck`, `selfcheck.json`), real directories with hash-shaped names beneath the fan-outs, and at least one of the three cache directories must be there. One other file, a symlink, or a hand-kept wheelhouse leaves the location unverified.
 
 `XDG_CACHE_HOME` is a cache base by specification, so a fixed ecosystem subdirectory beneath it is trusted structurally and stays verified without a `CACHEDIR.TAG`; this keeps the sanctioned `XDG_CACHE_HOME=/scratch/$USER/cache` relocation cleanable. `XDG_DATA_HOME` holds user data rather than cache, so degu derives no eligible finding from it: its only `XDG_DATA_HOME` consumers, the podman and rootless docker container stores, are always **Not managed**.
 

@@ -167,7 +167,11 @@ pub enum Confidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindingSource {
     WellKnownRoot,
-    RedirectRoot { has_valid_cachedir_tag: bool },
+    /// `corroborated`: the location carries its own evidence, a valid `CACHEDIR.TAG`
+    /// or a layout only the tool leaves.
+    RedirectRoot {
+        corroborated: bool,
+    },
     ProjectRoot,
 }
 

@@ -112,22 +112,40 @@ pub(super) fn self_anchor_path_for_uid(
 /// services. A statically linked build cannot: the switch resolves its backends
 /// by loading plugins, which a static image has no way to load, so an account
 /// held in LDAP, SSSD, or winbind reads as absent. That is not "no such user",
-/// and the two are indistinguishable at the libc call — musl reports a missing
-/// entry with a success status and a null result, never an errno. So a miss
-/// falls through to `delegated_home_dir`, which puts the same question to the
-/// host's own resolver in a separate process.
+/// and the two are indistinguishable at the libc call. It can also read as a
+/// failure: musl asks a running nscd after `/etc/passwd`, and reports `EIO` when
+/// that exchange fails. Neither says anything about the account, so a miss and
+/// a failure both fall through to `delegated_home_dir`, which puts the same
+/// question to the host's own resolver in a separate process.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn passwd_home_dir(uid: libc::uid_t) -> Result<Option<PathBuf>, AccountBaseError> {
-    if let Some(home) = libc_home_dir(uid).map_err(AccountBaseError::Lookup)? {
-        return Ok(Some(home));
-    }
+    let direct = libc_home_dir(uid);
     #[cfg(target_os = "linux")]
     {
-        delegated_home_dir(uid)
+        settle_home_lookup(direct, || delegated_home_dir(uid))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        Ok(None)
+        direct.map_err(AccountBaseError::Lookup)
+    }
+}
+
+/// Combines the libc lookup with the delegated one, which runs unless libc named
+/// a home. The delegated answer stands when it names one. When it does not, a
+/// libc failure is what gets reported: it is the older and more specific fact,
+/// and calling the account missing would turn a failed question into an answer.
+#[cfg(any(target_os = "linux", test))]
+fn settle_home_lookup(
+    direct: Result<Option<PathBuf>, i32>,
+    delegated: impl FnOnce() -> Result<Option<PathBuf>, AccountBaseError>,
+) -> Result<Option<PathBuf>, AccountBaseError> {
+    if let Ok(Some(home)) = direct {
+        return Ok(Some(home));
+    }
+    match (direct, delegated()) {
+        (_, Ok(Some(home))) => Ok(Some(home)),
+        (Err(errno), _) => Err(AccountBaseError::Lookup(errno)),
+        (Ok(_), delegated) => delegated,
     }
 }
 
@@ -286,3 +304,62 @@ mod tests;
 
 #[cfg(all(test, target_os = "linux"))]
 mod delegate_tests;
+
+#[cfg(test)]
+mod settle_tests {
+    use super::*;
+
+    const HOME: &str = "/home/account";
+
+    fn named() -> Result<Option<PathBuf>, AccountBaseError> {
+        Ok(Some(PathBuf::from(HOME)))
+    }
+
+    // musl with a running nscd: the socket exchange fails, `getpwuid_r` reports
+    // EIO, and `getent` still knows the account.
+    #[test]
+    fn libc_failure_defers() {
+        assert_eq!(
+            settle_home_lookup(Err(libc::EIO), named),
+            Ok(Some(PathBuf::from(HOME)))
+        );
+    }
+
+    // A failed question stays a failed question: neither a resolver that finds
+    // nothing nor one that cannot run may turn it into "no such account".
+    #[test]
+    fn libc_failure_survives() {
+        assert_eq!(
+            settle_home_lookup(Err(libc::EIO), || Ok(None)),
+            Err(AccountBaseError::Lookup(libc::EIO))
+        );
+        assert_eq!(
+            settle_home_lookup(Err(libc::EIO), || Err(
+                AccountBaseError::ResolverUnavailable
+            )),
+            Err(AccountBaseError::Lookup(libc::EIO))
+        );
+    }
+
+    #[test]
+    fn libc_home_wins() {
+        let answered = settle_home_lookup(Ok(Some(PathBuf::from(HOME))), || {
+            panic!("a named home must not consult the resolver")
+        });
+        assert_eq!(answered, Ok(Some(PathBuf::from(HOME))));
+    }
+
+    // A miss keeps the delegated verdict, settled or not.
+    #[test]
+    fn libc_miss_defers() {
+        assert_eq!(
+            settle_home_lookup(Ok(None), named),
+            Ok(Some(PathBuf::from(HOME)))
+        );
+        assert_eq!(settle_home_lookup(Ok(None), || Ok(None)), Ok(None));
+        assert_eq!(
+            settle_home_lookup(Ok(None), || Err(AccountBaseError::ResolverUnavailable)),
+            Err(AccountBaseError::ResolverUnavailable)
+        );
+    }
+}

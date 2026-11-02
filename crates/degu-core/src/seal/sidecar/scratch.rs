@@ -245,6 +245,8 @@ struct RecordIndex {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScratchStep {
     Create,
+    /// The output of a merge, before it reads and authenticates the runs it merges.
+    CreateMerged,
     Write,
     Finish,
     /// Damages the run's last byte instead of failing, so its digest cannot match.
@@ -269,6 +271,10 @@ std::thread_local! {
         const { std::cell::Cell::new(None) };
     static SCRATCH_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static SCRATCH_REMOVALS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static SCRATCH_MERGES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// What else goes wrong at the moment the armed failure fires.
+    static AT_FAULT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
     /// A smaller sort budget, so that a producer spills while it is still running.
     pub(crate) static SCRATCH_MEMORY: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
@@ -278,7 +284,13 @@ std::thread_local! {
 pub(crate) fn arm_fault(fault: ScratchFault) {
     SCRATCH_RUNS.with(|runs| runs.set(0));
     SCRATCH_REMOVALS.with(|removals| removals.set(0));
+    SCRATCH_MERGES.with(|merges| merges.set(0));
     SCRATCH_FAULT.with(|slot| slot.set(Some(fault)));
+}
+
+#[cfg(test)]
+pub(crate) fn at_fault(callback: impl FnOnce() + 'static) {
+    AT_FAULT.with(|slot| *slot.borrow_mut() = Some(Box::new(callback)));
 }
 
 /// Takes back an armed failure, and says whether it was still waiting to fire.
@@ -295,16 +307,22 @@ pub(super) fn injected_fault(step: ScratchStep) -> Option<io::Error> {
     if step == ScratchStep::Remove {
         SCRATCH_REMOVALS.with(|removals| removals.set(removals.get() + 1));
     }
-    let seen = if step == ScratchStep::Remove {
-        SCRATCH_REMOVALS.with(std::cell::Cell::get)
-    } else {
-        SCRATCH_RUNS.with(std::cell::Cell::get)
+    if step == ScratchStep::CreateMerged {
+        SCRATCH_MERGES.with(|merges| merges.set(merges.get() + 1));
+    }
+    let seen = match step {
+        ScratchStep::Remove => SCRATCH_REMOVALS.with(std::cell::Cell::get),
+        ScratchStep::CreateMerged => SCRATCH_MERGES.with(std::cell::Cell::get),
+        _ => SCRATCH_RUNS.with(std::cell::Cell::get),
     };
     let fault = SCRATCH_FAULT.with(std::cell::Cell::get)?;
     if fault.step != step || seen != fault.run + 1 {
         return None;
     }
     SCRATCH_FAULT.with(std::cell::Cell::take);
+    if let Some(callback) = AT_FAULT.with(|slot| slot.borrow_mut().take()) {
+        callback();
+    }
     Some(io::Error::from_raw_os_error(fault.errno))
 }
 
@@ -838,9 +856,9 @@ impl TreeSidecarStore {
             Ok(())
         };
         match (validation, cleanup) {
-            (Err(TreeSidecarFoldError::Sidecar(primary)), _) => {
-                Err(TreeSidecarFoldError::Sidecar(primary))
-            }
+            (Err(TreeSidecarFoldError::Sidecar(primary)), cleanup) => Err(
+                TreeSidecarFoldError::Sidecar(sweep_outranks_disk(primary, cleanup)),
+            ),
             (Err(TreeSidecarFoldError::Fold(error)), Err(cleanup)) if cleanup.is_disk_full() => {
                 Err(TreeSidecarFoldError::Fold(error))
             }
@@ -1179,6 +1197,10 @@ impl TreeSidecarStore {
         level: u8,
         order: ScratchOrder,
     ) -> Result<ScratchRun, TreeSidecarError> {
+        #[cfg(test)]
+        if let Some(error) = injected_fault(ScratchStep::CreateMerged) {
+            return Err(io_error(&self.path, error));
+        }
         let mut writer = ScratchRunWriter::create(self, transaction)?;
         let count = self
             .merge_runs(runs, order, |record| writer.push(record))
@@ -1269,6 +1291,20 @@ impl TreeSidecarStore {
             )?;
         }
         Ok(())
+    }
+}
+
+/// What a scratch step reports when it failed and then swept up after itself. A
+/// full disk has learned nothing about the scratch, and a merge fails on its output
+/// before it reads its inputs, so what the sweep found wrong is the only finding
+/// there is. Every other failure keeps its place ahead of the sweep.
+pub(super) fn sweep_outranks_disk(
+    primary: TreeSidecarError,
+    cleanup: Result<(), TreeSidecarError>,
+) -> TreeSidecarError {
+    match cleanup {
+        Err(found) if primary.is_disk_full() && !found.is_disk_full() => found,
+        _ => primary,
     }
 }
 

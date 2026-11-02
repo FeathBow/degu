@@ -353,7 +353,7 @@ fn undo_failure_reason(error: &degu_core::staging::VerifiedUndoError) -> String 
             )
         } else {
             format!(
-                "no room to finish checking the staged copy; its directory modes are already restored and it has not moved, and the next degu run with room finishes the undo: {}",
+                "no room to finish checking the staged copy; its directory modes are already restored and it has not moved. The next degu run with room finishes the undo, as long as nothing has been created at the original path: anything there has to be moved aside first: {}",
                 root_cause(error)
             )
         };

@@ -29,7 +29,9 @@ mod scratch;
 #[cfg(test)]
 pub(crate) use scratch::TreeDirectoryPlan;
 #[cfg(test)]
-pub(crate) use scratch::{SCRATCH_MEMORY, ScratchFault, ScratchStep, arm_fault, disarm_fault};
+pub(crate) use scratch::{
+    SCRATCH_MEMORY, ScratchFault, ScratchStep, arm_fault, at_fault, disarm_fault,
+};
 pub(crate) use scratch::{
     TreeManifestScratchBuildError, TreePurgePlan, TreeStructureScratchCursor,
 };
@@ -773,6 +775,7 @@ impl TreeSidecarStore {
             .map_err(io::Error::from)
             .map_err(|error| io_error(&self.path, error))?;
         let mut removed = 0_u64;
+        let mut disk_full = None;
         for entry in entries {
             let entry = entry
                 .map_err(io::Error::from)
@@ -785,14 +788,23 @@ impl TreeSidecarStore {
             let path = self.path.join(name);
             let fd = rustix::fs::openat(&self.directory, name, OPEN_EXISTING, Mode::empty())
                 .map_err(|error| io_error(&path, error.into()))?;
-            remove_validated_private_file(
+            match remove_validated_private_file(
                 &self.directory,
                 name,
                 &fd,
                 self.backend,
                 self.device,
                 &path,
-            )?;
+            ) {
+                Ok(()) => {}
+                // A full disk on this entry says nothing about the next, which may
+                // be the one that is wrong, so the rest still get looked at.
+                Err(error) if error.is_disk_full() => {
+                    disk_full.get_or_insert(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
             removed = removed.checked_add(1).ok_or(TreeSidecarError::Malformed {
                 path: self.path.clone(),
                 reason: "unpublished sidecar count overflow",
@@ -804,6 +816,9 @@ impl TreeSidecarStore {
         }
         self.require_matching_wal(wal)?;
         self.revalidate_store_binding()?;
+        if let Some(error) = disk_full {
+            return Err(error);
+        }
         Ok(removed)
     }
 
@@ -2209,6 +2224,111 @@ mod tests {
                 Ok(()) => panic!("the fold failed"),
             }
         }
+    }
+
+    /// Runs nobody will consume, for the sweep to find.
+    fn leftover_runs(
+        store: &TreeSidecarStore,
+        wal: &mut SealWal<RecoverySession>,
+        count: usize,
+    ) -> Vec<scratch::TreeHardlinkScratch> {
+        (0..count)
+            .map(|_| {
+                store
+                    .build_sorted_hardlink_scratch_with_output(wal, tx(43), |emit| {
+                        emit(crate::backend::held::hardlink_scratch_sentinel_record())?;
+                        Ok::<_, TreeSidecarError>(())
+                    })
+                    .unwrap()
+                    .0
+            })
+            .collect()
+    }
+
+    fn scratch_paths(root: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".tree-scratch-v1-"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sweep_keeps_rest() {
+        // Only a full disk gives way to what the sweep found. Any other failure
+        // keeps its place, and so does a full disk when the sweep found only that.
+        let disk = |name: &str| TreeSidecarError::Io {
+            path: PathBuf::from(name),
+            source: io::Error::from_raw_os_error(libc::EDQUOT),
+        };
+        let damage = || TreeSidecarError::Integrity(PathBuf::from("found"));
+        let path_of = |error: TreeSidecarError| match error {
+            TreeSidecarError::Io { path, .. } | TreeSidecarError::Integrity(path) => path,
+            other => panic!("{other}"),
+        };
+        assert_eq!(
+            path_of(scratch::sweep_outranks_disk(disk("primary"), Err(damage()))),
+            PathBuf::from("found")
+        );
+        assert_eq!(
+            path_of(scratch::sweep_outranks_disk(disk("primary"), Ok(()))),
+            PathBuf::from("primary")
+        );
+        assert_eq!(
+            path_of(scratch::sweep_outranks_disk(
+                disk("primary"),
+                Err(disk("later"))
+            )),
+            PathBuf::from("primary")
+        );
+        assert_eq!(
+            path_of(scratch::sweep_outranks_disk(
+                TreeSidecarError::Integrity(PathBuf::from("primary")),
+                Err(damage())
+            )),
+            PathBuf::from("primary")
+        );
+    }
+
+    #[test]
+    fn sweep_finds_damage() {
+        // A full disk on one leftover says nothing about the next, so the sweep has
+        // to look at them all. The directory order decides which it meets first,
+        // so one damaged run hides among eight healthy ones.
+        for _ in 0..3 {
+            let (_temp, root, store, mut wal) = fixture();
+            let _leftovers = leftover_runs(&store, &mut wal, 9);
+            let damaged = scratch_paths(&root).pop().unwrap();
+            std::fs::set_permissions(&damaged, std::fs::Permissions::from_mode(0o644)).unwrap();
+            scratch::arm_fault(scratch::ScratchFault {
+                step: scratch::ScratchStep::Remove,
+                run: 0,
+                errno: libc::EDQUOT,
+            });
+            let error = store.cleanup_unpublished(&mut wal).unwrap_err();
+            assert!(matches!(error, TreeSidecarError::Unsafe { .. }), "{error}");
+            scratch::disarm_fault();
+        }
+    }
+
+    #[test]
+    fn sweep_reports_disk() {
+        // With nothing else wrong the sweep still says it could not finish, and
+        // takes off everything it can.
+        let (_temp, root, store, mut wal) = fixture();
+        let _leftovers = leftover_runs(&store, &mut wal, 3);
+        scratch::arm_fault(scratch::ScratchFault {
+            step: scratch::ScratchStep::Remove,
+            run: 0,
+            errno: libc::ENOSPC,
+        });
+        let error = store.cleanup_unpublished(&mut wal).unwrap_err();
+        assert!(error.is_disk_full(), "{error}");
+        assert_eq!(scratch_paths(&root).len(), 1);
+        assert_eq!(store.cleanup_unpublished(&mut wal).unwrap(), 1);
     }
 
     #[test]

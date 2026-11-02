@@ -243,7 +243,12 @@ fn purge_plan_error_after_auth_cleanup(
     let cleanup = sidecars.cleanup_unpublished(wal);
     authenticated
         .err()
-        .or_else(|| cleanup.err().map(RecoveryRebindError::PurgePlan))
+        .or_else(|| {
+            cleanup
+                .err()
+                .filter(|found| !found.is_disk_full())
+                .map(RecoveryRebindError::PurgePlan)
+        })
         .unwrap_or(RecoveryRebindError::PurgePlan(primary))
 }
 

@@ -3,7 +3,9 @@
 //! same check must pass once there is room.
 
 use super::*;
-use crate::seal::sidecar::{SCRATCH_MEMORY, ScratchFault, ScratchStep, arm_fault, disarm_fault};
+use crate::seal::sidecar::{
+    SCRATCH_MEMORY, ScratchFault, ScratchStep, TreeSidecarError, arm_fault, at_fault, disarm_fault,
+};
 use crate::staging::{ReadyStagingEngine, VerifiedPurgeError, VerifiedUndoError};
 
 const FULL: [i32; 2] = [libc::ENOSPC, libc::EDQUOT];
@@ -637,4 +639,313 @@ fn other_errors_unchanged() {
         "a staged check's other failures still quarantine"
     );
     assert_eq!(ready.state(ROOT), Some(TransactionState::Quarantined));
+}
+
+/// A build merges every eight runs of a level as it goes, so a scratch only has
+/// more runs than one merge takes when it ends on seven at the bottom with at least
+/// two above them: 23 records. The tree has three entries already, and a hardlink
+/// scratch adds its sentinel and counts only files, so 20 more files brings the
+/// manifest and structure to 23 and 21 brings the hardlinks there.
+const SPILLED_TREES: [usize; 2] = [20, 21];
+
+fn grow_tree(fixture: &Fixture, files: usize) {
+    for file in 0..files {
+        std::fs::write(
+            fixture.source_root.join(format!("child/more-{file}")),
+            b"more",
+        )
+        .unwrap();
+    }
+}
+
+/// Another process with the same UID changes a run while the disk is full.
+fn damage_run_later(fixture: &Fixture) {
+    let store = fixture.base.join("wal-store");
+    at_fault(move || {
+        let run = std::fs::read_dir(&store)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".tree-scratch-v1-"))
+            })
+            .expect("a failing scratch step has a run to damage");
+        set_mode(&run, 0o644);
+    });
+}
+
+fn is_unsafe_scratch(source: Option<&(dyn std::error::Error + 'static)>) -> bool {
+    matches!(
+        source.and_then(|source| source.downcast_ref::<RecoveryRebindError>()),
+        Some(
+            RecoveryRebindError::Sidecar(TreeSidecarError::Unsafe { .. })
+                | RecoveryRebindError::PurgePlan(TreeSidecarError::Unsafe { .. })
+        )
+    )
+}
+
+/// One purge with a full disk at `step` and a damaged run found afterwards. Says
+/// whether the armed step was reached, and whether the store recorded the damage.
+fn damaged_purge(files: usize, step: ScratchStep, run: u32, errno: i32) -> Option<bool> {
+    let fixture = Fixture::new()?;
+    grow_tree(&fixture, files);
+    let label = format!("purge {files} files {step:?} {run} errno {errno}");
+    let mut ready = stage_production(&fixture, ROOT);
+    SCRATCH_MEMORY.with(|memory| memory.set(Some(1)));
+    arm_fault(fault(step, run, errno));
+    damage_run_later(&fixture);
+    let result = request_purge(&mut ready, &fixture);
+    SCRATCH_MEMORY.with(|memory| memory.set(None));
+    if disarm_fault() {
+        result.expect(&label);
+        return None;
+    }
+    let error = result.expect_err(&label);
+    assert!(!error.is_disk_full(), "{label}: {error}");
+    assert!(
+        is_unsafe_scratch(std::error::Error::source(&error)),
+        "{label}: {error}"
+    );
+    assert!(
+        fixture.destination_root.join("child/data").is_file(),
+        "{label}"
+    );
+    match ready.state(ROOT) {
+        Some(TransactionState::RecoveryRequired) => {
+            assert_eq!(
+                error.disposition(),
+                VerifiedPurgeFailureDisposition::Terminal(TransactionState::RecoveryRequired),
+                "{label}"
+            );
+            Some(true)
+        }
+        // A purge plan's failures have always been retryable, and that is all
+        // this one is once the tree itself has passed.
+        Some(TransactionState::VerifiedCommitted) => {
+            assert_eq!(
+                error.disposition(),
+                VerifiedPurgeFailureDisposition::NotStarted,
+                "{label}"
+            );
+            Some(false)
+        }
+        other => panic!("{label}: {other:?}"),
+    }
+}
+
+#[test]
+fn damage_outranks_full() {
+    // A merge's output fails for lack of room before the merge reads its inputs,
+    // so the sweep after it is the only thing that finds the damage. It must not
+    // be read as a full disk, on the merges of any scratch.
+    for files in SPILLED_TREES {
+        for errno in FULL {
+            let mut recorded = 0;
+            let mut plan = 0;
+            let mut run = 0;
+            while let Some(found) = damaged_purge(files, ScratchStep::CreateMerged, run, errno) {
+                if found {
+                    recorded += 1;
+                } else {
+                    plan += 1;
+                }
+                run += 1;
+                assert!(run < 100, "the walk never ended");
+            }
+            if run != 0 {
+                assert!(recorded >= 6, "only {recorded} recorded");
+                assert!(plan >= 1, "no plan merge");
+            }
+        }
+    }
+}
+
+#[test]
+fn removal_damage_outranks() {
+    // The same when removing a run is what ran out of room.
+    let mut recorded = 0;
+    let mut run = 0;
+    while let Some(found) = damaged_purge(SPILLED_TREES[1], ScratchStep::Remove, run, libc::EDQUOT)
+    {
+        recorded += usize::from(found);
+        run += 1;
+        assert!(run < 400, "the walk never ended");
+    }
+    if run != 0 {
+        assert!(recorded >= 6, "only {recorded} recorded");
+    }
+}
+
+#[test]
+fn undo_damage_outranks() {
+    for (files, errno) in SPILLED_TREES
+        .into_iter()
+        .flat_map(|files| FULL.map(|errno| (files, errno)))
+    {
+        let mut run = 0;
+        loop {
+            let Some(fixture) = Fixture::new() else {
+                return;
+            };
+            grow_tree(&fixture, files);
+            let label = format!("undo {files} files merge {run} errno {errno}");
+            let mut ready = stage_production(&fixture, ROOT);
+            SCRATCH_MEMORY.with(|memory| memory.set(Some(1)));
+            arm_fault(fault(ScratchStep::CreateMerged, run, errno));
+            damage_run_later(&fixture);
+            let result = run_undo(&mut ready, &fixture);
+            SCRATCH_MEMORY.with(|memory| memory.set(None));
+            if disarm_fault() {
+                result.expect(&label);
+                assert!(run >= 6, "only {run} merges");
+                break;
+            }
+            let error = result.expect_err(&label);
+            assert!(!error.is_disk_full(), "{label}: {error}");
+            assert!(
+                is_unsafe_scratch(std::error::Error::source(&error)),
+                "{label}: {error}"
+            );
+            assert_eq!(
+                ready.state(ROOT),
+                Some(TransactionState::RecoveryRequired),
+                "{label}"
+            );
+            assert!(!fixture.source_root.exists(), "{label}");
+            assert!(
+                fixture.destination_root.join("child/data").is_file(),
+                "{label}"
+            );
+            run += 1;
+            assert!(run < 100, "the walk never ended");
+        }
+    }
+}
+
+#[test]
+fn staged_damage_quarantines() {
+    // Damage found while the check waits for room is not waiting for room.
+    for (files, errno) in SPILLED_TREES
+        .into_iter()
+        .flat_map(|files| FULL.map(|errno| (files, errno)))
+    {
+        let mut run = 0;
+        loop {
+            let Some(fixture) = Fixture::new() else {
+                return;
+            };
+            grow_tree(&fixture, files);
+            let label = format!("staged {files} files merge {run} errno {errno}");
+            set_mode(&fixture.source_parent, 0o700);
+            let mut ready = fixture.ready_engine();
+            let association = ProductionAssociation::new("undo-group".into()).unwrap();
+            let store = fixture.base.join("wal-store");
+            AFTER_RENAME.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    SCRATCH_MEMORY.with(|memory| memory.set(Some(1)));
+                    arm_fault(fault(ScratchStep::CreateMerged, run, errno));
+                    at_fault(move || {
+                        let damaged = std::fs::read_dir(&store)
+                            .unwrap()
+                            .map(|entry| entry.unwrap().path())
+                            .find(|path| {
+                                path.file_name().is_some_and(|name| {
+                                    name.to_string_lossy().starts_with(".tree-scratch-v1-")
+                                })
+                            })
+                            .expect("a merge has inputs to damage");
+                        set_mode(&damaged, 0o644);
+                    });
+                }));
+            });
+            let result = ready.stage_to_verified_commit(
+                ROOT,
+                fixture
+                    .forward_request("root", "staged")
+                    .with_production_association(association)
+                    .with_recovery_anchor(fixture.base.clone()),
+            );
+            SCRATCH_MEMORY.with(|memory| memory.set(None));
+            if disarm_fault() {
+                result.expect(&label);
+                assert!(run >= 6, "only {run} merges");
+                break;
+            }
+            let Err(error) = result else {
+                panic!("{label}: the damage must stop the staging");
+            };
+            assert_eq!(
+                error.disposition(),
+                ForwardFailureDisposition::Terminal(TransactionState::Quarantined),
+                "{label}"
+            );
+            assert_eq!(
+                ready.state(ROOT),
+                Some(TransactionState::Quarantined),
+                "{label}"
+            );
+            assert!(
+                fixture.destination_root.join("child/data").is_file(),
+                "{label}"
+            );
+            run += 1;
+            assert!(run < 100, "the walk never ended");
+        }
+    }
+}
+
+#[test]
+fn plan_finding_outranks() {
+    // A plan that failed for a real reason and then could not tidy up for lack of
+    // room is not a full disk either, though both only refuse.
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let mut ready = stage_production(&fixture, ROOT);
+    crate::staging::recovery::PURGE_PLAN_FAIL_AFTER_SCRATCH_BUILD.with(|fail| fail.set(true));
+    // The removals before it belong to the check's three scratches.
+    arm_fault(fault(ScratchStep::Remove, 3, libc::EDQUOT));
+    let error = request_purge(&mut ready, &fixture).unwrap_err();
+    crate::staging::recovery::PURGE_PLAN_FAIL_AFTER_SCRATCH_BUILD.with(|fail| fail.set(false));
+    assert!(!disarm_fault(), "the removal must have failed");
+    assert!(!error.is_disk_full(), "{error}");
+    assert_eq!(
+        error.disposition(),
+        VerifiedPurgeFailureDisposition::NotStarted
+    );
+}
+
+#[test]
+fn undo_waits_occupied() {
+    // Room alone does not finish a waiting undo: something created at the original
+    // path has to be moved aside first, and nothing is lost until it is.
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let mut ready = stage_production(&fixture, ROOT);
+    // The first check's three scratches pass; the second's first one fails.
+    arm_fault(fault(ScratchStep::Create, 3, libc::EDQUOT));
+    let error = run_undo(&mut ready, &fixture).unwrap_err();
+    assert_eq!(
+        error.disposition(),
+        VerifiedUndoFailureDisposition::RecoveryBlocked
+    );
+    assert_eq!(ready.state(ROOT), Some(TransactionState::UndoModesRestored));
+    drop(ready);
+
+    std::fs::create_dir(&fixture.source_root).unwrap();
+    for _ in 0..2 {
+        let (engine, report) = SealedStagingEngine::open(&fixture.store).unwrap();
+        let waited = engine
+            .recover_startup(report, |_, _| Ok(fixture.raw_anchors()))
+            .err()
+            .expect("the original path is occupied");
+        assert!(waited.to_string().contains("occupied"), "{waited}");
+        assert!(fixture.destination_root.join("child/data").is_file());
+    }
+
+    std::fs::rename(&fixture.source_root, fixture.base.join("moved-aside")).unwrap();
+    let ready = reopen(&fixture);
+    assert_eq!(ready.state(ROOT), Some(TransactionState::Restored));
+    assert_restored(&fixture, "moved aside");
 }

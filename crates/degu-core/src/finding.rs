@@ -161,13 +161,28 @@ pub type FindingFacts = (Recovery, Ownership, Option<Hazard>);
 pub enum Confidence {
     Verified,
     Unverified,
+    /// A redirected root whose layout matches its tool. That is weak evidence, enough
+    /// to offer the location for review and not enough to plan it by default, so it
+    /// reads as unverified to anything outside.
+    #[serde(rename = "unverified")]
+    LayoutMatched,
+}
+
+/// What a redirected root carries to speak for its location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectEvidence {
+    None,
+    /// A valid `CACHEDIR.TAG`, which a tool or the user wrote to say what this is.
+    CachedirTag,
+    /// A layout that matches the tool's, as far as the layout check looks.
+    ToolLayout,
 }
 
 /// Evidence used by core to derive a finding's confidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindingSource {
     WellKnownRoot,
-    RedirectRoot { has_valid_cachedir_tag: bool },
+    RedirectRoot { evidence: RedirectEvidence },
     ProjectRoot,
 }
 

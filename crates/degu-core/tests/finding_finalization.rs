@@ -1,6 +1,7 @@
 use degu_core::finding::{
     AuthorityConstraint, Confidence, DispositionMode, FindingCandidate, FindingKind, FindingSource,
-    Hazard, Ownership, Recovery, RegenCost, finalize_findings, finalize_findings_with_constraint,
+    Hazard, Ownership, Recovery, RedirectEvidence, RegenCost, finalize_findings,
+    finalize_findings_with_constraint,
 };
 use degu_core::plan::Plan;
 use degu_core::safety::{
@@ -50,14 +51,21 @@ fn source_evidence_derives_confidence_and_disposition() {
         ),
         (
             FindingSource::RedirectRoot {
-                has_valid_cachedir_tag: true,
+                evidence: RedirectEvidence::CachedirTag,
             },
             Confidence::Verified,
             DispositionMode::OptIn,
         ),
         (
             FindingSource::RedirectRoot {
-                has_valid_cachedir_tag: false,
+                evidence: RedirectEvidence::ToolLayout,
+            },
+            Confidence::LayoutMatched,
+            DispositionMode::OptIn,
+        ),
+        (
+            FindingSource::RedirectRoot {
+                evidence: RedirectEvidence::None,
             },
             Confidence::Unverified,
             DispositionMode::ReportOnly,

@@ -132,6 +132,144 @@ fn scan_json_reports_cargo_registry_cache() {
     assert!(arr[0]["bytes_allocated"].as_u64().unwrap() >= 2048);
 }
 
+fn pip_cache_at(dir: &std::path::Path) {
+    for relative in ["http-v2/a/b/c/d/e", "wheels/0f/1a/2b/rest", "selfcheck"] {
+        std::fs::create_dir_all(dir.join(relative)).unwrap();
+    }
+    std::fs::write(dir.join("http-v2/a/b/c/d/e/entry.body"), [0_u8; 2048]).unwrap();
+    std::fs::write(dir.join("wheels/0f/1a/2b/rest/pkg.whl"), [0_u8; 2048]).unwrap();
+    std::fs::write(dir.join("selfcheck/117cf651f8fc"), b"{}").unwrap();
+}
+
+fn pip_redirect_finding(home: &std::path::Path, cache: &std::path::Path) -> serde_json::Value {
+    crate::common::make_tree_non_shared_writable(home).unwrap();
+    let out = degu()
+        .env("HOME", home)
+        .env("PIP_CACHE_DIR", cache)
+        .args(["scan", "--json", "--only", "pip"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let findings = scan_findings(&out.stdout);
+    let arr = findings.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "{arr:?}");
+    arr[0].clone()
+}
+
+/// pip writes no `CACHEDIR.TAG`, so its layout is all a redirect has to go on. That
+/// earns a review and nothing more.
+#[test]
+fn pip_layout_earns_review() {
+    let home = tempfile::tempdir().unwrap();
+    let cache = home.path().join("scratch/cache/pip");
+    pip_cache_at(&cache);
+
+    let finding = pip_redirect_finding(home.path(), &cache);
+
+    assert_eq!(finding["confidence"], "unverified");
+    assert_eq!(finding["disposition"]["mode"], "opt_in");
+    assert_eq!(
+        finding["disposition"]["reason"],
+        degu_core::disposition::LAYOUT_ONLY_REDIRECT
+    );
+}
+
+/// A `CACHEDIR.TAG` still does what it did: the same layout with a tag is eligible.
+#[test]
+fn tagged_layout_stays_eligible() {
+    let home = tempfile::tempdir().unwrap();
+    let cache = home.path().join("scratch/cache/pip");
+    pip_cache_at(&cache);
+    std::fs::write(
+        cache.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+
+    let finding = pip_redirect_finding(home.path(), &cache);
+
+    assert_eq!(finding["confidence"], "verified");
+    assert_eq!(finding["disposition"]["mode"], "eligible");
+}
+
+/// What the layout cannot see: user data below the levels it looks at, or a stray
+/// file in `selfcheck`. These match, which is why a match is only ever a question.
+#[test]
+fn deep_user_data_earns_review() {
+    let cases: [(&str, &[&str], &str); 2] = [
+        ("wheels/ab", &[], "wheels/ab/results.csv"),
+        ("selfcheck", &["http"], "selfcheck/notes.txt"),
+    ];
+    for (holder, others, file) in cases {
+        let home = tempfile::tempdir().unwrap();
+        let cache = home.path().join("scratch/somewhere");
+        std::fs::create_dir_all(cache.join(holder)).unwrap();
+        for other in others {
+            std::fs::create_dir_all(cache.join(other)).unwrap();
+        }
+        std::fs::write(cache.join(file), [0_u8; 2048]).unwrap();
+
+        let finding = pip_redirect_finding(home.path(), &cache);
+
+        assert_eq!(finding["disposition"]["mode"], "opt_in", "{file}");
+    }
+}
+
+/// The other half: the variable can name anything, and only pip's own layout passes.
+#[test]
+fn other_redirects_stay_unverified() {
+    type Seed = fn(&std::path::Path);
+    let cases: [(&str, Seed); 4] = [
+        ("a real cache with one stray file", |dir| {
+            pip_cache_at(dir);
+            std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
+        }),
+        ("a home", |dir| {
+            pip_cache_at(dir);
+            std::fs::write(dir.join(".bashrc"), b"export X=1").unwrap();
+            std::fs::create_dir_all(dir.join("Documents")).unwrap();
+        }),
+        ("a project", |dir| {
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(dir.join("pyproject.toml"), b"[project]").unwrap();
+            std::fs::create_dir_all(dir.join("wheels")).unwrap();
+        }),
+        ("a hand-kept wheelhouse", |dir| {
+            std::fs::create_dir_all(dir.join("wheels")).unwrap();
+            std::fs::write(dir.join("wheels/torch-2.1.whl"), [0_u8; 2048]).unwrap();
+        }),
+    ];
+    for (label, seed) in cases {
+        let home = tempfile::tempdir().unwrap();
+        let cache = home.path().join("scratch/somewhere");
+        std::fs::create_dir_all(&cache).unwrap();
+        seed(&cache);
+
+        let finding = pip_redirect_finding(home.path(), &cache);
+
+        assert_eq!(finding["confidence"], "unverified", "{label}");
+        assert_eq!(finding["disposition"]["mode"], "report_only", "{label}");
+        assert_eq!(
+            finding["disposition"]["reason"],
+            "relocated via an environment variable degu cannot verify",
+            "{label}"
+        );
+    }
+}
+
+/// An empty directory carries no evidence either, and leaves nothing to report.
+#[test]
+fn empty_redirect_stays_unverified() {
+    let home = tempfile::tempdir().unwrap();
+    let cache = home.path().join("scratch/empty");
+    std::fs::create_dir_all(&cache).unwrap();
+
+    let finding = pip_redirect_finding(home.path(), &cache);
+
+    assert_eq!(finding["confidence"], "unverified");
+    assert_eq!(finding["disposition"]["mode"], "report_only");
+}
+
 #[test]
 fn scan_json_treats_environment_homes_as_unverified_redirects() {
     let home = tempfile::tempdir().unwrap();

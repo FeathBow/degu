@@ -71,7 +71,11 @@ impl Collector<'_> {
                 &request.root.path,
             ));
         }
-        let source = finding_source(request.registration.id(), request.root, candidates.len());
+        let source = finding_source(
+            request.registration.ecosystem(),
+            request.root,
+            candidates.len(),
+        );
         let constraint = apply_mixed_state_constraints(
             request.root,
             &mut candidates,

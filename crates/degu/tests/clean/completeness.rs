@@ -68,10 +68,11 @@ fn path_clean_of_a_fully_measured_root_survives_an_incomplete_sibling_root() {
         !would_move.contains(">="),
         "fully measured selection must not display a lower bound: {would_move}"
     );
-    assert!(!whole_plan.status.success());
+    // The whole plan reaches the same answer: the sibling is proven clear of it.
     assert!(
+        whole_plan.status.success(),
+        "stderr: {}",
         String::from_utf8_lossy(&whole_plan.stderr)
-            .contains("refusing to clean on incomplete results")
     );
     assert!(registry.join("cache/crate.crate").exists());
     assert!(!state.path().join("degu/trash").exists());
@@ -165,6 +166,56 @@ fn clean_json_omits_a_native_path_and_keeps_representable_findings() {
 #[cfg(unix)]
 #[test]
 fn whole_scope_refusal_names_the_incomplete_region() {
+    let home = tempfile::tempdir().unwrap();
+    let (cache, state) = fake_pip_cache(&home, ".cache/pip");
+    // Spelled apart from the plan, but it resolves to a planned location, so nothing
+    // proves the plan clear of what the scan could not inspect.
+    let alias = home.path().join("uv-cache-link");
+    std::os::unix::fs::symlink(&cache, &alias).unwrap();
+
+    let out = run_gap_clean(&home, &state, &alias, &["clean", "--dry-run"]);
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to clean on incomplete results"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("uv-cache-link"),
+        "refusal does not name the incomplete region; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("resolve the reported scan warnings"),
+        "refusal still points at scan warnings the clean never prints; stderr: {stderr}"
+    );
+    assert!(cache.join("wheel.whl").exists());
+    assert!(!state.path().join("degu/trash").exists());
+    assert!(!state.path().join("degu/ops.jsonl").exists());
+}
+
+fn run_gap_clean(
+    home: &tempfile::TempDir,
+    state: &tempfile::TempDir,
+    uv_cache: &std::path::Path,
+    args: &[&str],
+) -> std::process::Output {
+    let mut command = degu();
+    crate::common::with_mutation_anchor(&mut command, state.path());
+    command
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .env("UV_CACHE_DIR", uv_cache)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// The positive half: a region beside the plan leaves the plan alone, and the
+/// output names what stayed out of it.
+#[cfg(unix)]
+#[test]
+fn whole_scope_names_left_out() {
     if root_ignores_dir_modes() {
         return;
     }
@@ -175,23 +226,55 @@ fn whole_scope_refusal_names_the_incomplete_region() {
     let out = run_clean(&home, &state, &["clean", "--dry-run"]);
     set_mode(&git_db, 0o755);
 
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("refusing to clean on incomplete results"),
-        "stderr: {stderr}"
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let unwrapped: String = stdout.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        stderr.contains(".cargo/git"),
-        "refusal does not name the incomplete region; stderr: {stderr}"
+        unwrapped.contains("Couldnotbeinspected,soleftoutofthisplan:"),
+        "stdout: {stdout}"
     );
-    assert!(
-        !stderr.contains("resolve the reported scan warnings"),
-        "refusal still points at scan warnings the clean never prints; stderr: {stderr}"
-    );
+    assert!(unwrapped.contains(".cargo/git"), "stdout: {stdout}");
+    assert!(stdout.contains("Would move "), "stdout: {stdout}");
+    assert!(stdout.contains(".cargo/registry"), "stdout: {stdout}");
     assert!(registry.join("cache/crate.crate").exists());
     assert!(!state.path().join("degu/trash").exists());
-    assert!(!state.path().join("degu/ops.jsonl").exists());
+}
+
+/// All the way through: the plan moves, the unreadable sibling stays where it is,
+/// and undo brings the plan back.
+#[cfg(unix)]
+#[test]
+fn whole_clean_stages_beside_gap() {
+    if root_ignores_dir_modes() {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let (registry, git_db) = fake_cargo_home_with_unreadable_git(&home);
+
+    let cleaned = run_clean(&home, &state, &["clean", "--yes"]);
+    let moved = !registry.exists();
+    set_mode(&git_db, 0o755);
+
+    assert!(
+        cleaned.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&cleaned.stderr)
+    );
+    assert!(moved, "the planned location must have moved");
+    assert!(git_db.exists(), "the unmeasured region must stay in place");
+
+    let undone = run_clean(&home, &state, &["undo"]);
+    assert!(
+        undone.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&undone.stderr)
+    );
+    assert!(registry.join("cache/crate.crate").exists());
 }
 
 /// Selecting the incompletely measured root itself must keep failing closed,
@@ -367,10 +450,9 @@ fn interactive_clean_rejects_an_incomplete_nonempty_plan_before_confirmation() {
     use crate::pty::{PtyRun, run as run_pty};
 
     let home = tempfile::tempdir().unwrap();
-    let unresolved = tempfile::tempdir().unwrap();
     let (cache, state) = fake_pip_cache(&home, ".cache/pip");
     let alias = home.path().join("uv-cache-link");
-    std::os::unix::fs::symlink(unresolved.path(), &alias).unwrap();
+    std::os::unix::fs::symlink(&cache, &alias).unwrap();
     let body = r#"
 spawn -noecho $env(DEGU_BIN) clean
 expect {
@@ -404,4 +486,414 @@ expect {
     assert!(cache.join("wheel.whl").exists());
     assert!(!state.path().join("degu/trash").exists());
     assert!(!state.path().join("degu/ops.jsonl").exists());
+}
+
+/// A plan clear of the gaps still reaches the prompt, and the reader sees what it
+/// leaves out before answering.
+#[cfg(unix)]
+#[test]
+fn interactive_clean_discloses_gap() {
+    use crate::pty::{PtyRun, run as run_pty};
+
+    let home = tempfile::tempdir().unwrap();
+    let unresolved = tempfile::tempdir().unwrap();
+    let (cache, state) = fake_pip_cache(&home, ".cache/pip");
+    let alias = home.path().join("uv-cache-link");
+    std::os::unix::fs::symlink(unresolved.path(), &alias).unwrap();
+    let body = r#"
+spawn -noecho $env(DEGU_BIN) --color never clean
+expect -exact {Proceed? [y/N] }
+send "n\r"
+expect eof
+"#;
+    let extra_env = [("UV_CACHE_DIR", alias.as_os_str())];
+    let out = run_pty(PtyRun {
+        body,
+        home: home.path(),
+        config_home: test_config_home(),
+        state_home: state.path(),
+        extra_env: &extra_env,
+    });
+
+    let transcript = String::from_utf8_lossy(&out.stdout);
+    let unwrapped: String = transcript.chars().filter(|c| !c.is_whitespace()).collect();
+    let disclosed = unwrapped
+        .find("Couldnotbeinspected,soleftoutofthisplan:")
+        .unwrap_or_else(|| panic!("transcript: {transcript}"));
+    let prompt = unwrapped.find("Proceed?[y/N]").unwrap();
+    assert!(disclosed < prompt, "transcript: {transcript}");
+    assert!(
+        unwrapped.contains("uv-cache-link"),
+        "transcript: {transcript}"
+    );
+    assert!(cache.join("wheel.whl").exists());
+    assert!(!state.path().join("degu/trash").exists());
+}
+
+/// Lays out a directory `PIP_CACHE_DIR` will name: pip's shape, no tag.
+fn redirected_pip_layout(home: &tempfile::TempDir) -> std::path::PathBuf {
+    let cache = home.path().join("scratch/cache/pip");
+    std::fs::create_dir_all(cache.join("wheels/ab")).unwrap();
+    std::fs::write(cache.join("wheels/ab/results.csv"), [0_u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+    cache
+}
+
+fn run_with_pip_dir(
+    home: &tempfile::TempDir,
+    state: &tempfile::TempDir,
+    cache: &std::path::Path,
+    args: &[&str],
+) -> std::process::Output {
+    let mut command = degu();
+    crate::common::with_mutation_anchor(&mut command, state.path());
+    command
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", state.path())
+        .env("PIP_CACHE_DIR", cache)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// Data a shallow layout check cannot see stays where it is unless someone asks for
+/// that exact location: a default clean never takes it.
+#[test]
+fn default_clean_spares_layout_match() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+
+    let out = run_with_pip_dir(&home, &state, &cache, &["clean", "--yes"]);
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(cache.join("wheels/ab/results.csv").exists());
+    assert!(!state.path().join("degu/ops.jsonl").exists());
+}
+
+/// The other half: a location offered for review moves when asked for, and comes back.
+#[test]
+fn review_moves_layout_match() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+    let path = cache.to_str().unwrap();
+
+    let moved = run_with_pip_dir(&home, &state, &cache, &["clean", "--yes", "--review", path]);
+
+    assert!(
+        moved.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    assert!(!cache.exists(), "the reviewed location must have moved");
+
+    let undone = run_with_pip_dir(&home, &state, &cache, &["undo"]);
+    assert!(
+        undone.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&undone.stderr)
+    );
+    assert!(cache.join("wheels/ab/results.csv").exists());
+}
+
+fn confirm_after_change(
+    home: &tempfile::TempDir,
+    state: &tempfile::TempDir,
+    cache: &std::path::Path,
+    late_dir: &std::path::Path,
+) -> std::process::Output {
+    use crate::pty::{PtyRun, run as run_pty};
+
+    let body = r#"
+spawn -noecho $env(DEGU_BIN) --color never clean --review $env(PIP_CACHE_DIR)
+expect -exact {Proceed? [y/N] }
+file mkdir $env(LATE_DIR)
+file attributes $env(LATE_DIR) -permissions 0755
+send "y\r"
+expect eof
+"#;
+    let extra_env = [
+        ("PIP_CACHE_DIR", cache.as_os_str()),
+        ("LATE_DIR", late_dir.as_os_str()),
+    ];
+    run_pty(PtyRun {
+        body,
+        home: home.path(),
+        config_home: test_config_home(),
+        state_home: state.path(),
+        extra_env: &extra_env,
+    })
+}
+
+/// A write below the root leaves the root's identity alone, so only asking the layout
+/// again can notice it. Here a build drops a release directory into `wheels` while the
+/// plan waits for its answer.
+#[cfg(unix)]
+#[test]
+fn layout_change_during_prompt_refuses() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+    let late = cache.join("wheels/release");
+
+    let out = confirm_after_change(&home, &state, &cache, &late);
+
+    let transcript: String = String::from_utf8_lossy(&out.stdout)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        transcript.contains("nolongerhasthelayout"),
+        "transcript: {transcript}"
+    );
+    assert!(cache.join("wheels/ab/results.csv").exists());
+    assert!(late.exists());
+}
+
+/// The positive half: the same prompt with a change the layout allows goes through.
+#[cfg(unix)]
+#[test]
+fn layout_kept_during_prompt_moves() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+
+    let out = confirm_after_change(&home, &state, &cache, &cache.join("wheels/cd"));
+
+    assert!(
+        out.status.success(),
+        "transcript: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(!cache.exists(), "the reviewed location must have moved");
+}
+
+/// A layout match inside another Needs review location, older than it, so an age
+/// filter can leave the match as all that remains of a selection of the other.
+struct NestedMatch {
+    home: tempfile::TempDir,
+    state: tempfile::TempDir,
+    torch: std::path::PathBuf,
+    pip: std::path::PathBuf,
+}
+
+impl NestedMatch {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let torch = home.path().join(".cache/torch");
+        std::fs::create_dir_all(torch.join("hub")).unwrap();
+        std::fs::write(torch.join("hub/fresh.bin"), [0_u8; 2048]).unwrap();
+        let pip = torch.join("pip");
+        std::fs::create_dir_all(pip.join("wheels/ab")).unwrap();
+        let old = pip.join("wheels/ab/results.csv");
+        std::fs::write(&old, [0_u8; 2048]).unwrap();
+        let sixty_days = std::time::Duration::from_secs(60 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - sixty_days)
+            .unwrap();
+        crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+        Self {
+            home,
+            state,
+            torch,
+            pip,
+        }
+    }
+
+    fn clean(&self, args: &[&str]) -> std::process::Output {
+        run_with_pip_dir(&self.home, &self.state, &self.pip, args)
+    }
+
+    fn assert_spared(&self, args: &[&str]) {
+        let out = self.clean(args);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            self.pip.join("wheels/ab/results.csv").exists(),
+            "{args:?} moved a layout match nobody named; stdout: {stdout}"
+        );
+        assert!(
+            self.torch.join("hub/fresh.bin").exists(),
+            "{args:?} moved the location the filter excluded; stdout: {stdout}"
+        );
+    }
+}
+
+/// The hole: the review validates the ancestor, the filter removes the ancestor, and
+/// without the rule the one location nobody named is the whole plan.
+#[test]
+fn ancestor_review_spares_match() {
+    let fixture = NestedMatch::new();
+    let torch = fixture.torch.to_str().unwrap().to_owned();
+    fixture.assert_spared(&["clean", "--yes", "--review", &torch, "--older-than", "30"]);
+}
+
+/// The same selection spelled the way the terminal review spells a chosen location.
+#[test]
+fn ancestor_path_spares_match() {
+    let fixture = NestedMatch::new();
+    let torch = fixture.torch.to_str().unwrap().to_owned();
+    fixture.assert_spared(&[
+        "clean",
+        "--yes",
+        "--include-review",
+        "--path",
+        &torch,
+        "--older-than",
+        "30",
+    ]);
+}
+
+#[test]
+fn path_alone_spares_match() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+    let path = cache.to_str().unwrap();
+
+    run_with_pip_dir(&home, &state, &cache, &["clean", "--yes", "--path", path]);
+
+    assert!(cache.join("wheels/ab/results.csv").exists());
+}
+
+/// A path that names something else leaves the match out, and the plan still runs.
+#[test]
+fn other_path_spares_match() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+    let torch = home.path().join(".cache/torch");
+    std::fs::create_dir_all(&torch).unwrap();
+    std::fs::write(torch.join("hub.bin"), [0_u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+
+    let out = run_with_pip_dir(
+        &home,
+        &state,
+        &cache,
+        &[
+            "clean",
+            "--yes",
+            "--include-review",
+            "--path",
+            torch.to_str().unwrap(),
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!torch.exists(), "the named location must have moved");
+    assert!(cache.join("wheels/ab/results.csv").exists());
+}
+
+/// The cases that do bring it in: asked for by exact path, and asked for with every
+/// other Needs review location.
+#[test]
+fn named_path_takes_match() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+    let path = cache.to_str().unwrap();
+
+    let out = run_with_pip_dir(
+        &home,
+        &state,
+        &cache,
+        &["clean", "--yes", "--include-review", "--path", path],
+    );
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!cache.exists(), "the named location must have moved");
+}
+
+#[test]
+fn bulk_review_takes_match() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+
+    let out = run_with_pip_dir(
+        &home,
+        &state,
+        &cache,
+        &["clean", "--yes", "--include-review"],
+    );
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !cache.exists(),
+        "--include-review asks for every review location"
+    );
+}
+
+/// Spelling the exact location through a symlink still names it.
+#[cfg(unix)]
+#[test]
+fn review_alias_takes_match() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+    let alias = home.path().join("pip-link");
+    std::os::unix::fs::symlink(&cache, &alias).unwrap();
+
+    let out = run_with_pip_dir(
+        &home,
+        &state,
+        &cache,
+        &["clean", "--yes", "--review", alias.to_str().unwrap()],
+    );
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!cache.exists(), "the alias names this location");
+}
+
+/// The plan says which locations are in it on layout alone, however they got there,
+/// and says nothing when none are.
+#[test]
+fn plan_names_layout_match() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+
+    for args in [
+        vec!["clean", "--dry-run", "--include-review"],
+        vec!["clean", "--dry-run", "--review", cache.to_str().unwrap()],
+    ] {
+        let out = run_with_pip_dir(&home, &state, &cache, &args);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let unwrapped: String = stdout.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            unwrapped.contains("1location(s)arehereonlayoutalone"),
+            "{args:?}; stdout: {stdout}"
+        );
+    }
+
+    let tagged = tempfile::tempdir().unwrap();
+    let (_plain, plain_state) = fake_pip_cache(&tagged, ".cache/pip");
+    let out = run_clean(&tagged, &plain_state, &["clean", "--dry-run"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("layout alone"), "stdout: {stdout}");
 }

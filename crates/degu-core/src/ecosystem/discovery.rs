@@ -42,6 +42,14 @@ pub trait Ecosystem: Send + Sync {
         None
     }
 
+    /// Whether a redirected directory looks like this tool's cache, as far as a
+    /// shallow look at its layout can tell. Weaker than a `CACHEDIR.TAG`: a directory
+    /// the tool never wrote can pass, so a match offers the location for review and
+    /// never plans it by default. Any doubt answers `false`.
+    fn matches_redirect_layout(&self, _path: &Path) -> bool {
+        false
+    }
+
     fn relocations(&self) -> Vec<Relocation> {
         Vec::new()
     }

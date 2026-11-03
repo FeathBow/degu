@@ -10,19 +10,21 @@ pub const TOOL_MANAGED: &str = "managed by the owning tool; delete through it";
 pub const UNKNOWN_OWNERSHIP: &str = "ownership and coordination requirements are unknown";
 pub const UNVERIFIED_REDIRECT: &str = "relocated via an environment variable degu cannot verify";
 pub const INCOMPLETE_MEASUREMENT: &str = "measurement incomplete: some paths were not measured";
+pub const LAYOUT_ONLY_REDIRECT: &str = "relocated via an environment variable; its layout looks like this tool's cache, which does not prove it is one";
 pub const BREAKS_CONSUMERS: &str = "deletion can break software that links into this data";
 pub const ACTIVE_USE: &str = "deletion can disrupt active sessions using this data";
 pub const COSTLY_REGEN: &str = "costly to regenerate";
 
 /// Every reason `derive` can attach, strictest-first. The order is load-bearing
 /// for `authority_rank` (and lets presentation prove exhaustiveness) — do not reorder.
-pub const STATIC_REASONS: [&str; 9] = [
+pub const STATIC_REASONS: [&str; 10] = [
     UNKNOWN_RECOVERY,
     USER_ASSET,
     TOOL_MANAGED,
     UNKNOWN_OWNERSHIP,
     UNVERIFIED_REDIRECT,
     INCOMPLETE_MEASUREMENT,
+    LAYOUT_ONLY_REDIRECT,
     BREAKS_CONSUMERS,
     ACTIVE_USE,
     COSTLY_REGEN,
@@ -136,6 +138,9 @@ fn report_only_reason(facts: DispositionFacts<'_>) -> Option<&'static str> {
 }
 
 fn opt_in_reason(facts: DispositionFacts<'_>) -> Option<&'static str> {
+    if facts.confidence == Confidence::LayoutMatched {
+        return Some(LAYOUT_ONLY_REDIRECT);
+    }
     match (facts.hazard, facts.recovery) {
         (Some(Hazard::BreaksConsumers), _) => Some(BREAKS_CONSUMERS),
         (Some(Hazard::ActiveUse), _) => Some(ACTIVE_USE),
@@ -146,6 +151,72 @@ fn opt_in_reason(facts: DispositionFacts<'_>) -> Option<&'static str> {
             },
         ) => Some(COSTLY_REGEN),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    fn cheap_with(confidence: Confidence) -> Disposition {
+        derive(DispositionFacts {
+            recovery: &Recovery::Regenerable {
+                cost: RegenCost::Cheap,
+            },
+            ownership: Ownership::Standalone,
+            hazard: None,
+            confidence,
+            measurement_complete: true,
+        })
+    }
+
+    // The three levels of evidence for one cheap redirected cache.
+    #[test]
+    fn layout_earns_review_only() {
+        assert_eq!(
+            cheap_with(Confidence::Verified).mode,
+            DispositionMode::Eligible
+        );
+        let layout = cheap_with(Confidence::LayoutMatched);
+        assert_eq!(layout.mode, DispositionMode::OptIn);
+        assert_eq!(layout.reason.as_deref(), Some(LAYOUT_ONLY_REDIRECT));
+        assert_eq!(
+            cheap_with(Confidence::Unverified).mode,
+            DispositionMode::ReportOnly
+        );
+    }
+
+    // Anything that would keep a location out of a plan still does.
+    #[test]
+    fn layout_grants_no_authority() {
+        let tool_managed = derive(DispositionFacts {
+            recovery: &Recovery::Regenerable {
+                cost: RegenCost::Cheap,
+            },
+            ownership: Ownership::ToolCoordinated,
+            hazard: None,
+            confidence: Confidence::LayoutMatched,
+            measurement_complete: true,
+        });
+        assert_eq!(tool_managed.mode, DispositionMode::ReportOnly);
+        let unmeasured = derive(DispositionFacts {
+            recovery: &Recovery::Regenerable {
+                cost: RegenCost::Cheap,
+            },
+            ownership: Ownership::Standalone,
+            hazard: None,
+            confidence: Confidence::LayoutMatched,
+            measurement_complete: false,
+        });
+        assert_eq!(unmeasured.mode, DispositionMode::ReportOnly);
+    }
+
+    #[test]
+    fn layout_serializes_unverified() {
+        assert_eq!(
+            serde_json::to_value(Confidence::LayoutMatched).unwrap(),
+            serde_json::json!("unverified")
+        );
     }
 }
 

@@ -360,17 +360,7 @@ fn unreadable_nested_artifact_dir_reports_incomplete_instead_of_failing() {
     let mut command = fixture.command();
     command.arg("clean");
     let out = run_unreadable_scan_with(&unreadable, fixture.root.path(), command, &["--dry-run"]);
-    assert!(!out.status.success());
-    let stderr = String::from_utf8(out.stderr).unwrap();
-    assert!(
-        stderr.contains("refusing to clean on incomplete results"),
-        "stderr: {stderr}"
-    );
-    assert!(
-        stderr.contains(&region.display().to_string()),
-        "refusal does not name the incomplete region {}; stderr: {stderr}",
-        region.display()
-    );
+    assert_leaves_out_region(out, &region, &readable);
 
     let mut command = fixture.command();
     command.arg("clean");
@@ -440,17 +430,7 @@ fn unreadable_claimed_node_modules_records_a_region_but_loses_its_finding() {
     let mut command = fixture.command();
     command.arg("clean");
     let out = run_unreadable_scan_with(&unreadable, fixture.root.path(), command, &["--dry-run"]);
-    assert!(!out.status.success());
-    let stderr = String::from_utf8(out.stderr).unwrap();
-    assert!(
-        stderr.contains("refusing to clean on incomplete results"),
-        "stderr: {stderr}"
-    );
-    assert!(
-        stderr.contains(&region.display().to_string()),
-        "refusal does not name the incomplete region {}; stderr: {stderr}",
-        region.display()
-    );
+    assert_leaves_out_region(out, &region, &readable);
 }
 
 /// Unclassified-site degrade: no probe claims the unreadable dir, so the
@@ -483,5 +463,35 @@ fn unreadable_nested_dir_under_a_readable_root_keeps_readable_findings() {
             .iter()
             .any(|finding| finding["path"].as_str() == Some(readable.to_str().unwrap())),
         "{report}"
+    );
+}
+
+/// A whole-plan clean beside an unreadable directory moves what it measured and
+/// names the directory it could not.
+fn assert_leaves_out_region(
+    out: std::process::Output,
+    region: &std::path::Path,
+    planned: &std::path::Path,
+) {
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("Would move "), "stdout: {stdout}");
+    let unwrapped: String = stdout.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        unwrapped.contains("Couldnotbeinspected,soleftoutofthisplan:"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        unwrapped.contains(&region.display().to_string()),
+        "output does not name the incomplete region {}; stdout: {stdout}",
+        region.display()
+    );
+    assert!(
+        unwrapped.contains(planned.file_name().unwrap().to_str().unwrap()),
+        "stdout: {stdout}"
     );
 }

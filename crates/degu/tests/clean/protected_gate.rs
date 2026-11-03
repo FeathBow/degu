@@ -128,11 +128,12 @@ fn protected_credential_prune_does_not_block_the_whole_plan() {
 }
 
 /// Measurement wins: the same finding carries a deliberate prune and an
-/// unreadable directory, so the region cause upgrades to measurement and
-/// the whole plan keeps refusing.
+/// unreadable directory, so the region cause upgrades to measurement. The finding
+/// stays out of the plan, and the region is named; the rest of the plan is clear
+/// of it and proceeds.
 #[cfg(unix)]
 #[test]
-fn mixed_protected_and_unreadable_prune_refuses_the_whole_plan() {
+fn unreadable_prune_spares_plan() {
     if root_ignores_dir_modes() {
         return;
     }
@@ -148,16 +149,19 @@ fn mixed_protected_and_unreadable_prune_refuses_the_whole_plan() {
     let out = run_with_pip_cache(&home, &state, &cache, &["clean", "--dry-run"]);
     set_mode(&unreadable, 0o755);
 
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("refusing to clean on incomplete results"),
-        "stderr: {stderr}"
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let unwrapped: String = stdout.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        stderr.contains("cache/pip"),
-        "refusal must name the incompletely measured region: {stderr}"
+        unwrapped.contains("Couldnotbeinspected,soleftoutofthisplan:")
+            && unwrapped.contains("cache/pip"),
+        "output must name the incompletely measured region: {stdout}"
     );
+    assert!(stdout.contains(".cargo/registry"), "stdout: {stdout}");
     assert!(cache.join("payload.bin").exists());
     assert!(!state.path().join("degu/trash").exists());
     assert!(!state.path().join("degu/ops.jsonl").exists());

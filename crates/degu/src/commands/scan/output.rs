@@ -43,6 +43,7 @@ pub(super) fn print(report: &ScanReport) -> Result<()> {
             trash_entries,
             completeness: report.completeness,
             protected_prunes_only: report.incomplete_regions.protected_prunes_only(),
+            gaps_clear_of_cleanable: gaps_clear_of_cleanable(report),
             cleanable: has_cleanable_findings(report),
             needs_review: has_needs_review_findings(report),
             has_effective_project_roots: report.has_effective_project_roots,
@@ -257,6 +258,18 @@ fn render_trash_summary(
 fn is_cleanable(finding: &Finding, report: &ScanReport) -> bool {
     finding.disposition().mode == DispositionMode::Eligible
         && (finding.ecosystem() != "artifacts" || report.scope.has_explicit_roots())
+}
+
+/// Asks the clean gate's question about every eligible location, a superset of any
+/// plan the suggested preview could build, so a hint offered here is one it accepts.
+fn gaps_clear_of_cleanable(report: &ScanReport) -> bool {
+    let eligible = report
+        .findings
+        .iter()
+        .filter(|finding| is_cleanable(finding, report))
+        .map(Finding::path)
+        .collect::<Vec<_>>();
+    crate::commands::regions::prove_disjoint(&eligible, &report.incomplete_regions).is_ok()
 }
 
 fn has_cleanable_findings(report: &ScanReport) -> bool {

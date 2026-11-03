@@ -409,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn real_row_reads_limits() {
+    fn real_row_limits() {
         let parsed = parse_user(REAL_USER).unwrap().unwrap();
         assert_eq!(parsed.space.used, 19_748_892 * 1024);
         assert_eq!(parsed.space.soft_limit, None);
@@ -423,7 +423,7 @@ mod tests {
     // The server answered, and it has no limit for this user. That is a fact,
     // unlike a missing row.
     #[test]
-    fn zero_limits_mean_unlimited() {
+    fn zero_limits_unlimited() {
         let stdout = user_output("nfs.example:/p2/home /home 5 0 0 0 7 0 0 0");
         let parsed = parse_user(&stdout).unwrap().unwrap();
         assert_eq!(parsed.space.hard_limit, None);
@@ -431,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn over_limit_row_keeps_values() {
+    fn over_limit_row() {
         let stdout = user_output(&format!(
             "nfs.example:/p2/home /home 300* 200 400 {} 9* 5 10 {}",
             OBSERVED_AT + 60,
@@ -447,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_row_is_no_answer() {
+    fn missing_row_unanswered() {
         assert!(parse_user("").unwrap().is_none());
         let none = "Disk quotas for user researcher (uid 1000): none\n";
         assert!(parse_user(none).unwrap().is_none());
@@ -457,7 +457,7 @@ mod tests {
 
     // `-g -f` prints one block per group, and only the one asked for counts.
     #[test]
-    fn group_block_is_anchored() {
+    fn group_block_anchored() {
         let stdout = format!(
             "Disk quotas for group first (gid 1500): \n{COLUMNS}\nnfs.example:/p2/home /home 1 0 0 0 1 0 0 0\nDisk quotas for group second (gid 2000): \n{COLUMNS}\nnfs.example:/p2/home /home 8 0 16 0 1 0 0 0\n"
         );
@@ -471,13 +471,13 @@ mod tests {
     }
 
     #[test]
-    fn user_block_for_another_uid_is_no_answer() {
+    fn other_uid_unanswered() {
         let stdout = REAL_USER.replace("(uid 1000)", "(uid 1001)");
         assert!(parse_user(&stdout).unwrap().is_none());
     }
 
     #[test]
-    fn mount_point_with_spaces_survives() {
+    fn spaced_mount_survives() {
         let stdout = user_output("nfs.example:/x /mnt/my home 5 0 10 0 7 0 0 0");
         let expected = ExpectedRow {
             source: "nfs.example:/x",
@@ -490,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn row_for_another_mount_fails() {
+    fn other_mount_fails() {
         for row in [
             "nfs.example:/p2/tools /tools 5 0 0 0 7 0 0 0",
             "/home 5 0 0 0 7 0 0 0",
@@ -504,7 +504,7 @@ mod tests {
     // One mount on top of another at the same path: the tool can ask the server
     // underneath and still print the path. The source is what gives it away.
     #[test]
-    fn same_path_other_source_fails() {
+    fn other_source_fails() {
         for row in [
             "other.example:/p2/home /home 5 0 0 0 7 0 0 0",
             "nfs.example:/p2/home2 /home 5 0 0 0 7 0 0 0",
@@ -589,7 +589,7 @@ mod tests {
 
     // A hostile group name cannot supply the anchor.
     #[test]
-    fn name_cannot_fake_anchor() {
+    fn name_fakes_nothing() {
         let stdout = format!(
             "Disk quotas for group x (gid 2000): (gid 1500): \n{COLUMNS}\nnfs.example:/p2/home /home 8 0 0 0 1 0 0 0\n"
         );
@@ -598,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn refusal_names_the_server_reason() {
+    fn refusal_keeps_reason() {
         let stderr = "quota: error while getting quota from nfs.example:/p2/home for other (id 1500): Connection refused\nquota: error while getting quota from nfs.example:/p2/home for lab (id 2000): Timed out\n";
         assert_eq!(refusal_reason(stderr, Family::Group, GID), "Timed out");
         // No line about this id: the rest of stderr is still all there is to say.
@@ -637,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn asks_about_this_mount_only() {
+    fn argv_names_mount() {
         let dir = tempfile::tempdir().unwrap();
         let script = stub(dir.path(), "#!/bin/sh\necho \"$*\"\n");
         let mount = MountInfo {
@@ -656,7 +656,7 @@ mod tests {
     // `quota` exits non-zero when a limit is exceeded. That is the moment this
     // report matters most, so the status cannot be what decides.
     #[test]
-    fn over_limit_exit_keeps_the_row() {
+    fn over_limit_exit() {
         let body = "#!/bin/sh\nprintf 'Disk quotas for user x (uid 1000): \\n%s\\nnfs.example:/p2/home /home 300* 200 400 0 9 0 0 0\\n' 'Filesystem blocks quota limit grace files quota limit grace'\nexit 1\n";
         let parsed = stubbed(body, Family::User, UID).unwrap();
         assert_eq!(parsed.space.used, 300 * 1024);
@@ -668,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_grace_reads_with_the_soft_limit() {
+    fn zero_grace_soft() {
         // Over the soft limit: expired, with no deadline made up.
         let over = parse_user(&user_output(
             "nfs.example:/p2/home /home 300* 200 400 0 9* 5 10 0",
@@ -699,7 +699,7 @@ mod tests {
     // And it exits zero when the server refused, with nothing on stdout for the
     // mount: the shape a real VAST server gives for a group.
     #[test]
-    fn refused_with_exit_zero_is_unavailable() {
+    fn refused_exit_zero() {
         let body = "#!/bin/sh\necho 'quota: error while getting quota from nfs.example:/h for lab (id 2000): Connection refused' >&2\nprintf 'Disk quotas for group lab (gid 2000): none\\n'\nexit 0\n";
         let error = stubbed(body, Family::Group, GID).map(|_| ()).unwrap_err();
         let ProbeError::Unavailable { reason, .. } = error else {
@@ -709,14 +709,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_failure_is_unavailable() {
+    fn empty_failure_unavailable() {
         let body = "#!/bin/sh\necho 'quota: Cannot initialize mountpoint scan.' >&2\nexit 2\n";
         let error = stubbed(body, Family::User, UID).map(|_| ()).unwrap_err();
         assert!(matches!(error, ProbeError::Unavailable { .. }), "{error:?}");
     }
 
     #[test]
-    fn missing_tool_is_unavailable() {
+    fn missing_tool_unavailable() {
         let mount = nfs_mount();
         let error = run_quota(
             Path::new("/nonexistent/degu-test-quota"),
@@ -732,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn garbage_row_is_incomplete() {
+    fn garbage_row_incomplete() {
         let body = "#!/bin/sh\nprintf 'Disk quotas for user x (uid 1000): \\nnot columns\\n'\n";
         let error = stubbed(body, Family::User, UID).map(|_| ()).unwrap_err();
         assert!(matches!(error, ProbeError::Incomplete { .. }), "{error:?}");
@@ -773,7 +773,7 @@ mod tests {
 
     // The shape the validated server gives: the user answers, the group is refused.
     #[test]
-    fn survey_keeps_a_refused_group() {
+    fn survey_refused_group() {
         let (_dir, host) = stand_in(
             "echo 'quota: error while getting quota from nfs.example:/p2/home for lab (id 2000): Connection refused' >&2",
         );
@@ -788,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn survey_reports_unknown_group() {
+    fn survey_unknown_group() {
         let (_dir, host) = stand_in("echo 'must not be asked' >&2; exit 1");
         let report = survey(
             &host,
@@ -805,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn group_failure_is_not_fatal() {
+    fn group_failure_survives() {
         let dir = tempfile::tempdir().unwrap();
         let quota = group_quota(&QuotaHost::standing_in(dir.path()), &home_mount(), GID);
         assert_eq!(quota.kind, "group");
@@ -817,7 +817,7 @@ mod tests {
 
     // The user's own answer is what the report stands on, so losing it is an error.
     #[test]
-    fn user_failure_stays_an_error() {
+    fn user_failure_fatal() {
         let dir = tempfile::tempdir().unwrap();
         let error = survey(
             &QuotaHost::standing_in(dir.path()),

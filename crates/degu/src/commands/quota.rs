@@ -12,13 +12,16 @@ use std::time::Duration;
 
 /// Four tool runs at their own ten-second limit, and room for the calls around them.
 const SURVEY_DEADLINE: Duration = Duration::from_secs(45);
+/// Lets a test reach the deadline without waiting for it. Debug builds only.
+#[cfg(debug_assertions)]
+const DEADLINE_TEST_ENV: &str = "DEGU_QUOTA_TEST_DEADLINE_MS";
 
 type Survey = fn(&Path) -> Result<QuotaSnapshot, ProbeError>;
 
 pub(crate) fn run(args: QuotaArgs, ui: Ui) -> Result<()> {
     let json = args.output.json;
     let target = resolve_target(args.path)?;
-    let report = read_report(target, crate::quota::survey, SURVEY_DEADLINE)?;
+    let report = read_report(target, crate::quota::survey, survey_deadline())?;
     output::print(&report, json, ui)?;
     guidance::print(Request {
         output: output_mode(json, ui),
@@ -32,8 +35,9 @@ pub(crate) fn run(args: QuotaArgs, ui: Ui) -> Result<()> {
 /// `statfs` both ask the filesystem, and on a hard NFS mount whose server is away
 /// they wait for as long as it stays away, before any tool's own time limit starts.
 /// Past the deadline this reports the filesystem as unavailable and the process
-/// exits, which ends the waiting thread. A client stuck in a wait that cannot be
-/// killed can still hold up that exit, after the message has been printed.
+/// exits, which ends the waiting thread and, through its parent-death signal, any
+/// tool that thread had running. A client stuck in a wait that cannot be killed can
+/// still hold up that exit, after the message has been printed.
 fn read_report(target: PathBuf, survey: Survey, deadline: Duration) -> Result<QuotaSnapshot> {
     let target_text = escape_terminal_text(&target.display().to_string());
     let (sender, receiver) = mpsc::channel();
@@ -57,6 +61,17 @@ fn read_report(target: PathBuf, survey: Survey, deadline: Duration) -> Result<Qu
             "the quota probe for {target_text} stopped without an answer"
         )),
     }
+}
+
+fn survey_deadline() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(milliseconds) = std::env::var(DEADLINE_TEST_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return Duration::from_millis(milliseconds);
+    }
+    SURVEY_DEADLINE
 }
 
 fn output_mode(json: bool, ui: Ui) -> OutputMode {
@@ -102,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn hung_probe_meets_the_deadline() {
+    fn hung_probe_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let started = Instant::now();
         let error = read_report(dir.path().to_owned(), hangs, Duration::from_millis(100))
@@ -115,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn dead_probe_is_reported() {
+    fn dead_probe_reported() {
         let dir = tempfile::tempdir().unwrap();
         let error = read_report(dir.path().to_owned(), panics, Duration::from_secs(30))
             .map(|_| ())
@@ -125,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_failure_passes_through() {
+    fn probe_failure_passes() {
         let dir = tempfile::tempdir().unwrap();
         let error = read_report(dir.path().to_owned(), unsupported, Duration::from_secs(30))
             .map(|_| ())
@@ -135,7 +150,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_target_is_named() {
+    fn missing_target_named() {
         let error = read_report(
             PathBuf::from("/degu-missing-quota-target"),
             hangs,

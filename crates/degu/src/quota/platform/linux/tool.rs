@@ -4,11 +4,21 @@
 //! locale, a neutral working directory, closed stdin, bounded concurrent capture
 //! of both streams, and a bounded timeout. `degu_core::system_tool` has the same
 //! shape but discards stderr, which is where these tools say why they failed.
+//!
+//! A tool also dies with degu. `Child` does not kill on drop, and the timeout below
+//! is enforced by the thread running it, so `degu quota` passing its own deadline,
+//! a Ctrl-C or a kill would otherwise leave a tool running with nobody watching it.
+//! That is what the parent-death signal is for. It fires when the *thread* that
+//! spawned the child ends, which is safe here: `capture` is what spawns, and it
+//! holds that thread until the child has exited or been given up on. The kernel
+//! clears the signal on executing a set-user-ID binary, and it reaches only the tool
+//! itself and not anything the tool started.
 
 use super::{MountInfo, ProbeError};
 use std::ffi::OsStr;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
@@ -92,14 +102,31 @@ fn spawn_tool(run: &ToolRun<'_>, mount: &MountInfo) -> Result<Child, ProbeError>
     // land inside another thread's write-then-exec window.
     #[cfg(test)]
     let _shared = crate::fork_gate::forking();
-    Command::new(run.binary)
+    let parent = rustix::process::getpid();
+    let mut command = Command::new(run.binary);
+    command
         .args(run.arguments)
         .env_clear()
         .env("LC_ALL", "C")
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: this runs in the child between fork and exec, where only
+    // async-signal-safe work is allowed. Both calls are single raw syscalls that
+    // allocate nothing and take no lock.
+    unsafe {
+        command.pre_exec(move || {
+            rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))?;
+            // The parent may have gone before the signal was armed, and then it
+            // would never fire.
+            if rustix::process::getppid() != Some(parent) {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+    command
         .spawn()
         .map_err(|error| spawn_error(run, mount, &error))
 }

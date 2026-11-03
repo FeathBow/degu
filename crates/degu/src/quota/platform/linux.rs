@@ -423,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn setgid_directory_names_the_group() {
+    fn setgid_names_group() {
         assert_eq!(super::charged_group(0o2770, 2000, 1000), 2000);
         assert_eq!(super::charged_group(0o0770, 2000, 1000), 1000);
     }
@@ -431,7 +431,7 @@ mod tests {
     // A file answers for the directory it sits in, whose setgid bit is the one
     // that decides.
     #[test]
-    fn file_answers_for_its_directory() {
+    fn file_uses_parent() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("file");
         std::fs::write(&file, b"x").unwrap();
@@ -443,14 +443,14 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_group_is_not_guessed() {
+    fn group_never_guessed() {
         let reason = super::group_for_files(Path::new("/degu-missing-group-target")).unwrap_err();
         assert!(reason.contains("No such file"), "{reason}");
     }
 
     // The top mount at one path is the one a new write lands on.
     #[test]
-    fn top_mount_wins_a_path() {
+    fn top_mount_wins() {
         let table = "40 25 0:64 / /home rw - nfs4 a:/export rw\n41 40 0:65 / /home rw - nfs4 b:/export rw\n";
         let mount = parse_mountinfo(table, Path::new("/home/me")).unwrap();
         assert_eq!(mount.source, Path::new("b:/export"));
@@ -473,7 +473,7 @@ mod tests {
     // A clean waits on this, so it must not reach a tool that can hang. The stand-in
     // has no tools at all: asking would fail differently.
     #[test]
-    fn clean_does_not_ask_nfs() {
+    fn clean_skips_nfs() {
         let target = tempfile::tempdir().unwrap();
         let (_dir, host) = stand_in("nfs4", "server:/export", target.path());
         let error = read_quota(&host, target.path(), Reach::UserOnly).unwrap_err();
@@ -493,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn other_filesystems_stay_unsupported() {
+    fn others_stay_unsupported() {
         let target = tempfile::tempdir().unwrap();
         let (_dir, host) = stand_in("xfs", "/dev/sda1", target.path());
         for reach in [Reach::UserOnly, Reach::EverySubject] {

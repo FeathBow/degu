@@ -222,7 +222,7 @@ fn lustre_user() -> QuotaSnapshot {
 // The whole point: a user with no limit of their own must not read as unlimited
 // when the project they write into is nearly out of inodes.
 #[test]
-fn quota_human_leads_with_highest_use() {
+fn human_leads_use() {
     let report = lustre_user().with_subjects(vec![
         SubjectQuota::active(
             "project",
@@ -260,7 +260,7 @@ fn quota_human_leads_with_highest_use() {
 }
 
 #[test]
-fn quota_human_names_a_limit_in_force() {
+fn human_names_reached() {
     let report = lustre_user().with_subjects(vec![SubjectQuota::active(
         "project",
         654_321,
@@ -272,15 +272,22 @@ fn quota_human_names_a_limit_in_force() {
 
     let line = rendered
         .lines()
-        .find(|line| line.starts_with("In force"))
+        .find(|line| line.starts_with("At limit"))
         .unwrap();
     assert!(line.contains("project 654321 inodes"), "{line}");
     assert!(line.contains("at hard limit"), "{line}");
     assert!(!rendered.contains("Highest use"), "{rendered}");
+    // It reports the numbers, and a filesystem can account without enforcing, so
+    // nothing here may claim that writes are being refused.
+    let lowered = rendered.to_lowercase();
+    assert!(
+        !lowered.contains("refus") && !lowered.contains("force"),
+        "{rendered}"
+    );
 }
 
 #[test]
-fn quota_human_names_an_expired_grace() {
+fn human_names_expiry() {
     let report = QuotaSnapshot::active(
         QuotaScope::new(
             PathBuf::from("/home/me"),
@@ -308,7 +315,7 @@ fn quota_human_names_an_expired_grace() {
 
     let line = rendered
         .lines()
-        .find(|line| line.starts_with("In force"))
+        .find(|line| line.starts_with("At limit"))
         .unwrap();
     assert!(line.contains("user 1000 space"), "{line}");
     assert!(line.contains("soft limit exceeded"), "{line}");
@@ -316,7 +323,7 @@ fn quota_human_names_an_expired_grace() {
 }
 
 #[test]
-fn quota_human_says_nothing_is_configured() {
+fn human_none_configured() {
     let rendered = render_human(&lustre_user(), Ui::test_terminal(120));
     assert!(rendered.contains("none configured"), "{rendered}");
     // A single subject needs no section title.
@@ -325,7 +332,7 @@ fn quota_human_says_nothing_is_configured() {
 
 // With a subject unread, "no limit found" must not read as "no limit".
 #[test]
-fn quota_human_refuses_to_claim_unlimited() {
+fn human_refuses_unlimited() {
     let report = lustre_user().with_subjects(vec![SubjectQuota::unavailable(
         "group",
         Some(2000),
@@ -345,7 +352,7 @@ fn quota_human_refuses_to_claim_unlimited() {
 }
 
 #[test]
-fn quota_human_doubts_a_partial_answer() {
+fn human_doubts_partial() {
     let report = QuotaSnapshot::active(
         QuotaScope::new(
             PathBuf::from("/home/me"),

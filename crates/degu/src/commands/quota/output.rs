@@ -55,10 +55,11 @@ fn render_human(report: &QuotaSnapshot, ui: Ui) -> String {
     reflow_human(&output, ui.width)
 }
 
-/// What to look at first: a limit already refusing writes, or else the highest
-/// use. Every limit is stated below too, but a reader should not have to compare
-/// percentages across subjects to find this. It is not a forecast of what fills
-/// first, so it does not read as one.
+/// What to look at first: a limit already reached, or else the highest use. Every
+/// limit is stated below too, but a reader should not have to compare percentages
+/// across subjects to find this. It claims no more than the numbers do: not that a
+/// write will be refused, since a filesystem can account without enforcing, and not
+/// which limit fills first.
 fn leading_line(report: &QuotaSnapshot, glyphs: Glyphs) -> String {
     let Some(leading) = &report.leading_limit else {
         let label = "Limits";
@@ -107,13 +108,13 @@ fn describe_leading(leading: &LeadingLimit, glyphs: Glyphs) -> String {
         leading.used,
         format_value,
     );
-    if leading.in_force {
+    if leading.at_limit {
         let expired = if leading.limit_kind == "soft" {
             ", grace expired"
         } else {
             ""
         };
-        let label = "In force";
+        let label = "At limit";
         return format!(
             "{label:<DETAIL_INDENT$}{subject} {} {separator} {status}{expired}",
             leading.dimension

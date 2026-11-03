@@ -188,8 +188,9 @@ fn quota_linux_lustre_fixture_reports_the_lfs_provider() {
 
 /// `degu quota` end to end, with a stand-in host: a mount table, and tools that
 /// answer the way the real ones do. Only this reaches the command's own wiring, so
-/// it is what fails if the command stops asking about every subject.
-#[cfg(target_os = "linux")]
+/// it is what fails if the command stops asking about every subject. The host is
+/// read from a variable only a debug build looks at, so these need one too.
+#[cfg(all(target_os = "linux", debug_assertions))]
 mod stand_in {
     use super::degu;
     use std::io::Write;
@@ -197,6 +198,7 @@ mod stand_in {
     use std::process::{Command, Stdio};
 
     const HOST_ENV: &str = "DEGU_QUOTA_TEST_HOST";
+    const DEADLINE_ENV: &str = "DEGU_QUOTA_TEST_DEADLINE_MS";
     const LFS_COLUMNS: &str =
         "     Filesystem  kbytes   quota   limit   grace   files   quota   limit   grace";
     const QUOTA_COLUMNS: &str =
@@ -273,7 +275,7 @@ mod stand_in {
         "echo \"Disk quotas for grp lab (gid $3):\"; echo \"$C\"; echo \"  $4 9 0 0 - 9 0 0 -\"";
 
     #[test]
-    fn lustre_reports_every_subject() {
+    fn lustre_every_subject() {
         let (root, target) = lustre(GROUP_ANSWERS);
         let json = report(root.path(), target.path());
 
@@ -290,7 +292,7 @@ mod stand_in {
         assert_eq!(json["limits_complete"], true);
         assert_eq!(json["leading_limit"]["subject_kind"], "project");
         assert_eq!(json["leading_limit"]["dimension"], "inodes");
-        assert_eq!(json["leading_limit"]["in_force"], false);
+        assert_eq!(json["leading_limit"]["at_limit"], false);
 
         let human = run(root.path(), target.path(), false);
         let text = String::from_utf8_lossy(&human.stdout);
@@ -301,7 +303,7 @@ mod stand_in {
     }
 
     #[test]
-    fn lustre_reports_a_partial_failure() {
+    fn lustre_partial_failure() {
         let (root, target) = lustre("echo 'lfs quota: group refused' >&2; exit 1");
         let json = report(root.path(), target.path());
 
@@ -332,7 +334,7 @@ mod stand_in {
     }
 
     #[test]
-    fn nfs_reports_a_refused_group() {
+    fn nfs_refused_group() {
         let source = "nfs.example:/p2/home";
         let (root, target) = host("nfs4", source);
         let mount = std::fs::canonicalize(target.path()).unwrap();
@@ -355,7 +357,7 @@ mod stand_in {
     }
 
     #[test]
-    fn nfs_refuses_another_source() {
+    fn nfs_other_source() {
         let (root, target) = host("nfs4", "nfs.example:/p2/home");
         let mount = std::fs::canonicalize(target.path()).unwrap();
         install_tool(
@@ -373,4 +375,93 @@ mod stand_in {
         );
         assert!(stderr.contains("other.example:/p2/home"), "{stderr}");
     }
+
+    /// Gone, or finished and waiting for whoever adopted it to reap it.
+    fn has_ended(pid: &str) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return true;
+        };
+        stat.rsplit(')')
+            .next()
+            .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+    }
+
+    // The deadline ends degu with a tool still running, and only the thread that
+    // degu is about to lose was watching that tool's own time limit.
+    #[test]
+    fn deadline_kills_tool() {
+        let (root, target) = host("lustre", "10.0.0.1@tcp:/scratch");
+        let pid_file = root.path().join("tool.pid");
+        install_tool(
+            &root.path().join("lfs"),
+            &format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 300\n",
+                pid_file.display()
+            ),
+        );
+        let home = tempfile::tempdir().unwrap();
+        let output = degu(home.path())
+            .env(HOST_ENV, root.path())
+            .env(DEADLINE_ENV, "1000")
+            .args(["quota", "--json"])
+            .arg(target.path())
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stderr}");
+        assert!(stderr.contains("did not answer within"), "{stderr}");
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let pid = pid.trim();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !has_ended(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let ended = has_ended(pid);
+        if !ended {
+            // Do not leave it behind when this fails.
+            let _ = Command::new("kill").args(["-9", pid]).status();
+        }
+        assert!(ended, "the tool outlived degu");
+    }
+}
+
+/// With debug assertions off the stand-in must be ignored: the real mount table is
+/// read, so the stand-in tool never runs. `cargo test --release` cannot build this
+/// today, because this crate's tests turn on `integration-test-anchor`, which refuses
+/// to compile without debug assertions. It stays here so the check is written down
+/// next to the seam it guards, and it passes with that feature removed.
+#[cfg(all(target_os = "linux", not(debug_assertions)))]
+#[test]
+fn release_ignores_host() {
+    let root = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let canonical = std::fs::canonicalize(target.path()).unwrap();
+    std::fs::write(
+        root.path().join("mountinfo"),
+        format!(
+            "40 25 0:64 / {} rw - lustre 10.0.0.1@tcp:/scratch rw\n",
+            canonical.display()
+        ),
+    )
+    .unwrap();
+    let marker = root.path().join("tool-ran");
+    let tool = root.path().join("lfs");
+    std::fs::write(&tool, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    let mut permissions = std::fs::metadata(&tool).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&tool, permissions).unwrap();
+    let output = degu(root.path())
+        .env("DEGU_QUOTA_TEST_HOST", root.path())
+        .env("DEGU_QUOTA_TEST_DEADLINE_MS", "1")
+        .args(["quota", "--json"])
+        .arg(target.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!marker.exists(), "{stdout}{stderr}");
+    assert!(!stdout.contains("lustre_lfs"), "{stdout}");
+    // The deadline seam is gone too: one millisecond would have failed this.
+    assert!(!stderr.contains("did not answer within"), "{stderr}");
 }

@@ -1155,7 +1155,7 @@ mod tests {
     const REAL_PROJECT: &str = "Disk quotas for prj 654321 (pid 654321):\n     Filesystem  kbytes   quota   limit   grace   files   quota   limit   grace\n  /lus/fs 2307527940       0 5368709120       -  828409       0 1024000       -\n";
 
     #[test]
-    fn project_row_reports_limits() {
+    fn project_row_limits() {
         let parsed = parse(REAL_PROJECT, Path::new("/lus/fs"), project(), OBSERVED_AT).unwrap();
         assert_eq!(parsed.space.hard_limit, Some(5_368_709_120 * 1024));
         assert_eq!(parsed.inodes.used, 828_409);
@@ -1164,7 +1164,7 @@ mod tests {
 
     // The anchor is what proves the row answers the question that was asked.
     #[test]
-    fn subject_anchors_the_header() {
+    fn subject_anchors_header() {
         let wrong_id = REAL_PROJECT.replace("654321", "999");
         let reason = parse(&wrong_id, Path::new("/lus/fs"), project(), OBSERVED_AT)
             .map(|_| ())
@@ -1177,7 +1177,7 @@ mod tests {
     }
 
     #[test]
-    fn group_trailers_are_accepted() {
+    fn group_trailers_accepted() {
         let stdout = fixture(&[
             "Disk quotas for grp 2000 (gid 2000):",
             COLUMNS,
@@ -1202,7 +1202,7 @@ mod tests {
     }
 
     #[test]
-    fn subject_picks_the_flag() {
+    fn subject_picks_flag() {
         let dir = tempfile::tempdir().unwrap();
         let script = stub(dir.path(), "#!/bin/sh\necho \"$*\"\n");
         let mount = test_mount();
@@ -1217,7 +1217,7 @@ mod tests {
     }
 
     #[test]
-    fn project_query_names_the_target() {
+    fn project_query_target() {
         let dir = tempfile::tempdir().unwrap();
         // Echoes the id only when asked exactly this, and otherwise prints nothing.
         let script = stub(
@@ -1247,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    fn project_line_fails_closed() {
+    fn project_line_refused() {
         let target = Path::new("/lus/fs/me");
         for (stdout, expected) in [
             ("", "no output"),
@@ -1264,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn project_refusal_is_a_reason() {
+    fn project_refusal_reason() {
         let dir = tempfile::tempdir().unwrap();
         let script = stub(
             dir.path(),
@@ -1280,7 +1280,7 @@ mod tests {
 
     // A subject that cannot be read must say why instead of failing the report.
     #[test]
-    fn subject_failure_becomes_unavailable() {
+    fn subject_failure_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         let quota = subject_quota(
             &QuotaHost::standing_in(dir.path()),
@@ -1317,7 +1317,7 @@ mod tests {
     }
 
     #[test]
-    fn survey_reads_every_subject() {
+    fn survey_every_subject() {
         let (_dir, host) = stand_in(
             "echo \"Disk quotas for grp lab (gid $3):\"; echo \"$COLUMNS\"; echo \"  $4 9 0 0 - 9 0 0 -\"",
         );
@@ -1340,7 +1340,7 @@ mod tests {
     }
 
     #[test]
-    fn survey_keeps_a_partial_answer() {
+    fn survey_keeps_partial() {
         let (_dir, host) = stand_in("echo 'lfs quota: group refused' >&2; exit 1");
         let report = survey(
             &host,
@@ -1362,7 +1362,7 @@ mod tests {
 
     // Not knowing which group applies is reported, and no group is queried.
     #[test]
-    fn survey_reports_unknown_group() {
+    fn survey_unknown_group() {
         let (_dir, host) = stand_in("echo 'must not be asked' >&2; exit 1");
         let report = survey(
             &host,

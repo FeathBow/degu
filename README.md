@@ -194,7 +194,7 @@ To include a project tree in every `degu scan`, add it to `roots` in the [config
 degu quota
 ```
 
-Leads with the limit you will hit first, across the user, group, and project. Validated on Linux ext4, and field-validated on a Lustre 2.15 client (user, project, and group) and an NFSv4.2 home (user, and group where the server answers); other filesystems and macOS report unsupported instead of guessing. See the [user guide](https://github.com/FeathBow/degu/blob/main/docs/usage.md) for supported providers and failure behavior.
+Leads with any limit already refusing writes, or else the one with the highest use, across the user, group, and project. Validated on Linux ext4, and field-validated on a Lustre 2.15 client (user, project, and group) and an NFSv4.2 home (user, and group where the server answers); other filesystems and macOS report unsupported instead of guessing. See the [user guide](https://github.com/FeathBow/degu/blob/main/docs/usage.md) for supported providers and failure behavior.
 
 Run `degu <command> --help` or `degu man <command>` for complete command details.
 

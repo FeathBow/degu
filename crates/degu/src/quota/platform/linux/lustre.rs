@@ -15,14 +15,15 @@
 //! controls this process's view of the filesystem. One residual is accepted:
 //! the in-process statfs cross-check and path canonicalization below run
 //! before the time-bounded child and can still block on a mount whose
-//! servers are unresponsive — degu then hangs honestly rather than printing
-//! a number it could not verify.
+//! servers are unresponsive. `degu quota` bounds that with a deadline of its own;
+//! a clean's observation hangs honestly rather than printing a number it could
+//! not verify.
 
 use super::tool::{
     self, Execution, ToolRun, kib_to_bytes, numeric_plain, numeric_usage, reason_snippet,
     unavailable,
 };
-use super::{MountInfo, ProbeError};
+use super::{MountInfo, ProbeError, QuotaHost};
 use crate::quota::model::{
     ActiveQuota, QuotaDimension, QuotaGrace, QuotaGraceState, QuotaLimits, QuotaSnapshot,
     SubjectQuota,
@@ -36,7 +37,7 @@ const DATA_SOURCE: &str = "lfs_quota";
 pub(super) const FILESYSTEM: &str = "lustre";
 /// The only binary this provider will ever execute. No PATH resolution and
 /// no fallback locations: a missing tool is an honest Unavailable error.
-const LFS_BINARY: &str = "/usr/bin/lfs";
+pub(super) const LFS_BINARY: &str = "/usr/bin/lfs";
 const LUSTRE_SUPER_MAGIC: u64 = 0x0BD0_0BD0;
 const LFS_TIMEOUT: Duration = Duration::from_secs(10);
 const QUOTAS_NOT_ENABLED_MARKER: &str = "quotas are not enabled";
@@ -145,11 +146,12 @@ impl Subject {
 }
 
 pub(super) fn probe(
+    host: &QuotaHost,
     mount: MountInfo,
     path: &Path,
     subject_id: u32,
 ) -> Result<QuotaSnapshot, ProbeError> {
-    let parsed = read_subject(Path::new(LFS_BINARY), &mount, Subject::user(subject_id))?;
+    let parsed = read_subject(host, &mount, Subject::user(subject_id))?;
     let scope = mount.scope(path);
     Ok(QuotaSnapshot::active(
         scope,
@@ -168,38 +170,47 @@ pub(super) fn probe(
 /// and still be nearly out of the project's inodes. Only the user's failure
 /// fails the survey. Any other is reported beside what could be read.
 pub(super) fn survey(
+    host: &QuotaHost,
     mount: MountInfo,
     path: &Path,
     subject_id: u32,
-    group_id: u32,
+    group: Result<u32, String>,
 ) -> Result<QuotaSnapshot, ProbeError> {
-    let binary = Path::new(LFS_BINARY);
-    let snapshot = probe(mount.clone(), path, subject_id)?;
+    let snapshot = probe(host, mount.clone(), path, subject_id)?;
     let mut others = Vec::new();
-    match project_of(binary, &mount, path) {
+    match project_of(&host.lfs, &mount, path) {
         Ok(None) => {}
-        Ok(Some(id)) => others.push(subject_quota(binary, &mount, SubjectKind::Project, id)),
+        Ok(Some(id)) => others.push(subject_quota(host, &mount, SubjectKind::Project, id)),
         Err(error) => others.push(SubjectQuota::unavailable(
             SubjectKind::Project.name(),
             None,
             error.reason_text(),
         )),
     }
-    others.push(subject_quota(binary, &mount, SubjectKind::Group, group_id));
+    others.push(match group {
+        Ok(id) => subject_quota(host, &mount, SubjectKind::Group, id),
+        Err(reason) => SubjectQuota::unavailable(SubjectKind::Group.name(), None, reason),
+    });
     Ok(snapshot.with_subjects(others))
 }
 
-fn subject_quota(binary: &Path, mount: &MountInfo, kind: SubjectKind, id: u32) -> SubjectQuota {
-    match read_subject(binary, mount, Subject { kind, id }) {
+fn subject_quota(host: &QuotaHost, mount: &MountInfo, kind: SubjectKind, id: u32) -> SubjectQuota {
+    match read_subject(host, mount, Subject { kind, id }) {
         Ok(parsed) => SubjectQuota::active(kind.name(), id, parsed.space, parsed.inodes),
         Err(error) => SubjectQuota::unavailable(kind.name(), Some(id), error.reason_text()),
     }
 }
 
-fn read_subject(binary: &Path, mount: &MountInfo, subject: Subject) -> Result<Parsed, ProbeError> {
+fn read_subject(
+    host: &QuotaHost,
+    mount: &MountInfo,
+    subject: Subject,
+) -> Result<Parsed, ProbeError> {
     tool::require_rooted_mount_point(mount)?;
-    verify_statfs_is_lustre(mount)?;
-    let execution = capture(binary, mount, subject, LFS_TIMEOUT)?;
+    if host.check_magic {
+        verify_statfs_is_lustre(mount)?;
+    }
+    let execution = capture(&host.lfs, mount, subject, LFS_TIMEOUT)?;
     let stdout = successful_stdout(mount, execution)?;
     // Sampled right after lfs exits, so it sits closest to the instant the
     // server produced the countdown that expires_at_unix is derived from.
@@ -573,9 +584,9 @@ fn parse_trailers(lines: std::str::Lines<'_>, subject: Subject) -> Result<(), In
 mod tests {
     use super::tool::{CappedStream, require_rooted_mount_point};
     use super::{
-        LFS_TIMEOUT, MountInfo, Parsed, ProbeError, QuotaGraceState, Subject, SubjectKind, capture,
-        countdown_seconds, parse, parse_project, project_of, subject_quota, successful_stdout,
-        verify_statfs_is_lustre,
+        LFS_TIMEOUT, MountInfo, Parsed, ProbeError, QuotaGraceState, QuotaHost, Subject,
+        SubjectKind, capture, countdown_seconds, parse, parse_project, project_of, subject_quota,
+        successful_stdout, survey, verify_statfs_is_lustre,
     };
     use std::path::{Path, PathBuf};
     use std::process::ExitStatus;
@@ -1270,23 +1281,101 @@ mod tests {
     // A subject that cannot be read must say why instead of failing the report.
     #[test]
     fn subject_failure_becomes_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
         let quota = subject_quota(
-            Path::new("/nonexistent/degu-test-lfs"),
-            &MountInfo {
-                mount_point: PathBuf::from("/"),
-                filesystem: "lustre".to_owned(),
-                source: PathBuf::from("10.0.0.1@tcp:/scratch"),
-                mount_id: 40,
-                device_major: 0,
-                device_minor: 42,
-            },
+            &QuotaHost::standing_in(dir.path()),
+            &test_mount(),
             SubjectKind::Group,
             2000,
         );
         assert_eq!(quota.kind, "group");
         assert_eq!(quota.id, Some(2000));
         assert_eq!(quota.state, "unavailable");
-        assert!(quota.reason.is_some() && quota.space.is_none());
+        assert!(
+            quota
+                .reason
+                .as_deref()
+                .is_some_and(|text| text.contains("lfs")),
+            "{quota:?}"
+        );
+        assert!(quota.space.is_none());
+    }
+
+    /// A stand-in `lfs` answering the way a real client does, with the group
+    /// query's behaviour left to the caller.
+    fn stand_in(group_answer: &str) -> (tempfile::TempDir, QuotaHost) {
+        let dir = tempfile::tempdir().unwrap();
+        stub(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nCOLUMNS='{COLUMNS}'\ncase \"$1 $2\" in\n'project -d') echo \"654321 P $3\" ;;\n'quota -u') echo \"Disk quotas for usr me (uid $3):\"; echo \"$COLUMNS\"; echo \"  $4 8 0 0 - 8 0 0 -\" ;;\n'quota -p') echo \"Disk quotas for prj $3 (pid $3):\"; echo \"$COLUMNS\"; echo \"  $4 2048 0 5120 - 81 0 100 -\" ;;\n'quota -g') {group_answer} ;;\nesac\n"
+            ),
+        );
+        std::fs::rename(dir.path().join("lfs-stub.sh"), dir.path().join("lfs")).unwrap();
+        let host = QuotaHost::standing_in(dir.path());
+        (dir, host)
+    }
+
+    #[test]
+    fn survey_reads_every_subject() {
+        let (_dir, host) = stand_in(
+            "echo \"Disk quotas for grp lab (gid $3):\"; echo \"$COLUMNS\"; echo \"  $4 9 0 0 - 9 0 0 -\"",
+        );
+        let report = survey(
+            &host,
+            test_mount(),
+            Path::new("/scratch/me"),
+            EUID,
+            Ok(2000),
+        )
+        .unwrap();
+        let others = &report.other_subjects;
+        assert_eq!(others.len(), 2, "{others:?}");
+        assert_eq!((others[0].kind, others[0].id), ("project", Some(654_321)));
+        assert_eq!((others[1].kind, others[1].id), ("group", Some(2000)));
+        let leading = report.leading_limit.as_ref().unwrap();
+        assert_eq!(leading.subject_kind, "project");
+        assert_eq!(leading.dimension, "inodes");
+        assert!(report.limits_complete);
+    }
+
+    #[test]
+    fn survey_keeps_a_partial_answer() {
+        let (_dir, host) = stand_in("echo 'lfs quota: group refused' >&2; exit 1");
+        let report = survey(
+            &host,
+            test_mount(),
+            Path::new("/scratch/me"),
+            EUID,
+            Ok(2000),
+        )
+        .unwrap();
+        assert_eq!(report.other_subjects[1].state, "unavailable");
+        assert!(!report.limits_complete);
+        // What could be read is still there.
+        assert_eq!(report.other_subjects[0].state, "active");
+        assert_eq!(
+            report.leading_limit.as_ref().unwrap().subject_kind,
+            "project"
+        );
+    }
+
+    // Not knowing which group applies is reported, and no group is queried.
+    #[test]
+    fn survey_reports_unknown_group() {
+        let (_dir, host) = stand_in("echo 'must not be asked' >&2; exit 1");
+        let report = survey(
+            &host,
+            test_mount(),
+            Path::new("/scratch/me"),
+            EUID,
+            Err("Permission denied".to_owned()),
+        )
+        .unwrap();
+        let group = &report.other_subjects[1];
+        assert_eq!((group.kind, group.id), ("group", None));
+        assert_eq!(group.reason.as_deref(), Some("Permission denied"));
+        assert!(!report.limits_complete);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::output::stdoutln;
 use crate::presentation::{escape_terminal_text, human_bytes, ratio_bar};
 use crate::quota::model::{
-    ClosestLimit, QuotaDimension, QuotaGrace, QuotaGraceState, QuotaSnapshot, SubjectQuota,
+    LeadingLimit, QuotaDimension, QuotaGrace, QuotaGraceState, QuotaSnapshot, SubjectQuota,
 };
 use crate::runtime::{Glyphs, Ui};
 use anyhow::Result;
@@ -34,7 +34,7 @@ fn render_human(report: &QuotaSnapshot, ui: Ui) -> String {
         "Quota {separator} {target}\n\nFilesystem  {filesystem} {separator} {mount}\nSubject     {subject} {}\nProvider    {provider}\nData source {data_source}",
         report.subject.id
     );
-    write!(output, "\n\n{}", closest_line(report, glyphs))
+    write!(output, "\n\n{}", leading_line(report, glyphs))
         .expect("writing to a String cannot fail");
     if !report.other_subjects.is_empty() {
         write!(output, "\n\nUser {}", report.subject.id).expect("writing to a String cannot fail");
@@ -55,62 +55,75 @@ fn render_human(report: &QuotaSnapshot, ui: Ui) -> String {
     reflow_human(&output, ui.width)
 }
 
-/// The answer to "what do I hit first?". Every limit below is stated too, but a
-/// reader should not have to compare percentages across subjects to find it.
-fn closest_line(report: &QuotaSnapshot, glyphs: Glyphs) -> String {
-    const LABEL: &str = "Closest";
-    let Some(closest) = &report.closest_limit else {
+/// What to look at first: a limit already refusing writes, or else the highest
+/// use. Every limit is stated below too, but a reader should not have to compare
+/// percentages across subjects to find this. It is not a forecast of what fills
+/// first, so it does not read as one.
+fn leading_line(report: &QuotaSnapshot, glyphs: Glyphs) -> String {
+    let Some(leading) = &report.leading_limit else {
+        let label = "Limits";
         return if report.limits_complete {
-            format!("{LABEL:<DETAIL_INDENT$}no limit configured on any subject read")
+            format!("{label:<DETAIL_INDENT$}none configured on any subject read")
         } else {
             format!(
-                "{LABEL:<DETAIL_INDENT$}unknown: no limit found, but not every subject could be read"
+                "{label:<DETAIL_INDENT$}unknown: none found, but not every subject could be read"
             )
         };
     };
-    let line = format!(
-        "{LABEL:<DETAIL_INDENT$}{}",
-        describe_closest(closest, glyphs)
-    );
+    let line = describe_leading(leading, glyphs);
     if report.limits_complete {
         line
     } else {
         format!(
             "{line}\n{}",
-            detail_line("may not be the real one: not every subject could be read".to_owned())
+            detail_line(
+                "a subject could not be read, so this may not be the one that matters".to_owned()
+            )
         )
     }
 }
 
-fn describe_closest(closest: &ClosestLimit, glyphs: Glyphs) -> String {
+fn describe_leading(leading: &LeadingLimit, glyphs: Glyphs) -> String {
     let separator = glyphs.separator;
-    let format_value: fn(u64) -> String = if closest.dimension == "space" {
+    let format_value: fn(u64) -> String = if leading.dimension == "space" {
         human_bytes
     } else {
         format_count
     };
-    let kind = if closest.limit_kind == "soft" {
+    let kind = if leading.limit_kind == "soft" {
         "soft limit"
     } else {
         "hard limit"
     };
-    let subject = match closest.subject_id {
-        Some(id) => format!("{} {id}", closest.subject_kind),
-        None => closest.subject_kind.to_owned(),
+    let subject = match leading.subject_id {
+        Some(id) => format!("{} {id}", leading.subject_kind),
+        None => leading.subject_kind.to_owned(),
     };
-    let ratio = closest.used as f64 / closest.limit as f64;
+    let status = boundary_status(
+        Boundary {
+            kind,
+            limit: leading.limit,
+        },
+        leading.used,
+        format_value,
+    );
+    if leading.in_force {
+        let expired = if leading.limit_kind == "soft" {
+            ", grace expired"
+        } else {
+            ""
+        };
+        let label = "In force";
+        return format!(
+            "{label:<DETAIL_INDENT$}{subject} {} {separator} {status}{expired}",
+            leading.dimension
+        );
+    }
+    let ratio = leading.used as f64 / leading.limit as f64;
     format!(
-        "{subject} {} {:.1}% of {kind} {separator} {}",
-        closest.dimension,
-        ratio * PERCENT_SCALE,
-        boundary_status(
-            Boundary {
-                kind,
-                limit: closest.limit,
-            },
-            closest.used,
-            format_value,
-        )
+        "Highest use {subject} {} {:.1}% of {kind} {separator} {status}",
+        leading.dimension,
+        ratio * PERCENT_SCALE
     )
 }
 

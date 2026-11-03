@@ -222,7 +222,7 @@ fn lustre_user() -> QuotaSnapshot {
 // The whole point: a user with no limit of their own must not read as unlimited
 // when the project they write into is nearly out of inodes.
 #[test]
-fn quota_human_leads_with_the_closest_limit() {
+fn quota_human_leads_with_highest_use() {
     let report = lustre_user().with_subjects(vec![
         SubjectQuota::active(
             "project",
@@ -240,12 +240,12 @@ fn quota_human_leads_with_the_closest_limit() {
 
     let rendered = render_human(&report, Ui::test_terminal(120));
 
-    let closest = rendered.find("Closest").unwrap();
+    let leading = rendered.find("Highest use").unwrap();
     let first_section = rendered.find("User 1000").unwrap();
-    assert!(closest < first_section, "{rendered}");
+    assert!(leading < first_section, "{rendered}");
     let line = rendered
         .lines()
-        .find(|line| line.starts_with("Closest"))
+        .find(|line| line.starts_with("Highest use"))
         .unwrap();
     assert!(
         line.contains("project 654321 inodes 80.9% of hard limit"),
@@ -254,12 +254,71 @@ fn quota_human_leads_with_the_closest_limit() {
     assert!(line.contains("195591 remaining to hard limit"), "{line}");
     assert!(rendered.contains("Project 654321"), "{rendered}");
     assert!(rendered.contains("Group 2000"), "{rendered}");
+    // Nothing here promises which limit is hit first.
+    assert!(!rendered.to_lowercase().contains("first"), "{rendered}");
+    assert!(!rendered.contains("Closest"), "{rendered}");
+}
+
+#[test]
+fn quota_human_names_a_limit_in_force() {
+    let report = lustre_user().with_subjects(vec![SubjectQuota::active(
+        "project",
+        654_321,
+        QuotaDimension::new(1, QuotaLimits::new(0, 1000), None),
+        QuotaDimension::new(500, QuotaLimits::new(0, 500), None),
+    )]);
+
+    let rendered = render_human(&report, Ui::test_terminal(120));
+
+    let line = rendered
+        .lines()
+        .find(|line| line.starts_with("In force"))
+        .unwrap();
+    assert!(line.contains("project 654321 inodes"), "{line}");
+    assert!(line.contains("at hard limit"), "{line}");
+    assert!(!rendered.contains("Highest use"), "{rendered}");
+}
+
+#[test]
+fn quota_human_names_an_expired_grace() {
+    let report = QuotaSnapshot::active(
+        QuotaScope::new(
+            PathBuf::from("/home/me"),
+            PathBuf::from("/home"),
+            "nfs4".to_owned(),
+            QuotaScopeIdentity::new(36, 0, 1, PathBuf::from("server:/home")),
+        ),
+        1000,
+        ActiveQuota {
+            provider: "nfs_rquota",
+            data_source: "quota_tool",
+            space: QuotaDimension::new(
+                300,
+                QuotaLimits::new(200, 400),
+                Some(QuotaGrace {
+                    state: QuotaGraceState::Expired,
+                    expires_at_unix: None,
+                }),
+            ),
+            inodes: QuotaDimension::new(1, QuotaLimits::new(0, 0), None),
+        },
+    );
+
+    let rendered = render_human(&report, Ui::test_terminal(120));
+
+    let line = rendered
+        .lines()
+        .find(|line| line.starts_with("In force"))
+        .unwrap();
+    assert!(line.contains("user 1000 space"), "{line}");
+    assert!(line.contains("soft limit exceeded"), "{line}");
+    assert!(line.contains("grace expired"), "{line}");
 }
 
 #[test]
 fn quota_human_says_nothing_is_configured() {
     let rendered = render_human(&lustre_user(), Ui::test_terminal(120));
-    assert!(rendered.contains("no limit configured"), "{rendered}");
+    assert!(rendered.contains("none configured"), "{rendered}");
     // A single subject needs no section title.
     assert!(!rendered.contains("User 1000"), "{rendered}");
 }
@@ -275,8 +334,8 @@ fn quota_human_refuses_to_claim_unlimited() {
 
     let rendered = render_human(&report, Ui::test_terminal(120));
 
-    assert!(!rendered.contains("no limit configured"), "{rendered}");
-    assert!(rendered.contains("unknown: no limit found"), "{rendered}");
+    assert!(!rendered.contains("none configured"), "{rendered}");
+    assert!(rendered.contains("unknown: none found"), "{rendered}");
     assert!(rendered.contains("Group 2000"), "{rendered}");
     assert!(
         rendered.contains("could not be read: Connection refused"),
@@ -314,5 +373,8 @@ fn quota_human_doubts_a_partial_answer() {
         rendered.contains("user 1000 space 10.0% of hard limit"),
         "{rendered}"
     );
-    assert!(rendered.contains("may not be the real one"), "{rendered}");
+    assert!(
+        rendered.contains("may not be the one that matters"),
+        "{rendered}"
+    );
 }

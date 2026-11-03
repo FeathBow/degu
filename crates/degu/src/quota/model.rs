@@ -13,10 +13,11 @@ pub(crate) struct QuotaSnapshot {
     /// The group and project this path also answers to. `subject` stays the
     /// user, whose usage is what a clean observes changing.
     pub(crate) other_subjects: Vec<SubjectQuota>,
-    /// The limit nearest to being reached, among everything that could be read.
-    pub(crate) closest_limit: Option<ClosestLimit>,
-    /// False when a subject could not be read, so `closest_limit` may not be
-    /// the real one, and its absence does not mean there is no limit.
+    /// The limit a reader should look at first: one already refusing writes if
+    /// any is, otherwise the one with the highest use. See [`LeadingLimit`].
+    pub(crate) leading_limit: Option<LeadingLimit>,
+    /// False when a subject could not be read, so `leading_limit` may not be
+    /// the one that matters, and its absence does not mean there is no limit.
     pub(crate) limits_complete: bool,
 }
 
@@ -32,7 +33,7 @@ impl QuotaSnapshot {
             space: quota.space,
             inodes: quota.inodes,
             other_subjects: Vec::new(),
-            closest_limit: None,
+            leading_limit: None,
             limits_complete: true,
         };
         snapshot.settle_limits();
@@ -50,9 +51,9 @@ impl QuotaSnapshot {
             .other_subjects
             .iter()
             .all(|subject| subject.state == SUBJECT_ACTIVE);
-        let mut closest = None;
+        let mut leading = None;
         offer_dimensions(
-            &mut closest,
+            &mut leading,
             self.subject.kind,
             Some(self.subject.id),
             &self.space,
@@ -60,16 +61,16 @@ impl QuotaSnapshot {
         );
         for other in &self.other_subjects {
             if let (Some(space), Some(inodes)) = (&other.space, &other.inodes) {
-                offer_dimensions(&mut closest, other.kind, other.id, space, inodes);
+                offer_dimensions(&mut leading, other.kind, other.id, space, inodes);
             }
         }
-        self.closest_limit = closest;
+        self.leading_limit = leading;
     }
 }
 
 #[cfg(any(target_os = "linux", test))]
 fn offer_dimensions(
-    closest: &mut Option<ClosestLimit>,
+    leading: &mut Option<LeadingLimit>,
     kind: &'static str,
     id: Option<u32>,
     space: &QuotaDimension,
@@ -82,7 +83,7 @@ fn offer_dimensions(
             let Some(limit) = limit else {
                 continue;
             };
-            let candidate = ClosestLimit {
+            let candidate = LeadingLimit {
                 subject_kind: kind,
                 subject_id: id,
                 dimension,
@@ -90,21 +91,37 @@ fn offer_dimensions(
                 used: values.used,
                 limit,
                 headroom: limit.saturating_sub(values.used),
+                in_force: limit_in_force(limit_kind, values.used, limit, values.grace.as_ref()),
             };
-            if closest
+            if leading
                 .as_ref()
                 .is_none_or(|held| candidate.displaces(held))
             {
-                *closest = Some(candidate);
+                *leading = Some(candidate);
             }
         }
     }
 }
 
-/// One limit, and how close it is. Bytes and inodes share no unit, so limits
-/// compare by the fraction used.
+/// A hard limit refuses writes once reached. A soft limit does only once it is
+/// exceeded and its grace has run out. A provider that reports no grace for an
+/// exceeded soft limit has not said it is enforced, so it is not claimed to be.
+#[cfg(any(target_os = "linux", test))]
+fn limit_in_force(kind: &str, used: u64, limit: u64, grace: Option<&QuotaGrace>) -> bool {
+    if kind == "hard" {
+        return used >= limit;
+    }
+    used > limit && grace.is_some_and(|grace| grace.state == QuotaGraceState::Expired)
+}
+
+/// The limit a report leads with. One in force outranks any that is not, because
+/// it is refusing writes now. Otherwise this is the highest use, which is a hint
+/// and not a prediction of what fills first. Bytes and inodes share no unit, so
+/// limits compare by the fraction used, and that fraction says nothing about
+/// room: 990 of 1000 GiB outranks 9 of 10 GiB, though the second has less left,
+/// and what runs out first depends on what is written next.
 #[derive(Debug, Serialize)]
-pub(crate) struct ClosestLimit {
+pub(crate) struct LeadingLimit {
     pub(crate) subject_kind: &'static str,
     pub(crate) subject_id: Option<u32>,
     pub(crate) dimension: &'static str,
@@ -112,20 +129,30 @@ pub(crate) struct ClosestLimit {
     pub(crate) used: u64,
     pub(crate) limit: u64,
     pub(crate) headroom: u64,
+    pub(crate) in_force: bool,
 }
 
 #[cfg(any(target_os = "linux", test))]
-impl ClosestLimit {
+impl LeadingLimit {
     fn displaces(&self, held: &Self) -> bool {
+        if self.in_force != held.in_force {
+            return self.in_force;
+        }
+        let same_quantity = self.subject_kind == held.subject_kind
+            && self.subject_id == held.subject_id
+            && self.dimension == held.dimension;
+        // Past both limits of one quantity, the hard limit is the one to name,
+        // even though the soft limit has the larger fraction.
+        if same_quantity && self.in_force && self.limit_kind == "hard" {
+            return true;
+        }
         let mine = u128::from(self.used) * u128::from(held.limit);
         let theirs = u128::from(held.used) * u128::from(self.limit);
         mine > theirs
             || (mine == theirs
                 && self.limit_kind == "hard"
                 && held.limit_kind == "soft"
-                && self.subject_kind == held.subject_kind
-                && self.subject_id == held.subject_id
-                && self.dimension == held.dimension)
+                && same_quantity)
     }
 }
 
@@ -434,9 +461,9 @@ mod tests {
         assert_json_keys(
             &json,
             &[
-                "closest_limit",
                 "data_source",
                 "inodes",
+                "leading_limit",
                 "limits_complete",
                 "other_subjects",
                 "provider",
@@ -491,6 +518,25 @@ mod tests {
         user(dimension(8, 0, 0), dimension(8, 0, 0))
     }
 
+    fn expired(used: u64, soft: u64, hard: u64) -> QuotaDimension {
+        QuotaDimension::new(
+            used,
+            QuotaLimits::new(soft, hard),
+            Some(QuotaGrace {
+                state: QuotaGraceState::Expired,
+                expires_at_unix: None,
+            }),
+        )
+    }
+
+    fn in_grace(used: u64, soft: u64, hard: u64) -> QuotaDimension {
+        QuotaDimension::new(
+            used,
+            QuotaLimits::new(soft, hard),
+            QuotaGrace::from_kernel_deadline(200, 100),
+        )
+    }
+
     // The shape that made `degu quota` say "no configured limit" on a real
     // cluster: nothing on the user, and the project nearly out of inodes.
     #[test]
@@ -504,24 +550,25 @@ mod tests {
             ),
             SubjectQuota::active("group", 2000, dimension(9, 0, 0), dimension(9, 0, 0)),
         ]);
-        let closest = report.closest_limit.as_ref().unwrap();
-        assert_eq!(closest.subject_kind, "project");
-        assert_eq!(closest.subject_id, Some(654_321));
-        assert_eq!(closest.dimension, "inodes");
-        assert_eq!(closest.limit_kind, "hard");
-        assert_eq!(closest.headroom, 1_024_000 - 828_409);
+        let leading = report.leading_limit.as_ref().unwrap();
+        assert_eq!(leading.subject_kind, "project");
+        assert_eq!(leading.subject_id, Some(654_321));
+        assert_eq!(leading.dimension, "inodes");
+        assert_eq!(leading.limit_kind, "hard");
+        assert_eq!(leading.headroom, 1_024_000 - 828_409);
+        assert!(!leading.in_force);
         assert!(report.limits_complete);
     }
 
     #[test]
-    fn no_limit_means_no_closest() {
+    fn no_limit_means_no_leader() {
         let report = unlimited_user().with_subjects(vec![SubjectQuota::active(
             "group",
             2000,
             dimension(9, 0, 0),
             dimension(9, 0, 0),
         )]);
-        assert!(report.closest_limit.is_none());
+        assert!(report.leading_limit.is_none());
         assert!(report.limits_complete);
     }
 
@@ -533,11 +580,11 @@ mod tests {
             Some(2000),
             "Connection refused".to_owned(),
         )]);
-        assert!(report.closest_limit.is_none());
+        assert!(report.leading_limit.is_none());
         assert!(!report.limits_complete);
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["limits_complete"], false);
-        assert!(json["closest_limit"].is_null());
+        assert!(json["leading_limit"].is_null());
         let other = &json["other_subjects"][0];
         assert_json_keys(other, &["id", "inodes", "kind", "reason", "space", "state"]);
         assert_eq!(other["state"], "unavailable");
@@ -545,31 +592,106 @@ mod tests {
         assert!(other["space"].is_null());
     }
 
-    // A soft limit is crossed first, so it is the closer one until they are equal,
-    // and then the hard limit is the one that refuses a write.
+    // A soft limit has the larger fraction until they are equal, and then the hard
+    // limit is the one that refuses a write.
     #[test]
-    fn soft_closes_before_hard() {
+    fn soft_leads_until_equal() {
         let report = user(dimension(50, 60, 100), dimension(1, 0, 0));
-        assert_eq!(report.closest_limit.as_ref().unwrap().limit_kind, "soft");
+        assert_eq!(report.leading_limit.as_ref().unwrap().limit_kind, "soft");
         let equal = user(dimension(50, 100, 100), dimension(1, 0, 0));
-        assert_eq!(equal.closest_limit.as_ref().unwrap().limit_kind, "hard");
-    }
-
-    #[test]
-    fn exceeded_limit_stays_closest() {
-        let report = user(dimension(150, 0, 100), dimension(99, 0, 100));
-        let closest = report.closest_limit.as_ref().unwrap();
-        assert_eq!(closest.dimension, "space");
-        assert_eq!(closest.headroom, 0);
+        assert_eq!(equal.leading_limit.as_ref().unwrap().limit_kind, "hard");
     }
 
     #[test]
     fn huge_limits_compare_exactly() {
-        // A float would call these equal; the larger ratio is the second.
+        // A float would call these equal; the larger fraction is the second.
         let report = user(
             dimension(u64::MAX - 2, 0, u64::MAX),
             dimension(u64::MAX - 1, 0, u64::MAX),
         );
-        assert_eq!(report.closest_limit.as_ref().unwrap().dimension, "inodes");
+        assert_eq!(report.leading_limit.as_ref().unwrap().dimension, "inodes");
+    }
+
+    // The documented limit of "highest use": it names the larger fraction, not the
+    // quantity with the least room, and the report still shows the group's numbers.
+    #[test]
+    fn highest_use_ignores_room() {
+        let gib = 1024 * 1024 * 1024;
+        let report =
+            user(dimension(990 * gib, 0, 1000 * gib), dimension(1, 0, 0)).with_subjects(vec![
+                SubjectQuota::active(
+                    "group",
+                    2000,
+                    dimension(9 * gib, 0, 10 * gib),
+                    dimension(1, 0, 0),
+                ),
+            ]);
+        let leading = report.leading_limit.as_ref().unwrap();
+        assert_eq!(leading.subject_kind, "user");
+        assert_eq!(leading.headroom, 10 * gib);
+        assert_eq!(
+            report.other_subjects[0]
+                .space
+                .as_ref()
+                .unwrap()
+                .headroom_to_hard_limit,
+            Some(gib)
+        );
+    }
+
+    // A soft limit at 120% still in grace lets writes through. An inode hard limit
+    // at 100% does not, so it leads despite the smaller fraction.
+    #[test]
+    fn in_force_outranks_higher_use() {
+        let report = user(in_grace(120, 100, 1000), dimension(1, 0, 0)).with_subjects(vec![
+            SubjectQuota::active(
+                "project",
+                654_321,
+                dimension(1, 0, 1000),
+                dimension(500, 0, 500),
+            ),
+        ]);
+        let leading = report.leading_limit.as_ref().unwrap();
+        assert_eq!(leading.subject_kind, "project");
+        assert_eq!(leading.dimension, "inodes");
+        assert!(leading.in_force);
+    }
+
+    #[test]
+    fn soft_in_force_needs_expired_grace() {
+        let expired_soft = user(expired(120, 100, 1000), dimension(1, 0, 0));
+        let leading = expired_soft.leading_limit.as_ref().unwrap();
+        assert_eq!(leading.limit_kind, "soft");
+        assert!(leading.in_force);
+
+        let in_grace_soft = user(in_grace(120, 100, 1000), dimension(1, 0, 0));
+        assert!(!in_grace_soft.leading_limit.as_ref().unwrap().in_force);
+
+        // Exceeded with no grace reported: not claimed as enforced.
+        let silent = user(dimension(120, 100, 1000), dimension(1, 0, 0));
+        assert!(!silent.leading_limit.as_ref().unwrap().in_force);
+
+        // Exactly at a soft limit is not over it, whatever the grace says.
+        let at_soft = user(expired(100, 100, 1000), dimension(1, 0, 0));
+        assert!(!at_soft.leading_limit.as_ref().unwrap().in_force);
+    }
+
+    #[test]
+    fn hard_limit_in_force_when_reached() {
+        let reached = user(dimension(100, 0, 100), dimension(1, 0, 0));
+        assert!(reached.leading_limit.as_ref().unwrap().in_force);
+        let below = user(dimension(99, 0, 100), dimension(1, 0, 0));
+        assert!(!below.leading_limit.as_ref().unwrap().in_force);
+    }
+
+    // Past both limits of one quantity the hard limit is named, though the soft
+    // limit has the larger fraction.
+    #[test]
+    fn hard_named_past_both() {
+        let report = user(expired(300, 100, 200), dimension(1, 0, 0));
+        let leading = report.leading_limit.as_ref().unwrap();
+        assert_eq!(leading.limit_kind, "hard");
+        assert!(leading.in_force);
+        assert_eq!(leading.headroom, 0);
     }
 }

@@ -7,18 +7,30 @@
 //! the answer, and its absence is the failure, reported with whatever stderr
 //! said. A row with zero limits is a real answer: the server has none configured.
 //!
-//! `-f` keeps the question to this one mount, so another server that hangs cannot
-//! take the answer down with it. `-v` keeps a row with no limits, which would
-//! otherwise be left out and read the same as a refused query. The threat
-//! boundary is the Lustre provider's: this defends against confusion, not against
-//! whoever controls /usr/bin/quota.
+//! A row has to name both this mount point and this mount's source. The tool picks
+//! the first table entry matching a directory's device and inode, so with one mount
+//! on top of another at the same path it can ask the server underneath and still
+//! print the path. A row that names another source fails closed.
+//!
+//! `-f` limits the rows to this one mount. It does not limit what the tool touches:
+//! quota-tools scans every mount in the table with `realpath` and `statfs` before it
+//! filters, so another mount whose server is away can make this query time out even
+//! though this mount is healthy. `-v` keeps a row with no limits, which would
+//! otherwise be left out and read the same as a refused query. The threat boundary
+//! is the Lustre provider's: this defends against confusion, not against whoever
+//! controls /usr/bin/quota.
+//!
+//! Only `degu quota` reaches this provider, under its own deadline. The statfs below
+//! and the tool's mount scan can both block for as long as a server is away, and a
+//! clean must not wait on that.
 
 use super::tool::{
     self, Execution, ToolRun, kib_to_bytes, numeric_plain, numeric_usage, reason_snippet,
 };
-use super::{MountInfo, ProbeError};
+use super::{MountInfo, ProbeError, QuotaHost};
 use crate::quota::model::{
-    ActiveQuota, QuotaDimension, QuotaGrace, QuotaLimits, QuotaSnapshot, SubjectQuota,
+    ActiveQuota, QuotaDimension, QuotaGrace, QuotaGraceState, QuotaLimits, QuotaSnapshot,
+    SubjectQuota,
 };
 use std::ffi::OsStr;
 use std::path::Path;
@@ -29,7 +41,7 @@ const PROVIDER: &str = "nfs_rquota";
 const DATA_SOURCE: &str = "quota_tool";
 /// The only binary this provider will ever execute. No PATH resolution and
 /// no fallback locations: a missing tool is an honest Unavailable error.
-const QUOTA_BINARY: &str = "/usr/bin/quota";
+pub(super) const QUOTA_BINARY: &str = "/usr/bin/quota";
 const NFS_SUPER_MAGIC: u64 = 0x6969;
 const QUOTA_TIMEOUT: Duration = Duration::from_secs(10);
 const VALUE_COLUMN_COUNT: usize = 8;
@@ -81,12 +93,27 @@ struct Parsed {
     inodes: QuotaDimension,
 }
 
-pub(super) fn probe(
+/// What a row has to name to answer for this mount, both byte for byte.
+struct ExpectedRow<'a> {
+    source: &'a str,
+    mount_point: &'a str,
+}
+
+/// The user, and the group this path answers to. A server can answer for users
+/// and refuse groups, as the one this was validated on does. That leaves the group
+/// unread, not the report wrong.
+pub(super) fn survey(
+    host: &QuotaHost,
     mount: MountInfo,
     path: &Path,
     subject_id: u32,
+    group: Result<u32, String>,
 ) -> Result<QuotaSnapshot, ProbeError> {
-    let parsed = read_subject(Path::new(QUOTA_BINARY), &mount, Family::User, subject_id)?;
+    let parsed = read_subject(host, &mount, Family::User, subject_id)?;
+    let others = vec![match group {
+        Ok(id) => group_quota(host, &mount, id),
+        Err(reason) => SubjectQuota::unavailable(Family::Group.word(), None, reason),
+    }];
     let scope = mount.scope(path);
     Ok(QuotaSnapshot::active(
         scope,
@@ -97,40 +124,29 @@ pub(super) fn probe(
             space: parsed.space,
             inodes: parsed.inodes,
         },
-    ))
+    )
+    .with_subjects(others))
 }
 
-/// The user, and the group this path answers to. A server can answer for users
-/// and refuse groups, as the one this was validated on does. That leaves the group
-/// unread, not the report wrong.
-pub(super) fn survey(
-    mount: MountInfo,
-    path: &Path,
-    subject_id: u32,
-    group_id: u32,
-) -> Result<QuotaSnapshot, ProbeError> {
-    let snapshot = probe(mount.clone(), path, subject_id)?;
-    let group = group_quota(Path::new(QUOTA_BINARY), &mount, group_id);
-    Ok(snapshot.with_subjects(vec![group]))
-}
-
-fn group_quota(binary: &Path, mount: &MountInfo, id: u32) -> SubjectQuota {
+fn group_quota(host: &QuotaHost, mount: &MountInfo, id: u32) -> SubjectQuota {
     let word = Family::Group.word();
-    match read_subject(binary, mount, Family::Group, id) {
+    match read_subject(host, mount, Family::Group, id) {
         Ok(parsed) => SubjectQuota::active(word, id, parsed.space, parsed.inodes),
         Err(error) => SubjectQuota::unavailable(word, Some(id), error.reason_text()),
     }
 }
 
 fn read_subject(
-    binary: &Path,
+    host: &QuotaHost,
     mount: &MountInfo,
     family: Family,
     id: u32,
 ) -> Result<Parsed, ProbeError> {
     tool::require_rooted_mount_point(mount)?;
-    tool::verify_statfs(mount, NFS_SUPER_MAGIC)?;
-    let execution = run_quota(binary, mount, family)?;
+    if host.check_magic {
+        tool::verify_statfs(mount, NFS_SUPER_MAGIC)?;
+    }
+    let execution = run_quota(&host.quota, mount, family)?;
     let observed_at_unix =
         super::unix_time_now().map_err(|reason| super::incomplete(mount, reason))?;
     interpret(execution, mount, family, id, observed_at_unix)
@@ -172,11 +188,17 @@ fn interpret(
     }
     let stdout = String::from_utf8(execution.stdout.bytes)
         .map_err(|_| super::incomplete(mount, "quota stdout is not valid UTF-8"))?;
-    let mount_text = mount
-        .mount_point
-        .to_str()
-        .ok_or_else(|| super::incomplete(mount, "mount point is not valid UTF-8"))?;
-    let parsed = parse(&stdout, mount_text, family, id, observed_at_unix)
+    let expected = ExpectedRow {
+        source: mount
+            .source
+            .to_str()
+            .ok_or_else(|| super::incomplete(mount, "mount source is not valid UTF-8"))?,
+        mount_point: mount
+            .mount_point
+            .to_str()
+            .ok_or_else(|| super::incomplete(mount, "mount point is not valid UTF-8"))?,
+    };
+    let parsed = parse(&stdout, &expected, family, id, observed_at_unix)
         .map_err(|reason| super::incomplete(mount, reason))?;
     parsed.ok_or_else(|| {
         let stderr = String::from_utf8_lossy(&execution.stderr.bytes);
@@ -207,7 +229,7 @@ fn refusal_reason(stderr: &str, family: Family, id: u32) -> String {
 /// row answered for this subject. Anything unrecognized fails closed.
 fn parse(
     stdout: &str,
-    mount_text: &str,
+    expected: &ExpectedRow<'_>,
     family: Family,
     id: u32,
     observed_at_unix: u64,
@@ -235,7 +257,7 @@ fn parse(
             if found.is_some() {
                 return Err("quota printed more than one row for this mount".to_owned());
             }
-            found = Some(parse_row(row, mount_text, observed_at_unix)?);
+            found = Some(parse_row(row, expected, observed_at_unix)?);
         }
     }
     Ok(found)
@@ -267,26 +289,32 @@ fn parse_header(line: &str, family: Family) -> Result<(u32, bool), String> {
     }
 }
 
-/// `<device> <mount point> <eight values>`. The values are taken from the end so
-/// a mount point with spaces in it survives, and the mount point is compared
-/// byte for byte. The device has to be one token, which stops a row for the mount
-/// `/x /home` from answering for `/home`.
-fn parse_row(row: &str, mount_text: &str, observed_at_unix: u64) -> Result<Parsed, String> {
+/// `<source> <mount point> <eight values>`. The values are taken from the end so a
+/// mount point with spaces in it survives. The source and mount point are then
+/// compared as one string, so a row has to name both.
+fn parse_row(
+    row: &str,
+    expected: &ExpectedRow<'_>,
+    observed_at_unix: u64,
+) -> Result<Parsed, String> {
     let mut rest = row.trim_end();
     let mut values = [""; VALUE_COLUMN_COUNT];
     for slot in values.iter_mut().rev() {
         let split = rest.rfind(char::is_whitespace).ok_or_else(|| {
-            format!("expected a device, a mount point and {VALUE_COLUMN_COUNT} value columns")
+            format!("expected a source, a mount point and {VALUE_COLUMN_COUNT} value columns")
         })?;
         *slot = &rest[split + 1..];
         rest = rest[..split].trim_end();
     }
-    let device = rest
-        .strip_suffix(mount_text)
-        .and_then(|device| device.strip_suffix(' '))
+    let named_source = rest
+        .strip_suffix(expected.mount_point)
+        .and_then(|source| source.strip_suffix(' '))
         .ok_or_else(|| "row does not name the probed mount point".to_owned())?;
-    if device.is_empty() || device.contains(char::is_whitespace) {
-        return Err("row does not name the probed mount point".to_owned());
+    if named_source != expected.source {
+        return Err(format!(
+            "row is for {named_source}, but the mount table has {} at this path",
+            expected.source
+        ));
     }
     let [
         blocks,
@@ -298,41 +326,57 @@ fn parse_row(row: &str, mount_text: &str, observed_at_unix: u64) -> Result<Parse
         inode_hard,
         inode_grace,
     ] = values;
+    let used_blocks = numeric_usage(blocks, "blocks")?;
+    let soft_blocks = numeric_plain(block_soft, "block soft limit")?;
+    let used_files = numeric_usage(files, "files")?;
+    let soft_files = numeric_plain(inode_soft, "inode soft limit")?;
     let space = QuotaDimension::new(
-        kib_to_bytes(numeric_usage(blocks, "blocks")?, "blocks")?,
+        kib_to_bytes(used_blocks, "blocks")?,
         QuotaLimits::new(
-            kib_to_bytes(
-                numeric_plain(block_soft, "block soft limit")?,
-                "block soft limit",
-            )?,
+            kib_to_bytes(soft_blocks, "block soft limit")?,
             kib_to_bytes(
                 numeric_plain(block_hard, "block hard limit")?,
                 "block hard limit",
             )?,
         ),
-        QuotaGrace::from_kernel_deadline(
+        row_grace(
             numeric_plain(block_grace, "block grace")?,
+            used_blocks,
+            soft_blocks,
             observed_at_unix,
         ),
     );
     let inodes = QuotaDimension::new(
-        numeric_usage(files, "files")?,
-        QuotaLimits::new(
-            numeric_plain(inode_soft, "inode soft limit")?,
-            numeric_plain(inode_hard, "inode hard limit")?,
-        ),
-        QuotaGrace::from_kernel_deadline(
+        used_files,
+        QuotaLimits::new(soft_files, numeric_plain(inode_hard, "inode hard limit")?),
+        row_grace(
             numeric_plain(inode_grace, "inode grace")?,
+            used_files,
+            soft_files,
             observed_at_unix,
         ),
     );
     Ok(Parsed { space, inodes })
 }
 
+/// A grace column of zero means nothing is running, unless the row is over its soft
+/// limit. quota-tools calls that over quota, because the deadline is not in the
+/// future, and so does this: expired, with no deadline to report since none was given.
+fn row_grace(deadline: u64, used: u64, soft: u64, observed_at_unix: u64) -> Option<QuotaGrace> {
+    if deadline == 0 && soft != 0 && used > soft {
+        return Some(QuotaGrace {
+            state: QuotaGraceState::Expired,
+            expires_at_unix: None,
+        });
+    }
+    QuotaGrace::from_kernel_deadline(deadline, observed_at_unix)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Family, Parsed, ProbeError, group_quota, interpret, parse, refusal_reason, run_quota,
+        ExpectedRow, Family, Parsed, ProbeError, QuotaHost, group_quota, interpret, parse,
+        refusal_reason, run_quota, survey,
     };
     use crate::quota::model::QuotaGraceState;
     use crate::quota::platform::MountInfo;
@@ -342,6 +386,11 @@ mod tests {
     const GID: u32 = 2000;
     const OBSERVED_AT: u64 = 1_700_000_000;
     const MOUNT: &str = "/home";
+    const SOURCE: &str = "nfs.example:/p2/home";
+    const EXPECTED: ExpectedRow<'static> = ExpectedRow {
+        source: SOURCE,
+        mount_point: MOUNT,
+    };
     const COLUMNS: &str =
         "     Filesystem  blocks   quota   limit   grace   files   quota   limit   grace";
     /// Real output from quota 4.05 against a VAST NFSv4.2 home, names replaced.
@@ -352,7 +401,7 @@ mod tests {
     }
 
     fn parse_user(stdout: &str) -> Result<Option<Parsed>, String> {
-        parse(stdout, MOUNT, Family::User, UID, OBSERVED_AT)
+        parse(stdout, &EXPECTED, Family::User, UID, OBSERVED_AT)
     }
 
     fn parse_error(stdout: &str) -> String {
@@ -412,12 +461,12 @@ mod tests {
         let stdout = format!(
             "Disk quotas for group first (gid 1500): \n{COLUMNS}\nnfs.example:/p2/home /home 1 0 0 0 1 0 0 0\nDisk quotas for group second (gid 2000): \n{COLUMNS}\nnfs.example:/p2/home /home 8 0 16 0 1 0 0 0\n"
         );
-        let parsed = parse(&stdout, MOUNT, Family::Group, GID, OBSERVED_AT)
+        let parsed = parse(&stdout, &EXPECTED, Family::Group, GID, OBSERVED_AT)
             .unwrap()
             .unwrap();
         assert_eq!(parsed.space.used, 8 * 1024);
         assert_eq!(parsed.space.hard_limit, Some(16 * 1024));
-        let absent = parse(&stdout, MOUNT, Family::Group, 9, OBSERVED_AT).unwrap();
+        let absent = parse(&stdout, &EXPECTED, Family::Group, 9, OBSERVED_AT).unwrap();
         assert!(absent.is_none());
     }
 
@@ -430,7 +479,11 @@ mod tests {
     #[test]
     fn mount_point_with_spaces_survives() {
         let stdout = user_output("nfs.example:/x /mnt/my home 5 0 10 0 7 0 0 0");
-        let parsed = parse(&stdout, "/mnt/my home", Family::User, UID, OBSERVED_AT)
+        let expected = ExpectedRow {
+            source: "nfs.example:/x",
+            mount_point: "/mnt/my home",
+        };
+        let parsed = parse(&stdout, &expected, Family::User, UID, OBSERVED_AT)
             .unwrap()
             .unwrap();
         assert_eq!(parsed.space.hard_limit, Some(10 * 1024));
@@ -440,13 +493,32 @@ mod tests {
     fn row_for_another_mount_fails() {
         for row in [
             "nfs.example:/p2/tools /tools 5 0 0 0 7 0 0 0",
-            "nfs.example:/x /x /home 5 0 0 0 7 0 0 0",
             "/home 5 0 0 0 7 0 0 0",
             "nfs.example:/p2/home2 /home2 5 0 0 0 7 0 0 0",
         ] {
             let reason = parse_error(&user_output(row));
             assert!(reason.contains("mount point"), "{row}: {reason}");
         }
+    }
+
+    // One mount on top of another at the same path: the tool can ask the server
+    // underneath and still print the path. The source is what gives it away.
+    #[test]
+    fn same_path_other_source_fails() {
+        for row in [
+            "other.example:/p2/home /home 5 0 0 0 7 0 0 0",
+            "nfs.example:/p2/home2 /home 5 0 0 0 7 0 0 0",
+            "nfs.example:/x /x /home 5 0 0 0 7 0 0 0",
+            " /home 5 0 0 0 7 0 0 0",
+        ] {
+            assert!(parse_user(&user_output(row)).is_err(), "{row}");
+        }
+        let reason = parse_error(&user_output("other.example:/p2/home /home 5 0 0 0 7 0 0 0"));
+        assert!(reason.contains("other.example:/p2/home"), "{reason}");
+        assert!(
+            reason.contains("the mount table has nfs.example:/p2/home"),
+            "{reason}"
+        );
     }
 
     // A missing column shifts the mount point into the values, so it cannot pass.
@@ -505,7 +577,7 @@ mod tests {
             ),
             (
                 format!(
-                    "Disk quotas for user x (uid 1000): \n{COLUMNS}\nd /home 1 0 0 0 1 0 0 0\nd /home 1 0 0 0 1 0 0 0\n"
+                    "Disk quotas for user x (uid 1000): \n{COLUMNS}\nnfs.example:/p2/home /home 1 0 0 0 1 0 0 0\nnfs.example:/p2/home /home 1 0 0 0 1 0 0 0\n"
                 ),
                 "more than one row",
             ),
@@ -519,9 +591,9 @@ mod tests {
     #[test]
     fn name_cannot_fake_anchor() {
         let stdout = format!(
-            "Disk quotas for group x (gid 2000): (gid 1500): \n{COLUMNS}\nd /home 8 0 0 0 1 0 0 0\n"
+            "Disk quotas for group x (gid 2000): (gid 1500): \n{COLUMNS}\nnfs.example:/p2/home /home 8 0 0 0 1 0 0 0\n"
         );
-        let absent = parse(&stdout, MOUNT, Family::Group, GID, OBSERVED_AT).unwrap();
+        let absent = parse(&stdout, &EXPECTED, Family::Group, GID, OBSERVED_AT).unwrap();
         assert!(absent.is_none());
     }
 
@@ -585,10 +657,43 @@ mod tests {
     // report matters most, so the status cannot be what decides.
     #[test]
     fn over_limit_exit_keeps_the_row() {
-        let body = "#!/bin/sh\nprintf 'Disk quotas for user x (uid 1000): \\n%s\\nnfs.example:/h /home 300* 200 400 0 9 0 0 0\\n' 'Filesystem blocks quota limit grace files quota limit grace'\nexit 1\n";
+        let body = "#!/bin/sh\nprintf 'Disk quotas for user x (uid 1000): \\n%s\\nnfs.example:/p2/home /home 300* 200 400 0 9 0 0 0\\n' 'Filesystem blocks quota limit grace files quota limit grace'\nexit 1\n";
         let parsed = stubbed(body, Family::User, UID).unwrap();
         assert_eq!(parsed.space.used, 300 * 1024);
         assert_eq!(parsed.space.hard_limit, Some(400 * 1024));
+        // A zero grace column over the soft limit: quota-tools calls this over quota.
+        let grace = parsed.space.grace.unwrap();
+        assert_eq!(grace.state, QuotaGraceState::Expired);
+        assert_eq!(grace.expires_at_unix, None);
+    }
+
+    #[test]
+    fn zero_grace_reads_with_the_soft_limit() {
+        // Over the soft limit: expired, with no deadline made up.
+        let over = parse_user(&user_output(
+            "nfs.example:/p2/home /home 300* 200 400 0 9* 5 10 0",
+        ))
+        .unwrap()
+        .unwrap();
+        let block = over.space.grace.unwrap();
+        assert_eq!(block.state, QuotaGraceState::Expired);
+        assert_eq!(block.expires_at_unix, None);
+        let inode = over.inodes.grace.unwrap();
+        assert_eq!(inode.state, QuotaGraceState::Expired);
+        assert_eq!(inode.expires_at_unix, None);
+        // At the soft limit is not over it, and no soft limit has nothing to be over.
+        let at = parse_user(&user_output(
+            "nfs.example:/p2/home /home 200 200 400 0 5 5 10 0",
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(at.space.grace.is_none() && at.inodes.grace.is_none());
+        let none = parse_user(&user_output(
+            "nfs.example:/p2/home /home 300 0 400 0 9 0 10 0",
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(none.space.grace.is_none() && none.inodes.grace.is_none());
     }
 
     // And it exits zero when the server refused, with nothing on stdout for the
@@ -637,18 +742,72 @@ mod tests {
         MountInfo {
             mount_point: PathBuf::from("/"),
             filesystem: "nfs4".to_owned(),
-            source: PathBuf::from("nfs.example:/p2/home"),
+            source: PathBuf::from(SOURCE),
             mount_id: 40,
             device_major: 0,
             device_minor: 64,
         }
     }
 
+    fn home_mount() -> MountInfo {
+        MountInfo {
+            mount_point: PathBuf::from(MOUNT),
+            ..nfs_mount()
+        }
+    }
+
+    /// A stand-in `quota` answering the way the real one does for a user, with the
+    /// group query's behaviour left to the caller.
+    fn stand_in(group_answer: &str) -> (tempfile::TempDir, QuotaHost) {
+        let dir = tempfile::tempdir().unwrap();
+        stub(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\ncase \"$5\" in\n-u) printf 'Disk quotas for user x (uid 1000): \\n%s\\nnfs.example:/p2/home /home 8 0 16 0 1 0 0 0\\n' 'Filesystem blocks quota limit grace files quota limit grace' ;;\n-g) {group_answer} ;;\nesac\n"
+            ),
+        );
+        std::fs::rename(dir.path().join("quota-stub.sh"), dir.path().join("quota")).unwrap();
+        let host = QuotaHost::standing_in(dir.path());
+        (dir, host)
+    }
+
+    // The shape the validated server gives: the user answers, the group is refused.
+    #[test]
+    fn survey_keeps_a_refused_group() {
+        let (_dir, host) = stand_in(
+            "echo 'quota: error while getting quota from nfs.example:/p2/home for lab (id 2000): Connection refused' >&2",
+        );
+        let report = survey(&host, home_mount(), Path::new("/home/me"), UID, Ok(GID)).unwrap();
+        assert_eq!(report.provider, "nfs_rquota");
+        assert_eq!(report.space.hard_limit, Some(16 * 1024));
+        let group = &report.other_subjects[0];
+        assert_eq!((group.kind, group.id), ("group", Some(GID)));
+        assert_eq!(group.state, "unavailable");
+        assert_eq!(group.reason.as_deref(), Some("Connection refused"));
+        assert!(!report.limits_complete);
+    }
+
+    #[test]
+    fn survey_reports_unknown_group() {
+        let (_dir, host) = stand_in("echo 'must not be asked' >&2; exit 1");
+        let report = survey(
+            &host,
+            home_mount(),
+            Path::new("/home/me"),
+            UID,
+            Err("Permission denied".to_owned()),
+        )
+        .unwrap();
+        let group = &report.other_subjects[0];
+        assert_eq!((group.kind, group.id), ("group", None));
+        assert_eq!(group.reason.as_deref(), Some("Permission denied"));
+        assert!(!report.limits_complete);
+    }
+
     #[test]
     fn group_failure_is_not_fatal() {
-        // The statfs cross-check fails first here, which is a failure like any
-        // other: the report keeps the user and names the group as unread.
-        let quota = group_quota(Path::new("/nonexistent/degu-test-quota"), &nfs_mount(), GID);
+        let dir = tempfile::tempdir().unwrap();
+        let quota = group_quota(&QuotaHost::standing_in(dir.path()), &home_mount(), GID);
         assert_eq!(quota.kind, "group");
         assert_eq!(quota.id, Some(GID));
         assert_eq!(quota.state, "unavailable");
@@ -656,9 +815,19 @@ mod tests {
         assert!(quota.space.is_none() && quota.inodes.is_none());
     }
 
+    // The user's own answer is what the report stands on, so losing it is an error.
     #[test]
     fn user_failure_stays_an_error() {
-        let error = super::probe(nfs_mount(), Path::new("/"), UID).unwrap_err();
-        assert!(matches!(error, ProbeError::Incomplete { .. }), "{error:?}");
+        let dir = tempfile::tempdir().unwrap();
+        let error = survey(
+            &QuotaHost::standing_in(dir.path()),
+            home_mount(),
+            Path::new("/home/me"),
+            UID,
+            Ok(GID),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert!(matches!(error, ProbeError::Unavailable { .. }), "{error:?}");
     }
 }

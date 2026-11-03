@@ -395,7 +395,10 @@ fn filter_findings(
     let (plan_candidates, policy_candidates): (Vec<_>, Vec<_>) =
         findings.into_iter().partition(|finding| {
             finding.disposition().mode == DispositionMode::Eligible
-                || (include_review && finding.disposition().mode == DispositionMode::OptIn)
+                || (include_review
+                    && finding.disposition().mode == DispositionMode::OptIn
+                    && (finding.confidence() != Confidence::LayoutMatched
+                        || layout_match_named(finding, paths)))
         });
     let policy = filter.select(policy_candidates)?;
     let planned = filter.select(plan_candidates)?;
@@ -417,6 +420,22 @@ fn filter_findings(
             filter_hidden,
         },
     })
+}
+
+/// A location on layout alone needs asking for by name. A path below which it
+/// happens to sit is someone reviewing that other location, and a filter can then
+/// leave this one as all that remains. `--include-review` with no path asks for every
+/// Needs review location, and the plan says which of them are here on layout alone.
+fn layout_match_named(finding: &Finding, paths: &[PathBuf]) -> bool {
+    if paths.is_empty() {
+        return true;
+    }
+    let Ok(location) = std::fs::canonicalize(finding.path()) else {
+        return false;
+    };
+    paths
+        .iter()
+        .any(|path| std::fs::canonicalize(path).is_ok_and(|named| named == location))
 }
 
 fn capture_clean_plan(
@@ -460,10 +479,12 @@ fn capture_clean_plan(
             refuse_incompleteness_overlapping_selection(&selected, incomplete_regions)?;
             note_protected_regions_skipped(incomplete_regions);
         } else {
-            // The plan is the selection here. A region proven clear of every planned
-            // location cannot veto one, and a location it hides simply stays out of
-            // this plan, which the output says. The same proof, and for the same
-            // reason, as --path: only the selection differs.
+            // The plan is the selection here. A region that compares clear of every
+            // planned location cannot veto one, and a location it hides simply stays
+            // out of this plan, which the output says. The same comparison, and for
+            // the same reason, as --path: only the selection differs. It covers the
+            // roots of regions and locations and their ancestors, not what is mounted
+            // inside a region (see `regions`).
             let selected = planned.iter().map(Finding::path).collect::<Vec<_>>();
             refuse_incompleteness_overlapping_plan(&selected, incomplete_regions)?;
             note_protected_regions_skipped(incomplete_regions);

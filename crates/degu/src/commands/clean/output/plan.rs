@@ -8,7 +8,7 @@ use crate::presentation::{
 };
 use crate::runtime::{Headline, HeadlineLead};
 use anyhow::Result;
-use degu_core::finding::DispositionMode;
+use degu_core::finding::{Confidence, DispositionMode};
 
 mod exclusions;
 
@@ -85,8 +85,9 @@ fn print_dry_run_header(prepared: &PreparedClean) -> Result<()> {
     )
 }
 
-/// Names what the scan could not inspect, and so what this plan leaves out. Every
-/// recorded region is proven clear of the plan by the time a plan gets here.
+/// Names what the scan could not inspect, and so what this plan leaves out. A plan
+/// reaches this only after every recorded region compared clear of it (see `regions`
+/// for what that comparison covers).
 fn print_not_inspected(prepared: &PreparedClean) -> Result<()> {
     let Some(listed) = &prepared.not_inspected else {
         return Ok(());
@@ -101,7 +102,29 @@ fn print_not_inspected(prepared: &PreparedClean) -> Result<()> {
     )
 }
 
+/// Counts the whole plan, not only what its preview could assess: a location the
+/// preview cannot assess still moves, and it still only looks like a cache.
+fn print_layout_only(prepared: &PreparedClean) -> Result<()> {
+    let layout_only = prepared
+        .plan
+        .items()
+        .iter()
+        .filter(|finding| finding.confidence() == Confidence::LayoutMatched)
+        .count();
+    if layout_only == 0 {
+        return Ok(());
+    }
+    let note = format!(
+        "{layout_only} location(s) are here on layout alone: they look like their tool's cache, which does not prove they are one."
+    );
+    stdoutln!(
+        "{}",
+        prepared.settings.ui.toned_prose(0, &note, Tone::Review)
+    )
+}
+
 fn print_selected(prepared: &PreparedClean) -> Result<()> {
+    print_layout_only(prepared)?;
     let assessed = prepared.preview_tree_policy_assessed();
     let assessed_owned = assessed
         .iter()

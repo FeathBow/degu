@@ -8,6 +8,12 @@
 //! identities as well, because `canonicalize` leaves two attachments of one
 //! directory as two paths. Anything unprovable is reported as a failure so
 //! callers stay fail-closed.
+//!
+//! The comparison covers each location's root and ancestors, and nothing inside it.
+//! A region is by definition a directory degu could not walk, so a mount somewhere
+//! within one is not seen: binding part of a planned location under an unmeasured
+//! region still compares clear. Making that needs root and a deliberate bind, and it
+//! exists whatever this proof decides.
 
 use degu_core::ecosystem::{IncompleteRegion, IncompleteRegions, RegionCause};
 use std::os::unix::fs::MetadataExt;

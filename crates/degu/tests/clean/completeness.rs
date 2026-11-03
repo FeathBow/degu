@@ -671,3 +671,228 @@ fn layout_kept_during_prompt_moves() {
     );
     assert!(!cache.exists(), "the reviewed location must have moved");
 }
+
+/// A layout match inside another Needs review location, older than it, so an age
+/// filter can leave the match as all that remains of a selection of the other.
+struct NestedMatch {
+    home: tempfile::TempDir,
+    state: tempfile::TempDir,
+    torch: std::path::PathBuf,
+    pip: std::path::PathBuf,
+}
+
+impl NestedMatch {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let torch = home.path().join(".cache/torch");
+        std::fs::create_dir_all(torch.join("hub")).unwrap();
+        std::fs::write(torch.join("hub/fresh.bin"), [0_u8; 2048]).unwrap();
+        let pip = torch.join("pip");
+        std::fs::create_dir_all(pip.join("wheels/ab")).unwrap();
+        let old = pip.join("wheels/ab/results.csv");
+        std::fs::write(&old, [0_u8; 2048]).unwrap();
+        let sixty_days = std::time::Duration::from_secs(60 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - sixty_days)
+            .unwrap();
+        crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+        Self {
+            home,
+            state,
+            torch,
+            pip,
+        }
+    }
+
+    fn clean(&self, args: &[&str]) -> std::process::Output {
+        run_with_pip_dir(&self.home, &self.state, &self.pip, args)
+    }
+
+    fn assert_spared(&self, args: &[&str]) {
+        let out = self.clean(args);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            self.pip.join("wheels/ab/results.csv").exists(),
+            "{args:?} moved a layout match nobody named; stdout: {stdout}"
+        );
+        assert!(
+            self.torch.join("hub/fresh.bin").exists(),
+            "{args:?} moved the location the filter excluded; stdout: {stdout}"
+        );
+    }
+}
+
+/// The hole: the review validates the ancestor, the filter removes the ancestor, and
+/// without the rule the one location nobody named is the whole plan.
+#[test]
+fn ancestor_review_spares_match() {
+    let fixture = NestedMatch::new();
+    let torch = fixture.torch.to_str().unwrap().to_owned();
+    fixture.assert_spared(&["clean", "--yes", "--review", &torch, "--older-than", "30"]);
+}
+
+/// The same selection spelled the way the terminal review spells a chosen location.
+#[test]
+fn ancestor_path_spares_match() {
+    let fixture = NestedMatch::new();
+    let torch = fixture.torch.to_str().unwrap().to_owned();
+    fixture.assert_spared(&[
+        "clean",
+        "--yes",
+        "--include-review",
+        "--path",
+        &torch,
+        "--older-than",
+        "30",
+    ]);
+}
+
+#[test]
+fn path_alone_spares_match() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+    let path = cache.to_str().unwrap();
+
+    run_with_pip_dir(&home, &state, &cache, &["clean", "--yes", "--path", path]);
+
+    assert!(cache.join("wheels/ab/results.csv").exists());
+}
+
+/// A path that names something else leaves the match out, and the plan still runs.
+#[test]
+fn other_path_spares_match() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+    let torch = home.path().join(".cache/torch");
+    std::fs::create_dir_all(&torch).unwrap();
+    std::fs::write(torch.join("hub.bin"), [0_u8; 2048]).unwrap();
+    crate::common::make_tree_non_shared_writable(home.path()).unwrap();
+
+    let out = run_with_pip_dir(
+        &home,
+        &state,
+        &cache,
+        &[
+            "clean",
+            "--yes",
+            "--include-review",
+            "--path",
+            torch.to_str().unwrap(),
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!torch.exists(), "the named location must have moved");
+    assert!(cache.join("wheels/ab/results.csv").exists());
+}
+
+/// The cases that do bring it in: asked for by exact path, and asked for with every
+/// other Needs review location.
+#[test]
+fn named_path_takes_match() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+    let path = cache.to_str().unwrap();
+
+    let out = run_with_pip_dir(
+        &home,
+        &state,
+        &cache,
+        &["clean", "--yes", "--include-review", "--path", path],
+    );
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!cache.exists(), "the named location must have moved");
+}
+
+#[test]
+fn bulk_review_takes_match() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+
+    let out = run_with_pip_dir(
+        &home,
+        &state,
+        &cache,
+        &["clean", "--yes", "--include-review"],
+    );
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !cache.exists(),
+        "--include-review asks for every review location"
+    );
+}
+
+/// Spelling the exact location through a symlink still names it.
+#[cfg(unix)]
+#[test]
+fn review_alias_takes_match() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+    let alias = home.path().join("pip-link");
+    std::os::unix::fs::symlink(&cache, &alias).unwrap();
+
+    let out = run_with_pip_dir(
+        &home,
+        &state,
+        &cache,
+        &["clean", "--yes", "--review", alias.to_str().unwrap()],
+    );
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!cache.exists(), "the alias names this location");
+}
+
+/// The plan says which locations are in it on layout alone, however they got there,
+/// and says nothing when none are.
+#[test]
+fn plan_names_layout_match() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cache = redirected_pip_layout(&home);
+
+    for args in [
+        vec!["clean", "--dry-run", "--include-review"],
+        vec!["clean", "--dry-run", "--review", cache.to_str().unwrap()],
+    ] {
+        let out = run_with_pip_dir(&home, &state, &cache, &args);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let unwrapped: String = stdout.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            unwrapped.contains("1location(s)arehereonlayoutalone"),
+            "{args:?}; stdout: {stdout}"
+        );
+    }
+
+    let tagged = tempfile::tempdir().unwrap();
+    let (_plain, plain_state) = fake_pip_cache(&tagged, ".cache/pip");
+    let out = run_clean(&tagged, &plain_state, &["clean", "--dry-run"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("layout alone"), "stdout: {stdout}");
+}

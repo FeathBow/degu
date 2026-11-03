@@ -43,7 +43,7 @@ pub(crate) struct ScanState<'a> {
     /// The findings incompleteness ledger holds only deliberate protected
     /// prunes -- the same classification that leaves a clean plan unaffected.
     pub(crate) protected_prunes_only: bool,
-    /// Every region the scan could not measure is proven clear of every eligible
+    /// Every region the scan could not measure compares clear of every eligible
     /// location, which is what the clean gate asks of its plan.
     pub(crate) gaps_clear_of_cleanable: bool,
     pub(crate) cleanable: bool,

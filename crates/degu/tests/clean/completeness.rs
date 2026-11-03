@@ -613,6 +613,7 @@ fn confirm_after_change(
 spawn -noecho $env(DEGU_BIN) --color never clean --review $env(PIP_CACHE_DIR)
 expect -exact {Proceed? [y/N] }
 file mkdir $env(LATE_DIR)
+file attributes $env(LATE_DIR) -permissions 0755
 send "y\r"
 expect eof
 "#;

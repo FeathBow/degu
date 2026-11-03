@@ -214,6 +214,22 @@ mod tests {
         ));
     }
 
+    // The stats can disagree with the path if something is replaced between them, and
+    // the path alone is still enough to refuse.
+    #[test]
+    fn path_alone_holds_selection() {
+        let region = at("/home/u/.cache", &[OTHER, HOME, ROOT]);
+        assert!(matches!(
+            Overlap::between(&region, &selected_pip()),
+            Some(Overlap::ContainsSelection)
+        ));
+        let inside = at("/home/u/.cache/pip/sub", &[SUB, OTHER, HOME, ROOT]);
+        assert!(matches!(
+            Overlap::between(&inside, &at("/home/u/.cache/pip", &[PIP, ROOT])),
+            Some(Overlap::InsideSelection)
+        ));
+    }
+
     // Sharing an ancestor is what siblings do, and it is not an overlap.
     #[test]
     fn shared_ancestor_stays_disjoint() {

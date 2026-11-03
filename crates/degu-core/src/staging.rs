@@ -451,6 +451,13 @@ pub struct VerifiedPurgeError {
 }
 
 impl VerifiedPurgeError {
+    /// The purge stopped for lack of room to write its check's scratch.
+    pub fn is_disk_full(&self) -> bool {
+        self.source
+            .downcast_ref::<crate::staging::recovery::RecoveryRebindError>()
+            .is_some_and(crate::staging::recovery::RecoveryRebindError::is_disk_full)
+    }
+
     fn new<E>(
         transaction: TransactionId,
         stage: &'static str,
@@ -594,6 +601,32 @@ impl VerifiedUndoError {
                 )
             })
     }
+
+    /// The undo stopped for lack of room to write its check's scratch.
+    pub fn is_disk_full(&self) -> bool {
+        self.source
+            .downcast_ref::<crate::staging::recovery::RecoveryRebindError>()
+            .is_some_and(crate::staging::recovery::RecoveryRebindError::is_disk_full)
+    }
+}
+
+impl ForwardRecoveryError {
+    /// The rename has happened and only the check after it is waiting, for room
+    /// to write its scratch. Nothing was recorded against the tree.
+    fn awaits_room(&self) -> bool {
+        let Self::Recovery(recovery) = self else {
+            return false;
+        };
+        recovery
+            .source
+            .downcast_ref::<crate::staging::recovery::StagedVerificationError>()
+            .is_some_and(|source| {
+                matches!(
+                    source,
+                    crate::staging::recovery::StagedVerificationError::DiskFull(_)
+                )
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -606,6 +639,10 @@ pub enum ForwardFailureDisposition {
     /// Recovery did not reach a safe terminal state. No later transaction may
     /// be attempted until a reopened coordinator completes or manually resolves it.
     RecoveryBlocked,
+    /// The rename happened and the check after it has no room to write its
+    /// scratch. Nothing was recorded against the tree: a reopened coordinator
+    /// repeats the check, and no later transaction may start before it passes.
+    AwaitingRoom,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -685,9 +722,9 @@ impl ForwardStagingError {
     pub fn terminal_state(&self) -> Option<TransactionState> {
         match self.disposition {
             ForwardFailureDisposition::Terminal(state) => Some(state),
-            ForwardFailureDisposition::NotStarted | ForwardFailureDisposition::RecoveryBlocked => {
-                None
-            }
+            ForwardFailureDisposition::NotStarted
+            | ForwardFailureDisposition::RecoveryBlocked
+            | ForwardFailureDisposition::AwaitingRoom => None,
         }
     }
 }
@@ -901,6 +938,12 @@ impl ReadyStagingEngine {
                     | crate::staging::recovery::RecoveryRebindError::PurgePlan(_),
                     Some(TransactionState::VerifiedCommitted | TransactionState::Purgeable),
                 ) if !self.engine.startup_blocked => VerifiedPurgeFailureDisposition::NotStarted,
+                (
+                    error,
+                    Some(TransactionState::VerifiedCommitted | TransactionState::Purgeable),
+                ) if error.is_disk_full() && !self.engine.startup_blocked => {
+                    VerifiedPurgeFailureDisposition::NotStarted
+                }
                 (_, Some(TransactionState::RecoveryRequired)) => {
                     VerifiedPurgeFailureDisposition::Terminal(TransactionState::RecoveryRequired)
                 }
@@ -1176,10 +1219,15 @@ impl ReadyStagingEngine {
         let terminal = self
             .recover_forward_transaction(transaction, &recovery_anchors)
             .map_err(|source| {
+                let disposition = if source.awaits_room() {
+                    ForwardFailureDisposition::AwaitingRoom
+                } else {
+                    ForwardFailureDisposition::RecoveryBlocked
+                };
                 ForwardStagingError::new(
                     transaction,
                     "forward commit recovery",
-                    ForwardFailureDisposition::RecoveryBlocked,
+                    disposition,
                     source,
                 )
             })?;

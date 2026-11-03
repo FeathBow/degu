@@ -362,7 +362,11 @@ pub(super) fn execute(
             recovery_blocked: false,
         },
         Err((reason, disposition)) => {
-            let blocked = disposition == ForwardFailureDisposition::RecoveryBlocked;
+            let blocked = matches!(
+                disposition,
+                ForwardFailureDisposition::RecoveryBlocked
+                    | ForwardFailureDisposition::AwaitingRoom
+            );
             let quarantined =
                 disposition == ForwardFailureDisposition::Terminal(TransactionState::Quarantined);
             // Never remove a claim while recovery is blocked or quarantined.
@@ -735,6 +739,11 @@ fn classified_failure(
             execution: CleanExecution::recovery_blocked(finding, entry, reason),
             recovery_blocked: true,
         },
+        // The transaction is still open, so no later item can start either.
+        ForwardFailureDisposition::AwaitingRoom => ProductionOutcome {
+            execution: CleanExecution::awaiting_room(finding, entry, reason),
+            recovery_blocked: true,
+        },
         ForwardFailureDisposition::NotStarted | ForwardFailureDisposition::Terminal(_) => {
             failed(finding, reason, false)
         }
@@ -952,6 +961,30 @@ mod tests {
         assert!(!atomic.contains("deferred"), "{atomic}");
         assert!(!state.join("degu/trash").exists());
         assert!(!state.join("degu/sealed-staging").exists());
+    }
+
+    #[test]
+    fn awaiting_room_outcome() {
+        // It stops the batch and keeps the entry like a blocked recovery, but it
+        // asks nothing of a person, and the WAL can still restore it.
+        let finding = super::super::tests::finding_for_test(PathBuf::from("/cache"), 1, 1);
+        let entry = PathBuf::from("/trash/0001-cache");
+        let outcome = classified_failure(
+            &finding,
+            Some(entry.clone()),
+            "Quota exceeded (os error 122)".into(),
+            ForwardFailureDisposition::AwaitingRoom,
+        );
+        assert!(outcome.recovery_blocked);
+        assert_eq!(outcome.execution.state_label(), "awaiting_room");
+        assert_eq!(outcome.execution.trash_entry(), Some(entry.as_path()));
+        assert!(!outcome.execution.requires_manual_recovery());
+        assert!(outcome.execution.failed());
+        assert!(outcome.execution.staged_under_seal_authority());
+        assert_eq!(
+            outcome.execution.restore_authority(),
+            super::super::execution::RestoreAuthority::SealWal
+        );
     }
 
     #[test]

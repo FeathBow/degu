@@ -509,6 +509,17 @@ impl MutationSession {
                     failure::root_cause(&error)
                 ))
             }
+            Err(error)
+                if matches!(
+                    error.disposition(),
+                    degu_core::staging::VerifiedPurgeFailureDisposition::NotStarted
+                ) && error.is_disk_full() =>
+            {
+                SealedPurgeOutcome::Blocked(format!(
+                    "no room to check the entry before deleting it, so nothing was deleted and it stays in the trash; free some space and purge again: {}",
+                    failure::root_cause(&error)
+                ))
+            }
             Err(error) => SealedPurgeOutcome::Blocked(format!(
                 "sealed staging explicit purge admission failed during {} ({:?}): {}",
                 error.stage(),

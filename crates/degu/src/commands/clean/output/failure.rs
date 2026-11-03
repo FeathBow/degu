@@ -41,6 +41,16 @@ fn render(path: &Path, failure: CleanExecutionFailure<'_>) -> (Severity, String)
                 ),
             },
         ),
+        CleanExecutionFailure::AwaitingRoom { entry, reason } => (
+            Severity::Error,
+            format!(
+                "moved {path}{}, but there is no room to finish checking it, so quota is unchanged. It stays staged: free some space, and the next degu clean, undo or trash purge finishes the check first: {}",
+                entry
+                    .map(|entry| format!(" to {}", escaped_path(entry)))
+                    .unwrap_or_default(),
+                escape_terminal_text(reason)
+            ),
+        ),
         CleanExecutionFailure::UnverifiedDestination { entry, reason } => (
             Severity::Error,
             format!(
@@ -176,6 +186,18 @@ mod tests {
         assert!(matches!(severity, Severity::Error));
         assert!(blocked.contains("WAL and reservation evidence are retained"));
         assert!(!blocked.contains(" at /trash/"));
+
+        let (severity, waiting) = render(
+            Path::new("/cache"),
+            CleanExecutionFailure::AwaitingRoom {
+                entry: Some(Path::new("/trash/0001-cache")),
+                reason: "Quota exceeded (os error 122)",
+            },
+        );
+        assert!(matches!(severity, Severity::Error));
+        assert!(waiting.contains("no room to finish checking it"));
+        assert!(waiting.contains("moved /cache to /trash/0001-cache,"));
+        assert!(!waiting.contains("manual recovery"));
 
         let (severity, projection) = render(
             Path::new("/cache"),

@@ -13,6 +13,8 @@ use crate::staging::{
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+mod disk_full;
+
 struct Fixture {
     _temp: tempfile::TempDir,
     base: std::path::PathBuf,

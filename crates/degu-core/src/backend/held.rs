@@ -2625,6 +2625,15 @@ impl PendingV3Finalizer {
 }
 
 impl HardlinkTopologyFold {
+    /// A fold that has already counted the wrong number of links for one file.
+    #[cfg(test)]
+    pub(crate) fn miscounted() -> Self {
+        Self {
+            first_count_failure: Some((PathBuf::from("linked"), true)),
+            ..Self::new()
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             current: None,

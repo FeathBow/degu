@@ -342,6 +342,22 @@ fn sealed_undo_active(state: TransactionState) -> bool {
 /// the one fact they cannot use. Everything else is a real failure, where the
 /// transaction and the stage are what a report would be chased by.
 fn undo_failure_reason(error: &degu_core::staging::VerifiedUndoError) -> String {
+    if error.is_disk_full() {
+        return if matches!(
+            error.disposition(),
+            VerifiedUndoFailureDisposition::NotStarted
+        ) {
+            format!(
+                "no room to check the staged copy, so nothing was restored and it stays in the trash; free some space and undo again: {}",
+                root_cause(error)
+            )
+        } else {
+            format!(
+                "no room to finish checking the staged copy; its directory modes are already restored and it has not moved. The next degu run with room finishes the undo, as long as nothing has been created at the original path: anything there has to be moved aside first: {}",
+                root_cause(error)
+            )
+        };
+    }
     if error.is_destination_occupied() {
         return "the original location already holds something, so the staged copy was left where it is; move what is there aside and undo again, or purge the entry to accept the deletion".to_owned();
     }

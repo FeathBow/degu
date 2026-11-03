@@ -1,6 +1,8 @@
 use crate::output::stdoutln;
 use crate::presentation::{escape_terminal_text, human_bytes, ratio_bar};
-use crate::quota::model::{QuotaDimension, QuotaGrace, QuotaGraceState, QuotaSnapshot};
+use crate::quota::model::{
+    LeadingLimit, QuotaDimension, QuotaGrace, QuotaGraceState, QuotaSnapshot, SubjectQuota,
+};
 use crate::runtime::{Glyphs, Ui};
 use anyhow::Result;
 use std::cmp::Ordering;
@@ -32,14 +34,127 @@ fn render_human(report: &QuotaSnapshot, ui: Ui) -> String {
         "Quota {separator} {target}\n\nFilesystem  {filesystem} {separator} {mount}\nSubject     {subject} {}\nProvider    {provider}\nData source {data_source}",
         report.subject.id
     );
+    write!(output, "\n\n{}", leading_line(report, glyphs))
+        .expect("writing to a String cannot fail");
+    if !report.other_subjects.is_empty() {
+        write!(output, "\n\nUser {}", report.subject.id).expect("writing to a String cannot fail");
+    } else {
+        output.push('\n');
+    }
     write!(
         output,
-        "\n\n{}\n{}",
+        "\n{}\n{}",
         render_dimension("Space", &report.space, human_bytes, glyphs),
         render_dimension("Inodes", &report.inodes, format_count, glyphs)
     )
     .expect("writing to a String cannot fail");
+    for other in &report.other_subjects {
+        write!(output, "\n\n{}", render_subject(other, glyphs))
+            .expect("writing to a String cannot fail");
+    }
     reflow_human(&output, ui.width)
+}
+
+/// What to look at first: a limit already reached, or else the highest use. Every
+/// limit is stated below too, but a reader should not have to compare percentages
+/// across subjects to find this. It claims no more than the numbers do: not that a
+/// write will be refused, since a filesystem can account without enforcing, and not
+/// which limit fills first.
+fn leading_line(report: &QuotaSnapshot, glyphs: Glyphs) -> String {
+    let Some(leading) = &report.leading_limit else {
+        let label = "Limits";
+        return if report.limits_complete {
+            format!("{label:<DETAIL_INDENT$}none configured on any subject read")
+        } else {
+            format!(
+                "{label:<DETAIL_INDENT$}unknown: none found, but not every subject could be read"
+            )
+        };
+    };
+    let line = describe_leading(leading, glyphs);
+    if report.limits_complete {
+        line
+    } else {
+        format!(
+            "{line}\n{}",
+            detail_line(
+                "a subject could not be read, so this may not be the one that matters".to_owned()
+            )
+        )
+    }
+}
+
+fn describe_leading(leading: &LeadingLimit, glyphs: Glyphs) -> String {
+    let separator = glyphs.separator;
+    let format_value: fn(u64) -> String = if leading.dimension == "space" {
+        human_bytes
+    } else {
+        format_count
+    };
+    let kind = if leading.limit_kind == "soft" {
+        "soft limit"
+    } else {
+        "hard limit"
+    };
+    let subject = match leading.subject_id {
+        Some(id) => format!("{} {id}", leading.subject_kind),
+        None => leading.subject_kind.to_owned(),
+    };
+    let status = boundary_status(
+        Boundary {
+            kind,
+            limit: leading.limit,
+        },
+        leading.used,
+        format_value,
+    );
+    if leading.at_limit {
+        let expired = if leading.limit_kind == "soft" {
+            ", grace expired"
+        } else {
+            ""
+        };
+        let label = "At limit";
+        return format!(
+            "{label:<DETAIL_INDENT$}{subject} {} {separator} {status}{expired}",
+            leading.dimension
+        );
+    }
+    let ratio = leading.used as f64 / leading.limit as f64;
+    format!(
+        "Highest use {subject} {} {:.1}% of {kind} {separator} {status}",
+        leading.dimension,
+        ratio * PERCENT_SCALE
+    )
+}
+
+fn render_subject(subject: &SubjectQuota, glyphs: Glyphs) -> String {
+    let title = match subject.id {
+        Some(id) => format!("{} {id}", capitalized(subject.kind)),
+        None => capitalized(subject.kind),
+    };
+    match (&subject.space, &subject.inodes) {
+        (Some(space), Some(inodes)) => format!(
+            "{title}\n{}\n{}",
+            render_dimension("Space", space, human_bytes, glyphs),
+            render_dimension("Inodes", inodes, format_count, glyphs)
+        ),
+        _ => format!(
+            "{title}\n{}",
+            detail_line(format!(
+                "could not be read: {}",
+                escape_terminal_text(subject.reason.as_deref().unwrap_or("no reason given"))
+            ))
+        ),
+    }
+}
+
+fn capitalized(word: &str) -> String {
+    let mut characters = word.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
+    }
 }
 
 fn reflow_human(output: &str, width: u16) -> String {

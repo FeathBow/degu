@@ -1,11 +1,12 @@
-//! Lustre user quota provider backed by the `lfs` client tool.
+//! Lustre quota provider backed by the `lfs` client tool: the user, and for a
+//! survey the path's project and group as well.
 //!
 //! There is no stable kernel ABI for Lustre quota queries, so this provider
 //! executes `/usr/bin/lfs quota` and parses its stdout under a strict
 //! whole-output grammar. Any deviation from that grammar fails closed with an
 //! honest error instead of risking a wrong number.
 //!
-//! Threat boundary: the exec hardening below (absolute binary path, cleared
+//! Threat boundary: the exec hardening in `tool` (absolute binary path, cleared
 //! environment, pinned C locale, neutral working directory, closed stdin,
 //! bounded concurrent output capture, bounded timeout, escaped error text)
 //! defends against confusion: PATH or environment injection, locale drift,
@@ -14,45 +15,32 @@
 //! controls this process's view of the filesystem. One residual is accepted:
 //! the in-process statfs cross-check and path canonicalization below run
 //! before the time-bounded child and can still block on a mount whose
-//! servers are unresponsive — degu then hangs honestly rather than printing
-//! a number it could not verify.
+//! servers are unresponsive. `degu quota` bounds that with a deadline of its own;
+//! a clean's observation hangs honestly rather than printing a number it could
+//! not verify.
 
-use super::{MountInfo, ProbeError};
+use super::tool::{
+    self, Execution, ToolRun, kib_to_bytes, numeric_plain, numeric_usage, reason_snippet,
+    unavailable,
+};
+use super::{MountInfo, ProbeError, QuotaHost};
 use crate::quota::model::{
     ActiveQuota, QuotaDimension, QuotaGrace, QuotaGraceState, QuotaLimits, QuotaSnapshot,
+    SubjectQuota,
 };
-use std::io::Read;
-use std::os::unix::ffi::OsStrExt;
+use std::ffi::OsStr;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const PROVIDER: &str = "lustre_lfs";
 const DATA_SOURCE: &str = "lfs_quota";
 pub(super) const FILESYSTEM: &str = "lustre";
 /// The only binary this provider will ever execute. No PATH resolution and
 /// no fallback locations: a missing tool is an honest Unavailable error.
-const LFS_BINARY: &str = "/usr/bin/lfs";
+pub(super) const LFS_BINARY: &str = "/usr/bin/lfs";
 const LUSTRE_SUPER_MAGIC: u64 = 0x0BD0_0BD0;
-/// Linux `f_type` has arch-dependent signedness and width; every known magic
-/// value is 32-bit, so comparisons mask to the low 32 bits first. This is the
-/// same trick as degu-walk's fstype module, reimplemented locally because
-/// that module is private to degu-walk.
-const LINUX_F_TYPE_MASK: u64 = u32::MAX as u64;
-/// Per-stream capture bound; output beyond it makes the probe Incomplete.
-const OUTPUT_CAP_BYTES: usize = 64 * 1024;
-const READ_CHUNK_BYTES: usize = 4096;
 const LFS_TIMEOUT: Duration = Duration::from_secs(10);
-const REAP_TIMEOUT: Duration = Duration::from_secs(2);
-const OUTPUT_COLLECT_TIMEOUT: Duration = Duration::from_secs(2);
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
-const KIB: u64 = 1024;
 const QUOTAS_NOT_ENABLED_MARKER: &str = "quotas are not enabled";
-/// Reasons surface on stderr; keep hostile or verbose lfs output bounded.
-/// The display layer escapes terminal controls, so truncation is the only
-/// concern here.
-const STDERR_REASON_CHAR_CAP: usize = 200;
 /// Column-header token sequences, one per lfs generation. The legacy header
 /// repeats `quota limit grace` for both dimensions; current lustre-release
 /// master (lfs.c print_quota_title at commit 90dfed83) renames the limit and
@@ -99,34 +87,71 @@ struct Parsed {
     inodes: QuotaDimension,
 }
 
-#[derive(Debug)]
-struct Execution {
-    status: ExitStatus,
-    stdout: CappedStream,
-    stderr: CappedStream,
+/// Who a quota row belongs to, spelled as `lfs` spells it.
+#[derive(Clone, Copy, Debug)]
+enum SubjectKind {
+    User,
+    Group,
+    Project,
 }
 
-#[derive(Debug)]
-struct CappedStream {
-    bytes: Vec<u8>,
-    truncated: bool,
+impl SubjectKind {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::User => "-u",
+            Self::Group => "-g",
+            Self::Project => "-p",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Group => "group",
+            Self::Project => "project",
+        }
+    }
+
+    /// `lfs` prints `usr`, `grp` and `prj`; some builds spell the word out.
+    fn header_words(self) -> [&'static str; 2] {
+        match self {
+            Self::User => ["usr", "user"],
+            Self::Group => ["grp", "group"],
+            Self::Project => ["prj", "project"],
+        }
+    }
+
+    fn id_label(self) -> &'static str {
+        match self {
+            Self::User => "uid",
+            Self::Group => "gid",
+            Self::Project => "pid",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Subject {
+    kind: SubjectKind,
+    id: u32,
+}
+
+impl Subject {
+    fn user(id: u32) -> Self {
+        Self {
+            kind: SubjectKind::User,
+            id,
+        }
+    }
 }
 
 pub(super) fn probe(
+    host: &QuotaHost,
     mount: MountInfo,
     path: &Path,
     subject_id: u32,
 ) -> Result<QuotaSnapshot, ProbeError> {
-    require_rooted_mount_point(&mount)?;
-    verify_statfs_is_lustre(&mount)?;
-    let execution = capture(Path::new(LFS_BINARY), &mount, subject_id, LFS_TIMEOUT)?;
-    let stdout = successful_stdout(&mount, execution)?;
-    // Sampled right after lfs exits, so it sits closest to the instant the
-    // server produced the countdown that expires_at_unix is derived from.
-    let observed_at_unix =
-        super::unix_time_now().map_err(|reason| super::incomplete(&mount, reason))?;
-    let parsed = parse(&stdout, &mount.mount_point, subject_id, observed_at_unix)
-        .map_err(|reason| super::incomplete(&mount, reason))?;
+    let parsed = read_subject(host, &mount, Subject::user(subject_id))?;
     let scope = mount.scope(path);
     Ok(QuotaSnapshot::active(
         scope,
@@ -140,189 +165,137 @@ pub(super) fn probe(
     ))
 }
 
-/// The mount point is handed to lfs as a positional argument; require an
-/// absolute path so a mangled mountinfo entry can never smuggle an
-/// option-like or relative argument into the child process.
-fn require_rooted_mount_point(mount: &MountInfo) -> Result<(), ProbeError> {
-    if mount.mount_point.as_os_str().as_bytes().starts_with(b"/") {
-        return Ok(());
+/// The user, and the project and group this path answers to. On a Lustre site
+/// the limit that stops a write is usually the project's: a user can have none
+/// and still be nearly out of the project's inodes. Only the user's failure
+/// fails the survey. Any other is reported beside what could be read.
+pub(super) fn survey(
+    host: &QuotaHost,
+    mount: MountInfo,
+    path: &Path,
+    subject_id: u32,
+    group: Result<u32, String>,
+) -> Result<QuotaSnapshot, ProbeError> {
+    let snapshot = probe(host, mount.clone(), path, subject_id)?;
+    let mut others = Vec::new();
+    match project_of(&host.lfs, &mount, path) {
+        Ok(None) => {}
+        Ok(Some(id)) => others.push(subject_quota(host, &mount, SubjectKind::Project, id)),
+        Err(error) => others.push(SubjectQuota::unavailable(
+            SubjectKind::Project.name(),
+            None,
+            error.reason_text(),
+        )),
     }
-    Err(super::incomplete(
+    others.push(match group {
+        Ok(id) => subject_quota(host, &mount, SubjectKind::Group, id),
+        Err(reason) => SubjectQuota::unavailable(SubjectKind::Group.name(), None, reason),
+    });
+    Ok(snapshot.with_subjects(others))
+}
+
+fn subject_quota(host: &QuotaHost, mount: &MountInfo, kind: SubjectKind, id: u32) -> SubjectQuota {
+    match read_subject(host, mount, Subject { kind, id }) {
+        Ok(parsed) => SubjectQuota::active(kind.name(), id, parsed.space, parsed.inodes),
+        Err(error) => SubjectQuota::unavailable(kind.name(), Some(id), error.reason_text()),
+    }
+}
+
+fn read_subject(
+    host: &QuotaHost,
+    mount: &MountInfo,
+    subject: Subject,
+) -> Result<Parsed, ProbeError> {
+    tool::require_rooted_mount_point(mount)?;
+    if host.check_magic {
+        verify_statfs_is_lustre(mount)?;
+    }
+    let execution = capture(&host.lfs, mount, subject, LFS_TIMEOUT)?;
+    let stdout = successful_stdout(mount, execution)?;
+    // Sampled right after lfs exits, so it sits closest to the instant the
+    // server produced the countdown that expires_at_unix is derived from.
+    let observed_at_unix =
+        super::unix_time_now().map_err(|reason| super::incomplete(mount, reason))?;
+    parse(&stdout, &mount.mount_point, subject, observed_at_unix)
+        .map_err(|reason| super::incomplete(mount, reason))
+}
+
+/// The project this path is charged to, or `None` for project 0, which means it
+/// has none. `path` is canonical, so absolute, and cannot read as an option.
+fn project_of(binary: &Path, mount: &MountInfo, path: &Path) -> Result<Option<u32>, ProbeError> {
+    let execution = tool::capture(
+        ToolRun {
+            binary,
+            tool: "lfs",
+            arguments: &[OsStr::new("project"), OsStr::new("-d"), path.as_os_str()],
+            timeout: LFS_TIMEOUT,
+        },
         mount,
-        "mount point is not an absolute path",
-    ))
+    )?;
+    let stdout = successful_stdout(mount, execution)?;
+    parse_project(&stdout, path).map_err(|reason| super::incomplete(mount, reason))
+}
+
+/// `lfs project -d` prints one line: the id, `P` or `-` for the inherit flag, and
+/// the path it was given. The path is compared rather than parsed, so one with
+/// spaces in it is fine, and a line about another path fails closed.
+fn parse_project(stdout: &str, path: &Path) -> Result<Option<u32>, IncompleteReason> {
+    let path_text = path
+        .to_str()
+        .ok_or_else(|| "quota target is not valid UTF-8".to_owned())?;
+    let mut lines = stdout.lines();
+    let line = lines
+        .next()
+        .ok_or_else(|| "lfs project printed no output".to_owned())?;
+    if lines.next().is_some() {
+        return Err("lfs project printed more than one line".to_owned());
+    }
+    let line = line.trim_start();
+    let (id, rest) = line
+        .split_once(' ')
+        .ok_or_else(|| "lfs project line has no flag column".to_owned())?;
+    let rest = rest.trim_start();
+    let named = rest
+        .strip_prefix("P ")
+        .or_else(|| rest.strip_prefix("- "))
+        .ok_or_else(|| "lfs project line has no recognized flag".to_owned())?;
+    if named != path_text {
+        return Err("lfs project line names another path".to_owned());
+    }
+    let id: u32 = id
+        .parse()
+        .map_err(|_| "lfs project id is not numeric".to_owned())?;
+    Ok((id != 0).then_some(id))
 }
 
 /// Cross-check: mountinfo said "lustre"; require the kernel's statfs magic to
 /// agree before executing lfs against this mount point.
 fn verify_statfs_is_lustre(mount: &MountInfo) -> Result<(), ProbeError> {
-    let stat = rustix::fs::statfs(&mount.mount_point).map_err(|error| {
-        super::incomplete(mount, format!("statfs failed for the mount point: {error}"))
-    })?;
-    let magic = stat.f_type as u64 & LINUX_F_TYPE_MASK;
-    if magic != LUSTRE_SUPER_MAGIC {
-        return Err(super::incomplete(
-            mount,
-            format!("mountinfo reports lustre but the statfs magic is {magic:#x}"),
-        ));
-    }
-    Ok(())
+    tool::verify_statfs(mount, LUSTRE_SUPER_MAGIC)
 }
 
 fn capture(
     binary: &Path,
     mount: &MountInfo,
-    euid: u32,
+    subject: Subject,
     timeout: Duration,
 ) -> Result<Execution, ProbeError> {
-    let mut child = spawn_lfs(binary, mount, euid)?;
-    // Read both pipes concurrently on dedicated threads: a child that fills
-    // stderr while the parent drains only stdout (or vice versa) would
-    // deadlock against a full pipe buffer. The threads are never joined; on
-    // the failure paths below they stay parked on a read until this
-    // short-lived process exits.
-    let stdout_stream = child.stdout.take().expect("stdout is piped at spawn");
-    let stderr_stream = child.stderr.take().expect("stderr is piped at spawn");
-    let stdout_receiver = spawn_capped_reader(stdout_stream);
-    let stderr_receiver = spawn_capped_reader(stderr_stream);
-    let status = await_exit(&mut child, mount, timeout)?;
-    // The pipes normally close when the child exits, but lfs could have
-    // leaked its descriptors to a grandchild that keeps them open; bound the
-    // wait and abandon the reader instead of hanging.
-    let stdout = collect_stream(&stdout_receiver).ok_or_else(|| {
-        unavailable(
-            mount,
-            "lfs exited but its stdout pipe stayed open".to_owned(),
-        )
-    })?;
-    let stderr = collect_stream(&stderr_receiver).ok_or_else(|| {
-        unavailable(
-            mount,
-            "lfs exited but its stderr pipe stayed open".to_owned(),
-        )
-    })?;
-    Ok(Execution {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-fn spawn_lfs(binary: &Path, mount: &MountInfo, euid: u32) -> Result<Child, ProbeError> {
-    // Shares the gate the native runner's exec takes, so a fork here cannot
-    // land inside another thread's write-then-exec window.
-    #[cfg(test)]
-    let _shared = crate::fork_gate::forking();
-    // Hardened exec: absolute path only, no shell, argv fixed to
-    // ["quota", "-u", <numeric euid>, <mount point>], an emptied environment
-    // with a pinned C locale, a neutral working directory, and closed stdin.
-    Command::new(binary)
-        .arg("quota")
-        .arg("-u")
-        .arg(euid.to_string())
-        .arg(&mount.mount_point)
-        .env_clear()
-        .env("LC_ALL", "C")
-        .current_dir("/")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| spawn_error(binary, mount, &error))
-}
-
-fn spawn_error(binary: &Path, mount: &MountInfo, error: &std::io::Error) -> ProbeError {
-    let reason = if error.kind() == std::io::ErrorKind::NotFound {
-        format!("the lfs client tool is not present at {}", binary.display())
-    } else {
-        format!("failed to launch {}: {error}", binary.display())
-    };
-    unavailable(mount, reason)
-}
-
-fn spawn_capped_reader(stream: impl Read + Send + 'static) -> mpsc::Receiver<CappedStream> {
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        // A dropped receiver on the timeout path makes this send fail; the
-        // capture is discarded on purpose there.
-        let _ = sender.send(read_capped(stream));
-    });
-    receiver
-}
-
-fn read_capped(mut stream: impl Read) -> CappedStream {
-    let mut bytes = Vec::new();
-    let mut truncated = false;
-    let mut chunk = [0_u8; READ_CHUNK_BYTES];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(count) => {
-                let capacity_left = OUTPUT_CAP_BYTES - bytes.len();
-                if count > capacity_left {
-                    truncated = true;
-                }
-                bytes.extend_from_slice(&chunk[..count.min(capacity_left)]);
-                // Keep draining past the bound so the child never blocks on a
-                // full pipe; the excess is discarded and the probe fails
-                // closed on `truncated`.
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            // A read error means the capture cannot be trusted to be
-            // complete; fail closed the same way as an over-bound stream.
-            Err(_) => {
-                truncated = true;
-                break;
-            }
-        }
-    }
-    CappedStream { bytes, truncated }
-}
-
-fn collect_stream(receiver: &mpsc::Receiver<CappedStream>) -> Option<CappedStream> {
-    receiver.recv_timeout(OUTPUT_COLLECT_TIMEOUT).ok()
-}
-
-fn await_exit(
-    child: &mut Child,
-    mount: &MountInfo,
-    timeout: Duration,
-) -> Result<ExitStatus, ProbeError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) => {}
-            Err(error) => {
-                abandon(child);
-                return Err(unavailable(
-                    mount,
-                    format!("failed to monitor the lfs process: {error}"),
-                ));
-            }
-        }
-        if Instant::now() >= deadline {
-            abandon(child);
-            return Err(unavailable(mount, "lfs quota timed out".to_owned()));
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    }
-}
-
-/// Kill, then reap within a bounded window. A Lustre client stuck in
-/// uninterruptible I/O (D state) can outlive SIGKILL indefinitely; a blocking
-/// `wait()` here could hang degu forever, so after the window the child is
-/// abandoned unreaped. degu exits shortly afterwards and init adopts and
-/// reaps the orphan; a lingering D-state process is the accepted residual.
-fn abandon(child: &mut Child) {
-    let _ = child.kill();
-    let deadline = Instant::now() + REAP_TIMEOUT;
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) => std::thread::sleep(POLL_INTERVAL),
-        }
-    }
+    let id = subject.id.to_string();
+    // argv fixed to ["quota", <flag>, <numeric id>, <mount point>].
+    tool::capture(
+        ToolRun {
+            binary,
+            tool: "lfs",
+            arguments: &[
+                OsStr::new("quota"),
+                OsStr::new(subject.kind.flag()),
+                OsStr::new(&id),
+                mount.mount_point.as_os_str(),
+            ],
+            timeout,
+        },
+        mount,
+    )
 }
 
 /// Exit status is a hard precondition: stdout is parsed only when lfs exited
@@ -377,26 +350,6 @@ fn successful_stdout(mount: &MountInfo, execution: Execution) -> Result<String, 
         .map_err(|_| super::incomplete(mount, "lfs stdout is not valid UTF-8"))
 }
 
-fn reason_snippet(stderr: &str) -> String {
-    let trimmed = stderr.trim();
-    if trimmed.is_empty() {
-        return "no stderr output".to_owned();
-    }
-    let mut snippet: String = trimmed.chars().take(STDERR_REASON_CHAR_CAP).collect();
-    if snippet.len() < trimmed.len() {
-        snippet.push_str("...");
-    }
-    snippet
-}
-
-fn unavailable(mount: &MountInfo, reason: String) -> ProbeError {
-    ProbeError::Unavailable {
-        filesystem: mount.filesystem.clone(),
-        mount_point: mount.mount_point.display().to_string(),
-        reason,
-    }
-}
-
 /// Strict whole-output grammar for `lfs quota -u <euid> <mount point>`.
 ///
 /// Pure function: no process state, unit-testable with fixture text. Every
@@ -404,7 +357,7 @@ fn unavailable(mount: &MountInfo, reason: String) -> ProbeError {
 fn parse(
     stdout: &str,
     mount_point: &Path,
-    euid: u32,
+    subject: Subject,
     observed_at_unix: u64,
 ) -> Result<Parsed, IncompleteReason> {
     let mount_text = mount_point
@@ -415,7 +368,7 @@ fn parse(
         lines
             .next()
             .ok_or_else(|| "lfs printed no output".to_owned())?,
-        euid,
+        subject,
     )?;
     parse_column_header(
         lines
@@ -424,30 +377,36 @@ fn parse(
     )?;
     let columns = parse_data_row(&mut lines, mount_text)?;
     let parsed = parse_columns(columns, observed_at_unix)?;
-    parse_trailers(lines, euid)?;
+    parse_trailers(lines, subject)?;
     Ok(parsed)
 }
 
-/// Line 1: `Disk quotas for usr <name> (uid N):`. Vanilla builds print `usr`
-/// and some builds print `user`; the name field is unvalidated, but the
-/// trailing `(uid N):` anchor must match the probed euid exactly.
-fn parse_header(line: &str, euid: u32) -> Result<(), IncompleteReason> {
+/// Line 1: `Disk quotas for usr <name> (uid N):`, or `grp` and `gid`, or `prj` and
+/// `pid`. Vanilla builds print the short word and some builds print `user`; the
+/// name field is unvalidated, but the trailing anchor must match the probed
+/// subject exactly.
+fn parse_header(line: &str, subject: Subject) -> Result<(), IncompleteReason> {
+    let label = subject.kind.id_label();
+    let [short, long] = subject.kind.header_words();
     let rest = line
-        .strip_prefix("Disk quotas for usr ")
-        .or_else(|| line.strip_prefix("Disk quotas for user "))
-        .ok_or_else(|| "first line is not a user quota header".to_owned())?;
-    // Anchor on the last " (uid " so a hostile user name cannot fake it.
-    let (_, uid_text) = rest
-        .rsplit_once(" (uid ")
-        .ok_or_else(|| "quota header lacks a (uid N): anchor".to_owned())?;
-    let digits = uid_text
+        .strip_prefix(&format!("Disk quotas for {short} "))
+        .or_else(|| line.strip_prefix(&format!("Disk quotas for {long} ")))
+        .ok_or_else(|| format!("first line is not a {} quota header", subject.kind.name()))?;
+    // Anchor on the last " (uid " so a hostile name cannot fake it.
+    let (_, id_text) = rest
+        .rsplit_once(&format!(" ({label} "))
+        .ok_or_else(|| format!("quota header lacks a ({label} N): anchor"))?;
+    let digits = id_text
         .strip_suffix("):")
-        .ok_or_else(|| "quota header lacks a (uid N): anchor".to_owned())?;
-    let uid: u32 = digits
+        .ok_or_else(|| format!("quota header lacks a ({label} N): anchor"))?;
+    let id: u32 = digits
         .parse()
-        .map_err(|_| "quota header uid is not numeric".to_owned())?;
-    if uid != euid {
-        return Err(format!("quota header reports uid {uid}, expected {euid}"));
+        .map_err(|_| format!("quota header {label} is not numeric"))?;
+    if id != subject.id {
+        return Err(format!(
+            "quota header reports {label} {id}, expected {}",
+            subject.id
+        ));
     }
     Ok(())
 }
@@ -547,32 +506,6 @@ fn parse_columns(
     Ok(Parsed { space, inodes })
 }
 
-/// Numeric columns are plain unsigned integers, optionally carrying one
-/// trailing `*`. With exit status zero as a precondition the marker is a
-/// genuine over-limit flag, so it is stripped without further semantics.
-/// Everything else -- bracketed `[N]` placeholders, signs, empty tokens --
-/// fails closed.
-/// A trailing `*` is lfs's over-limit marker on the usage columns only; a
-/// starred limit is not lfs grammar and fails closed.
-fn numeric_usage(token: &str, column: &str) -> Result<u64, IncompleteReason> {
-    numeric_plain(token.strip_suffix('*').unwrap_or(token), column)
-}
-
-fn numeric_plain(token: &str, column: &str) -> Result<u64, IncompleteReason> {
-    if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(format!("{column} column is not an unsigned integer"));
-    }
-    token
-        .parse()
-        .map_err(|_| format!("{column} column does not fit in 64 bits"))
-}
-
-fn kib_to_bytes(value: u64, column: &str) -> Result<u64, IncompleteReason> {
-    value
-        .checked_mul(KIB)
-        .ok_or_else(|| format!("{column} column overflows when converted to bytes"))
-}
-
 /// Grace column: `-` means no grace period is running. Vanilla Lustre 2.15
 /// prints `none` for an expired grace period while the Cray fork prints
 /// `expired`; both map to Expired with no deadline, because lfs reports no
@@ -622,12 +555,14 @@ fn countdown_seconds(token: &str) -> Option<u64> {
 }
 
 /// Optional trailers, in order, each independently optional. lfs prints them
-/// when the uid has no explicitly configured limits. Anything else after the
+/// when the subject has no explicitly configured limits. Anything else after the
 /// data row -- a second usr/grp block, an error trailer -- fails closed.
-fn parse_trailers(lines: std::str::Lines<'_>, euid: u32) -> Result<(), IncompleteReason> {
+fn parse_trailers(lines: std::str::Lines<'_>, subject: Subject) -> Result<(), IncompleteReason> {
+    let label = subject.kind.id_label();
+    let id = subject.id;
     let expected = [
-        format!("uid {euid} is using default block quota setting"),
-        format!("uid {euid} is using default file quota setting"),
+        format!("{label} {id} is using default block quota setting"),
+        format!("{label} {id} is using default file quota setting"),
     ];
     let mut next = 0_usize;
     for line in lines {
@@ -647,10 +582,11 @@ fn parse_trailers(lines: std::str::Lines<'_>, euid: u32) -> Result<(), Incomplet
 
 #[cfg(test)]
 mod tests {
+    use super::tool::{CappedStream, require_rooted_mount_point};
     use super::{
-        CappedStream, LFS_TIMEOUT, MountInfo, Parsed, ProbeError, QuotaGraceState, capture,
-        countdown_seconds, parse, require_rooted_mount_point, successful_stdout,
-        verify_statfs_is_lustre,
+        LFS_TIMEOUT, MountInfo, Parsed, ProbeError, QuotaGraceState, QuotaHost, Subject,
+        SubjectKind, capture, countdown_seconds, parse, parse_project, project_of, subject_quota,
+        successful_stdout, survey, verify_statfs_is_lustre,
     };
     use std::path::{Path, PathBuf};
     use std::process::ExitStatus;
@@ -676,7 +612,7 @@ mod tests {
     }
 
     fn parse_fixture(stdout: &str) -> Result<Parsed, String> {
-        parse(stdout, Path::new(MOUNT), EUID, OBSERVED_AT)
+        parse(stdout, Path::new(MOUNT), Subject::user(EUID), OBSERVED_AT)
     }
 
     #[test]
@@ -740,7 +676,7 @@ mod tests {
         let parsed = parse(
             &stdout,
             Path::new("/scratch/lab/researcher"),
-            EUID,
+            Subject::user(EUID),
             OBSERVED_AT,
         )
         .unwrap();
@@ -1001,7 +937,13 @@ mod tests {
     #[test]
     fn lustre_parser_prefix_strips_a_mount_point_containing_a_space() {
         let stdout = fixture(&[HEADER, COLUMNS, " /mnt/my scratch 8 0 0 - 1 0 0 -"]);
-        let parsed = parse(&stdout, Path::new("/mnt/my scratch"), EUID, OBSERVED_AT).unwrap();
+        let parsed = parse(
+            &stdout,
+            Path::new("/mnt/my scratch"),
+            Subject::user(EUID),
+            OBSERVED_AT,
+        )
+        .unwrap();
         assert_eq!(parsed.space.used, 8 * 1024);
         assert_eq!(parsed.inodes.used, 1);
     }
@@ -1075,7 +1017,7 @@ mod tests {
         let error = capture(
             Path::new("/nonexistent/degu-test-lfs"),
             &test_mount(),
-            EUID,
+            Subject::user(EUID),
             LFS_TIMEOUT,
         )
         .unwrap_err();
@@ -1093,7 +1035,7 @@ mod tests {
             "#!/bin/sh\necho 'lfs quota: quotas are not enabled.' >&2\nexit 1\n",
         );
         let mount = test_mount();
-        let execution = capture(&script, &mount, EUID, LFS_TIMEOUT).unwrap();
+        let execution = capture(&script, &mount, Subject::user(EUID), LFS_TIMEOUT).unwrap();
         let error = successful_stdout(&mount, execution).unwrap_err();
         assert!(
             matches!(error, ProbeError::NotConfigured { .. }),
@@ -1109,7 +1051,7 @@ mod tests {
             "#!/bin/sh\necho 'lfs quota: cannot resolve mount' >&2\nexit 4\n",
         );
         let mount = test_mount();
-        let execution = capture(&script, &mount, EUID, LFS_TIMEOUT).unwrap();
+        let execution = capture(&script, &mount, Subject::user(EUID), LFS_TIMEOUT).unwrap();
         let error = successful_stdout(&mount, execution).unwrap_err();
         let ProbeError::Unavailable { reason, .. } = error else {
             panic!("non-zero exit must be unavailable: {error:?}");
@@ -1121,7 +1063,13 @@ mod tests {
     fn lustre_exec_kills_and_reports_a_child_that_exceeds_the_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let script = stub(dir.path(), "#!/bin/sh\nexec sleep 30\n");
-        let error = capture(&script, &test_mount(), EUID, Duration::from_millis(200)).unwrap_err();
+        let error = capture(
+            &script,
+            &test_mount(),
+            Subject::user(EUID),
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
         let ProbeError::Unavailable { reason, .. } = error else {
             panic!("timeout must be unavailable: {error:?}");
         };
@@ -1133,7 +1081,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let script = stub(dir.path(), "#!/bin/sh\necho 'hello from the stub'\n");
         let mount = test_mount();
-        let execution = capture(&script, &mount, EUID, LFS_TIMEOUT).unwrap();
+        let execution = capture(&script, &mount, Subject::user(EUID), LFS_TIMEOUT).unwrap();
         let stdout = successful_stdout(&mount, execution).unwrap();
         assert_eq!(stdout, "hello from the stub\n");
     }
@@ -1187,6 +1135,247 @@ mod tests {
         };
         let error = verify_statfs_is_lustre(&mount).unwrap_err();
         assert!(matches!(error, ProbeError::Incomplete { .. }), "{error:?}");
+    }
+
+    fn project() -> Subject {
+        Subject {
+            kind: SubjectKind::Project,
+            id: 654_321,
+        }
+    }
+
+    fn group() -> Subject {
+        Subject {
+            kind: SubjectKind::Group,
+            id: 2000,
+        }
+    }
+
+    // Real output from a Lustre 2.15 client (the Cray build), account names removed.
+    const REAL_PROJECT: &str = "Disk quotas for prj 654321 (pid 654321):\n     Filesystem  kbytes   quota   limit   grace   files   quota   limit   grace\n  /lus/fs 2307527940       0 5368709120       -  828409       0 1024000       -\n";
+
+    #[test]
+    fn project_row_limits() {
+        let parsed = parse(REAL_PROJECT, Path::new("/lus/fs"), project(), OBSERVED_AT).unwrap();
+        assert_eq!(parsed.space.hard_limit, Some(5_368_709_120 * 1024));
+        assert_eq!(parsed.inodes.used, 828_409);
+        assert_eq!(parsed.inodes.hard_limit, Some(1_024_000));
+    }
+
+    // The anchor is what proves the row answers the question that was asked.
+    #[test]
+    fn subject_anchors_header() {
+        let wrong_id = REAL_PROJECT.replace("654321", "999");
+        let reason = parse(&wrong_id, Path::new("/lus/fs"), project(), OBSERVED_AT)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(reason.contains("pid 999"), "{reason}");
+        let reason = parse(REAL_PROJECT, Path::new("/lus/fs"), group(), OBSERVED_AT)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(reason.contains("group quota header"), "{reason}");
+    }
+
+    #[test]
+    fn group_trailers_accepted() {
+        let stdout = fixture(&[
+            "Disk quotas for grp 2000 (gid 2000):",
+            COLUMNS,
+            "  /lus/fs 3134131868       0       0       - 5837102       0       0       -",
+            "gid 2000 is using default block quota setting",
+            "gid 2000 is using default file quota setting",
+        ]);
+        let parsed = parse(&stdout, Path::new("/lus/fs"), group(), OBSERVED_AT).unwrap();
+        assert_eq!(parsed.space.hard_limit, None);
+        assert_eq!(parsed.inodes.used, 5_837_102);
+        // Another subject's trailer is not this one's.
+        let stray = fixture(&[
+            "Disk quotas for grp 2000 (gid 2000):",
+            COLUMNS,
+            "  /lus/fs 1 0 0 - 1 0 0 -",
+            "uid 2000 is using default block quota setting",
+        ]);
+        let reason = parse(&stray, Path::new("/lus/fs"), group(), OBSERVED_AT)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(reason.contains("unexpected line"), "{reason}");
+    }
+
+    #[test]
+    fn subject_picks_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = stub(dir.path(), "#!/bin/sh\necho \"$*\"\n");
+        let mount = test_mount();
+        for (subject, expected) in [
+            (Subject::user(EUID), "quota -u 12345 /scratch\n"),
+            (group(), "quota -g 2000 /scratch\n"),
+            (project(), "quota -p 654321 /scratch\n"),
+        ] {
+            let execution = capture(&script, &mount, subject, LFS_TIMEOUT).unwrap();
+            assert_eq!(String::from_utf8(execution.stdout.bytes).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn project_query_target() {
+        let dir = tempfile::tempdir().unwrap();
+        // Echoes the id only when asked exactly this, and otherwise prints nothing.
+        let script = stub(
+            dir.path(),
+            "#!/bin/sh\n[ \"$*\" = 'project -d /scratch/me' ] && echo '654321 P /scratch/me'\n",
+        );
+        let id = project_of(&script, &test_mount(), Path::new("/scratch/me")).unwrap();
+        assert_eq!(id, Some(654_321));
+    }
+
+    #[test]
+    fn project_line_shapes() {
+        let target = Path::new("/lus/fs/scratch/me");
+        assert_eq!(
+            parse_project("654321 P /lus/fs/scratch/me\n", target),
+            Ok(Some(654_321))
+        );
+        // Project 0 is how a path says it has no project.
+        assert_eq!(
+            parse_project("    0 - /lus/fs/scratch/me\n", target),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_project("7 P /lus/my scratch\n", Path::new("/lus/my scratch")),
+            Ok(Some(7))
+        );
+    }
+
+    #[test]
+    fn project_line_refused() {
+        let target = Path::new("/lus/fs/me");
+        for (stdout, expected) in [
+            ("", "no output"),
+            ("7 P /lus/fs/me\n8 P /lus/fs/me\n", "more than one line"),
+            ("7\n", "no flag column"),
+            ("7 Q /lus/fs/me\n", "no recognized flag"),
+            ("7 P /lus/fs/other\n", "another path"),
+            ("x P /lus/fs/me\n", "not numeric"),
+            ("-1 P /lus/fs/me\n", "not numeric"),
+        ] {
+            let reason = parse_project(stdout, target).unwrap_err();
+            assert!(reason.contains(expected), "{stdout:?}: {reason}");
+        }
+    }
+
+    #[test]
+    fn project_refusal_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = stub(
+            dir.path(),
+            "#!/bin/sh\necho \"lfs: failed to get xattr: Inappropriate ioctl for device\" >&2\nexit 25\n",
+        );
+        let error = project_of(&script, &test_mount(), Path::new("/scratch/me")).unwrap_err();
+        assert!(matches!(error, ProbeError::Unavailable { .. }), "{error:?}");
+        assert!(
+            error.reason_text().contains("Inappropriate ioctl"),
+            "{error:?}"
+        );
+    }
+
+    // A subject that cannot be read must say why instead of failing the report.
+    #[test]
+    fn subject_failure_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let quota = subject_quota(
+            &QuotaHost::standing_in(dir.path()),
+            &test_mount(),
+            SubjectKind::Group,
+            2000,
+        );
+        assert_eq!(quota.kind, "group");
+        assert_eq!(quota.id, Some(2000));
+        assert_eq!(quota.state, "unavailable");
+        assert!(
+            quota
+                .reason
+                .as_deref()
+                .is_some_and(|text| text.contains("lfs")),
+            "{quota:?}"
+        );
+        assert!(quota.space.is_none());
+    }
+
+    /// A stand-in `lfs` answering the way a real client does, with the group
+    /// query's behaviour left to the caller.
+    fn stand_in(group_answer: &str) -> (tempfile::TempDir, QuotaHost) {
+        let dir = tempfile::tempdir().unwrap();
+        stub(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nCOLUMNS='{COLUMNS}'\ncase \"$1 $2\" in\n'project -d') echo \"654321 P $3\" ;;\n'quota -u') echo \"Disk quotas for usr me (uid $3):\"; echo \"$COLUMNS\"; echo \"  $4 8 0 0 - 8 0 0 -\" ;;\n'quota -p') echo \"Disk quotas for prj $3 (pid $3):\"; echo \"$COLUMNS\"; echo \"  $4 2048 0 5120 - 81 0 100 -\" ;;\n'quota -g') {group_answer} ;;\nesac\n"
+            ),
+        );
+        std::fs::rename(dir.path().join("lfs-stub.sh"), dir.path().join("lfs")).unwrap();
+        let host = QuotaHost::standing_in(dir.path());
+        (dir, host)
+    }
+
+    #[test]
+    fn survey_every_subject() {
+        let (_dir, host) = stand_in(
+            "echo \"Disk quotas for grp lab (gid $3):\"; echo \"$COLUMNS\"; echo \"  $4 9 0 0 - 9 0 0 -\"",
+        );
+        let report = survey(
+            &host,
+            test_mount(),
+            Path::new("/scratch/me"),
+            EUID,
+            Ok(2000),
+        )
+        .unwrap();
+        let others = &report.other_subjects;
+        assert_eq!(others.len(), 2, "{others:?}");
+        assert_eq!((others[0].kind, others[0].id), ("project", Some(654_321)));
+        assert_eq!((others[1].kind, others[1].id), ("group", Some(2000)));
+        let leading = report.leading_limit.as_ref().unwrap();
+        assert_eq!(leading.subject_kind, "project");
+        assert_eq!(leading.dimension, "inodes");
+        assert!(report.limits_complete);
+    }
+
+    #[test]
+    fn survey_keeps_partial() {
+        let (_dir, host) = stand_in("echo 'lfs quota: group refused' >&2; exit 1");
+        let report = survey(
+            &host,
+            test_mount(),
+            Path::new("/scratch/me"),
+            EUID,
+            Ok(2000),
+        )
+        .unwrap();
+        assert_eq!(report.other_subjects[1].state, "unavailable");
+        assert!(!report.limits_complete);
+        // What could be read is still there.
+        assert_eq!(report.other_subjects[0].state, "active");
+        assert_eq!(
+            report.leading_limit.as_ref().unwrap().subject_kind,
+            "project"
+        );
+    }
+
+    // Not knowing which group applies is reported, and no group is queried.
+    #[test]
+    fn survey_unknown_group() {
+        let (_dir, host) = stand_in("echo 'must not be asked' >&2; exit 1");
+        let report = survey(
+            &host,
+            test_mount(),
+            Path::new("/scratch/me"),
+            EUID,
+            Err("Permission denied".to_owned()),
+        )
+        .unwrap();
+        let group = &report.other_subjects[1];
+        assert_eq!((group.kind, group.id), ("group", None));
+        assert_eq!(group.reason.as_deref(), Some("Permission denied"));
+        assert!(!report.limits_complete);
     }
 
     #[test]

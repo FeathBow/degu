@@ -1,4 +1,6 @@
 mod lustre;
+mod nfs;
+mod tool;
 
 use super::{MountInfo, ProbeError};
 use crate::quota::model::{ActiveQuota, QuotaDimension, QuotaGrace, QuotaLimits, QuotaSnapshot};
@@ -11,6 +13,8 @@ const PROVIDER: &str = "linux_vfs";
 const DATA_SOURCE: &str = "linux_quotactl";
 const QUOTA_BLOCK_BYTES: u64 = 1024;
 const SUPPORTED_FILESYSTEM: &str = "ext4";
+const SETGID_BIT: u32 = 0o2000;
+const MOUNTINFO: &str = "/proc/self/mountinfo";
 const SUBCOMMAND_SHIFT: u32 = 8;
 const OCTAL_DIGIT_COUNT: usize = 3;
 const OCTAL_RADIX: u32 = 8;
@@ -22,18 +26,79 @@ struct QueryResult {
     inodes: QuotaDimension,
 }
 
+/// Where a probe finds the host's facts. A release build only ever reads the real
+/// ones. A debug build can be pointed at a stand-in, which is how a test reaches
+/// the whole of `degu quota` without a Lustre or NFS mount to run on.
+#[derive(Clone, Debug)]
+struct QuotaHost {
+    mountinfo: PathBuf,
+    lfs: PathBuf,
+    quota: PathBuf,
+    check_magic: bool,
+}
+
+impl QuotaHost {
+    fn current() -> Self {
+        #[cfg(debug_assertions)]
+        if let Some(root) = std::env::var_os("DEGU_QUOTA_TEST_HOST") {
+            return Self::standing_in(Path::new(&root));
+        }
+        Self {
+            mountinfo: PathBuf::from(MOUNTINFO),
+            lfs: PathBuf::from(lustre::LFS_BINARY),
+            quota: PathBuf::from(nfs::QUOTA_BINARY),
+            check_magic: true,
+        }
+    }
+
+    #[cfg(any(debug_assertions, test))]
+    fn standing_in(root: &Path) -> Self {
+        Self {
+            mountinfo: root.join("mountinfo"),
+            lfs: root.join("lfs"),
+            quota: root.join("quota"),
+            check_magic: false,
+        }
+    }
+}
+
 pub(super) fn probe(path: &Path) -> Result<QuotaSnapshot, ProbeError> {
-    let mount = inspect_mount(path)?;
+    read_quota(&QuotaHost::current(), path, Reach::UserOnly)
+}
+
+pub(super) fn survey(path: &Path) -> Result<QuotaSnapshot, ProbeError> {
+    read_quota(&QuotaHost::current(), path, Reach::EverySubject)
+}
+
+#[derive(Clone, Copy)]
+enum Reach {
+    UserOnly,
+    EverySubject,
+}
+
+fn read_quota(host: &QuotaHost, path: &Path, reach: Reach) -> Result<QuotaSnapshot, ProbeError> {
+    let mount = inspect_mount(host, path)?;
     let subject_id = rustix::process::geteuid().as_raw();
-    let snapshot = match mount.filesystem.as_str() {
-        SUPPORTED_FILESYSTEM => probe_vfs(mount.clone(), path, subject_id),
-        lustre::FILESYSTEM => lustre::probe(mount.clone(), path, subject_id),
+    let snapshot = match (mount.filesystem.as_str(), reach) {
+        (SUPPORTED_FILESYSTEM, _) => probe_vfs(mount.clone(), path, subject_id),
+        (lustre::FILESYSTEM, Reach::UserOnly) => {
+            lustre::probe(host, mount.clone(), path, subject_id)
+        }
+        (lustre::FILESYSTEM, Reach::EverySubject) => {
+            lustre::survey(host, mount.clone(), path, subject_id, group_for_files(path))
+        }
+        (filesystem, Reach::UserOnly) if nfs::FILESYSTEMS.contains(&filesystem) => {
+            Err(not_observed(&mount))
+        }
+        (filesystem, Reach::EverySubject) if nfs::FILESYSTEMS.contains(&filesystem) => {
+            nfs::survey(host, mount.clone(), path, subject_id, group_for_files(path))
+        }
         _ => Err(unsupported(&mount)),
     }?;
     // Detect ordinary concurrent replacement. A privileged mount controller can
     // still arrange A -> B -> the same A; that hostile-root ABA is outside this
     // reporting-only provider's threat boundary (see the Lustre module notes).
-    let rebound = inspect_mount(path)?;
+    let rebound = inspect_mount(host, path)?;
     if rebound != mount {
         return Err(incomplete(
             &mount,
@@ -41,6 +106,41 @@ pub(super) fn probe(path: &Path) -> Result<QuotaSnapshot, ProbeError> {
         ));
     }
     Ok(snapshot)
+}
+
+/// The group a file created here is charged to. Shared project directories on a
+/// cluster are setgid, and that group is the one whose limit a write there runs
+/// into. Not being able to tell is reported, rather than taken for an ordinary
+/// directory and answered with the process's group, whose limit may not apply.
+fn group_for_files(path: &Path) -> Result<u32, String> {
+    use std::os::unix::fs::MetadataExt;
+    let target = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    let directory = holding_directory(path, target)?;
+    Ok(charged_group(
+        directory.mode(),
+        directory.gid(),
+        rustix::process::getegid().as_raw(),
+    ))
+}
+
+/// The one metadata read of the target settles what it is, so a failure there can
+/// never read as "not a directory".
+fn holding_directory(path: &Path, target: std::fs::Metadata) -> Result<std::fs::Metadata, String> {
+    if target.is_dir() {
+        return Ok(target);
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the quota target has no parent directory".to_owned())?;
+    std::fs::metadata(parent).map_err(|error| error.to_string())
+}
+
+fn charged_group(directory_mode: u32, directory_gid: u32, egid: u32) -> u32 {
+    if directory_mode & SETGID_BIT != 0 {
+        directory_gid
+    } else {
+        egid
+    }
 }
 
 fn probe_vfs(mount: MountInfo, path: &Path, subject_id: u32) -> Result<QuotaSnapshot, ProbeError> {
@@ -58,12 +158,11 @@ fn probe_vfs(mount: MountInfo, path: &Path, subject_id: u32) -> Result<QuotaSnap
     ))
 }
 
-fn inspect_mount(path: &Path) -> Result<MountInfo, ProbeError> {
-    let mountinfo =
-        std::fs::read_to_string("/proc/self/mountinfo").map_err(|source| ProbeError::Io {
-            path: "/proc/self/mountinfo".to_owned(),
-            source,
-        })?;
+fn inspect_mount(host: &QuotaHost, path: &Path) -> Result<MountInfo, ProbeError> {
+    let mountinfo = std::fs::read_to_string(&host.mountinfo).map_err(|source| ProbeError::Io {
+        path: host.mountinfo.display().to_string(),
+        source,
+    })?;
     parse_mountinfo(&mountinfo, path).ok_or_else(|| ProbeError::Incomplete {
         filesystem: "unknown".to_owned(),
         mount_point: path.display().to_string(),
@@ -226,7 +325,17 @@ fn unsupported(mount: &MountInfo) -> ProbeError {
     ProbeError::Unsupported {
         filesystem: mount.filesystem.clone(),
         mount_point: mount.mount_point.display().to_string(),
-        reason: "only positively validated ext4 and lustre user quotas are supported",
+        reason: "only positively validated ext4, lustre and nfs quotas are supported",
+    }
+}
+
+/// A clean waits on its quota observation, and an NFS probe can block for as long
+/// as a server is away. So a clean does not ask, and `degu quota` does.
+fn not_observed(mount: &MountInfo) -> ProbeError {
+    ProbeError::Unsupported {
+        filesystem: mount.filesystem.clone(),
+        mount_point: mount.mount_point.display().to_string(),
+        reason: "a clean observes quota only on ext4 and lustre; degu quota reads nfs",
     }
 }
 
@@ -241,7 +350,8 @@ fn incomplete(mount: &MountInfo, reason: impl Into<String>) -> ProbeError {
 #[cfg(test)]
 mod tests {
     use super::{
-        MountInfo, ProbeError, QueryResult, classify_error, incomplete, normalize, parse_mountinfo,
+        MountInfo, ProbeError, QueryResult, QuotaHost, Reach, classify_error, incomplete,
+        normalize, parse_mountinfo, read_quota,
     };
     use crate::quota::model::QuotaGraceState;
     use std::path::{Path, PathBuf};
@@ -310,6 +420,86 @@ mod tests {
         assert_eq!(inodes.headroom_to_hard_limit, Some(2));
         assert_eq!(space.grace.unwrap().state, QuotaGraceState::Active);
         assert_eq!(inodes.grace.unwrap().state, QuotaGraceState::Expired);
+    }
+
+    #[test]
+    fn setgid_names_group() {
+        assert_eq!(super::charged_group(0o2770, 2000, 1000), 2000);
+        assert_eq!(super::charged_group(0o0770, 2000, 1000), 1000);
+    }
+
+    // A file answers for the directory it sits in, whose setgid bit is the one
+    // that decides.
+    #[test]
+    fn file_uses_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let of_file = super::holding_directory(&file, std::fs::metadata(&file).unwrap()).unwrap();
+        assert!(of_file.is_dir());
+        let of_dir =
+            super::holding_directory(dir.path(), std::fs::metadata(dir.path()).unwrap()).unwrap();
+        assert!(of_dir.is_dir());
+    }
+
+    #[test]
+    fn group_never_guessed() {
+        let reason = super::group_for_files(Path::new("/degu-missing-group-target")).unwrap_err();
+        assert!(reason.contains("No such file"), "{reason}");
+    }
+
+    // The top mount at one path is the one a new write lands on.
+    #[test]
+    fn top_mount_wins() {
+        let table = "40 25 0:64 / /home rw - nfs4 a:/export rw\n41 40 0:65 / /home rw - nfs4 b:/export rw\n";
+        let mount = parse_mountinfo(table, Path::new("/home/me")).unwrap();
+        assert_eq!(mount.source, Path::new("b:/export"));
+    }
+
+    fn stand_in(filesystem: &str, source: &str, mount: &Path) -> (tempfile::TempDir, QuotaHost) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mountinfo"),
+            format!(
+                "40 25 0:64 / {} rw - {filesystem} {source} rw\n",
+                mount.display()
+            ),
+        )
+        .unwrap();
+        let host = QuotaHost::standing_in(dir.path());
+        (dir, host)
+    }
+
+    // A clean waits on this, so it must not reach a tool that can hang. The stand-in
+    // has no tools at all: asking would fail differently.
+    #[test]
+    fn clean_skips_nfs() {
+        let target = tempfile::tempdir().unwrap();
+        let (_dir, host) = stand_in("nfs4", "server:/export", target.path());
+        let error = read_quota(&host, target.path(), Reach::UserOnly).unwrap_err();
+        let ProbeError::Unsupported { reason, .. } = error else {
+            panic!("a clean's observation must not read nfs: {error:?}");
+        };
+        assert!(reason.contains("degu quota reads nfs"), "{reason}");
+    }
+
+    // `degu quota` does ask, and with no tool there it says so.
+    #[test]
+    fn survey_asks_nfs() {
+        let target = tempfile::tempdir().unwrap();
+        let (_dir, host) = stand_in("nfs4", "server:/export", target.path());
+        let error = read_quota(&host, target.path(), Reach::EverySubject).unwrap_err();
+        assert!(matches!(error, ProbeError::Unavailable { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn others_stay_unsupported() {
+        let target = tempfile::tempdir().unwrap();
+        let (_dir, host) = stand_in("xfs", "/dev/sda1", target.path());
+        for reach in [Reach::UserOnly, Reach::EverySubject] {
+            let error = read_quota(&host, target.path(), reach).unwrap_err();
+            assert!(matches!(error, ProbeError::Unsupported { .. }), "{error:?}");
+        }
     }
 
     #[test]

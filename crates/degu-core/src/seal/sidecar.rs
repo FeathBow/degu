@@ -31,6 +31,7 @@ pub(crate) use scratch::TreeDirectoryPlan;
 #[cfg(test)]
 pub(crate) use scratch::{
     SCRATCH_MEMORY, ScratchFault, ScratchStep, arm_fault, at_fault, disarm_fault,
+    disarm_sweep_sync, fail_sweep_sync,
 };
 pub(crate) use scratch::{
     TreeManifestScratchBuildError, TreePurgePlan, TreeStructureScratchCursor,
@@ -811,6 +812,10 @@ impl TreeSidecarStore {
             })?;
         }
         if removed != 0 {
+            #[cfg(test)]
+            if let Some(error) = scratch::injected_sweep_sync() {
+                return Err(io_error(&self.path, error));
+            }
             rustix::fs::fsync(&self.directory)
                 .map_err(|error| io_error(&self.path, error.into()))?;
         }

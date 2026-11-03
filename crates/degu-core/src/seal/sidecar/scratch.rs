@@ -272,6 +272,9 @@ std::thread_local! {
     static SCRATCH_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static SCRATCH_REMOVALS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static SCRATCH_MERGES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// A failure for the next sweep's directory sync, the one write a later sweep
+    /// with nothing left to remove cannot repeat.
+    static SWEEP_SYNC_FAULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     /// What else goes wrong at the moment the armed failure fires.
     static AT_FAULT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
@@ -286,6 +289,24 @@ pub(crate) fn arm_fault(fault: ScratchFault) {
     SCRATCH_REMOVALS.with(|removals| removals.set(0));
     SCRATCH_MERGES.with(|merges| merges.set(0));
     SCRATCH_FAULT.with(|slot| slot.set(Some(fault)));
+}
+
+#[cfg(test)]
+pub(crate) fn fail_sweep_sync(errno: i32) {
+    SWEEP_SYNC_FAULT.with(|slot| slot.set(Some(errno)));
+}
+
+/// Takes back an armed sync failure, and says whether it was still waiting.
+#[cfg(test)]
+pub(crate) fn disarm_sweep_sync() -> bool {
+    SWEEP_SYNC_FAULT.with(std::cell::Cell::take).is_some()
+}
+
+#[cfg(test)]
+pub(super) fn injected_sweep_sync() -> Option<io::Error> {
+    SWEEP_SYNC_FAULT
+        .with(std::cell::Cell::take)
+        .map(io::Error::from_raw_os_error)
 }
 
 #[cfg(test)]
@@ -711,7 +732,7 @@ impl TreeSidecarStore {
         // exact run handle was lost; published final sidecars are out of scope.
         let cleanup = self.cleanup_unpublished(wal).map(|_| ());
         match (validation, cleanup) {
-            (Err(primary), _) => Err(primary),
+            (Err(primary), cleanup) => Err(sweep_outranks_disk(primary, cleanup)),
             (Ok(()), Err(cleanup)) => Err(cleanup),
             (Ok(()), Ok(())) => Ok(()),
         }
@@ -1110,7 +1131,7 @@ impl TreeSidecarStore {
         })();
         let cleanup = self.cleanup_unpublished(wal).map(|_| ());
         match (validation, cleanup) {
-            (Err(primary), _) => Err(primary),
+            (Err(primary), cleanup) => Err(sweep_outranks_disk(primary, cleanup)),
             (Ok(_), Err(cleanup)) => Err(cleanup),
             (Ok(plan), Ok(())) => Ok(plan),
         }
@@ -1297,7 +1318,9 @@ impl TreeSidecarStore {
 /// What a scratch step reports when it failed and then swept up after itself. A
 /// full disk has learned nothing about the scratch, and a merge fails on its output
 /// before it reads its inputs, so what the sweep found wrong is the only finding
-/// there is. Every other failure keeps its place ahead of the sweep.
+/// there is. A caller that sweeps again cannot make up for dropping it: a damaged
+/// file would still be there, but a failed directory sync would not happen twice.
+/// Every other failure keeps its place ahead of the sweep.
 pub(super) fn sweep_outranks_disk(
     primary: TreeSidecarError,
     cleanup: Result<(), TreeSidecarError>,

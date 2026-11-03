@@ -5,6 +5,7 @@
 use super::*;
 use crate::seal::sidecar::{
     SCRATCH_MEMORY, ScratchFault, ScratchStep, TreeSidecarError, arm_fault, at_fault, disarm_fault,
+    disarm_sweep_sync, fail_sweep_sync,
 };
 use crate::staging::{ReadyStagingEngine, VerifiedPurgeError, VerifiedUndoError};
 
@@ -948,4 +949,159 @@ fn undo_waits_occupied() {
     let ready = reopen(&fixture);
     assert_eq!(ready.state(ROOT), Some(TransactionState::Restored));
     assert_restored(&fixture, "moved aside");
+}
+
+/// Removing a run runs out of room, then the sweep after it removes what is left
+/// and its directory sync fails. Nothing remains for a later sweep to sync, so this
+/// is the only moment that failure can be seen.
+fn arm_sync_failure(run: u32, errno: i32) {
+    arm_fault(fault(ScratchStep::Remove, run, errno));
+    at_fault(|| fail_sweep_sync(libc::EIO));
+}
+
+fn is_failed_sync(source: Option<&(dyn std::error::Error + 'static)>) -> bool {
+    let scratch = match source.and_then(|source| source.downcast_ref::<RecoveryRebindError>()) {
+        Some(RecoveryRebindError::Sidecar(error) | RecoveryRebindError::PurgePlan(error)) => error,
+        _ => return false,
+    };
+    matches!(
+        scratch,
+        TreeSidecarError::Io { source, .. } if source.raw_os_error() == Some(libc::EIO)
+    )
+}
+
+#[test]
+fn sync_outranks_full() {
+    // The check's three scratches, then the purge plan's: the first three record
+    // the failure, and the plan's stays as retryable as it has always been.
+    for errno in FULL {
+        let mut outcomes = Vec::new();
+        for run in 0.. {
+            let Some(fixture) = Fixture::new() else {
+                return;
+            };
+            let label = format!("purge removal {run} errno {errno}");
+            let mut ready = stage_production(&fixture, ROOT);
+            arm_sync_failure(run, errno);
+            let result = request_purge(&mut ready, &fixture);
+            if disarm_fault() {
+                result.expect(&label);
+                disarm_sweep_sync();
+                break;
+            }
+            assert!(!disarm_sweep_sync(), "{label}: the sync must have failed");
+            let error = result.expect_err(&label);
+            assert!(!error.is_disk_full(), "{label}: {error}");
+            assert!(
+                is_failed_sync(std::error::Error::source(&error)),
+                "{label}: {error}"
+            );
+            assert!(
+                fixture.destination_root.join("child/data").is_file(),
+                "{label}"
+            );
+            outcomes.push(error.disposition());
+            assert_eq!(
+                ready.state(ROOT),
+                Some(match error.disposition() {
+                    VerifiedPurgeFailureDisposition::NotStarted =>
+                        TransactionState::VerifiedCommitted,
+                    _ => TransactionState::RecoveryRequired,
+                }),
+                "{label}"
+            );
+        }
+        if !outcomes.is_empty() {
+            let recorded =
+                VerifiedPurgeFailureDisposition::Terminal(TransactionState::RecoveryRequired);
+            assert_eq!(
+                outcomes,
+                [
+                    recorded,
+                    recorded,
+                    recorded,
+                    VerifiedPurgeFailureDisposition::NotStarted
+                ],
+                "manifest, hardlink, structure, purge plan"
+            );
+        }
+    }
+}
+
+#[test]
+fn undo_sync_outranks() {
+    // The first check's manifest, hardlink and structure scratches.
+    for errno in FULL {
+        for run in 0..3 {
+            let Some(fixture) = Fixture::new() else {
+                return;
+            };
+            let label = format!("undo removal {run} errno {errno}");
+            let mut ready = stage_production(&fixture, ROOT);
+            arm_sync_failure(run, errno);
+            let error = run_undo(&mut ready, &fixture).expect_err(&label);
+            assert!(!disarm_fault(), "{label}: the removal must have failed");
+            assert!(!disarm_sweep_sync(), "{label}: the sync must have failed");
+            assert!(!error.is_disk_full(), "{label}: {error}");
+            assert!(
+                is_failed_sync(std::error::Error::source(&error)),
+                "{label}: {error}"
+            );
+            assert_eq!(
+                ready.state(ROOT),
+                Some(TransactionState::RecoveryRequired),
+                "{label}"
+            );
+            assert!(!fixture.source_root.exists(), "{label}");
+            assert!(
+                fixture.destination_root.join("child/data").is_file(),
+                "{label}"
+            );
+        }
+    }
+}
+
+#[test]
+fn staged_sync_quarantines() {
+    // A failed sync is not waiting for room either, whichever scratch it follows.
+    for errno in FULL {
+        for run in 0..3 {
+            let Some(fixture) = Fixture::new() else {
+                return;
+            };
+            let label = format!("staged removal {run} errno {errno}");
+            set_mode(&fixture.source_parent, 0o700);
+            let mut ready = fixture.ready_engine();
+            let association = ProductionAssociation::new("undo-group".into()).unwrap();
+            AFTER_RENAME.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || arm_sync_failure(run, errno)));
+            });
+            let result = ready.stage_to_verified_commit(
+                ROOT,
+                fixture
+                    .forward_request("root", "staged")
+                    .with_production_association(association)
+                    .with_recovery_anchor(fixture.base.clone()),
+            );
+            assert!(!disarm_fault(), "{label}: the removal must have failed");
+            assert!(!disarm_sweep_sync(), "{label}: the sync must have failed");
+            let Err(error) = result else {
+                panic!("{label}: the failed sync must stop the staging");
+            };
+            assert_eq!(
+                error.disposition(),
+                ForwardFailureDisposition::Terminal(TransactionState::Quarantined),
+                "{label}"
+            );
+            assert_eq!(
+                ready.state(ROOT),
+                Some(TransactionState::Quarantined),
+                "{label}"
+            );
+            assert!(
+                fixture.destination_root.join("child/data").is_file(),
+                "{label}"
+            );
+        }
+    }
 }
